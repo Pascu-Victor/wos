@@ -16,7 +16,7 @@ TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
 THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
 SHM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "shm" / "shm.cpp"
-VMEM_ABI_HPP = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vmem.h"
+VMEM_ABI_HPP = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_ABI", ROOT / "modules/kern/src/abi/callnums/vmem.h"))
 DEBUG_FLAGS_DOC = ROOT / "docs" / "kernel_debug_flags.md"
 SYSCALL_PREPARATION_HPP = ROOT / "modules/kern/src/platform/sys/syscall_preparation.hpp"
 NUMA_ALLOC_CPP = ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp"
@@ -1671,7 +1671,41 @@ def test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary() -> Non
     require_cpp_tokens(fd, ["present(14, driver.pending_mremap_ps_policies != nullptr)"], "actual full-width recovery presence")
 
 
+def test_public_huge_constructor_preserves_prepared_publication_frontier() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    constructor = function_body(source, "allocate_public_huge_anonymous")
+    require_cpp_tokens(VMEM_ABI_HPP.read_text(), ["MAP_HUGETLB = 0x40000"], "existing public huge bit")
+    require_cpp_tokens(constructor, ["MAP_PRIVATE | vmabi::MAP_ANONYMOUS | vmabi::MAP_HUGETLB",
+        "(flags & ~SUPPORTED) != 0", "(prot & ~PROTECTION) != 0", "(size & (huge::LEAF_BYTES - 1)) != 0",
+        "size / huge::LEAF_BYTES > huge::MAX_ROOT_LEAVES", "attempt < 3", "metadata.serial() != initial_key.incarnation"],
+        "exact eager huge profile and premutation attempt bound")
+    if constructor.count("memory_policy_snapshot()") != 1 or constructor.count("capture_allocation_context(") != 1:
+        fail("huge constructor must capture actor policy/CPU once")
+    if constructor.count("metadata.matches(*task)") != 1:
+        fail("huge metadata validation must be single-use")
+    require_ordered_tokens(constructor, ["SyscallPreparationScope preparation", "capture_allocation_context",
+        "for (unsigned attempt", "SharedLazyVmemUpdate metadata", "CurrentHugeMapAdmission admission",
+        "observation.admit_mapping", "select_current_huge_vacancy", "metadata.prepare", "metadata.stage",
+        "batch.prepare", "CurrentHugeMapAdmission admission", "RegistryCore::same_root",
+        "observation.admit_mapping", "validate_current_huge_vacancy", "metadata.matches",
+        "admission.publish", "metadata.commit();", "metadata.advance_cursor", "observation.commit_mapping"],
+        "prepare outside leases and infallible postACK tail")
+    tail = constructor[constructor.index("metadata.commit();"):constructor.index("return 0;")]
+    if any(word in tail for word in ("matches(", "prepare(", "return -", "continue;")):
+        fail("huge postpublication tail acquired a fallible validator")
+    for name in ("select_current_huge_vacancy", "validate_current_huge_vacancy"):
+        body = function_body(source, name)
+        require_ordered_tokens(body, ["CurrentRangeRootAccess access{}", "PreemptGuard", "acquire_current_range_root",
+            "release_current_range_root", "if (status !="], "short normal reader before exclusive publisher")
+    require_cpp_tokens(function_body(source, "sys_vmem"), ["if ((a4 & ker::abi::vmem::MAP_HUGETLB) != 0)",
+        "allocate_public_huge_anonymous(a1, a2, a3, a4)"], "raw public constructor")
+    mapping = function_body(source, "sys_vmem_map")
+    require_order(mapping, "allocate_public_huge_anonymous", "MAP_ANONYMOUS", "huge map before ordinary File/anonymous routes")
+    require_order(mapping, "allocate_public_huge_anonymous", "if (fd >", "huge anonymous ignores fd/offset")
+
+
 def main() -> None:
+    test_public_huge_constructor_preserves_prepared_publication_frontier()
     test_public_mutations_use_current_geometry_and_finite_owner_free_handoff()
     test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary()
     test_file_fixed_preparation_preserves_retained_description_and_publication()

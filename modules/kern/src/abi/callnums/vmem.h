@@ -38,6 +38,7 @@ constexpr uint64_t MAP_FIXED = 0x10;
 constexpr uint64_t MAP_ANONYMOUS = 0x20;
 constexpr uint64_t MAP_NORESERVE = 0x4000;
 constexpr uint64_t MAP_POPULATE = 0x8000;
+constexpr uint64_t MAP_HUGETLB = 0x40000;
 
 // Error codes
 constexpr int VMEM_SUCCESS = 0;

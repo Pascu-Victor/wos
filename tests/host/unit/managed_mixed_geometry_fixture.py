@@ -791,7 +791,23 @@ void admission_boundary(){
 }
 }
 '''
-        return declarations + source + boundary + ports + callers + "\n}\n" + self.public_cases.read_text()
+        return declarations + source + boundary + self.huge_constructor_additions() + ports + callers + "\n}\n" + self.public_cases.read_text()
+
+    def huge_constructor_additions(self):
+        source = self.sources["syscalls_impl/vmem/sys_vmem.cpp"]
+        blocks = []
+        for first, last in [("// BEGIN checked huge vacancy selection.", "// END checked huge vacancy selection."),
+                            ("// BEGIN eager public huge anonymous construction.", "// END eager public huge anonymous construction.")]:
+            if source.count(first) not in (0, 1) or source.count(last) != source.count(first):
+                raise ValueError("ambiguous constructor extraction")
+            if first not in source:
+                if blocks:
+                    raise ValueError("partial constructor source")
+                continue
+            blocks.append(source[source.index(first):source.index(last) + len(last)])
+        if len(blocks) not in (0, 2):
+            raise ValueError("constructor requires checked selector")
+        return "\nnamespace ker::syscall::vmem {\n" + "\n".join(blocks) + "\n}\n" if blocks else ""
 
     def controls(self, source):
         # Exactly four new controls; original profiles retain every inherited
@@ -816,3 +832,164 @@ void admission_boundary(){
         assert actual.count(old) == 1 and source.count(actual) == 1
         bad = actual.replace(old, old + "\npublication_guard.~SharedVmemPublicationGuard(); ::new(&publication_guard) SharedVmemPublicationGuard;", 1)
         yield "public-reopens-final-publication", source.replace(actual, bad, 1), "ManagedPublicMutation.RawFreeDemotesBeforeUnmapUnderFinalPublication"
+
+class PublicHugeMapBuilder(PublicMutationBuilder):
+    """Actual358 constructor and real batch provider; finite context/AS/ACK ports."""
+
+    def __init__(self, kernel_file, support, definition):
+        super().__init__(kernel_file, support, definition)
+        from managed_huge_batch_fixture import Builder as BatchBuilder
+        self.batch = BatchBuilder(kernel_file, support, definition, lambda text, first, last: text[text.index(first):text.index(last) + len(last)])
+        self.huge_cases = support / "managed_public_huge_map_cases.inc"
+        if self.huge_cases.read_text().count("TEST_F(ManagedPublicHugeMap,") != 16:
+            raise ValueError("constructor profile requires exactly16 cases")
+        self.test_count += 16
+        self.inputs.extend([*self.batch.inputs, self.huge_cases, kernel_file("abi/callnums/vmem.h")])
+        if self.sources["syscalls_impl/vmem/sys_vmem.cpp"].count("// BEGIN eager public huge anonymous construction.") != 1:
+            raise ValueError("constructor profile requires actual358 source")
+
+    def compose(self, *arguments):
+        source = super().compose(*arguments)
+        replace = self.batch.replace
+        source = replace(source, "auto const PM_ADDR = reinterpret_cast<uintptr_t>(task->pagemap);",
+                         "auto const PM_ADDR = host_fixed::hhdm_address(task->pagemap);")
+        source = replace(source, "void* operator new(std::size_t n, const std::nothrow_t&) noexcept {", """void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+ if(host_batch::enabled&&n==sizeof(huge::detail::HugeMapBatchStorage)){
+  huge::Snapshot s{};huge_core.snapshot(s);EXPECT_EQ(s.plans,2U);EXPECT_GE(s.table_pages,5U);
+  if(host_batch::fail_heap){host_batch::fail_heap=false;return nullptr;}
+ }
+""")
+        source = replace(source, "return allocate(first, pages, alignment, initialization);", """
+ if(host_batch::enabled){
+  host_public_huge::before_data();
+  if(host_batch::allocation_index++==host_batch::fail_data_before)return nullptr;
+  uint64_t chosen=first;
+  for(;;){
+   bool occupied=false;
+   for(auto const&block:blocks)
+    if(block.storage&&chosen<block.physical+uint64_t{block.pages}*PAGE&&block.physical<chosen+uint64_t{pages}*PAGE){occupied=true;break;}
+   if(!occupied)break;
+   if(end-chosen<alignment)return nullptr;
+   chosen+=alignment;
+  }
+  if(chosen>end||uint64_t{pages}*PAGE>end-chosen)return nullptr;
+  return allocate(chosen,pages,alignment,initialization);
+ }
+ return allocate(first, pages, alignment, initialization);""")
+        source = replace(source, "void release_table(paging::PageTable* p) noexcept {",
+                         "void release_table(paging::PageTable* p) noexcept {\n host_batch::release(p);")
+        source = replace(source, "void flush_pagemap_after_update(PageTable* root, uint64_t va, bool full) {",
+                         "void flush_pagemap_after_update(PageTable* root, uint64_t va, bool full) {\n if(host_public_huge::active&&host_public_huge::publishing){host_public_huge::ack(root,va,full);host_batch::ack();}")
+        source = replace(source, "if(host_protect::active&&!root_readers){host_protect::acknowledge(root,va,full);return;}",
+                         "if(host_protect::active&&!root_readers&&!host_public_huge::active){host_protect::acknowledge(root,va,full);return;}")
+        source = replace(source, "void admission_boundary(){", "void admission_boundary(){\n if(host_public_huge::active){host_public_huge::admit_boundary();return;}")
+        source = replace(source, "auto observe_mapping_count(task::Task& subject,mm::paging::PageTable*,uint64_t)->bool{",
+                         "auto observe_mapping_count(task::Task& subject,mm::paging::PageTable*,uint64_t)->bool{\n if(host_public_huge::active){host_public_huge::observe_boundary(subject);return true;}")
+        source = replace(source, "if(!host_fixed::admit)return false;", "if(host_public_huge::active){if(!host_public_huge::admit())return false;}else if(!host_fixed::admit)return false;")
+        adapter = self.batch.adapter
+        call = "return virt::publish_managed_huge_batch_owned(root, publication, batch);"
+        assert adapter.count(call) == 1
+        adapter = adapter.replace(call, "host_public_huge::before_batch(root,batch);\n auto const result=virt::publish_managed_huge_batch_owned(root, publication, batch);\n host_public_huge::after_batch(batch,result);return result;", 1)
+        batch_support, boundary, _ = self.batch.case_path.read_text().partition("namespace {\nclass ManagedBatch")
+        if not boundary or "TEST_F(" in batch_support:
+            raise ValueError("batch non-test support boundary changed")
+        prefix = r'''
+#include <cstddef>
+#include <cstdint>
+namespace ker::mod::mm::paging {struct PageTable;}
+namespace ker::mod::sched::task {struct Task;}
+namespace ker::mod::mm::huge {class PreparedHugeMapBatch;enum class Error:uint8_t;}
+namespace host_batch {
+inline bool enabled=false,fail_heap=false,heap_without_plans=false;
+inline std::size_t allocation_index=0,fail_data_before=SIZE_MAX;
+void release(void*);void ack();
+}
+namespace host_public_huge {
+extern bool active,publishing;
+void before_data();void admit_boundary();auto admit()->bool;
+void observe_boundary(ker::mod::sched::task::Task&);
+void ack(ker::mod::mm::paging::PageTable*,uint64_t,bool);
+void before_batch(ker::mod::mm::paging::PageTable*,ker::mod::mm::huge::PreparedHugeMapBatch&);
+void after_batch(ker::mod::mm::huge::PreparedHugeMapBatch&,ker::mod::mm::huge::Error);
+}
+'''
+        return (prefix + source + "\n" + batch_support + self.ports() +
+                "\nnamespace ker::mod::mm::virt {\n" + self.batch.mapper +
+                "\n} namespace ker::mod::mm::huge::detail {\n" + adapter + "\n}\n" + self.huge_cases.read_text())
+
+    @staticmethod
+    def ports():
+        return r'''
+namespace host_public_huge {
+bool active{},publishing{},retry_cohort{},occupy_first{},changed{};
+uint64_t requested{};
+unsigned admissions{},observations{},acknowledgments{},entries{};
+int refuse_admission{-1};
+struct Range {uint64_t start{},length{};};
+std::array<Range,8> published{};unsigned published_count{};
+void admit_boundary(){
+ EXPECT_TRUE(host_range::interrupts);EXPECT_EQ(publication_depth,1U);
+ EXPECT_EQ(root_readers+cow_depth+pin_depth+backend().preempt_depth,0U);
+ ASSERT_NE(host_range::current,nullptr);EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(),1U);
+}
+auto admit()->bool{admit_boundary();return static_cast<int>(admissions++)!=refuse_admission;}
+void observe_boundary(ker::mod::sched::task::Task&subject){
+ admit_boundary();EXPECT_EQ(&subject,host_range::current);++observations;
+}
+void before_data(){
+ EXPECT_TRUE(host_fork_vm::ordinary());EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(),0U);
+ if(changed||(!retry_cohort&&!occupy_first))return;
+ changed=true;
+ auto&actor=*host_range::current;
+ ker::mod::sched::task::LazyVmemRange row{};
+ row.start=occupy_first?requested:TEST_VA+128*LARGE;row.end=row.start+PAGE;
+ row.kind=ker::mod::sched::task::LazyVmemKind::ANONYMOUS;row.prot=3;row.flags=ker::abi::vmem::MAP_PRIVATE;
+ {ker::syscall::vmem::SharedVmemPublicationGuard publication;
+  ASSERT_TRUE(ker::mod::sched::task::try_retain_lazy_vmem_range(row));ASSERT_TRUE(actor.lazy_vmem_ranges.push_back(row));}
+ if(retry_cohort){backend().current_cpu=1;host_protect::copied_policy={2,numa::Mode::BIND};}
+}
+void before_batch(ker::mod::mm::paging::PageTable*root,huge::PreparedHugeMapBatch&batch){
+ admit_boundary();EXPECT_EQ(root,runtime_root);EXPECT_FALSE(publishing);publishing=true;++entries;
+ host_batch::observed=huge::detail::HugeMapBatchAccess::storage(batch);
+ host_batch::observed_parents=huge::detail::HugeMapBatchAccess::parents(batch);
+ ASSERT_NE(host_batch::observed,nullptr);
+}
+void ack(ker::mod::mm::paging::PageTable*root,uint64_t address,bool full){
+ EXPECT_EQ(root,runtime_root);EXPECT_EQ(address,0U);EXPECT_TRUE(full);
+ EXPECT_TRUE(host_range::interrupts);EXPECT_TRUE(host_range::exclusive);EXPECT_EQ(publication_depth,1U);
+ EXPECT_EQ(root_readers+cow_depth+pin_depth,0U);EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(),1U);
+ ASSERT_NE(host_batch::observed,nullptr);auto const&b=*host_batch::observed;
+ ASSERT_LT(published_count,published.size());published[published_count++]={b.start,uint64_t{b.count}*LARGE};
+ for(auto const&row:host_range::current->lazy_vmem_ranges)EXPECT_FALSE(row.start<=b.start&&b.start<row.end);
+ EXPECT_LT(host_range::current->mmap_next.load(),b.start+uint64_t{b.count}*LARGE);
+ ++acknowledgments;
+}
+void after_batch(huge::PreparedHugeMapBatch&batch,huge::Error result){
+ EXPECT_TRUE(publishing);publishing=false;admit_boundary();
+ auto*s=huge::detail::HugeMapBatchAccess::storage(batch);ASSERT_EQ(s,host_batch::observed);
+ if(result==huge::Error::None){
+  EXPECT_TRUE(s->published&&s->acknowledged);
+  host_batch::returning_count=s->detached_count;host_batch::returning_after_ack=true;
+  for(uint16_t i=0;i<s->detached_count;++i)host_batch::returning[i]=s->detached[i];
+ }
+ // Clear heap borrows before automatic batch reset; later table checks use IDs.
+ host_batch::observed=nullptr;host_batch::observed_parents=nullptr;
+}
+}
+'''
+
+    def controls(self, source):
+        actual = self.definition(source, "auto allocate_public_huge_anonymous(")
+        def changed(old, new):
+            assert actual.count(old) == 1 and source.count(actual) == 1
+            return source.replace(actual, actual.replace(old, new, 1), 1)
+        yield "huge-missing-metadata", changed("metadata.commit();", "/* omitted mirrored metadata commit */"), "ManagedPublicHugeMap.AckBeforeRowsCursorAndSuccess"
+        yield "huge-postwrite-match", changed("metadata.commit();", "if(!metadata.matches(*task))return -EAGAIN;\n metadata.commit();"), "ManagedPublicHugeMap.AckBeforeRowsCursorAndSuccess"
+        old = "for (unsigned attempt = 0; attempt < 3; ++attempt) {"
+        new = old + "\n if(attempt){auto const again=task->memory_policy_snapshot();(void)numa::capture_allocation_context(again,placement);}"
+        yield "huge-recapture-retry", changed(old, new), "ManagedPublicHugeMap.OneCaptureAcrossCohortRetry"
+        caller = self.definition(source, "auto sys_vmem_map(")
+        old = "return allocate_public_huge_anonymous(hint, size, prot, flags);"
+        assert caller.count(old) == 1 and source.count(caller) == 1
+        bad = caller.replace(old, "return file_allocate(get_current_task(),hint,size,prot,flags,static_cast<int>(fd),offset,nullptr,MutationRoute::Public);", 1)
+        yield "huge-file-route", source.replace(caller, bad, 1), "ManagedPublicHugeMap.MapAliasIgnoresFileInputs"

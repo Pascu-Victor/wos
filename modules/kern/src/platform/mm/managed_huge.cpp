@@ -472,6 +472,54 @@ auto CurrentRangeSplitAdmission::allows(const sched::task::Task& target, uint64_
            publication_acquired() && range_current_context(*subject_, *preparation_, false);
 }
 
+// BEGIN current huge-map admission. Named access/key/status storage is born in
+// this instrumented constructor before any excluded adapter writes into it.
+CurrentHugeMapAdmission::CurrentHugeMapAdmission(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                                 const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept
+    : subject_(&subject), preparation_(&preparation), publication_(&publication) {
+    if (!context_valid()) return;
+    access_.subject = &subject;
+    access_.local = subject.try_acquire_usercopy_pagemap(access_.root);
+    if (!access_.local) {
+        status_ = Error::Again;
+        return;
+    }
+    // Successful local access is recorded even if a later root/key check fails.
+    // Deliberately never acquire a normal striped reader in this admission.
+    if (access_.root == nullptr || access_.root == virt::get_kernel_pagemap() || access_.root != subject.pagemap) {
+        status_ = Error::Stale;
+        return;
+    }
+    status_ = detail::root_key(access_.root, key_);
+    if (status_ == Error::None && (!RegistryCore::valid_root(key_) || key_.address_bits != reinterpret_cast<uint64_t>(access_.root)))
+        status_ = Error::Stale;
+    if (status_ == Error::None && !context_valid()) status_ = Error::Again;
+}
+CurrentHugeMapAdmission::~CurrentHugeMapAdmission() noexcept { detail::release_current_range_root(access_); }
+auto CurrentHugeMapAdmission::status() const noexcept -> Error { return status_; }
+auto CurrentHugeMapAdmission::root() const noexcept -> paging::PageTable* { return status_ == Error::None ? access_.root : nullptr; }
+auto CurrentHugeMapAdmission::key() const noexcept -> const RootKey& { return key_; }
+auto CurrentHugeMapAdmission::context_valid() const noexcept -> bool {
+    return subject_ != nullptr && preparation_ != nullptr && publication_ != nullptr && publication_->acquired() &&
+           range_current_context(*subject_, *preparation_, true) && !subject_->usercopy_pagemap_closing.load(std::memory_order_acquire);
+}
+auto CurrentHugeMapAdmission::publish(PreparedHugeMapBatch& batch) noexcept -> Error {
+    if (status_ != Error::None) return status_;
+    if (!context_valid()) return Error::Invalid;
+    if (access_.subject != subject_ || !access_.local || access_.gate != static_cast<size_t>(-1) || access_.root == nullptr ||
+        access_.root == virt::get_kernel_pagemap() || access_.root != subject_->pagemap)
+        return Error::Stale;
+    RootKey current{};
+    if (auto const error = detail::root_key(access_.root, current); error != Error::None) return error;
+    if (!RegistryCore::valid_root(key_) || !RegistryCore::same_root(current, key_)) return Error::Stale;
+    auto const* storage = detail::HugeMapBatchAccess::storage(batch);
+    if (storage == nullptr || !RegistryCore::same_root(storage->root, key_)) return Error::Invalid;
+    // All new refusal checks precede the unchanged original exclusive/mapper.
+    // Caller has ended every separate normal reader/split admission already.
+    return detail::publish_prepared_huge_batch(access_.root, *publication_, batch);
+}
+// END current huge-map admission.
+
 }  // namespace ker::mod::mm::huge
 
 namespace ker::mod::mm::virt {

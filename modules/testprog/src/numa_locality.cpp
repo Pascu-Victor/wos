@@ -12,6 +12,7 @@
 #include <sys/resource_policy.h>
 #include <sys/vmem.h>
 #include <sys/wait.h>
+#include <sys/wos-ptrace.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -24,6 +25,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+
+#include "numa_bench_core.hpp"
 
 namespace {
 namespace abi = ker::abi::vmem::numa;
@@ -2383,3 +2386,778 @@ auto run_numa_pressure(int argc, char** argv) -> int {
     if (!before(s.deadline)) pressure_error(s, -ETIMEDOUT);
     return s.first_error == 0 ? 0 : 1;
 }
+
+namespace {
+// BEGIN public huge CPL3 workload. Existing modes/helpers above stay unchanged.
+constexpr uint64_t HUGE_BYTES = uint64_t{2} << 20;
+constexpr uint64_t HUGE_PAYLOAD = 2 * HUGE_BYTES;
+constexpr uint64_t HUGE_FLAGS = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB;
+struct HugeOptions {
+    uint64_t nonce{}, bytes{HUGE_PAYLOAD}, loads{16777216};
+    uint32_t domains{}, timeout_ms{600000}, hold_ms{10000};
+    bool bench{};
+};
+enum class HugePhase : uint64_t {
+    RawAlias = 1,
+    MmapAlias,
+    PartialProtect,
+    PartialHole,
+    ForkParent,
+    ForkChild,
+    Usercopy,
+    PtraceChild,
+    ProtNone,
+    ReadOnly,
+    ExitOwned,
+    Bench4K = 20,
+    Bench2M = 21
+};
+struct HugePod {
+    uint64_t version{}, bytes{}, nonce{}, pid{}, tid{}, phase{}, sequence{}, range_address{}, range_bytes{}, parked{};
+};
+static_assert(sizeof(HugePod) == 80 && std::is_trivially_copyable_v<HugePod>);
+struct alignas(PAGE) HugePodPage {
+    HugePod value{};
+    std::array<uint8_t, PAGE - sizeof(HugePod)> padding{};
+};
+static_assert(sizeof(HugePodPage) == PAGE && alignof(HugePodPage) == PAGE);
+struct HugeInterval {
+    uint64_t address{}, bytes{};
+};
+struct HugeMapping {
+    uint64_t address{}, bytes{};
+    std::array<HugeInterval, 3> live{};
+    bool owned{};
+};
+struct HugeReady {
+    HugePod pod{};
+    uint64_t pod_address{}, observed{}, hold_end{};
+};
+struct HugeState {
+    HugeOptions options{};
+    uint64_t deadline{}, frontier{}, remaining{}, sequence{}, tid{}, original_affinity{};
+    uint32_t children{};
+    HugeMapping unexpected{};
+    QueryBuffers io{};
+    Topology topo{};
+    Selection selected{};
+    OwnResources own{};
+    HugePodPage page{};
+};
+struct HugeWait {
+    int64_t result{};
+    int error{}, status{};
+    uint64_t polls{};
+    bool status_valid{};
+};
+// END public huge types.
+auto huge_options(int argc, char** argv, HugeOptions& out) -> bool {
+    uint32_t seen = 0;
+    for (int i = 0; i < argc; i += 2) {
+        if (i + 1 >= argc) return false;
+        const char* key = argv[i];
+        const char* text = argv[i + 1];
+        uint64_t value{};
+        uint32_t bit{};
+        if (std::strcmp(key, "--phase") == 0) {
+            bit = 4;
+            if (std::strcmp(text, "bench") == 0)
+                out.bench = true;
+            else if (std::strcmp(text, "correctness") != 0)
+                return false;
+        } else {
+            if (!number(text, value)) return false;
+            if (std::strcmp(key, "--nonce") == 0 && value) {
+                bit = 1;
+                out.nonce = value;
+            } else if (std::strcmp(key, "--domains") == 0 && value >= 1 && value <= 2) {
+                bit = 2;
+                out.domains = value;
+            } else if (std::strcmp(key, "--timeout-ms") == 0 && value <= 600000) {
+                bit = 8;
+                out.timeout_ms = value;
+            } else if (std::strcmp(key, "--hold-ms") == 0 && value >= 1000 && value <= 10000) {
+                bit = 16;
+                out.hold_ms = value;
+            } else if (std::strcmp(key, "--bytes") == 0 && value >= HUGE_PAYLOAD && value <= (uint64_t{64} << 20) &&
+                       value % HUGE_BYTES == 0) {
+                bit = 32;
+                out.bytes = value;
+            } else if (std::strcmp(key, "--loads") == 0 && value >= 1 && value <= (uint64_t{1} << 28)) {
+                bit = 64;
+                out.loads = value;
+            } else
+                return false;
+        }
+        if (seen & bit) return false;
+        seen |= bit;
+    }
+    uint64_t const HOLDS = out.bench ? 40 : (out.domains == 1 ? 46 : 50);
+    return (seen & 7) == 7 && (out.bench || (out.bytes == HUGE_PAYLOAD && !(seen & 64))) && out.timeout_ms >= HOLDS * out.hold_ms + 30000;
+}
+auto huge_admit(const HugeState& s) -> bool {
+    uint64_t now{};
+    return now_ns(now) && now < s.frontier && s.remaining <= 50 && s.remaining * s.options.hold_ms * NS_PER_MS <= s.frontier - now;
+}
+auto huge_hold_until(uint64_t end, uint64_t frontier) -> bool {
+    uint64_t now{};
+    if (!now_ns(now) || now >= frontier) return false;
+    if (now >= end) return true;
+    if (end >= frontier) return false;
+    timespec const ABSOLUTE{static_cast<time_t>(end / 1000000000ULL), static_cast<long>(end % 1000000000ULL)};
+    if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ABSOLUTE, nullptr) != 0) return false;
+    uint64_t after{};
+    return now_ns(after) && after >= end && after < frontier;
+}
+auto huge_open(HugeState& s, HugeMapping& m, uint64_t bytes, bool libc, int prot = PROT_READ | PROT_WRITE, bool populate = false,
+               bool ordinary = false) -> int64_t {
+    if (!huge_admit(s) || !cpu_still(s.selected.cpu) || m.owned) return -ETIMEDOUT;
+    void* address = nullptr;
+    uint64_t const FLAGS = ordinary ? MAP_PRIVATE | MAP_ANONYMOUS : HUGE_FLAGS | (populate ? MAP_POPULATE : 0);
+    int64_t rc{};
+    if (libc) {
+        // A nonfixed aligned hint avoids extra reservation bytes for the4K arm.
+        address = mmap(ordinary ? reinterpret_cast<void*>(uint64_t{1} << 30) : nullptr, bytes, prot, FLAGS, -1, ordinary ? 0 : PAGE);
+        if (address == MAP_FAILED) rc = -errno;
+    } else
+        rc = ker::vmem::allocate(&address, bytes, prot, FLAGS);
+    if (rc != 0) return rc;
+    m.address = reinterpret_cast<uint64_t>(address);
+    m.bytes = bytes;
+    m.owned = true;
+    m.live[0] = {m.address, bytes};
+    ++s.own.maps;
+    ++s.own.created_maps;
+    if (!m.address || m.address % HUGE_BYTES) return -EPROTO;
+    return huge_admit(s) && cpu_still(s.selected.cpu) ? 0 : -ETIMEDOUT;
+}
+auto huge_release(HugeState& s, HugeMapping& m) -> bool {
+    bool ok = true;
+    for (auto& interval : m.live) {
+        if (interval.bytes == 0) continue;
+        if (munmap(reinterpret_cast<void*>(interval.address), interval.bytes) == 0)
+            interval = {};
+        else
+            ok = false;  // Keep this exact interval owned on failure.
+    }
+    if (m.owned && ok) {
+        m.owned = false;
+        --s.own.maps;
+        ++s.own.unmapped;
+    }
+    if (!ok) s.own.complete = false;
+    return ok;
+}
+auto huge_hole(HugeState& s, HugeMapping& m, uint64_t offset) -> bool {
+    if (!huge_admit(s) || offset > m.bytes - PAGE || m.live[1].bytes || m.live[2].bytes) return false;
+    if (munmap(reinterpret_cast<void*>(m.address + offset), PAGE) != 0) return false;
+    m.live[0] = {m.address, offset};
+    m.live[1] = {m.address + offset + PAGE, m.bytes - offset - PAGE};
+    return true;
+}
+auto huge_byte(uint64_t index) -> uint8_t { return static_cast<uint8_t>((index * 17 + 0x369) ^ (index >> 12)); }
+auto huge_payload(const HugeMapping& m, bool fill, bool zero = false) -> bool {
+    for (const auto& interval : m.live) {
+        auto* p = reinterpret_cast<volatile uint8_t*>(interval.address);
+        for (uint64_t i = 0; i < interval.bytes; ++i) {
+            uint8_t const EXPECTED = zero ? 0 : huge_byte(interval.address + i - m.address);
+            if (fill)
+                p[i] = EXPECTED;
+            else if (p[i] != EXPECTED)
+                return false;
+        }
+    }
+    return true;
+}
+auto huge_expected(uint32_t mode, uint64_t mask, uint64_t address) -> uint16_t {
+    uint16_t members[2]{};
+    uint32_t count{};
+    for (uint16_t n = 0; n < 2; ++n)
+        if (mask & (uint64_t{1} << n)) members[count++] = n;
+    if (!count) return abi::INVALID_NODE;
+    return mode == 3 ? members[(address / HUGE_BYTES) % count] : members[0];
+}
+auto huge_placement(HugeState& s, const HugeMapping& m, uint32_t mode, uint64_t mask, bool uniform_leaf = true) -> bool {
+    uint16_t leaf_node = abi::INVALID_NODE;
+    for (uint64_t offset = 0; offset < m.bytes; offset += abi::MAX_PAGE_NODES * PAGE) {
+        if (!huge_admit(s) || !cpu_still(s.selected.cpu)) return false;
+        uint32_t const COUNT =
+            static_cast<uint32_t>((m.bytes - offset) / PAGE < abi::MAX_PAGE_NODES ? (m.bytes - offset) / PAGE : abi::MAX_PAGE_NODES);
+        if (page_nodes(s.io, reinterpret_cast<void*>(m.address + offset), COUNT) != 0) return false;
+        for (uint32_t i = 0; i < COUNT; ++i) {
+            uint64_t const ADDRESS = m.address + offset + i * PAGE;
+            auto const& row = s.io.pages[i];
+            if (ADDRESS % HUGE_BYTES == 0) leaf_node = row.node;
+            if (row.reserved32 || row.status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) || row.node >= s.options.domains ||
+                (uniform_leaf && row.node != leaf_node) || ((mode == 2 || mode == 3) && row.node != huge_expected(mode, mask, ADDRESS)))
+                return false;
+        }
+    }
+    return true;  // Placement only; no leaf-size assertion.
+}
+auto huge_window(HugeState& s, HugePhase phase, uint64_t range, uint64_t observed, int send = -1, int ack = -1) -> bool {
+    if (!s.remaining || !huge_admit(s) || range % HUGE_BYTES || observed < range || observed - range >= HUGE_BYTES) return false;
+    uint64_t const POD_ADDRESS = reinterpret_cast<uint64_t>(&s.page.value);
+    if ((POD_ADDRESS / HUGE_BYTES) == range / HUGE_BYTES || static_cast<uint64_t>(getpid()) != s.tid) return false;
+    // Volatile field stores keep the debugger-visible POD resident and emitted;
+    // the fixed representation stays ten ordinary u64 fields, not atomic ABI.
+    volatile HugePod& p = s.page.value;
+    p.parked = 0;
+    p.version = 1;
+    p.bytes = sizeof(HugePod);
+    p.nonce = s.options.nonce;
+    p.pid = static_cast<uint64_t>(getpid());
+    p.tid = s.tid;
+    p.phase = static_cast<uint64_t>(phase);
+    p.sequence = ++s.sequence;
+    p.range_address = range;
+    p.range_bytes = HUGE_BYTES;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    p.parked = 1;
+    uint64_t start{};
+    if (!now_ns(start) || start > UINT64_MAX - s.options.hold_ms * NS_PER_MS) {
+        p.parked = 0;
+        return false;
+    }
+    uint64_t const END = start + s.options.hold_ms * NS_PER_MS;
+    if (END >= s.frontier) {
+        p.parked = 0;
+        return false;
+    }
+    std::printf(
+        "NUMA_HUGE_PARK nonce=%llu pid=%llu tid=%llu phase=%llu sequence=%llu pod=%llu range=%llu bytes=%llu observed=%llu end_ns=%llu "
+        "geometry=unobserved\n",
+        static_cast<unsigned long long>(p.nonce), static_cast<unsigned long long>(p.pid), static_cast<unsigned long long>(p.tid),
+        static_cast<unsigned long long>(p.phase), static_cast<unsigned long long>(p.sequence), static_cast<unsigned long long>(POD_ADDRESS),
+        static_cast<unsigned long long>(range), static_cast<unsigned long long>(HUGE_BYTES), static_cast<unsigned long long>(observed),
+        static_cast<unsigned long long>(END));
+    bool ok = std::fflush(stdout) == 0;
+    if (send >= 0) {
+        HugeReady message{{p.version, p.bytes, p.nonce, p.pid, p.tid, p.phase, p.sequence, p.range_address, p.range_bytes, p.parked},
+                          POD_ADDRESS,
+                          observed,
+                          END};
+        char release{};
+        ok = ok && transfer(send, &message, sizeof(message), true, s.frontier) && huge_hold_until(END, s.frontier) &&
+             transfer(ack, &release, 1, false, s.frontier) && release == 'A';
+        uint64_t now{};
+        ok = ok && now_ns(now) && now >= END && now < s.frontier;
+    } else
+        ok = ok && huge_hold_until(END, s.frontier);
+    p.parked = 0;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (ok) --s.remaining;
+    return ok;
+}
+auto huge_windows(HugeState& s, HugePhase phase, const HugeMapping& m, int send = -1, int ack = -1) -> bool {
+    return huge_window(s, phase, m.address, m.address, send, ack) &&
+           huge_window(s, phase, m.address + m.bytes - HUGE_BYTES, m.address + m.bytes - HUGE_BYTES, send, ack);
+}
+auto huge_serve(HugeState& s, pid_t pid, int read_fd, int ack_fd, uint32_t count, uint64_t& sequence, HugePhase phase,
+                uint64_t* first = nullptr) -> bool {
+    for (uint32_t i = 0; i < count; ++i) {
+        HugeReady m{};
+        if (!huge_admit(s) || !s.remaining || !transfer(read_fd, &m, sizeof(m), false, s.frontier)) return false;
+        auto const& p = m.pod;
+        uint64_t now{};
+        if (p.version != 1 || p.bytes != sizeof(HugePod) || p.nonce != s.options.nonce || p.pid != static_cast<uint64_t>(pid) ||
+            p.tid != p.pid || p.sequence <= sequence || p.phase != static_cast<uint64_t>(phase) || p.parked != 1 ||
+            p.range_bytes != HUGE_BYTES || p.range_address % HUGE_BYTES || m.observed < p.range_address ||
+            m.observed - p.range_address >= HUGE_BYTES || m.pod_address == 0 || m.pod_address >= (uint64_t{1} << 47) ||
+            m.pod_address % PAGE || p.range_address < PAGE || p.range_address > (uint64_t{1} << 47) - HUGE_BYTES ||
+            m.pod_address / HUGE_BYTES == p.range_address / HUGE_BYTES || !now_ns(now) || now >= m.hold_end || m.hold_end > s.frontier ||
+            m.hold_end - now > s.options.hold_ms * NS_PER_MS)
+            return false;
+        if (first != nullptr) {
+            if (i == 0 && *first == 0) *first = p.range_address;
+            if (p.range_address != *first + uint64_t{i} * HUGE_BYTES) return false;
+        }
+        sequence = p.sequence;
+        if (!huge_hold_until(m.hold_end, s.frontier)) return false;
+        --s.remaining;
+        char release = 'A';
+        if (!transfer(ack_fd, &release, 1, true, s.frontier)) return false;
+    }
+    return true;
+}
+auto huge_wait(pid_t pid, uint64_t deadline, bool stop, int expected_signal, bool& owned, HugeWait& out) -> bool {
+    while (before(deadline)) {
+        int status = 0;
+        pid_t const RC = waitpid(pid, &status, WNOHANG | (stop ? WUNTRACED : 0));
+        out.result = RC;
+        out.error = RC < 0 ? errno : 0;
+        ++out.polls;
+        out.status_valid = RC == pid;
+        out.status = out.status_valid ? status : 0;
+        if (RC == pid) {
+            bool const STOPPED = WIFSTOPPED(status);
+            if (!STOPPED) owned = false;
+            bool const GOOD = stop ? STOPPED && WSTOPSIG(status) == SIGSTOP
+                                   : (expected_signal ? WIFSIGNALED(status) && WTERMSIG(status) == expected_signal
+                                                      : WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            return GOOD && before(deadline);
+        }
+        if (RC < 0 && out.error != EINTR) return false;
+        if (RC != 0 && RC != -1) return false;
+        if (raw_error(ker::multiproc::yield())) return false;
+    }
+    return false;
+}
+auto huge_trace(ker::abi::ptrace::request request, pid_t pid, void* data = nullptr) -> int64_t {
+    return static_cast<int64_t>(::syscall(ker::abi::callnums::process, static_cast<uint64_t>(ker::abi::process::procmgmt_ops::PTRACE),
+                                          static_cast<uint64_t>(request), static_cast<uint64_t>(pid), 0, reinterpret_cast<uint64_t>(data)));
+}
+auto huge_dumpable(bool value, bool set) -> int64_t {
+    return static_cast<int64_t>(::syscall(ker::abi::callnums::process, static_cast<uint64_t>(ker::abi::process::procmgmt_ops::PRCTL),
+                                          set ? 4 : 3, value ? 1 : 0, 0, 0));
+}
+auto huge_ptrace_io(pid_t pid, uint64_t address, bool writing, std::array<uint8_t, 256>& buffer) -> bool {
+    ker::abi::ptrace::MemIo io{address, buffer.data(), buffer.size(), 0};
+    int64_t const RC = huge_trace(writing ? ker::abi::ptrace::request::WRITE_MEM : ker::abi::ptrace::request::READ_MEM, pid, &io);
+    return RC == 0 && io.transferred == buffer.size();
+}
+auto huge_unexpected(HugeState& s, void* address, uint64_t bytes) -> bool {
+    if (!address || !bytes || bytes > 65 * HUGE_BYTES || s.unexpected.owned) {
+        s.own.complete = false;
+        return false;
+    }
+    s.unexpected.address = reinterpret_cast<uint64_t>(address);
+    s.unexpected.bytes = bytes;
+    s.unexpected.live[0] = {s.unexpected.address, bytes};
+    s.unexpected.owned = true;
+    ++s.own.maps;
+    ++s.own.created_maps;
+    return huge_release(s, s.unexpected);
+}
+auto huge_errors(HugeState& s, HugeMapping& live) -> bool {
+    struct ErrorCase {
+        uint64_t bytes, flags, prot;
+        int error;
+    };
+    const ErrorCase cases[]{{0, HUGE_FLAGS, 3, EINVAL},
+                            {HUGE_BYTES - PAGE, HUGE_FLAGS, 3, EINVAL},
+                            {HUGE_BYTES, HUGE_FLAGS & ~uint64_t{MAP_PRIVATE}, 3, EINVAL},
+                            {HUGE_BYTES, HUGE_FLAGS & ~uint64_t{MAP_ANONYMOUS}, 3, EINVAL},
+                            {HUGE_BYTES, HUGE_FLAGS | MAP_SHARED, 3, EINVAL},
+                            {HUGE_BYTES, HUGE_FLAGS | MAP_FIXED, 3, EINVAL},
+                            {HUGE_BYTES, HUGE_FLAGS | MAP_NORESERVE, 3, EINVAL},
+                            {HUGE_BYTES, HUGE_FLAGS, 8, EINVAL},
+                            {65 * HUGE_BYTES, HUGE_FLAGS, 3, ENOMEM}};
+    for (auto c : cases) {
+        if (!huge_admit(s)) return false;
+        void* out = reinterpret_cast<void*>(0x369);
+        auto const RAW = ker::vmem::allocate(&out, c.bytes, c.prot, c.flags);
+        if (RAW != -c.error || out != reinterpret_cast<void*>(0x369)) {
+            if (RAW == 0) (void)huge_unexpected(s, out, c.bytes);
+            return false;
+        }
+        errno = 0;
+        out = mmap(nullptr, c.bytes, c.prot, c.flags, -1, 0);
+        int const ERROR = errno;
+        if (out != MAP_FAILED || ERROR != c.error) {
+            if (out != MAP_FAILED) (void)huge_unexpected(s, out, c.bytes);
+            return false;
+        }
+    }
+    void* result = reinterpret_cast<void*>(0x369);
+    int64_t rc = ker::vmem::remap(&result, reinterpret_cast<void*>(live.address), live.bytes, live.bytes, 0);
+    if (rc != 0 || result != reinterpret_cast<void*>(live.address)) {
+        if (rc == 0) {
+            live.address = reinterpret_cast<uint64_t>(result);
+            live.live[0] = {live.address, live.bytes};
+        }
+        return false;
+    }
+    for (auto request : std::array<std::array<uint64_t, 3>, 3>{
+             {{live.bytes + HUGE_BYTES, 0, ENOMEM}, {HUGE_BYTES, 1, EOPNOTSUPP}, {live.bytes + HUGE_BYTES, 1, EOPNOTSUPP}}}) {
+        result = reinterpret_cast<void*>(0x369);
+        rc = ker::vmem::remap(&result, reinterpret_cast<void*>(live.address), live.bytes, request[0], request[1]);
+        if (rc != -static_cast<int64_t>(request[2]) || result != reinterpret_cast<void*>(0x369)) {
+            if (rc == 0) {
+                live.address = reinterpret_cast<uint64_t>(result);
+                live.bytes = request[0];
+                live.live = {};
+                live.live[0] = {live.address, live.bytes};
+            }
+            return false;
+        }
+    }
+    return huge_payload(live, false);
+}
+auto huge_quota(HugeState& s) -> bool {
+    rlimit saved{};
+    ker::abi::resource::Usage usage{};
+    if (!huge_admit(s) || getrlimit(RLIMIT_AS, &saved) != 0 || policy_usage(usage) != 0 || usage.current > UINT64_MAX - HUGE_BYTES)
+        return false;
+    rlimit lowered{usage.current + HUGE_BYTES - PAGE, saved.rlim_max};
+    if (lowered.rlim_cur >= saved.rlim_cur || lowered.rlim_cur > saved.rlim_max || setrlimit(RLIMIT_AS, &lowered) != 0) return false;
+    void* address = reinterpret_cast<void*>(0x369);
+    int64_t const RC = ker::vmem::allocate(&address, HUGE_BYTES, 3, HUGE_FLAGS);
+    bool ok = RC == -ENOMEM && address == reinterpret_cast<void*>(0x369);
+    if (RC == 0) {
+        (void)huge_unexpected(s, address, HUGE_BYTES);
+        ok = false;
+    }
+    if (s.unexpected.owned) return false;
+    if (setrlimit(RLIMIT_AS, &saved) != 0) return false;
+    rlimit observed{};
+    return getrlimit(RLIMIT_AS, &observed) == 0 && observed.rlim_cur == saved.rlim_cur && observed.rlim_max == saved.rlim_max && ok;
+}
+auto huge_aliases(HugeState& s) -> bool {
+    for (uint32_t index = 0; index < (s.options.domains == 1 ? 4U : 5U); ++index) {
+        uint32_t const MODE = index == 4 ? 2 : index;
+        uint64_t const MASK = MODE == 0 ? 0 : MODE == 3 ? ((uint64_t{1} << s.options.domains) - 1) : uint64_t{1} << (index == 4 ? 1 : 0);
+        if (policy_set(MODE, MASK) != 0 || !policy_matches(s.io, MODE, MASK)) return false;
+        for (uint32_t alias = 0; alias < 2; ++alias) {
+            HugeMapping m{};
+            bool ok = huge_open(s, m, HUGE_PAYLOAD, alias != 0, 3, index == 0 && alias == 1) == 0 && huge_payload(m, false, true) &&
+                      huge_payload(m, true) && huge_payload(m, false) && huge_placement(s, m, MODE, MASK);
+            if (ok && index == 0 && alias == 0) ok = huge_errors(s, m);
+            if (ok) ok = huge_windows(s, alias ? HugePhase::MmapAlias : HugePhase::RawAlias, m) && huge_payload(m, false);
+            bool const CLEAN = huge_release(s, m);
+            if (!ok || !CLEAN) return false;
+        }
+    }
+    return policy_set(2, uint64_t{1} << s.selected.node) == 0 && policy_matches(s.io, 2, uint64_t{1} << s.selected.node) && huge_quota(s);
+}
+auto huge_mutations(HugeState& s) -> bool {
+    for (uint32_t kind = 0; kind < 3; ++kind) {
+        HugeMapping m{};
+        HugePhase const PHASE = kind == 0 ? HugePhase::PartialProtect : HugePhase::PartialHole;
+        bool ok = huge_open(s, m, HUGE_PAYLOAD, false) == 0 && huge_payload(m, true) && huge_windows(s, PHASE, m);
+        if (ok && kind == 0)
+            ok = mprotect(reinterpret_cast<void*>(m.address + PAGE), PAGE, PROT_READ) == 0 && huge_payload(m, false) &&
+                 mprotect(reinterpret_cast<void*>(m.address + PAGE), PAGE, PROT_READ | PROT_WRITE) == 0;
+        if (ok && kind == 0) *reinterpret_cast<volatile uint8_t*>(m.address + PAGE) = huge_byte(PAGE);
+        if (ok && kind == 1) ok = huge_hole(s, m, PAGE);
+        if (ok && kind == 2) {
+            void* const ADDRESS = reinterpret_cast<void*>(m.address + PAGE);
+            void* const REPLACEMENT = mmap(ADDRESS, PAGE, 3, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            ok = REPLACEMENT == ADDRESS;
+            if (REPLACEMENT != MAP_FAILED && REPLACEMENT != ADDRESS) {
+                (void)huge_unexpected(s, REPLACEMENT, PAGE);
+                ok = false;
+            }
+            if (ok) {
+                auto* bytes = static_cast<volatile uint8_t*>(ADDRESS);
+                for (uint64_t i = 0; i < PAGE; ++i)
+                    if (bytes[i] != 0) ok = false;
+                for (uint64_t i = 0; i < PAGE; ++i) bytes[i] = huge_byte(PAGE + i);
+            }
+        }
+        if (ok)
+            ok = huge_payload(m, false) && huge_window(s, PHASE, m.address, kind == 1 ? m.address + PAGE : m.address) &&
+                 huge_window(s, PHASE, m.address + HUGE_BYTES, m.address + HUGE_BYTES);
+        bool const CLEAN = huge_release(s, m);
+        if (!ok || !CLEAN) return false;
+    }
+    return true;
+}
+auto huge_changed(const HugeMapping& m) -> bool {
+    auto* bytes = reinterpret_cast<const volatile uint8_t*>(m.address);
+    for (uint64_t i = 0; i < m.bytes; ++i) {
+        uint8_t expected = huge_byte(i);
+        for (uint64_t boundary : {uint64_t{PAGE}, HUGE_BYTES})
+            if (i >= boundary - 128 && i < boundary + 128) expected = static_cast<uint8_t>(0xD3 ^ (i - (boundary - 128)));
+        if (bytes[i] != expected) return false;
+    }
+    return true;
+}
+auto huge_child_case(HugeState& s, uint32_t kind) -> bool {
+    // kind0 inherited COW,1 exit-owned,2 PROT_NONE,3 RO,4 ptrace-after-fork.
+    HugeMapping m{};
+    bool ok = true;
+    if (kind == 0) ok = huge_open(s, m, HUGE_PAYLOAD, false) == 0 && huge_payload(m, true) && huge_windows(s, HugePhase::ForkParent, m);
+    int ready[2]{-1, -1}, commands[2]{-1, -1};
+    if (ok) ok = huge_admit(s) && policy_pipe(ready, s.own) && policy_pipe(commands, s.own);
+    pid_t pid = -1;
+    bool owned = false, attached = false;
+    if (ok) ok = std::fflush(stdout) == 0;
+    if (ok) {
+        pid = fork();
+        if (pid == 0) {
+            bool child_ok = close_fd(ready[0], s.own) && close_fd(commands[1], s.own);
+            initialize_transport(s.page);
+            s.tid = ker::multiproc::currentThreadId();
+            s.sequence = 0;
+            uint64_t remaining{};
+            child_ok = child_ok && s.tid == static_cast<uint64_t>(getpid()) &&
+                       transfer(commands[0], &remaining, sizeof(remaining), false, s.frontier) && remaining <= 50;
+            s.remaining = remaining;
+            if (kind != 0 && child_ok) {
+                child_ok = huge_dumpable(kind == 4, true) == 0 && huge_dumpable(false, false) == (kind == 4 ? 1 : 0);
+                int const PROT = kind == 2 ? PROT_NONE : kind == 3 ? PROT_READ : PROT_READ | PROT_WRITE;
+                child_ok = child_ok && huge_open(s, m, kind == 2 || kind == 3 ? HUGE_BYTES : HUGE_PAYLOAD, false, PROT) == 0;
+                if (child_ok && kind != 2) child_ok = huge_payload(m, false, true);
+                if (child_ok && kind != 2 && kind != 3) child_ok = huge_payload(m, true);
+            }
+            HugePhase const PHASE = kind == 0   ? HugePhase::ForkChild
+                                    : kind == 1 ? HugePhase::ExitOwned
+                                    : kind == 2 ? HugePhase::ProtNone
+                                    : kind == 3 ? HugePhase::ReadOnly
+                                                : HugePhase::PtraceChild;
+            if (child_ok)
+                child_ok = (kind == 2 || kind == 3) ? huge_window(s, PHASE, m.address, m.address, ready[1], commands[0])
+                                                    : huge_windows(s, PHASE, m, ready[1], commands[0]);
+            if (child_ok && kind == 4) {
+                char response = 'R';
+                child_ok = transfer(ready[1], &response, 1, true, s.frontier) && transfer(commands[0], &response, 1, false, s.frontier) &&
+                           response == 'V' && huge_changed(m);
+                if (child_ok) child_ok = huge_windows(s, HugePhase::PtraceChild, m, ready[1], commands[0]);
+            }
+            if (child_ok && kind == 0) {
+                child_ok = huge_payload(m, false);
+                for (uint64_t boundary : {uint64_t{PAGE}, HUGE_BYTES}) {
+                    auto* bytes = reinterpret_cast<volatile uint8_t*>(m.address + boundary - 128);
+                    for (uint64_t i = 0; i < 256; ++i) bytes[i] = static_cast<uint8_t>(0xD3 ^ i);
+                }
+                child_ok = child_ok && huge_changed(m);
+            }
+            bool const READ_CLOSED = close_fd(ready[1], s.own);
+            bool const COMMAND_CLOSED = close_fd(commands[0], s.own);
+            child_ok = child_ok && READ_CLOSED && COMMAND_CLOSED;
+            if (child_ok && (kind == 2 || kind == 3)) {
+                auto* fault = reinterpret_cast<volatile uint8_t*>(m.address);
+                if (kind == 2) {
+                    uint8_t value = *fault;
+                    (void)value;
+                } else
+                    *fault = 0xA5;
+                child_ok = false;  // A permitted fault must not return.
+            }
+            if (kind != 1 || !child_ok) {
+                if (!huge_release(s, m)) child_ok = false;
+            }
+            std::printf("NUMA_HUGE_CHILD nonce=%llu pid=%lld kind=%u pass=%u exit_owned=%u maps=%u fds=%u\n",
+                        static_cast<unsigned long long>(s.options.nonce), static_cast<long long>(getpid()), kind,
+                        static_cast<unsigned>(child_ok), static_cast<unsigned>(kind == 1 && child_ok), s.own.maps, s.own.fds);
+            (void)std::fflush(stdout);
+            _exit(child_ok ? 0 : 1);
+        }
+        if (pid < 0)
+            ok = false;
+        else {
+            owned = true;
+            ++s.children;
+        }
+    }
+    if (pid > 0) {
+        bool const READ_CLOSED = close_fd(ready[1], s.own), COMMAND_CLOSED = close_fd(commands[0], s.own);
+        ok = ok && READ_CLOSED && COMMAND_CLOSED;
+        if (ok && kind == 0) ok = huge_windows(s, HugePhase::ForkParent, m);
+        if (ok) ok = transfer(commands[1], &s.remaining, sizeof(s.remaining), true, s.frontier);
+        uint64_t sequence = 0, child_address = 0;
+        HugePhase const PHASE = kind == 0   ? HugePhase::ForkChild
+                                : kind == 1 ? HugePhase::ExitOwned
+                                : kind == 2 ? HugePhase::ProtNone
+                                : kind == 3 ? HugePhase::ReadOnly
+                                            : HugePhase::PtraceChild;
+        if (ok) ok = huge_serve(s, pid, ready[0], commands[1], kind == 2 || kind == 3 ? 1 : 2, sequence, PHASE, &child_address);
+        if (ok && kind == 4) {
+            char response{};
+            HugeWait stop{};
+            ok = transfer(ready[0], &response, 1, false, s.frontier) && response == 'R';
+            if (ok) {
+                ok = huge_trace(ker::abi::ptrace::request::SEIZE, pid) == 0;
+                attached = ok;
+            }
+            if (ok) ok = huge_trace(ker::abi::ptrace::request::INTERRUPT, pid) == 0 && huge_wait(pid, s.frontier, true, 0, owned, stop);
+            for (uint64_t boundary : {uint64_t{PAGE}, HUGE_BYTES}) {
+                if (!ok) break;
+                std::array<uint8_t, 256> bytes{};
+                uint64_t const ADDRESS = child_address + boundary - 128;
+                ok = huge_ptrace_io(pid, ADDRESS, false, bytes);
+                for (size_t i = 0; i < bytes.size() && ok; ++i)
+                    if (bytes[i] != huge_byte(boundary - 128 + i)) ok = false;
+                for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(0xD3 ^ i);
+                if (ok) ok = huge_ptrace_io(pid, ADDRESS, true, bytes);
+                std::array<uint8_t, 256> readback{};
+                if (ok) ok = huge_ptrace_io(pid, ADDRESS, false, readback) && readback == bytes;
+            }
+            if (ok) {
+                ok = huge_trace(ker::abi::ptrace::request::DETACH, pid) == 0;
+                if (ok) attached = false;
+            }
+            char verify = 'V';
+            if (ok)
+                ok = transfer(commands[1], &verify, 1, true, s.frontier) &&
+                     huge_serve(s, pid, ready[0], commands[1], 2, sequence, HugePhase::PtraceChild, &child_address);
+            if (ok) {
+                HugeWait result{};
+                ok = huge_wait(pid, s.frontier, false, 0, owned, result);
+            }
+        }
+        if (ok && kind != 4) {
+            HugeWait result{};
+            ok = huge_wait(pid, s.frontier, false, kind == 2 || kind == 3 ? SIGSEGV : 0, owned, result);
+        }
+    }
+    if (attached) {
+        if (huge_trace(ker::abi::ptrace::request::DETACH, pid) == 0)
+            attached = false;
+        else {
+            ok = false;
+            (void)huge_trace(ker::abi::ptrace::request::KILL, pid);
+        }
+    }
+    if (owned && !terminate_and_reap(pid, owned)) ok = false;
+    bool const R0 = close_fd(ready[0], s.own), R1 = close_fd(ready[1], s.own);
+    bool const C0 = close_fd(commands[0], s.own), C1 = close_fd(commands[1], s.own);
+    if (kind == 0 && ok) ok = huge_payload(m, false);
+    bool const CLEAN = huge_release(s, m);
+    if (pid > 0 && !owned) --s.children;
+    if (owned || attached) s.own.complete = false;
+    return ok && !owned && !attached && R0 && R1 && C0 && C1 && CLEAN;
+}
+auto huge_usercopy(HugeState& s) -> bool {
+    HugeMapping m{};
+    int fds[2]{-1, -1};
+    int file = -1;
+    bool created = false;
+    char path[96]{};
+    int const N = std::snprintf(path, sizeof(path), "/tmp/numa-huge-%llu-%lld", static_cast<unsigned long long>(s.options.nonce),
+                                static_cast<long long>(getpid()));
+    bool ok = N > 0 && static_cast<size_t>(N) < sizeof(path) && huge_open(s, m, HUGE_PAYLOAD, false) == 0 && huge_payload(m, true) &&
+              huge_windows(s, HugePhase::Usercopy, m) && policy_pipe(fds, s.own);
+    if (ok) {
+        file = open(path, O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW, 0600);
+        if (file < 0)
+            ok = false;
+        else {
+            created = true;
+            ++s.own.fds;
+            ++s.own.created_fds;
+        }
+    }
+    for (uint64_t boundary : {uint64_t{PAGE}, HUGE_BYTES}) {
+        if (!ok) break;
+        auto* source = reinterpret_cast<uint8_t*>(m.address + boundary - 128);
+        std::array<uint8_t, 256> buffer{};
+        ok = huge_admit(s) && transfer(fds[1], source, buffer.size(), true, s.frontier) &&
+             transfer(fds[0], buffer.data(), buffer.size(), false, s.frontier);
+        for (size_t i = 0; i < buffer.size() && ok; ++i)
+            if (buffer[i] != huge_byte(boundary - 128 + i)) ok = false;
+        if (ok) ok = transfer(fds[1], buffer.data(), buffer.size(), true, s.frontier);
+        if (ok) {
+            for (size_t i = 0; i < buffer.size(); ++i) static_cast<volatile uint8_t*>(source)[i] = 0;
+            ok = transfer(fds[0], source, buffer.size(), false, s.frontier);
+        }
+        for (size_t i = 0; i < buffer.size() && ok; ++i)
+            if (source[i] != huge_byte(boundary - 128 + i)) ok = false;
+        if (ok) ok = lseek(file, 0, SEEK_SET) == 0 && write(file, source, buffer.size()) == static_cast<ssize_t>(buffer.size());
+        if (ok) {
+            for (size_t i = 0; i < buffer.size(); ++i) source[i] = 0;
+            ok = pread(file, source, buffer.size(), 0) == static_cast<ssize_t>(buffer.size());
+        }
+        if (ok) ok = huge_payload(m, false);
+    }
+    if (ok) ok = huge_windows(s, HugePhase::Usercopy, m);
+    bool const F = close_fd(file, s.own), A = close_fd(fds[0], s.own), B = close_fd(fds[1], s.own);
+    bool const U = !created || unlink(path) == 0;
+    bool const M = huge_release(s, m);
+    return ok && F && A && B && U && M;
+}
+auto huge_chain(HugeMapping& m, const uint32_t* indices, uint32_t count, bool initialize) -> bool {
+    auto* bytes = reinterpret_cast<volatile uint8_t*>(m.address);
+    if (initialize)
+        for (uint64_t i = 0; i < m.bytes; ++i) bytes[i] = 0xA5;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto* slot = reinterpret_cast<volatile uintptr_t*>(m.address + static_cast<uint64_t>(indices[i]) * PAGE);
+        uintptr_t const NEXT = m.address + static_cast<uint64_t>(indices[(i + 1) % count]) * PAGE;
+        if (initialize)
+            *slot = NEXT;
+        else if (*slot != NEXT)
+            return false;
+    }
+    if (!initialize)
+        for (uint64_t i = 0; i < m.bytes; ++i)
+            if (i % PAGE >= sizeof(uintptr_t) && bytes[i] != 0xA5) return false;
+    return true;
+}
+auto huge_bench(HugeState& s) -> bool {
+    std::array<uint32_t, 16384> indices{};
+    uint32_t const COUNT = static_cast<uint32_t>(s.options.bytes / PAGE);
+    numa_bench::permutation(indices.data(), COUNT, 0x369);
+    for (uint32_t pair = 0; pair < 10; ++pair)
+        for (uint32_t arm = 0; arm < 2; ++arm) {
+            bool const HUGE = ((pair + arm) & 1) != 0;
+            HugeMapping m{};
+            bool ok = huge_open(s, m, s.options.bytes, true, 3, false, !HUGE) == 0 && huge_payload(m, false, true) &&
+                      huge_chain(m, indices.data(), COUNT, true) && huge_placement(s, m, 2, uint64_t{1} << s.selected.node, HUGE) &&
+                      huge_windows(s, HUGE ? HugePhase::Bench2M : HugePhase::Bench4K, m);
+            uint64_t start{}, end{};
+            uintptr_t cursor{};
+            if (ok) {
+                cursor = numa_bench::dependent_loads(m.address + static_cast<uint64_t>(indices[0]) * PAGE, COUNT);
+                ok = cursor == m.address + static_cast<uint64_t>(indices[0]) * PAGE && huge_admit(s) && now_ns(start);
+            }
+            if (ok) {
+                cursor = numa_bench::dependent_loads(cursor, s.options.loads);
+                ok = now_ns(end) && end >= start && huge_admit(s);
+            }
+            uint64_t const EXPECTED = m.address + static_cast<uint64_t>(indices[s.options.loads % COUNT]) * PAGE;
+            if (ok)
+                ok = cursor == EXPECTED && huge_chain(m, indices.data(), COUNT, false) &&
+                     huge_placement(s, m, 2, uint64_t{1} << s.selected.node, HUGE);
+            std::printf(
+                "NUMA_HUGE_BENCH nonce=%llu pair=%u arm=%u huge=%u bytes=%llu loads=%llu elapsed_ns=%llu checksum=%llu geometry=%s "
+                "pass=%u\n",
+                static_cast<unsigned long long>(s.options.nonce), pair, arm, static_cast<unsigned>(HUGE),
+                static_cast<unsigned long long>(s.options.bytes), static_cast<unsigned long long>(s.options.loads),
+                static_cast<unsigned long long>(end - start), static_cast<unsigned long long>(ok ? (cursor - m.address) / PAGE : 0),
+                s.options.bytes == HUGE_PAYLOAD ? "two_leaf_windows" : "endpoint_samples_only", static_cast<unsigned>(ok));
+            bool const CLEAN = huge_release(s, m);
+            if (!ok || !CLEAN) return false;
+        }
+    return true;
+}
+}  // namespace
+
+auto run_numa_huge(int argc, char** argv) -> int {
+    HugeOptions options;
+    if (!huge_options(argc, argv, options)) {
+        std::fprintf(stderr, "numa-huge: invalid bounded options/scheduled holds\n");
+        return 2;
+    }
+    HugeState s;
+    initialize_transport(s);
+    s.own = OwnResources{};
+    s.options = options;
+    s.remaining = options.bench ? 40 : options.domains == 1 ? 46 : 50;
+    if (!deadline_after(options.timeout_ms, s.deadline)) return 1;
+    s.frontier = s.deadline - 10000 * NS_PER_MS;
+    abi::SelfPolicy original{};
+    rlimit limits{};
+    s.tid = ker::multiproc::currentThreadId();
+    s.original_affinity = ker::multiproc::getThreadAffinityMask(s.tid);
+    bool const SAVED = s.tid == static_cast<uint64_t>(getpid()) && policy_read(s.io, original) == 0 && getrlimit(RLIMIT_AS, &limits) == 0;
+    bool ok = SAVED && policy_topology(s.io, s.topo, options.domains) == 0 && pin_current_cpu(s.topo, s.selected, s.frontier) == 0 &&
+              huge_admit(s);
+    std::printf(
+        "NUMA_HUGE_BEGIN nonce=%llu pid=%llu tid=%llu domains=%u bench=%u holds=%llu physical_closure=unqualified geometry=unobserved\n",
+        static_cast<unsigned long long>(options.nonce), static_cast<unsigned long long>(getpid()), static_cast<unsigned long long>(s.tid),
+        options.domains, static_cast<unsigned>(options.bench), static_cast<unsigned long long>(s.remaining));
+    if (ok)
+        ok = options.bench ? policy_set(2, uint64_t{1} << s.selected.node) == 0 &&
+                                 policy_matches(s.io, 2, uint64_t{1} << s.selected.node) && huge_bench(s)
+                           : huge_aliases(s);
+    if (ok && !options.bench)
+        ok = huge_mutations(s) && huge_child_case(s, 0) && huge_child_case(s, 1) && huge_usercopy(s) && huge_child_case(s, 4) &&
+             huge_child_case(s, 2) && huge_child_case(s, 3);
+    bool restored = false;
+    if (SAVED && s.children == 0 && s.own.maps == 0 && s.own.fds == 0 && s.own.complete) {
+        restored = policy_set(original.mode, original.nodes) == 0 && policy_matches(s.io, original.mode, original.nodes) &&
+                   ker::multiproc::setThreadAffinityMask(s.tid, s.original_affinity) == 0 &&
+                   static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(s.tid)) == s.original_affinity;
+        rlimit final{};
+        restored = restored && getrlimit(RLIMIT_AS, &final) == 0 && final.rlim_cur == limits.rlim_cur && final.rlim_max == limits.rlim_max;
+    }
+    ok = ok && s.remaining == 0 && s.children == 0 && restored && s.own.maps == 0 && s.own.fds == 0 && s.own.complete && before(s.deadline);
+    std::printf(
+        "NUMA_HUGE_RESULT nonce=%llu pass=%u remaining=%llu maps=%u fds=%u children=%u complete=%u restored=%u "
+        "geometry=external_witness_required physical_closure=unqualified\n",
+        static_cast<unsigned long long>(options.nonce), static_cast<unsigned>(ok), static_cast<unsigned long long>(s.remaining), s.own.maps,
+        s.own.fds, s.children, static_cast<unsigned>(s.own.complete), static_cast<unsigned>(restored));
+    return ok && before(s.deadline) ? 0 : 1;
+}
+// END public huge CPL3 workload.

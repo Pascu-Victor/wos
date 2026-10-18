@@ -243,6 +243,39 @@ void release_mremap_ps_policy(RootKey& owned) noexcept;
 [[nodiscard]] auto prepare_unpublished_range_split(paging::PageTable*, uint64_t start, uint64_t end, RangeSplitSurvey& empty,
                                                    PreparedTables& empty_tables, uint16_t fail_before_table = UINT16_MAX) noexcept -> Error;
 }  // namespace detail
+// BEGIN current huge-map admission. This lexical holder owns Task-local access
+// only; its gate remains NONE so the batch publisher may take its exclusive.
+// Enter at preempt0/IF-on with actual current PROCESS preparation and borrowed
+// blocking PUB. Every independent normal reader must end before publish().
+class CurrentHugeMapAdmission {
+   public:
+    CurrentHugeMapAdmission(sched::task::Task&, const sys::SyscallPreparationScope&,
+                            const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept;
+    ~CurrentHugeMapAdmission() noexcept;
+    CurrentHugeMapAdmission(const CurrentHugeMapAdmission&) = delete;
+    CurrentHugeMapAdmission(CurrentHugeMapAdmission&&) = delete;
+    auto operator=(const CurrentHugeMapAdmission&) -> CurrentHugeMapAdmission& = delete;
+    auto operator=(CurrentHugeMapAdmission&&) -> CurrentHugeMapAdmission& = delete;
+    [[nodiscard]] auto status() const noexcept -> Error;
+    [[nodiscard]] auto root() const noexcept -> paging::PageTable*;
+    // Comparison data only, never AS/placement/metadata authority.
+    [[nodiscard]] auto key() const noexcept -> const RootKey&;
+    [[nodiscard]] auto publish(PreparedHugeMapBatch&) noexcept -> Error;
+
+   private:
+    [[nodiscard]] auto context_valid() const noexcept -> bool;
+    sched::task::Task* subject_{};
+    const sys::SyscallPreparationScope* preparation_{};
+    const ker::syscall::vmem::SharedVmemPublicationGuard* publication_{};
+    detail::CurrentRangeRootAccess access_{};
+    RootKey key_{};
+    Error status_{Error::Invalid};
+};
+// Final caller order: PUB, admission, then fresh AS observer. Validate every
+// AS/layout/vacancy/cohort/metadata condition before publish; commit afterward
+// without fallible work. Observer dies while local access/PUB live, admission
+// releases next, PUB last; unused prepared owners reset outside all of them.
+// END current huge-map admission.
 namespace detail {
 struct SpanPublicationView {
     LeafHandle handle{};

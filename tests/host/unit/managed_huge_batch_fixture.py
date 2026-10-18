@@ -89,3 +89,57 @@ void release(void*);void ack();
         yield ("batch-missing-transfer", replace(text,
                "huge::detail::HugeMapBatchAccess::transfer_after_publish(owner);", "/* missing actual owner transfer */"),
                "ManagedBatch.OneTwoAnd64LeavesTransferEveryIndependentReference")
+
+
+class CurrentBuilder(Builder):
+    """Real current admission with explicit finite entry/ACK observations only."""
+
+    def __init__(self, kernel_file, support, definition, bounded):
+        super().__init__(kernel_file, support, definition, bounded)
+        self.current_case_path = support / "managed_current_huge_map_cases.inc"
+        self.module = kernel_file("platform/mm/managed_huge.cpp")
+        self.header = kernel_file("platform/mm/managed_huge.hpp")
+        self.current_methods = bounded(self.module.read_text(), "// BEGIN current huge-map admission.",
+                                       "// END current huge-map admission.")
+        self.current_declaration = definition(self.header.read_text(), "class CurrentHugeMapAdmission {")
+        count = self.current_case_path.read_text().count("TEST_F(ManagedCurrentMap,")
+        if not 1 <= count <= 12:
+            raise RuntimeError("current huge-map fixture exceeds accepted named-case cap")
+        self.test_count += count
+        self.inputs.extend([self.current_case_path, self.module, self.header])
+
+    def compose(self, text):
+        text = super().compose(text)
+        # Observation seams only: the actual mapper and its old ACK assertions
+        # remain intact; no authority is supplied by these counters.
+        text = self.replace(text, "return virt::publish_managed_huge_batch_owned(root, publication, batch);",
+                            "host_current_map::entered(); return virt::publish_managed_huge_batch_owned(root, publication, batch);")
+        text = self.replace(text, "++acknowledgments;", "host_current_map::ack(); ++acknowledgments;")
+        prefix = """
+namespace ker::mod::sched::task { struct Task; }
+namespace host_current_map {
+inline bool enabled=false;
+inline ker::mod::sched::task::Task* actor=nullptr;
+inline unsigned entries=0,acks=0;
+void entered();void ack();
+}
+"""
+        return prefix + text + "\n" + self.current_case_path.read_text()
+
+    def module_controls(self, text):
+        # CppText supplied by the maintained driver tolerates canonical wrapping.
+        yield ("current-map-context", self.replace(text,
+               "range_current_context(*subject_, *preparation_, true)", "true"),
+               "ManagedCurrentMap.AbsentForeignInactiveAndDaemonCurrentNeverAcquire")
+        yield ("current-map-missing-release", self.replace(text,
+               "CurrentHugeMapAdmission::~CurrentHugeMapAdmission() noexcept { detail::release_current_range_root(access_); }",
+               "CurrentHugeMapAdmission::~CurrentHugeMapAdmission() noexcept { /* omitted local release */ }"),
+               "ManagedCurrentMap.PartialKernelKeyAndNullRootFailuresReleaseExactlyOnce")
+        yield ("current-map-stale-incarnation", self.replace(text,
+               "if (!RegistryCore::valid_root(key_) || !RegistryCore::same_root(current, key_)) return Error::Stale;",
+               "if (false) return Error::Stale;"),
+               "ManagedCurrentMap.IncarnationChangeRefusesBeforeOriginalPublisher")
+        yield ("current-map-normal-reader", self.replace(text,
+               "access_.subject = &subject; access_.local = subject.try_acquire_usercopy_pagemap(access_.root);",
+               "(void)detail::acquire_current_range_root(subject, access_);"),
+               "ManagedCurrentMap.LocalOnlyOneAndTwoLeafPublishRetainsLeaseThroughAck")

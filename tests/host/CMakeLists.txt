@@ -351,6 +351,14 @@ add_test(NAME managed_huge_batch_runtime_test
         --host-build ${CMAKE_BINARY_DIR} --map-batch-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_huge_batch_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_current_huge_map_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --current-huge-map-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_current_huge_map_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME huge_aligned_vacancy_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/huge_aligned_vacancy_runtime_test.py)
+set_tests_properties(huge_aligned_vacancy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 60)
 add_test(NAME managed_mixed_geometry_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --mixed-geometry-only
@@ -376,6 +384,11 @@ add_test(NAME managed_public_mutation_runtime_test
         --host-build ${CMAKE_BINARY_DIR} --public-mutation-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_public_mutation_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
+add_test(NAME managed_public_huge_map_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --public-huge-map-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_public_huge_map_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
 add_test(NAME managed_shm_occupancy_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --shm-occupancy-only
@@ -445,6 +458,12 @@ add_test(NAME numa_public_policy_runtime_test
     COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
         ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py --public-policy)
 set_tests_properties(numa_public_policy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
+add_test(NAME numa_public_huge_runtime_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py
+        --public-huge --source ${WOS_ROOT}/modules/testprog/src/numa_locality.cpp
+        --predecessor ${WOS_ROOT}/tests/fixtures/numa_huge_entry_preinit.inc)
+set_tests_properties(numa_public_huge_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
 add_test(NAME numa_chase_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_chase_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER})

@@ -649,6 +649,9 @@ auto main(int argc, char** argv, char** envp) -> int {
     if (command != nullptr && std::strcmp(command, "numa-policy") == 0) {
         return run_numa_policy(argc - 2, argv + 2);
     }
+    if (command != nullptr && std::strcmp(command, "numa-huge") == 0) {
+        return run_numa_huge(argc - 2, argv + 2);
+    }
     if (command != nullptr && std::strcmp(command, "numa-lifecycle") == 0) {
         return run_numa_lifecycle(argc - 2, argv + 2);
     }

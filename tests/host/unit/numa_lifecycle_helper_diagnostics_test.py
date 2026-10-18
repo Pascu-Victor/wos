@@ -177,10 +177,55 @@ def generate_pressure(actual, take, shell, callnums, wrappers):
     return generated, variants
 
 
+def generate_public_huge(actual, take, shell, callnums, wrappers, ptrace_types, predecessor):
+    """Actual critical guest helpers over explicit finite syscall/clock ports.
+
+    Actual entry/setup/final gates execute over finite endpoints; real phase workloads,
+    children/permissions/PTEs do not execute. The old entry is a genuine source control.
+    """
+    types = actual[actual.index("struct Selection {"):actual.index("// These POD transport bytes")]
+    types += take("struct OwnResources {", True)
+    types += actual[actual.index("enum ClockValid :"):actual.index("enum class WaitOutcome :")]
+    types += actual[actual.index("constexpr uint64_t HUGE_BYTES"):actual.index("// END public huge types.")]
+    functions = take("template <class T>") + "\n" + "\n".join(take(anchor) for anchor in [
+        "auto number(", "auto now_ns(", "auto deadline_after(", "auto before(", "auto raw_error(", "auto close_fd(",
+        "auto huge_options(", "auto huge_admit(", "auto huge_release(", "auto huge_expected(", "auto huge_wait(",
+        "auto huge_trace(", "auto huge_ptrace_io(", "auto run_numa_huge("])
+    if predecessor.count("auto run_numa_huge(") != 1:
+        raise ValueError("one genuine predecessor entry definition")
+    functions += "\n" + predecessor.replace("auto run_numa_huge(", "auto run_numa_huge_predecessor(")
+    for name in ("clock_gettime", "munmap", "waitpid", "close", "getpid", "getrlimit", "policy_read", "policy_set",
+                 "policy_matches", "policy_topology", "pin_current_cpu", "huge_bench", "huge_aliases", "huge_mutations",
+                 "huge_child_case", "huge_usercopy"):
+        functions = re.sub(r"(?<![\w:])" + name + r"\(", "fixture::" + name + "(", functions)
+    functions = functions.replace("ker::multiproc::", "fixture::")
+    functions = functions.replace("::syscall(", "fixture::process_call(")
+    generated = shell.read_text()
+    for key, value in (("ACTUAL_CALLNUMS", "namespace ker::abi {\n" + callnums + "\n}"),
+                       ("ACTUAL_PTRACE_TYPES", ptrace_types), ("ACTUAL_HUGE_TYPES", types),
+                       ("ACTUAL_HUGE_WRAPPERS", wrappers), ("ACTUAL_HUGE_FUNCTIONS", functions)):
+        marker = "/* @" + key + "@ */"
+        if generated.count(marker) != 1:
+            raise ValueError("unique actual huge marker: " + key)
+        generated = generated.replace(marker, value)
+    variants = {"actual": generated}
+    for label, old, new in [
+        ("lost-owned-unmap", "if (fixture::munmap(reinterpret_cast<void*>(interval.address), interval.bytes) == 0)", "if (true)"),
+        ("wrong-huge-interleave", "members[(address / HUGE_BYTES) % count]", "members[(address / PAGE) % count]"),
+        ("lost-stop-status", "stop ? STOPPED && WSTOPSIG(status) == SIGSTOP", "stop ? true"),
+        ("ignored-ptrace-count", "return RC == 0 && io.transferred == buffer.size();", "return RC == 0;"),
+    ]:
+        if generated.count(old) != 1:
+            raise ValueError("unique genuine huge control: " + label)
+        variants[label] = generated.replace(old, new)
+    return generated, variants
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--public-huge", action="store_true", help="actual huge guest critical helpers on explicit finite ports")
     parser.add_argument("--pressure-only", action="store_true", help="exercise actual public pressure workload on finite raw ABI ports")
     parser.add_argument("--workload-wait", action="store_true", help="exercise failure-only testprog wait observations")
     parser.add_argument("--workload-placement", action="store_true", help="exercise actual lifecycle ready/controller placement on finite endpoints")
@@ -188,11 +233,14 @@ def main():
     parser.add_argument("--predecessor", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
-    if sum((args.workload_wait, args.public_policy, args.workload_placement, args.pressure_only)) > 1:
+    if sum((args.workload_wait, args.public_policy, args.workload_placement, args.pressure_only, args.public_huge)) > 1:
         parser.error("select one explicit profile")
+    if args.public_huge and args.predecessor is None:
+        parser.error("public-huge entry regression requires the explicit genuine predecessor source")
     root = args.root.resolve(strict=True)
-    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy or args.workload_placement or args.pressure_only else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
-    shell = (Path(__file__).with_name("numa_pressure_cases.inc") if args.pressure_only else
+    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy or args.workload_placement or args.pressure_only or args.public_huge else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
+    shell = (Path(__file__).with_name("numa_huge_cases.inc") if args.public_huge else
+             Path(__file__).with_name("numa_pressure_cases.inc") if args.pressure_only else
              Path(__file__).with_name("numa_lifecycle_placement_test.inc") if args.workload_placement else
              Path(__file__).with_name("numa_policy_cases.inc") if args.public_policy else
              Path(__file__).with_name("numa_lifecycle_wait_diagnostics_test.inc") if args.workload_wait else Path(__file__).with_suffix(".inc"))
@@ -221,6 +269,10 @@ def main():
     if args.pressure_only:
         watched.extend([root / "toolchain/src/mlibc/sysdeps/wos/include/sys/vmem.h",
                         Path(__file__).resolve().parents[2] / "fixtures/validate_numa_pressure.py"])
+    if args.public_huge:
+        watched.extend([root / "toolchain/src/mlibc/sysdeps/wos/include/sys/vmem.h",
+                        root / "toolchain/src/mlibc/sysdeps/wos/include/sys/wos-ptrace.h",
+                        root / "toolchain/src/mlibc/abis/wos/vm-flags.h"])
     selected_compiler = os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")
     compiler = Path(shutil.which(selected_compiler) or selected_compiler).absolute()
     watched.extend([compiler, compiler.resolve(strict=True)])
@@ -288,7 +340,23 @@ def main():
             extracted.append(row)
             return body
 
-        if args.pressure_only:
+        if args.public_huge:
+            callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
+            extracted.append(row)
+            raw = (root / "toolchain/src/mlibc/sysdeps/wos/include/sys/vmem.h").read_text()
+            wrappers = []
+            for anchor in ("static inline int64_t\nallocate(", "static inline int64_t free("):
+                body, row = capture(raw, anchor)
+                extracted.append(row)
+                wrappers.append(body.replace("syscall(", "fixture::vmem_call("))
+            ptrace_types = (root / "toolchain/src/mlibc/sysdeps/wos/include/sys/wos-ptrace.h").read_text()
+            predecessor, predecessor_row = capture(args.predecessor.read_text(), "auto run_numa_huge(")
+            result["predecessor_extractions"] = [predecessor_row]
+            generated, variants = generate_public_huge(actual, take, shell, callnums, "\n".join(wrappers), ptrace_types, predecessor)
+            result["extractions"] = extracted
+            result["profile"] = "public-huge-actual-critical-guest-helpers-finite-ports"
+            result["endpoint_limits"] = "Actual full entry/setup/restoration/final gates and close/unmap over finite clock/policy/affinity/limit/workload endpoints; genuine old entry fails. Real phase workloads, children/kernel/PTE/PS/permissions/AS/physical closure not executed"
+        elif args.pressure_only:
             callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
             extracted.append(row)
             raw = (root / "toolchain/src/mlibc/sysdeps/wos/include/sys/vmem.h").read_text()

@@ -450,12 +450,15 @@ UNIT_TESTS=(
     lazy_vmem_staging_runtime_test
     managed_anonymous_remove_runtime_test
     managed_huge_batch_runtime_test
+    managed_current_huge_map_runtime_test
+    huge_aligned_vacancy_runtime_test
     managed_mremap_policy_runtime_test
     managed_mixed_geometry_runtime_test
     managed_mixed_protect_runtime_test
     managed_anonymous_fixed_runtime_test
     managed_file_fixed_runtime_test
     managed_public_mutation_runtime_test
+    managed_public_huge_map_runtime_test
     managed_shm_occupancy_runtime_test
     managed_huge_control_selection_test
     managed_huge_fork_runtime_test
@@ -470,6 +473,7 @@ UNIT_TESTS=(
     numa_lifecycle_wait_diagnostics_test
     numa_lifecycle_placement_diagnostics_test
     numa_lifecycle_helper_diagnostics_test
+    numa_public_huge_runtime_test
     numa_public_policy_runtime_test
     numa_public_pressure_runtime_test
     numa_lifecycle_census_runtime_test

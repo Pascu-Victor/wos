@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -415,20 +416,22 @@ def main() -> int:
     parser.add_argument("--anonymous-remove-only", action="store_true", help="exercise unwired managed anonymous removal with the retained original positive vectors")
     parser.add_argument("--mremap-policy-only", action="store_true", help="exercise real counted unsupported-PS mremap admission and recovery")
     parser.add_argument("--map-batch-only", action="store_true", help="exercise the unwired whole-batch mapper plus all original positive cases")
+    parser.add_argument("--current-huge-map-only", action="store_true", help="exercise actual current Task-local admission and original whole-batch publisher")
     parser.add_argument("--mixed-geometry-only", action="store_true", help="exercise prepared mixed geometry before the ordinary removal continuation")
     parser.add_argument("--mixed-protect-only", action="store_true", help="exercise prepared mixed geometry before the ordinary protection continuation")
     parser.add_argument("--anonymous-fixed-only", action="store_true", help="exercise private prepared anonymous fixed replacement and four new controls")
     parser.add_argument("--file-fixed-only", action="store_true", help="exercise private prepared retained-File fixed replacement and four new controls")
     parser.add_argument("--public-mutation-only", action="store_true", help="exercise actual public mutation dispatch, geometry proof and four source controls")
+    parser.add_argument("--public-huge-map-only", action="store_true", help="exercise actual eager private anonymous huge construction and four controls")
     parser.add_argument("--shm-occupancy-only", action="store_true", help="exercise real SHM overlap rejection through PS-aware occupied walkers")
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
     options = parser.parse_args()
-    selected_profiles = (options.mremap_policy_only, options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.public_mutation_only, options.shm_occupancy_only)
+    selected_profiles = (options.mremap_policy_only, options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.current_huge_map_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.public_mutation_only, options.public_huge_map_only, options.shm_occupancy_only)
     if sum(selected_profiles) > 1:
         parser.error("select at most one explicit managed memory profile")
-    overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only else OVERALL_SECONDS
+    overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only else OVERALL_SECONDS
     root = options.source_root.resolve()
     host_build = options.host_build.resolve()
     overlay = options.kernel_overlay.resolve() if options.kernel_overlay else None
@@ -493,26 +496,23 @@ def main() -> int:
                     remaining = work_deadline - time.monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(argv, COMMAND_SECONDS)
-                    try:
-                        code = process.wait(timeout=min(0.1, remaining))
+                    if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
                         break
-                    except subprocess.TimeoutExpired:
-                        continue
+                    time.sleep(min(0.01, remaining))
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=max(0, deadline - time.monotonic()))
                 raise RuntimeError(f"{label}: timed out")
+            finally:
+                # Keep the leader/SID reserved while the existing owner reaps
+                # adopted sanitizer helpers, including on fatal negative cases.
+                process_owner.reap_group(process, deadline)
+                groups.remove(process.pid)
+        code = process.returncode
         check_interrupted()
         try:
             os.killpg(process.pid, 0)
             absent = False
         except ProcessLookupError:
             absent = True
-        if absent:
-            groups.remove(process.pid)
         commands.append(
             {
                 "label": label,
@@ -552,9 +552,16 @@ def main() -> int:
                 options.gtest or host_build / "lib/libgtest.a",
             ]
         ]
+        process_owner_path = support / "file_mmap_registry_runtime_test.py"
         selected = [
-            pin(path) for path in [Path(__file__), module, factory, virt, header, fixture, prelude, cases, *libraries]
+            pin(path) for path in [Path(__file__), process_owner_path, module, factory, virt, header, fixture, prelude, cases, *libraries]
         ]
+        owner_spec = importlib.util.spec_from_file_location("managed_huge_process_owner", process_owner_path)
+        process_owner = importlib.util.module_from_spec(owner_spec)
+        owner_spec.loader.exec_module(process_owner)
+        process_owner.subreaper()
+        if pin(process_owner_path) != selected[1]:
+            raise RuntimeError("process-owner source changed during import")
 
         rows = json.loads((host_build / "compile_commands.json").read_text())
         row = next(
@@ -567,11 +574,11 @@ def main() -> int:
         context, context_methods, context_sources, context_map = context_overlay(scratch, kernel_file, root)
         selected.extend(pin(path) for path in context_sources)
         batch_fixture = None
-        if options.map_batch_only:
+        if options.map_batch_only or options.current_huge_map_only:
             if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.fork_contract_only:
                 raise RuntimeError("batch profile must be selected alone")
             import managed_huge_batch_fixture as batch_composition
-            batch_fixture = batch_composition.Builder(kernel_file, support, definition, bounded)
+            batch_fixture = (batch_composition.CurrentBuilder if options.current_huge_map_only else batch_composition.Builder)(kernel_file, support, definition, bounded)
             selected.extend(pin(path) for path in batch_fixture.inputs)
         policy_fixture = None
         if options.mremap_policy_only:
@@ -580,16 +587,16 @@ def main() -> int:
             policy_fixture.extend_context(context)
             selected.extend(pin(path) for path in policy_fixture.inputs)
         coordinator = None
-        if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.shm_occupancy_only:
+        if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only or options.shm_occupancy_only:
             if options.shm_occupancy_only:
                 import managed_shm_occupancy_fixture as composition
-            elif options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only:
+            elif options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only:
                 import managed_mixed_geometry_fixture as composition
             elif options.anonymous_remove_only:
                 import managed_anonymous_remove_fixture as composition
             else:
                 import fork_vm_coordinator_fixture as composition
-            coordinator = (composition.PublicMutationBuilder if options.public_mutation_only else composition.FileFixedBuilder if options.file_fixed_only else composition.FixedBuilder if options.anonymous_fixed_only else composition.ProtectBuilder if options.mixed_protect_only else composition.Builder)(kernel_file, support, definition)
+            coordinator = (composition.PublicHugeMapBuilder if options.public_huge_map_only else composition.PublicMutationBuilder if options.public_mutation_only else composition.FileFixedBuilder if options.file_fixed_only else composition.FixedBuilder if options.anonymous_fixed_only else composition.ProtectBuilder if options.mixed_protect_only else composition.Builder)(kernel_file, support, definition)
             coordinator.extend_context(context)
             selected.extend(pin(path) for path in coordinator.inputs)
         flags = compile_flags(row, overlay)
@@ -629,6 +636,12 @@ def main() -> int:
                 "auto commit_range_split(paging::PageTable*",
             )
         )
+        if coordinator is None:
+            adapters += (
+                "\n} namespace ker::mod::mm::virt {\n"
+                + definition(source, "auto get_kernel_pagemap() -> PageTable*")
+                + "\n} namespace ker::mod::mm::huge::detail {\n"
+            )
         range_cases = support / "managed_huge_range_cases.inc"
         fork_support = support / "managed_huge_fork_support.inc"
         fork_cases = support / "managed_huge_fork_cases.inc"
@@ -672,6 +685,13 @@ def main() -> int:
         if batch_fixture is not None:
             composite.write_text(batch_fixture.compose(composite.read_text()))
             shutil.copy2(composite, output / "actual-batch-source.cpp")
+        elif policy_fixture is None and not options.public_huge_map_only:
+            # Newly unwired method has no real batch mapper in legacy profiles.
+            # Link-only finite refusal; accidental execution is always a failure.
+            with composite.open("a") as stream:
+                stream.write("\nnamespace ker::mod::mm::huge::detail {\n"
+                             "auto publish_prepared_huge_batch(paging::PageTable*, const ker::syscall::vmem::SharedVmemPublicationGuard&, PreparedHugeMapBatch&) noexcept -> Error {\n"
+                             "ADD_FAILURE() << \"current huge-map adapter called in an unselected legacy profile\"; return Error::Unsupported;\n}\n}\n")
         if policy_fixture is not None:
             composite.write_text(policy_fixture.compose(composite.read_text()))
         segments = {
@@ -685,8 +705,11 @@ def main() -> int:
             "epoch": epoch,
             "adapters": adapters,
             **context_map,
+            **({"public_huge_mapper": coordinator.batch.mapper, "public_huge_adapter": coordinator.batch.adapter} if options.public_huge_map_only else {}),
             **({"mremap_policy": policy_fixture.manifest_text} if policy_fixture is not None else {}),
             **({"batch_mapper": batch_fixture.mapper, "batch_adapter": batch_fixture.adapter} if batch_fixture is not None else {}),
+            **({"current_huge_map_declaration": batch_fixture.current_declaration,
+                "current_huge_map_methods": batch_fixture.current_methods} if options.current_huge_map_only else {}),
         }
         if coordinator is not None:
             for path in context.rglob("*"):
@@ -793,13 +816,28 @@ def main() -> int:
         if policy_fixture is not None:
             for label, bad, test in policy_fixture.controls(composite.read_text()):
                 mutant(label, bad, test)
+        elif options.current_huge_map_only:
+            # Reuse the canonical owned command path; only module0 is replaced.
+            for label, text, test in batch_fixture.module_controls(CppText(module.read_text())):
+                control_case_names(test, baseline_names)
+                path = scratch / f"{label}.cpp"
+                path.write_text(text)
+                obj = scratch / f"{label}.o"
+                run(f"compile-{label}", flags + ["-iquote", module.parent, "-c", path, "-o", obj])
+                binary = link(label, [obj, *objects[1:]])
+                controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary),
+                                 "selected_cases": sorted(control_case_names(test, baseline_names))})
+                run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
+                binary.unlink()
+                obj.unlink()
+                path.unlink()
         elif batch_fixture is not None:
             for label, bad, test in batch_fixture.controls(composite.read_text()):
                 mutant(label, bad, test)
         elif coordinator is not None:
             for label, bad, test in coordinator.controls(composite.read_text()):
                 mutant(label, bad, test)
-            if not (options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.shm_occupancy_only):
+            if not (options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only or options.shm_occupancy_only):
                 for label, bad, test in coordinator.public.controls(public_source.read_text()):
                     mutant(label, bad, test, replace_index=3)
         elif options.fork_contract_only:

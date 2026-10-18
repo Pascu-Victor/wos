@@ -1859,6 +1859,156 @@ auto find_free_range(ker::mod::sched::task::Task* task, uint64_t size, uint64_t 
     return 0;  // No free range found
 }
 
+// BEGIN checked huge vacancy selection. Read-only preparation query.
+// Caller retains authentic PUB/current-root lifetime throughout each query.
+// No root capability, reservation or public huge admission is created here.
+struct CheckedHugeOccupiedRange {
+    OccupiedVmemRange range{};
+    uint64_t resume_after{};  // Full occupied span; range remains clipped.
+    bool valid{};
+};
+enum class HugeVacancyStatus : uint8_t { Invalid, Exhausted, Found };
+struct HugeVacancySelection {
+    HugeVacancyStatus status{HugeVacancyStatus::Invalid};
+    uint64_t address{};
+};
+auto align_huge_mmap_up(uint64_t value, uint64_t& output) -> bool {
+    output = 0;
+    constexpr uint64_t MASK = ker::mod::mm::huge::LEAF_BYTES - 1;
+    if (value > UINT64_MAX - MASK) return false;
+    output = (value + MASK) & ~MASK;
+    return true;
+}
+auto valid_huge_mmap_length(uint64_t length) -> bool {
+    return length != 0 && (length & (ker::mod::mm::huge::LEAF_BYTES - 1)) == 0 &&
+           length / ker::mod::mm::huge::LEAF_BYTES <= ker::mod::mm::huge::MAX_ROOT_LEAVES;
+}
+auto checked_huge_pagemap_occupied_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t end)
+    -> CheckedHugeOccupiedRange {
+    if (pagemap == nullptr || start < USER_SPACE_START || start >= end || end > USER_SPACE_END ||
+        ((start | end) & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0) {
+        return {};
+    }
+
+    constexpr uint64_t PML4_SHIFT = 39;
+    constexpr uint64_t PML3_SHIFT = 30;
+    constexpr uint64_t PML2_SHIFT = 21;
+    constexpr uint64_t PML1_SHIFT = 12;
+
+    uint64_t addr = page_align_down(start);
+    while (addr < end) {
+        uint64_t const PML4_END = std::min(next_table_boundary(addr, PML4_SHIFT), end);
+        auto const& pml4e = pagemap->entries[page_table_index(addr, PML4_SHIFT)];
+        if (pml4e.present == 0) {
+            addr = PML4_END;
+            continue;
+        }
+
+        if (pml4e.pagesize != 0) return {};  // Invalid PRESENT PML4 PS, before frame translation.
+        auto* pml3 = table_from_entry(pml4e);
+        while (addr < PML4_END) {
+            uint64_t const PML3_END = std::min(next_table_boundary(addr, PML3_SHIFT), PML4_END);
+            auto const& pml3e = pml3->entries[page_table_index(addr, PML3_SHIFT)];
+            if (pml3e.present == 0) {
+                addr = PML3_END;
+                continue;
+            }
+            if (pml3e.pagesize != 0) {
+                return {.range = {.start = addr, .end = PML3_END, .found = true},
+                        .resume_after = next_table_boundary(addr, PML3_SHIFT),
+                        .valid = true};
+            }
+
+            auto* pml2 = table_from_entry(pml3e);
+            while (addr < PML3_END) {
+                uint64_t const PML2_END = std::min(next_table_boundary(addr, PML2_SHIFT), PML3_END);
+                auto const& pml2e = pml2->entries[page_table_index(addr, PML2_SHIFT)];
+                if (pml2e.present == 0) {
+                    addr = PML2_END;
+                    continue;
+                }
+                if (pml2e.pagesize != 0) {
+                    return {.range = {.start = addr, .end = PML2_END, .found = true},
+                            .resume_after = next_table_boundary(addr, PML2_SHIFT),
+                            .valid = true};
+                }
+
+                auto* pml1 = table_from_entry(pml2e);
+                while (addr < PML2_END) {
+                    uint64_t const PML1_END = std::min(next_table_boundary(addr, PML1_SHIFT), PML2_END);
+                    auto const& pte = pml1->entries[page_table_index(addr, PML1_SHIFT)];
+                    if (pte.present != 0 || is_reserved_leaf(pte)) {
+                        return {.range = {.start = addr, .end = PML1_END, .found = true},
+                                .resume_after = next_table_boundary(addr, PML1_SHIFT),
+                                .valid = true};
+                    }
+                    addr = PML1_END;
+                }
+            }
+        }
+    }
+
+    return {.valid = true};
+}
+
+auto checked_huge_occupied_range(ker::mod::sched::task::Task* task, uint64_t start, uint64_t end) -> CheckedHugeOccupiedRange {
+    if (task == nullptr) return {};
+    auto result = checked_huge_pagemap_occupied_range(task->pagemap, start, end);
+    if (!result.valid) return {};
+    bool valid = true;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& row : task->lazy_vmem_ranges) {
+        // Match the existing AS union's page-aligned lower-half row geometry;
+        // an empty metadata row has no occupied bytes.
+        if (row.start > row.end || row.end > USER_SPACE_END + 1 || ((row.start | row.end) & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0) {
+            valid = false;
+            break;
+        }
+        if (row.start == row.end || !ranges_overlap(start, end, row.start, row.end)) continue;
+        OccupiedVmemRange const overlap{.start = std::max(start, row.start), .end = std::min(end, row.end), .found = true};
+        if (!result.range.found || overlap.start < result.range.start ||
+            (overlap.start == result.range.start && row.end > result.resume_after)) {
+            result.range = overlap;
+            result.resume_after = row.end;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return valid ? result : CheckedHugeOccupiedRange{};
+}
+auto find_huge_vacancy_from(ker::mod::sched::task::Task* task, uint64_t length, uint64_t start) -> HugeVacancySelection {
+    if (task == nullptr || task->pagemap == nullptr || !valid_huge_mmap_length(length) || start < USER_SPACE_START ||
+        start > USER_SPACE_END)
+        return {};
+    uint64_t current = 0;
+    if (!align_huge_mmap_up(start, current)) return {};
+    // Same serialized-publication assumption as the old sparse nonfixed scan.
+    // No guessed candidate cap or latency claim; every occupied jump advances.
+    while (current <= USER_SPACE_END - length) {
+        auto const occupied = checked_huge_occupied_range(task, current, current + length);
+        if (!occupied.valid) return {};
+        if (!occupied.range.found) return {.status = HugeVacancyStatus::Found, .address = current};
+        uint64_t next = 0;
+        if (occupied.resume_after <= current || !align_huge_mmap_up(occupied.resume_after, next) || next <= current) return {};
+        current = next;
+    }
+    return {.status = HugeVacancyStatus::Exhausted};
+}
+auto find_huge_vacancy(ker::mod::sched::task::Task* task, uint64_t length, uint64_t hint) -> HugeVacancySelection {
+    if (task == nullptr || task->pagemap == nullptr || !valid_huge_mmap_length(length)) return {};
+    uint64_t preferred = 0;
+    if (hint >= USER_SPACE_START && hint <= USER_SPACE_END && align_huge_mmap_up(hint, preferred) && preferred <= USER_SPACE_END - length) {
+        auto const occupied = checked_huge_occupied_range(task, preferred, preferred + length);
+        if (!occupied.valid) return {};
+        if (!occupied.range.found) return {.status = HugeVacancyStatus::Found, .address = preferred};
+    }
+    uint64_t cursor = task->mmap_next.load(std::memory_order_relaxed);
+    if (cursor < MMAP_START || cursor > USER_SPACE_END - length) cursor = MMAP_START;
+    auto const first = find_huge_vacancy_from(task, length, cursor);
+    if (first.status != HugeVacancyStatus::Exhausted || cursor == MMAP_START) return first;
+    return find_huge_vacancy_from(task, length, MMAP_START);
+}
+// END checked huge vacancy selection.
+
 auto reserve_free_mmap_range_locked(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint, uint64_t& out_vaddr) -> uint64_t {
     out_vaddr = 0;
 
@@ -2347,6 +2497,193 @@ class PublicRangeMutation {
 };
 
 // Allocate anonymous memory
+// BEGIN eager public huge anonymous construction. Preparation owns no incoming
+// PUB/root/MM owner; every independent reader ends before batch publication.
+auto huge_mmap_ordinary_context(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation) -> bool {
+    using namespace ker::mod;
+    return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
+           actor.type == sched::task::TaskType::PROCESS && actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) && !actor.exit_in_progress.load(std::memory_order_acquire) &&
+           actor.syscall_account_start_us != 0 && sched::interrupts_enabled() && sched::preempt_count() == 0;
+}
+
+// The admission's local lease protects the root itself. This separate normal
+// reader also excludes child-table retirement during the raw hierarchy walk.
+auto select_current_huge_vacancy(ker::mod::sched::task::Task& actor, ker::mod::mm::paging::PageTable* root, uint64_t length, uint64_t hint,
+                                 HugeVacancySelection& selected) -> int {
+    using namespace ker::mod;
+    mm::huge::detail::CurrentRangeRootAccess access{};
+    mm::huge::Error status = mm::huge::Error::Again;
+    {
+        sched::PreemptGuard preempt;
+        status = mm::huge::detail::acquire_current_range_root(actor, access);
+        if (status == mm::huge::Error::None) {
+            if (access.root != root)
+                status = mm::huge::Error::Stale;
+            else
+                selected = find_huge_vacancy(&actor, length, hint);
+        }
+        mm::huge::detail::release_current_range_root(access);
+    }
+    if (status != mm::huge::Error::None) return detail::managed_range_error(status);
+    if (selected.status == HugeVacancyStatus::Invalid) return -EOPNOTSUPP;
+    return selected.status == HugeVacancyStatus::Found ? 0 : -ENOMEM;
+}
+
+auto validate_current_huge_vacancy(ker::mod::sched::task::Task& actor, ker::mod::mm::paging::PageTable* root, uint64_t address,
+                                   uint64_t length) -> int {
+    using namespace ker::mod;
+    mm::huge::detail::CurrentRangeRootAccess access{};
+    mm::huge::Error status = mm::huge::Error::Again;
+    CheckedHugeOccupiedRange occupied{};
+    {
+        sched::PreemptGuard preempt;
+        status = mm::huge::detail::acquire_current_range_root(actor, access);
+        if (status == mm::huge::Error::None) {
+            if (access.root != root)
+                status = mm::huge::Error::Stale;
+            else
+                occupied = checked_huge_occupied_range(&actor, address, address + length);
+        }
+        mm::huge::detail::release_current_range_root(access);
+    }
+    if (status != mm::huge::Error::None) return detail::managed_range_error(status);
+    if (!occupied.valid) return -EOPNOTSUPP;
+    return occupied.range.found ? -EAGAIN : 0;
+}
+
+// PUB serializes membership and the registry. The caller adopts even a refused
+// query's SNAPSHOT into an initially empty owner declared outside PUB/local.
+auto huge_mmap_metadata_absent(ker::mod::sched::task::Task& actor, ker::mod::mm::paging::PageTable* root, uint64_t address, uint64_t length,
+                               ker::mod::mm::file_mapping::FileMappingBinding*& captured) -> int {
+    if (overlaps_kernel_managed_user_layout_locked(&actor, address, length)) return -EAGAIN;
+    bool absent = true;
+    g_file_mmap_ranges_lock.lock();
+    for (auto const& row : g_file_mmap_ranges) {
+        if (row.pagemap != root) continue;
+        uint64_t end = 0;
+        if (!checked_range_end(row.start, row.length, &end) || ranges_overlap(address, address + length, row.start, end)) {
+            absent = false;
+            break;
+        }
+    }
+    g_file_mmap_ranges_lock.unlock();
+    if (!absent) return -EAGAIN;
+    bool exact = false;
+    bool const QUERIED = ker::mod::mm::virt::query_current_file_binding(actor, address, address + length, captured, exact);
+    return QUERIED && captured == nullptr ? 0 : -EAGAIN;
+}
+
+auto allocate_public_huge_anonymous(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t {
+    using namespace ker::mod;
+    namespace vmabi = ker::abi::vmem;
+    namespace huge = mm::huge;
+    namespace fm = mm::file_mapping;
+    auto* task = get_current_task();
+    if (task == nullptr) {
+        dbg::error("vmem: no current task");
+        return static_cast<uint64_t>(-vmabi::VMEM_EFAULT);
+    }
+    if (task->pagemap == nullptr) {
+        dbg::error("vmem: task has no pagemap");
+        return static_cast<uint64_t>(-vmabi::VMEM_EFAULT);
+    }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
+    auto const PM_ADDR = reinterpret_cast<uintptr_t>(task->pagemap);
+    if (PM_ADDR < 0xffff800000000000ULL || PM_ADDR >= 0xffff900000000000ULL) {
+        log::error("task PID %x has corrupted pagemap ptr 0x%x", task->pid, PM_ADDR);
+        return static_cast<uint64_t>(-vmabi::VMEM_EFAULT);
+    }
+    [[maybe_unused]] uint64_t const PERF_STARTED_US = time::get_us();
+    if (size == 0) return static_cast<uint64_t>(-vmabi::VMEM_EINVAL);
+    if (size > USER_SPACE_END - USER_SPACE_START) return static_cast<uint64_t>(-vmabi::VMEM_EOVERFLOW);
+
+    constexpr uint64_t REQUIRED = vmabi::MAP_PRIVATE | vmabi::MAP_ANONYMOUS | vmabi::MAP_HUGETLB;
+    constexpr uint64_t SUPPORTED = REQUIRED | vmabi::MAP_POPULATE;
+    constexpr uint64_t PROTECTION = vmabi::PROT_READ | vmabi::PROT_WRITE | vmabi::PROT_EXEC;
+    if ((flags & REQUIRED) != REQUIRED || (flags & ~SUPPORTED) != 0 || (prot & ~PROTECTION) != 0 || (size & (huge::LEAF_BYTES - 1)) != 0)
+        return static_cast<uint64_t>(-vmabi::VMEM_EINVAL);
+    if (size / huge::LEAF_BYTES > huge::MAX_ROOT_LEAVES) return static_cast<uint64_t>(-vmabi::VMEM_ENOMEM);
+
+    // Declared before all prepared owners: their cleanup precedes IF restore.
+    sys::SyscallPreparationScope preparation(*task);
+    if (!huge_mmap_ordinary_context(*task, preparation)) return static_cast<uint64_t>(-EWOULDBLOCK);
+    numa::AllocationContext placement{};
+    auto const MEMORY_POLICY = task->memory_policy_snapshot();
+    auto const CAPTURE = numa::capture_allocation_context(MEMORY_POLICY, placement);
+    if (CAPTURE != numa::AllocationError::NONE)
+        return static_cast<uint64_t>(CAPTURE == numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
+    auto release_snapshot = [](fm::FileMappingBinding* binding) {
+        if (binding != nullptr) binding->release(fm::BindingOwner::SNAPSHOT);
+    };
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        SharedLazyVmemUpdate metadata{};
+        huge::PreparedHugeMapBatch batch{};
+        std::unique_ptr<fm::FileMappingBinding, decltype(release_snapshot)> initial_snapshot(nullptr, release_snapshot);
+        std::unique_ptr<fm::FileMappingBinding, decltype(release_snapshot)> final_snapshot(nullptr, release_snapshot);
+        fm::FileMappingBinding* initial_captured = nullptr;
+        fm::FileMappingBinding* final_captured = nullptr;
+        huge::RootKey initial_key{};
+        HugeVacancySelection selected{};
+        uint64_t address = 0;
+        int const STATUS = [&]() -> int {
+            {
+                SharedVmemPublicationGuard publication;
+                huge::CurrentHugeMapAdmission admission(*task, preparation, publication);
+                if (admission.status() != huge::Error::None)
+                    return admission.status() == huge::Error::Invalid ? -EWOULDBLOCK : detail::managed_range_error(admission.status());
+                sched::resource::AddressSpaceObservation observation(task);
+                if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return -EBUSY;
+                if (!observation.admit_mapping(admission.root(), size)) return -ENOMEM;
+                int const VACANCY = select_current_huge_vacancy(*task, admission.root(), size, hint, selected);
+                if (VACANCY != 0) return VACANCY;
+                address = selected.address;
+                int const ABSENT = huge_mmap_metadata_absent(*task, admission.root(), address, size, initial_captured);
+                initial_snapshot.reset(initial_captured);
+                if (ABSENT != 0) return ABSENT;
+                initial_key = admission.key();  // Comparison only after this live lease ends.
+            }
+            // No PUB/local/normal-reader/preempt owner spans fallible storage.
+            int const PREPARED = metadata.prepare(*task);
+            if (PREPARED != 0) return PREPARED;
+            if (metadata.serial() != initial_key.incarnation) return -EAGAIN;
+            LazyVmemRange const ROW{.start = address, .end = address + size, .prot = prot, .flags = flags, .kind = LazyVmemKind::ANONYMOUS};
+            int const STAGED = metadata.stage(SharedLazyVmemUpdate::Change::ADD, address, address + size, &ROW);
+            if (STAGED != 0) return STAGED;
+            int const BATCH = detail::managed_range_error(batch.prepare(initial_key, address, size, prot_to_page_flags(prot), placement));
+            if (BATCH != 0) return BATCH;
+            {
+                SharedVmemPublicationGuard publication;
+                huge::CurrentHugeMapAdmission admission(*task, preparation, publication);
+                if (admission.status() != huge::Error::None)
+                    return admission.status() == huge::Error::Invalid ? -EWOULDBLOCK : detail::managed_range_error(admission.status());
+                sched::resource::AddressSpaceObservation observation(task);
+                if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return -EBUSY;
+                if (!huge::RegistryCore::same_root(admission.key(), initial_key)) return -EAGAIN;
+                if (!observation.admit_mapping(admission.root(), size)) return -ENOMEM;
+                int const VACANCY = validate_current_huge_vacancy(*task, admission.root(), address, size);
+                if (VACANCY != 0) return VACANCY;
+                int const ABSENT = huge_mmap_metadata_absent(*task, admission.root(), address, size, final_captured);
+                final_snapshot.reset(final_captured);
+                if (ABSENT != 0) return ABSENT;
+                if (!metadata.matches(*task)) return -EAGAIN;  // One match consumes validation refs.
+                int const PUBLISHED = detail::managed_range_error(admission.publish(batch));
+                if (PUBLISHED != 0) return PUBLISHED;
+                // Full-root ACK has completed. This prepared tail cannot refuse.
+                metadata.commit();
+                metadata.advance_cursor(address, size);
+                observation.commit_mapping();
+            }
+            return 0;
+        }();
+        if (STATUS == 0) return address;
+        if (STATUS != -EAGAIN) return static_cast<uint64_t>(STATUS);
+        // All owners from this attempt die outside leases before the next one.
+    }
+    return static_cast<uint64_t>(-EAGAIN);
+}
+// END eager public huge anonymous construction.
+
 auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared,
                    MutationRoute route = MutationRoute::Legacy) -> uint64_t {
     // Get current task
@@ -5712,6 +6049,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             // a2: size
             // a3: protection flags
             // a4: mapping flags
+            if ((a4 & ker::abi::vmem::MAP_HUGETLB) != 0) return allocate_public_huge_anonymous(a1, a2, a3, a4);
             return anon_allocate(a1, a2, a3, a4, nullptr, MutationRoute::Public);
         }
 
@@ -5764,6 +6102,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 }
 
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t {
+    if ((flags & ker::abi::vmem::MAP_HUGETLB) != 0) return allocate_public_huge_anonymous(hint, size, prot, flags);
     if ((flags & ker::abi::vmem::MAP_ANONYMOUS) != 0) {
         uint64_t const RESULT = anon_allocate(hint, size, prot, flags, nullptr, MutationRoute::Public);
         if (static_cast<int64_t>(RESULT) < 0) {

@@ -1823,7 +1823,7 @@ def test_numa_ready_diagnostics_retain_failure_provenance_without_new_calls() ->
 
 def test_numa_public_pressure_preserves_eager_ownership_and_observation_frontiers() -> None:
     source = NUMA_LOCALITY_CPP.read_text()
-    body = source[source.index("constexpr uint64_t PRESSURE_MAX_BYTES"):]
+    body = source[source.index("constexpr uint64_t PRESSURE_MAX_BYTES"):source.index("auto run_numa_pressure(")] + function_body(source, "run_numa_pressure")
     require_tokens("".join(body.split()), ["".join(token.split()) for token in ["PRESSURE_MAX_ENTRIES = 4096", "PRESSURE_SNAPSHOT_BYTES = 262144",
         "ker::vmem::allocate(&output, bytes, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS)",
         "entry.owned = true", "pressure_verify(state, entry, false, foreign, deadline)",
@@ -1850,7 +1850,26 @@ def test_numa_public_pressure_preserves_eager_ownership_and_observation_frontier
         fail("separate opt-in pressure entrypoint missing")
 
 
+def test_numa_public_huge_owns_windows_intervals_and_consumed_children() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    runner = function_body(source, "run_numa_huge")
+    require_tokens(runner, ["s.remaining = options.bench ? 40 : options.domains == 1 ? 46 : 50", "s.frontier = s.deadline - 10000 * NS_PER_MS", "s.children == 0", "s.own.maps == 0", "restored", "before(s.deadline)"], "huge original-clock/ownership result")
+    require_tokens(function_body(source, "huge_options"), ["value <= 600000", "HOLDS * out.hold_ms + 30000", "seen & bit", "out.bytes == HUGE_PAYLOAD"], "bounded exact schedule before allocation")
+    require_tokens(function_body(source, "huge_window"), ["sizeof(HugePod)", "volatile HugePod& p", "p.parked = 1", "p.parked = 0", "++s.sequence", "--s.remaining", "hold_until", "geometry=unobserved"], "genuine caller-owned parked claim")
+    require_tokens(function_body(source, "huge_release"), ["for (auto& interval : m.live)", "interval.bytes", "munmap", "interval = {}", "if (m.owned && ok)"], "retained survivor intervals")
+    require_tokens(function_body(source, "huge_wait"), ["WNOHANG | (stop ? WUNTRACED : 0)", "out.status_valid = RC == pid", "if (!STOPPED) owned = false", "WSTOPSIG(status) == SIGSTOP", "before(deadline)"], "stop is not a reap")
+    child = function_body(source, "huge_child_case")
+    require_order(child, "pid = fork()", "huge_open(s, m, kind == 2", "huge ptrace/fault construction after fork")
+    require_tokens(child, ["HugePhase::PtraceChild", "child_address + boundary - 128", "request::SEIZE", "request::INTERRUPT", "request::DETACH", "request::KILL", "huge_changed(m)", "terminate_and_reap", "++s.children", "--s.children"], "real child/attachment cleanup")
+    require_tokens(function_body(source, "huge_expected"), ["members[(address / HUGE_BYTES) % count]"], "huge interleave virtual index")
+    require_tokens(function_body(source, "huge_ptrace_io"), ["RC == 0 && io.transferred == buffer.size()"], "full MemIo return and byte count")
+    require_tokens(function_body(source, "huge_bench"), ["pair < 10", "numa_bench::permutation", "numa_bench::dependent_loads", "endpoint_samples_only", "huge_release"], "separate paired sample scope")
+    if '"numa-huge"' not in TESTPROG_MAIN_CPP.read_text():
+        fail("separate opt-in huge workload entrypoint missing")
+
+
 def main() -> None:
+    test_numa_public_huge_owns_windows_intervals_and_consumed_children()
     test_numa_public_pressure_preserves_eager_ownership_and_observation_frontiers()
     test_numa_lifecycle_proves_inheritance_before_controller_placement()
     test_numa_public_policy_uses_real_actor_placement_and_quota_frontiers()
