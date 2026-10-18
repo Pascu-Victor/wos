@@ -2450,6 +2450,23 @@ struct HugeWait {
     uint64_t polls{};
     bool status_valid{};
 };
+// Parent-only observations do not alter the child/POD transport ABI.
+enum class HugeServeStage : uint32_t { NotCalled, Admission, Ready, Validation, Hold, Ack, Complete };
+struct HugeServeObservation {
+    HugeServeStage stage{};
+    HugePhase phase{};
+    uint32_t calls{}, count{}, index{};
+    uint64_t accepted_sequence{}, received_sequence{};
+    bool received_sequence_valid{};
+    ReadyObservation ready{}, ack{};
+};
+struct HugeChildObservation {
+    HugeServeObservation serve{};
+    HugeWait wait{};
+    CleanupObservation cleanup{};
+    bool wait_called{}, wait_ok{}, before_cleanup_ok{}, precleanup_owned{}, cleanup_called{}, cleanup_ok{};
+};
+static_assert(std::is_trivially_copyable_v<HugeChildObservation> && sizeof(HugeChildObservation) <= 512);
 // END public huge types.
 auto huge_options(int argc, char** argv, HugeOptions& out) -> bool {
     uint32_t seen = 0;
@@ -2654,11 +2671,33 @@ auto huge_windows(HugeState& s, HugePhase phase, const HugeMapping& m, int send 
            huge_window(s, phase, m.address + m.bytes - HUGE_BYTES, m.address + m.bytes - HUGE_BYTES, send, ack);
 }
 auto huge_serve(HugeState& s, pid_t pid, int read_fd, int ack_fd, uint32_t count, uint64_t& sequence, HugePhase phase,
-                uint64_t* first = nullptr) -> bool {
+                uint64_t* first = nullptr, HugeServeObservation* observation = nullptr) -> bool {
+    if (observation != nullptr) {
+        uint32_t const CALLS = observation->calls + 1;
+        *observation = {};
+        observation->calls = CALLS;
+        observation->count = count;
+        observation->phase = phase;
+        observation->accepted_sequence = sequence;
+    }
     for (uint32_t i = 0; i < count; ++i) {
         HugeReady m{};
-        if (!huge_admit(s) || !s.remaining || !transfer(read_fd, &m, sizeof(m), false, s.frontier)) return false;
+        if (observation != nullptr) {
+            observation->stage = HugeServeStage::Admission;
+            observation->index = i;
+            observation->received_sequence_valid = false;
+            observation->ready = {};
+            observation->ack = {};
+        }
+        if (!huge_admit(s) || !s.remaining) return false;
+        if (observation != nullptr) observation->stage = HugeServeStage::Ready;
+        if (!transfer(read_fd, &m, sizeof(m), false, s.frontier, observation != nullptr ? &observation->ready : nullptr)) return false;
         auto const& p = m.pod;
+        if (observation != nullptr) {
+            observation->stage = HugeServeStage::Validation;
+            observation->received_sequence = p.sequence;
+            observation->received_sequence_valid = true;
+        }
         uint64_t now{};
         if (p.version != 1 || p.bytes != sizeof(HugePod) || p.nonce != s.options.nonce || p.pid != static_cast<uint64_t>(pid) ||
             p.tid != p.pid || p.sequence <= sequence || p.phase != static_cast<uint64_t>(phase) || p.parked != 1 ||
@@ -2673,11 +2712,17 @@ auto huge_serve(HugeState& s, pid_t pid, int read_fd, int ack_fd, uint32_t count
             if (p.range_address != *first + uint64_t{i} * HUGE_BYTES) return false;
         }
         sequence = p.sequence;
+        if (observation != nullptr) {
+            observation->accepted_sequence = sequence;
+            observation->stage = HugeServeStage::Hold;
+        }
         if (!huge_hold_until(m.hold_end, s.frontier)) return false;
         --s.remaining;
         char release = 'A';
-        if (!transfer(ack_fd, &release, 1, true, s.frontier)) return false;
+        if (observation != nullptr) observation->stage = HugeServeStage::Ack;
+        if (!transfer(ack_fd, &release, 1, true, s.frontier, observation != nullptr ? &observation->ack : nullptr)) return false;
     }
+    if (observation != nullptr) observation->stage = HugeServeStage::Complete;
     return true;
 }
 auto huge_wait(pid_t pid, uint64_t deadline, bool stop, int expected_signal, bool& owned, HugeWait& out) -> bool {
@@ -2702,6 +2747,57 @@ auto huge_wait(pid_t pid, uint64_t deadline, bool stop, int expected_signal, boo
         if (raw_error(ker::multiproc::yield())) return false;
     }
     return false;
+}
+// Called only by the parent failure reporter after exact cleanup, never during a hold.
+void report_huge_transfer(const char* direction, const ReadyObservation& observation) {
+    if (observation.stage == ReadyStage::NOT_CALLED) return;
+    std::fprintf(stderr,
+                 "NUMA_CHILD_HUGE_TRANSFER version=1 direction=%s stage=%u reason=%u valid=%u requested=%llu done=%llu deadline=%llu "
+                 "clock_valid=%u clock_rc=%d clock_errno=%d clock_sec=%lld clock_nsec=%lld clock_ns=%llu "
+                 "io_rc=%lld io_errno=%d poll_rc=%d poll_errno=%d poll_revents=%d\n",
+                 direction, static_cast<unsigned>(observation.stage), static_cast<unsigned>(observation.reason), observation.valid,
+                 static_cast<unsigned long long>(observation.requested), static_cast<unsigned long long>(observation.done),
+                 static_cast<unsigned long long>(observation.deadline), observation.clock.valid, observation.clock.result,
+                 observation.clock.error, static_cast<long long>(observation.clock.seconds),
+                 static_cast<long long>(observation.clock.nanoseconds), static_cast<unsigned long long>(observation.clock.now),
+                 static_cast<long long>(observation.io_result), observation.io_error, observation.poll_result, observation.poll_error,
+                 observation.poll_revents);
+}
+void report_huge_child_failure(const HugeState& s, pid_t pid, uint32_t kind, const HugeChildObservation& observation, bool owned,
+                               bool attached) {
+    int const SAVED_ERRNO = errno;
+    auto const& serve = observation.serve;
+    auto const& wait = observation.wait;
+    auto const& cleanup = observation.cleanup;
+    std::fprintf(stderr,
+                 "NUMA_CHILD_HUGE_FAILURE version=1 nonce=%llu parent=%llu child=%lld kind=%u frontier=%llu remaining=%llu "
+                 "serve_stage=%u serve_phase=%llu serve_calls=%u serve_count=%u serve_index=%u accepted_sequence=%llu "
+                 "received_sequence_valid=%u received_sequence=%llu wait_called=%u wait_ok=%u wait_rc_valid=%u wait_rc=%lld "
+                 "wait_errno_valid=%u wait_errno=%d wait_status_valid=%u wait_status=%d wait_polls=%llu "
+                 "before_cleanup_ok=%u precleanup_owned=%u cleanup_called=%u cleanup_ok=%u cleanup_owned=%u attached=%u "
+                 "maps=%u fds=%u children=%u complete=%u cleanup_kill_rc_valid=%u cleanup_kill_rc=%lld "
+                 "cleanup_kill_errno_valid=%u cleanup_kill_errno=%d cleanup_wait_rc_valid=%u cleanup_wait_rc=%lld "
+                 "cleanup_wait_errno_valid=%u cleanup_wait_errno=%d cleanup_status_valid=%u cleanup_status=%d "
+                 "cleanup_waits=%llu cleanup_interrupted_waits=%llu\n",
+                 static_cast<unsigned long long>(s.options.nonce), static_cast<unsigned long long>(s.tid), static_cast<long long>(pid),
+                 kind, static_cast<unsigned long long>(s.frontier), static_cast<unsigned long long>(s.remaining),
+                 static_cast<unsigned>(serve.stage), static_cast<unsigned long long>(serve.phase), serve.calls, serve.count, serve.index,
+                 static_cast<unsigned long long>(serve.accepted_sequence), static_cast<unsigned>(serve.received_sequence_valid),
+                 static_cast<unsigned long long>(serve.received_sequence), static_cast<unsigned>(observation.wait_called),
+                 static_cast<unsigned>(observation.wait_ok), static_cast<unsigned>(wait.polls != 0), static_cast<long long>(wait.result),
+                 static_cast<unsigned>(wait.polls != 0 && wait.result < 0), wait.error, static_cast<unsigned>(wait.status_valid),
+                 wait.status, static_cast<unsigned long long>(wait.polls), static_cast<unsigned>(observation.before_cleanup_ok),
+                 static_cast<unsigned>(observation.precleanup_owned), static_cast<unsigned>(observation.cleanup_called),
+                 static_cast<unsigned>(observation.cleanup_ok), static_cast<unsigned>(owned), static_cast<unsigned>(attached), s.own.maps,
+                 s.own.fds, s.children, static_cast<unsigned>(s.own.complete), static_cast<unsigned>(cleanup.kill_result_valid),
+                 static_cast<long long>(cleanup.kill_result), static_cast<unsigned>(cleanup.kill_error_valid), cleanup.kill_error,
+                 static_cast<unsigned>(cleanup.wait_result_valid), static_cast<long long>(cleanup.wait_result),
+                 static_cast<unsigned>(cleanup.wait_error_valid), cleanup.wait_error, static_cast<unsigned>(cleanup.status_valid),
+                 cleanup.status, static_cast<unsigned long long>(cleanup.waits),
+                 static_cast<unsigned long long>(cleanup.interrupted_waits));
+    report_huge_transfer("ready", serve.ready);
+    report_huge_transfer("ack", serve.ack);
+    errno = SAVED_ERRNO;
 }
 auto huge_trace(ker::abi::ptrace::request request, pid_t pid, void* data = nullptr) -> int64_t {
     return static_cast<int64_t>(::syscall(ker::abi::callnums::process, static_cast<uint64_t>(ker::abi::process::procmgmt_ops::PTRACE),
@@ -2941,6 +3037,7 @@ auto huge_child_case(HugeState& s, uint32_t kind) -> bool {
             ++s.children;
         }
     }
+    HugeChildObservation observation{};
     if (pid > 0) {
         bool const READ_CLOSED = close_fd(ready[1], s.own), COMMAND_CLOSED = close_fd(commands[0], s.own);
         ok = ok && READ_CLOSED && COMMAND_CLOSED;
@@ -2952,7 +3049,9 @@ auto huge_child_case(HugeState& s, uint32_t kind) -> bool {
                                 : kind == 2 ? HugePhase::ProtNone
                                 : kind == 3 ? HugePhase::ReadOnly
                                             : HugePhase::PtraceChild;
-        if (ok) ok = huge_serve(s, pid, ready[0], commands[1], kind == 2 || kind == 3 ? 1 : 2, sequence, PHASE, &child_address);
+        if (ok)
+            ok = huge_serve(s, pid, ready[0], commands[1], kind == 2 || kind == 3 ? 1 : 2, sequence, PHASE, &child_address,
+                            &observation.serve);
         if (ok && kind == 4) {
             char response{};
             HugeWait stop{};
@@ -2981,15 +3080,17 @@ auto huge_child_case(HugeState& s, uint32_t kind) -> bool {
             char verify = 'V';
             if (ok)
                 ok = transfer(commands[1], &verify, 1, true, s.frontier) &&
-                     huge_serve(s, pid, ready[0], commands[1], 2, sequence, HugePhase::PtraceChild, &child_address);
+                     huge_serve(s, pid, ready[0], commands[1], 2, sequence, HugePhase::PtraceChild, &child_address, &observation.serve);
             if (ok) {
-                HugeWait result{};
-                ok = huge_wait(pid, s.frontier, false, 0, owned, result);
+                observation.wait_called = true;
+                ok = huge_wait(pid, s.frontier, false, 0, owned, observation.wait);
+                observation.wait_ok = ok;
             }
         }
         if (ok && kind != 4) {
-            HugeWait result{};
-            ok = huge_wait(pid, s.frontier, false, kind == 2 || kind == 3 ? SIGSEGV : 0, owned, result);
+            observation.wait_called = true;
+            ok = huge_wait(pid, s.frontier, false, kind == 2 || kind == 3 ? SIGSEGV : 0, owned, observation.wait);
+            observation.wait_ok = ok;
         }
     }
     if (attached) {
@@ -3000,14 +3101,22 @@ auto huge_child_case(HugeState& s, uint32_t kind) -> bool {
             (void)huge_trace(ker::abi::ptrace::request::KILL, pid);
         }
     }
-    if (owned && !terminate_and_reap(pid, owned)) ok = false;
+    observation.before_cleanup_ok = ok;
+    observation.precleanup_owned = owned;
+    if (owned) {
+        observation.cleanup_called = true;
+        observation.cleanup_ok = terminate_and_reap(pid, owned, &observation.cleanup);
+        if (!observation.cleanup_ok) ok = false;
+    }
     bool const R0 = close_fd(ready[0], s.own), R1 = close_fd(ready[1], s.own);
     bool const C0 = close_fd(commands[0], s.own), C1 = close_fd(commands[1], s.own);
     if (kind == 0 && ok) ok = huge_payload(m, false);
     bool const CLEAN = huge_release(s, m);
     if (pid > 0 && !owned) --s.children;
     if (owned || attached) s.own.complete = false;
-    return ok && !owned && !attached && R0 && R1 && C0 && C1 && CLEAN;
+    bool const SUCCESS = ok && !owned && !attached && R0 && R1 && C0 && C1 && CLEAN;
+    if (!SUCCESS) report_huge_child_failure(s, pid, kind, observation, owned, attached);
+    return SUCCESS;
 }
 auto huge_usercopy(HugeState& s) -> bool {
     HugeMapping m{};

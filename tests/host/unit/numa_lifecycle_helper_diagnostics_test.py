@@ -185,18 +185,31 @@ def generate_public_huge(actual, take, shell, callnums, wrappers, ptrace_types, 
     """
     types = actual[actual.index("struct Selection {"):actual.index("// These POD transport bytes")]
     types += take("struct OwnResources {", True)
-    types += actual[actual.index("enum ClockValid :"):actual.index("enum class WaitOutcome :")]
+    types += actual[actual.index("enum ClockValid :"):actual.index("auto now_ns(")]
     types += actual[actual.index("constexpr uint64_t HUGE_BYTES"):actual.index("// END public huge types.")]
     functions = take("template <class T>") + "\n" + "\n".join(take(anchor) for anchor in [
         "auto number(", "auto now_ns(", "auto deadline_after(", "auto before(", "auto raw_error(", "auto close_fd(",
-        "auto huge_options(", "auto huge_admit(", "auto huge_release(", "auto huge_expected(", "auto huge_wait(",
+        "auto transfer(", "auto terminate_and_reap(", "auto huge_hold_until(",
+        "auto huge_options(", "auto huge_admit(", "auto huge_release(", "auto huge_expected(", "auto huge_serve(", "auto huge_wait(",
+        "void report_huge_transfer(", "void report_huge_child_failure(",
         "auto huge_trace(", "auto huge_ptrace_io(", "auto run_numa_huge("])
+    # Execute the complete actual post-fork parent branch, including serve, wait,
+    # exact cleanup and final reporting. Only its already-created child/pipe
+    # context is finite; the child branch and real fork are not executed.
+    parent = take("auto huge_child_case(")
+    anchor = "    HugeChildObservation observation{};\n"
+    if parent.count(anchor) != 1:
+        raise ValueError("one actual huge parent observation frontier")
+    branch = parent[parent.index(anchor):]
+    functions += ("\nauto huge_parent_case(HugeState& s, uint32_t kind, pid_t pid, bool owned, bool attached, "
+                  "int (&ready)[2], int (&commands)[2], bool ok, HugeMapping& m) -> bool {\n" + branch)
     if predecessor.count("auto run_numa_huge(") != 1:
         raise ValueError("one genuine predecessor entry definition")
     functions += "\n" + predecessor.replace("auto run_numa_huge(", "auto run_numa_huge_predecessor(")
-    for name in ("clock_gettime", "munmap", "waitpid", "close", "getpid", "getrlimit", "policy_read", "policy_set",
+    functions = functions.replace("std::fprintf(", "fixture::fprintf(")
+    for name in ("clock_gettime", "clock_nanosleep", "read", "write", "poll", "kill", "munmap", "waitpid", "close", "getpid", "getrlimit", "policy_read", "policy_set",
                  "policy_matches", "policy_topology", "pin_current_cpu", "huge_bench", "huge_aliases", "huge_mutations",
-                 "huge_child_case", "huge_usercopy"):
+                 "huge_child_case", "huge_usercopy", "huge_windows", "huge_payload", "huge_byte", "huge_changed"):
         functions = re.sub(r"(?<![\w:])" + name + r"\(", "fixture::" + name + "(", functions)
     functions = functions.replace("ker::multiproc::", "fixture::")
     functions = functions.replace("::syscall(", "fixture::process_call(")
@@ -214,6 +227,8 @@ def generate_public_huge(actual, take, shell, callnums, wrappers, ptrace_types, 
         ("wrong-huge-interleave", "members[(address / HUGE_BYTES) % count]", "members[(address / PAGE) % count]"),
         ("lost-stop-status", "stop ? STOPPED && WSTOPSIG(status) == SIGSTOP", "stop ? true"),
         ("ignored-ptrace-count", "return RC == 0 && io.transferred == buffer.size();", "return RC == 0;"),
+        ("lost-huge-ack-observation", "observation != nullptr ? &observation->ack : nullptr", "nullptr"),
+        ("lost-huge-precleanup-owner", "observation.precleanup_owned = owned;", "observation.precleanup_owned = false;"),
     ]:
         if generated.count(old) != 1:
             raise ValueError("unique genuine huge control: " + label)
@@ -355,7 +370,7 @@ def main():
             generated, variants = generate_public_huge(actual, take, shell, callnums, "\n".join(wrappers), ptrace_types, predecessor)
             result["extractions"] = extracted
             result["profile"] = "public-huge-actual-critical-guest-helpers-finite-ports"
-            result["endpoint_limits"] = "Actual full entry/setup/restoration/final gates and close/unmap over finite clock/policy/affinity/limit/workload endpoints; genuine old entry fails. Real phase workloads, children/kernel/PTE/PS/permissions/AS/physical closure not executed"
+            result["endpoint_limits"] = "Actual full entry/setup/restoration/final gates and complete post-fork parent serve/terminal-wait/cleanup/report branch over finite clock/pipe/wait/kill/policy/affinity/limit/workload endpoints; genuine old entry fails. Real fork/child phase workloads/kernel/PTE/PS/permissions/AS/physical closure not executed"
         elif args.pressure_only:
             callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
             extracted.append(row)

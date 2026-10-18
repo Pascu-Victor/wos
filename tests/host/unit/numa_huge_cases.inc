@@ -4,6 +4,7 @@
 #include <abi/callnums/process.h>
 #include <abi/callnums/vmem.h>
 #include <abi/numa.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -14,10 +15,12 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <type_traits>
 #include <vector>
 /* @ACTUAL_CALLNUMS@ */
@@ -49,7 +52,16 @@ uint32_t post_maps{}, post_fds{}, current_policy_mode{};
 uint64_t current_policy_nodes{};
 unsigned entry_work_calls{}, restore_policy_calls{}, restore_affinity_calls{};
 bool refuse_close{};
+// Finite already-forked parent context for the actual parent branch below.
+bool huge_parent_mode{}, fail_final_ack{}, expire_before_wait{};
+unsigned ack_writes{}, parent_closes{}, parent_kills{}, sleeps{}, remaining_writes{};
+std::vector<std::string> huge_failure_records;
+std::vector<int> wait_flags;
 auto close(int fd) -> int {
+    if (huge_parent_mode) {
+        ++parent_closes;
+        if (fd >= 101 && fd <= 104) return 0;
+    }
     if (fd != 57 || refuse_close) {
         errno = EIO;
         return -1;
@@ -134,6 +146,10 @@ void reset() {
     current_policy_nodes = 0;
     entry_work_calls = restore_policy_calls = restore_affinity_calls = 0;
     refuse_close = false;
+    huge_parent_mode = fail_final_ack = expire_before_wait = false;
+    ack_writes = parent_closes = parent_kills = sleeps = remaining_writes = 0;
+    huge_failure_records.clear();
+    wait_flags.clear();
 }
 auto clock_gettime(clockid_t, timespec* out) -> int {
     ticks += clock_step;
@@ -191,7 +207,8 @@ auto huge_aliases(HugeState& state) -> bool {
     post_fds = state.own.fds;
     return CLOSED && RELEASED && retried;
 }
-auto waitpid(pid_t, int* status, int) -> pid_t {
+auto waitpid(pid_t, int* status, int flags) -> pid_t {
+    wait_flags.push_back(flags);
     if (wait_cursor >= waits.size()) {
         *status = 0;
         return 0;
@@ -200,6 +217,85 @@ auto waitpid(pid_t, int* status, int) -> pid_t {
     *status = row.status;
     errno = row.error;
     return row.result;
+}
+auto huge_windows(HugeState&, HugePhase, const HugeMapping&, int = -1, int = -1) -> bool { return true; }
+auto huge_payload(const HugeMapping&, bool) -> bool { return true; }
+auto huge_changed(const HugeMapping&) -> bool { return true; }
+auto huge_byte(uint64_t) -> uint8_t { return 0; }
+auto clock_nanosleep(clockid_t clock, int flags, const timespec* when, timespec* remaining) -> int {
+    ++sleeps;
+    if (clock != CLOCK_MONOTONIC || flags != TIMER_ABSTIME || remaining != nullptr) return EINVAL;
+    ticks = static_cast<uint64_t>(when->tv_sec) * 1000000000 + when->tv_nsec;
+    return 0;
+}
+auto read(int fd, void* buffer, size_t bytes) -> ssize_t {
+    if (!huge_parent_mode || fd != 101 || bytes != sizeof(HugeReady) || ack_writes >= 2) {
+        errno = EIO;
+        return -1;
+    }
+    HugeReady message{};
+    message.pod = {1,
+                   sizeof(HugePod),
+                   369,
+                   91,
+                   91,
+                   static_cast<uint64_t>(HugePhase::ExitOwned),
+                   ack_writes + 1,
+                   0x400000 + static_cast<uint64_t>(ack_writes) * HUGE_BYTES,
+                   HUGE_BYTES,
+                   1};
+    message.pod_address = 0xA00000;
+    message.observed = message.pod.range_address;
+    message.hold_end = static_cast<uint64_t>(ack_writes + 1) * 10000 * NS_PER_MS;
+    std::memcpy(buffer, &message, sizeof(message));
+    return sizeof(message);
+}
+auto write(int fd, const void* buffer, size_t bytes) -> ssize_t {
+    if (huge_parent_mode && fd == 104 && bytes == sizeof(uint64_t)) {
+        ++remaining_writes;
+        return bytes;
+    }
+    if (!huge_parent_mode || fd != 104 || bytes != 1 || *static_cast<const char*>(buffer) != 'A') {
+        errno = EIO;
+        return -1;
+    }
+    ++ack_writes;
+    if (fail_final_ack && ack_writes == 2) {
+        errno = EPIPE;
+        return -1;
+    }
+    if (expire_before_wait && ack_writes == 2) ticks = 590000 * NS_PER_MS;
+    return 1;
+}
+auto poll(pollfd*, nfds_t, int) -> int {
+    errno = ENOSYS;  // These finite cases need no retry; unexpected polling fails.
+    return -1;
+}
+auto kill(pid_t pid, int signal) -> int {
+    ++parent_kills;
+    if (!huge_parent_mode || pid != 91 || signal != SIGKILL) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+auto fprintf(FILE*, const char* format, ...) -> int {
+    std::array<char, 4096> buffer{};
+    va_list arguments;
+    va_start(arguments, format);
+    int const written = std::vsnprintf(buffer.data(), buffer.size(), format, arguments);
+    va_end(arguments);
+    check(written > 0 && static_cast<size_t>(written) < buffer.size(), "bounded actual failure record");
+    huge_failure_records.emplace_back(buffer.data());
+    errno = EOVERFLOW;  // Actual reporter must restore the pre-report errno.
+    return written;
+}
+auto failure_field(size_t record, const char* key) -> long long {
+    if (record >= huge_failure_records.size()) return -999999;
+    std::string const search = std::string(" ") + key + "=";
+    auto const offset = huge_failure_records[record].find(search);
+    if (offset == std::string::npos) return -999999;
+    return std::strtoll(huge_failure_records[record].c_str() + offset + search.size(), nullptr, 10);
 }
 template <class Call>
 auto process_call(Call, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t data) -> uint64_t {
@@ -220,7 +316,91 @@ namespace ker::vmem {
 /* @ACTUAL_HUGE_WRAPPERS@ */
 }
 /* @ACTUAL_HUGE_FUNCTIONS@ */
+void huge_parent_failure_cases() {
+    using fixture::check;
+    auto run = [](int mode) {
+        fixture::reset();
+        fixture::huge_parent_mode = true;
+        fixture::fail_final_ack = mode == 1;
+        fixture::expire_before_wait = mode == 4;
+        HugeState state{};
+        state.options.nonce = 369;
+        state.remaining = 12;
+        state.frontier = 590000 * NS_PER_MS;
+        state.tid = 77;
+        state.children = 1;
+        state.own.fds = 4;
+        state.own.created_fds = 4;
+        int ready[]{101, 102}, commands[]{103, 104};
+        HugeMapping mapping{};
+        if (mode == 0) fixture::waits = {{91, 0, 0}};
+        if (mode == 1 || mode == 4) fixture::waits = {{91, SIGKILL, 0}};
+        if (mode == 2) fixture::waits = {{-1, 0x7fff, ECHILD}, {91, SIGKILL, 0}};
+        if (mode == 3) fixture::waits = {{91, 1 << 8, 0}};
+        errno = 0;
+        bool const result = huge_parent_case(state, 1, 91, true, false, ready, commands, true, mapping);
+        check(result == (mode == 0), "actual parent return preserves success and each injected refusal");
+        check(state.remaining == 10 && state.children == 0 && state.own.fds == 0 && state.own.maps == 0 && state.own.complete &&
+                  fixture::parent_closes == 4 && fixture::remaining_writes == 1 && fixture::ack_writes == 2 && fixture::sleeps == 2,
+              "actual two decrements, original four closes, two holds and exact resource settlement");
+        check(fixture::wait_cursor == fixture::waits.size(), "all exact injected child waits consumed");
+        if (mode == 0) {
+            check(fixture::huge_failure_records.empty() && fixture::parent_kills == 0 && fixture::wait_flags == std::vector<int>{WNOHANG},
+                  "actual success has no diagnostic or cleanup kill and retains original wait flags");
+            return;
+        }
+        check(fixture::huge_failure_records.size() == 3 && fixture::huge_failure_records[0].find("NUMA_CHILD_HUGE_FAILURE ") == 0 &&
+                  fixture::huge_failure_records[1].find("NUMA_CHILD_HUGE_TRANSFER ") == 0 &&
+                  fixture::huge_failure_records[2].find("NUMA_CHILD_HUGE_TRANSFER ") == 0,
+              "actual failure reporter emits header and both actual transfer snapshots");
+        for (const auto& record : fixture::huge_failure_records)
+            check(record.find("NUMA_HUGE_") == std::string::npos, "diagnostic is outside strict existing huge grammar");
+        check(fixture::failure_field(0, "parent") == 77 && fixture::failure_field(0, "child") == 91 &&
+                  fixture::failure_field(0, "kind") == 1 && fixture::failure_field(0, "nonce") == 369 &&
+                  fixture::failure_field(0, "frontier") == 590000 * NS_PER_MS && fixture::failure_field(0, "remaining") == 10 &&
+                  fixture::failure_field(0, "serve_index") == 1 && fixture::failure_field(0, "accepted_sequence") == 2 &&
+                  fixture::failure_field(0, "received_sequence_valid") == 1 && fixture::failure_field(0, "received_sequence") == 2,
+              "actual failure carries precise original actor, frontier and second-window identity");
+        check(fixture::failure_field(0, "maps") == 0 && fixture::failure_field(0, "fds") == 0 &&
+                  fixture::failure_field(0, "children") == 0 && fixture::failure_field(0, "complete") == 1 && errno == 0,
+              "actual reporting occurs after settlement and restores errno even when stdio changes it");
+        if (mode == 1) {
+            check(fixture::failure_field(0, "serve_stage") == static_cast<unsigned>(HugeServeStage::Ack) &&
+                      fixture::failure_field(0, "wait_called") == 0 && fixture::failure_field(0, "wait_rc_valid") == 0 &&
+                      fixture::failure_field(0, "wait_status_valid") == 0 && fixture::failure_field(0, "precleanup_owned") == 1 &&
+                      fixture::failure_field(0, "cleanup_called") == 1 && fixture::failure_field(0, "cleanup_status") == SIGKILL &&
+                      fixture::failure_field(2, "io_rc") == -1 && fixture::failure_field(2, "io_errno") == EPIPE &&
+                      (fixture::failure_field(2, "valid") & READY_IO_ERRNO) != 0 && fixture::parent_kills == 1 &&
+                      fixture::wait_flags == std::vector<int>{0},
+                  "actual final ACK failure is distinct from uncalled terminal wait and later SIGKILL cleanup");
+        } else if (mode == 2) {
+            check(fixture::failure_field(0, "serve_stage") == static_cast<unsigned>(HugeServeStage::Complete) &&
+                      fixture::failure_field(0, "wait_called") == 1 && fixture::failure_field(0, "wait_ok") == 0 &&
+                      fixture::failure_field(0, "wait_rc_valid") == 1 && fixture::failure_field(0, "wait_rc") == -1 &&
+                      fixture::failure_field(0, "wait_errno_valid") == 1 && fixture::failure_field(0, "wait_errno") == ECHILD &&
+                      fixture::failure_field(0, "wait_status_valid") == 0 && fixture::failure_field(0, "wait_status") == 0 &&
+                      fixture::failure_field(0, "precleanup_owned") == 1 && fixture::failure_field(0, "cleanup_status_valid") == 1 &&
+                      fixture::failure_field(0, "cleanup_status") == SIGKILL && fixture::parent_kills == 1 &&
+                      fixture::wait_flags == std::vector<int>({WNOHANG, 0}),
+                  "actual wait errno/status validity stays separate from exact cleanup consumption");
+        } else if (mode == 3) {
+            check(fixture::failure_field(0, "wait_status_valid") == 1 && fixture::failure_field(0, "wait_status") == (1 << 8) &&
+                      fixture::failure_field(0, "wait_errno_valid") == 0 && fixture::failure_field(0, "precleanup_owned") == 0 &&
+                      fixture::failure_field(0, "cleanup_called") == 0 && fixture::failure_field(0, "cleanup_status_valid") == 0 &&
+                      fixture::parent_kills == 0 && fixture::wait_flags == std::vector<int>{WNOHANG},
+                  "actual nonzero child exit is consumed without a false cleanup kill or errno");
+        } else {
+            check(fixture::failure_field(0, "wait_called") == 1 && fixture::failure_field(0, "wait_rc_valid") == 0 &&
+                      fixture::failure_field(0, "wait_errno_valid") == 0 && fixture::failure_field(0, "wait_status_valid") == 0 &&
+                      fixture::failure_field(0, "wait_polls") == 0 && fixture::failure_field(0, "precleanup_owned") == 1 &&
+                      fixture::parent_kills == 1 && fixture::wait_flags == std::vector<int>{0},
+                  "actual deadline-before-first-wait reports called without inventing a wait result or status");
+        }
+    };
+    for (int mode = 0; mode != 5; ++mode) run(mode);
+}
 int main() {
+    huge_parent_failure_cases();
     using fixture::check;
     fixture::reset();
     HugeOptions parsed{};
