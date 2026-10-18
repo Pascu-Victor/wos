@@ -141,20 +141,24 @@ class PerCpuCrossAccess {
     // Locked access to current CPU's data - use when other CPUs might modify via withLock
     template <typename Func>
     auto this_cpu_locked(Func&& func) -> decltype(std::forward<Func>(func)(std::declval<T*>())) {
+        uint64_t flags = 0;
+        asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
         uint64_t const CPU = cpu::current_cpu();
-        uint64_t const FLAGS = lock_cpu(CPU);
+        static_cast<void>(lock_cpu(CPU));
         auto result = std::forward<Func>(func)(&data[CPU]);
-        unlock_cpu(CPU, FLAGS);
+        unlock_cpu(CPU, flags);
         return result;
     }
 
     // Locked access to current CPU's data without return value
     template <typename Func>
     void this_cpu_locked_void(Func&& func) {
+        uint64_t flags = 0;
+        asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
         uint64_t const CPU = cpu::current_cpu();
-        uint64_t const FLAGS = lock_cpu(CPU);
+        static_cast<void>(lock_cpu(CPU));
         std::forward<Func>(func)(&data[CPU]);
-        unlock_cpu(CPU, FLAGS);
+        unlock_cpu(CPU, flags);
     }
 
     // Access another CPU's data with locking

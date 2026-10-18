@@ -55,7 +55,7 @@ subsystem's object ownership, shutdown or reservation tests.
 ## Per-CPU storage and allocator paths
 
 - `modules/kern/src/platform/smt/smt.cpp` — **migration-protected / preemption-protected**. CPU-local objects are initialized on immutable boot CPUs; runtime cross-access uses per-CPU locks.
-- `modules/kern/src/platform/smt/smt.hpp` — **preemption-protected**. Locked accessors mask interrupts. Unlocked `this_cpu()` is restricted to the scheduler's audited IRQ-off/idle paths; its contract now forbids retention across a preemptible call without `MigrationGuard`.
+- `modules/kern/src/platform/smt/smt.hpp` — **preemption-protected**. Current-CPU locked accessors save entry flags and mask interrupts before sampling CPU, retain the selected row lock through the callback, then unlock before restoring entry flags. Unlocked `this_cpu()` is restricted to the scheduler's audited IRQ-off/idle paths; its contract now forbids retention across a preemptible call without `MigrationGuard`.
 - `modules/kern/src/platform/asm/cpu.cpp` — **re-read**. The safe CPU-ID helper returns a scalar snapshot and exposes no CPU-local pointer.
 - `modules/kern/src/platform/asm/cpu.hpp` — **re-read / preemption-protected**. GS leaf helpers return scalar state; direct base writes are used only by audited boot and handoff code.
 - `modules/kern/src/platform/asm/segment.hpp` — **preemption-protected**. Raw GS-base leaf operations are limited to audited context setup and switch paths.
@@ -152,11 +152,12 @@ pointer lifetime, replace object ownership or imply NMI context-switch support.
 - `modules/kern/src/test/numa_pressure_runtime_ktest.cpp` — **re-read / refactored**. Independent before/after CPU samples are diagnostic scalars; the initial scalar selects copied immutable NUMA placement. The executing daemon is a Task identity, not a cached CPU proxy.
 - `modules/kern/src/vfs/advisory.hpp` — **refactored**. The scanner match is comment-only: the declaration takes an explicit retained subject and states that it never resolves executing-task identity itself. No runtime CPU-local access occurs here.
 
-Source-known follow-up: PerCpuCrossAccess::this_cpu_locked() and
-this_cpu_locked_void() still sample CPU before acquiring their IRQ-save lock.
-This416 change closes only Task acquisition, not that separate selection
-interval or all CPU-local lifetimes. No observed failure or broader preemption
-certification is inferred from this ledger or the focused native test.
+PerCpuCrossAccess::this_cpu_locked() and this_cpu_locked_void() now mask
+IRQs before sampling CPU and retain that exclusion through row lock, callback,
+and unlock, then restore entry flags. This narrow selection fix complements
+416 Task acquisition; it grants no post-return CPU-local lifetime lease or NMI
+reentrancy guarantee. No observed failure, huge-workload cause, or broader
+preemption certification is inferred from this ledger or the focused native test.
 
 ## Enforcement and qualified migration boundary
 

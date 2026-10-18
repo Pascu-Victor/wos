@@ -434,6 +434,122 @@ void cases(){
 }
 '''
 
+PERCPU_HARDWARE = r'''
+#include <new>
+#include <type_traits>
+// Isolated complete-template profile; existing mocks/getter/cases are untouched.
+namespace percpu_lock_capture_fixture {
+namespace task=ker::mod::sched::task;
+bool irq_enabled=false,offer_lookup_migration=true,offer_restore_migration=true;
+bool callback_completed=false;
+unsigned cpu_index=0,migration_depth=0;
+unsigned cpu_samples=0,lookup_migrations=0,blocked_lookup_migrations=0;
+unsigned save_calls=0,restore_calls=0,callback_calls=0,restore_probe_calls=0,restore_migrations=0;
+task::Task* executing=nullptr;task::Task* foreign=nullptr;
+void migrate();
+void verify_unlocked();
+auto get_core_count()->uint64_t{return 2;}
+namespace cpu {
+auto current_cpu()->uint64_t{
+ ++cpu_samples;
+ auto const sampled_cpu=cpu_index;
+ // Offer interruption after sampling, preserving the sampled register value.
+ if(offer_lookup_migration){
+  if(irq_enabled){++lookup_migrations;migrate();}
+  else ++blocked_lookup_migrations;
+ }
+ return sampled_cpu;
+}
+}
+auto fixture_save_flags_and_cli()->uint64_t{
+ ++save_calls;
+ auto const flags=uint64_t{2}|(irq_enabled?uint64_t{0x200}:uint64_t{0});
+ irq_enabled=false;
+ return flags;
+}
+void fixture_restore_flags(uint64_t flags){
+ check(!irq_enabled);++restore_calls;
+ if((flags&0x200)!=0){
+  check(callback_completed);
+  // The actual template store must unlock before it restores entry IF.
+  verify_unlocked();
+ }
+ irq_enabled=(flags&0x200)!=0;
+ if(irq_enabled && offer_restore_migration){++restore_migrations;migrate();}
+}
+'''
+PERCPU_CASES = r'''
+struct Row {task::Task* current_task=nullptr;uint64_t value=0;unsigned visits=0;};
+// As in the kernel, the real template's array allocations have a durable root.
+PerCpuCrossAccess<Row> queues;
+void migrate(){
+ check(irq_enabled && executing && foreign);
+ check(executing->type==task::TaskType::DAEMON && migration_depth==0 && ker::mod::sched::guard_depth==0);
+ queues.that_cpu(cpu_index)->current_task=foreign;
+ cpu_index^=1;
+ queues.that_cpu(cpu_index)->current_task=executing;
+}
+void verify_unlocked(){
+ ++restore_probe_calls;
+ bool visited=false;
+ auto const cpu=cpu_index;
+ bool const acquired=queues.try_with_lock(cpu,[&](Row* row){
+  check(!irq_enabled && row==queues.that_cpu(cpu));visited=true;
+ });
+ check(acquired && visited);
+}
+auto observe_row(Row* row)->uint64_t{
+ ++callback_calls;
+ check(!irq_enabled && executing && executing->type==task::TaskType::DAEMON);
+ check(migration_depth==0 && ker::mod::sched::guard_depth==0);
+ // Old source selects row A after the DAEMON continuation resumes on CPU B.
+ check(row==queues.that_cpu(cpu_index) && row->current_task==executing);
+ check(!queues.try_with_lock(cpu_index,[](Row*){check(false);}));
+ ++row->visits;row->value=0x432;
+ callback_completed=true;
+ return row->value;
+}
+void cases(){
+ for(bool value_api:{true,false})for(bool entry_if:{true,false}){
+  task::Task self,other;self.type=other.type=task::TaskType::DAEMON;
+  executing=&self;foreign=&other;cpu_index=0;migration_depth=0;
+  *queues.that_cpu(0)=Row{.current_task=&self};
+  *queues.that_cpu(1)=Row{.current_task=&other};
+  irq_enabled=entry_if;offer_lookup_migration=offer_restore_migration=true;
+  callback_completed=false;
+  cpu_samples=lookup_migrations=blocked_lookup_migrations=save_calls=restore_calls=0;
+  callback_calls=restore_probe_calls=restore_migrations=0;
+  check(ker::mod::sched::guard_depth==0);
+  if(value_api){
+   auto const value=queues.this_cpu_locked([](Row* row){return observe_row(row);});
+   check(value==0x432);
+  }else{
+   queues.this_cpu_locked_void([](Row* row){static_cast<void>(observe_row(row));});
+  }
+  check(callback_completed && callback_calls==1 && irq_enabled==entry_if);
+  check(cpu_samples==1 && lookup_migrations==0 && blocked_lookup_migrations==1);
+  check(save_calls==(entry_if?4U:3U) && restore_calls==(entry_if?3U:2U));
+  check(restore_probe_calls==(entry_if?1U:0U) && restore_migrations==(entry_if?1U:0U));
+  check(cpu_index==(entry_if?1U:0U) && queues.that_cpu(cpu_index)->current_task==&self);
+  check(queues.that_cpu(0)->value==0x432 && queues.that_cpu(0)->visits==1);
+  check(queues.that_cpu(1)->value==0 && queues.that_cpu(1)->visits==0);
+  check(migration_depth==0 && ker::mod::sched::guard_depth==0);
+  // Both real locks remain usable, including the original IF0 path.
+  irq_enabled=false;offer_restore_migration=false;
+  for(uint64_t cpu:{0U,1U}){
+   bool visited=false;
+   check(queues.try_with_lock(cpu,[&](Row* row){
+    check(!irq_enabled && row==queues.that_cpu(cpu));visited=true;
+   }));
+   check(visited && !irq_enabled);
+  }
+  *queues.that_cpu(0)=Row{};*queues.that_cpu(1)=Row{};
+  executing=foreign=nullptr;
+ }
+}
+}
+'''
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source-root', type=Path, default=ROOT)
@@ -528,6 +644,24 @@ def main():
             getter = getter.replace(before, after)
         assert 'asm volatile' not in getter
         code += GETTER_HARDWARE + getter + GETTER_CASES
+    if new:
+        # Complete real template; replace only privileged hardware statements.
+        smt_header = (args.source_root / 'modules/kern/src/platform/smt/smt.hpp').read_text()
+        percpu = block(smt_header, r'^template <typename T>\nclass PerCpuCrossAccess ') + ';\n'
+        hardware = (
+            ('asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");',
+             'flags = fixture_save_flags_and_cli();'),
+            ('asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");',
+             'fixture_restore_flags(flags);'),
+        )
+        counts = tuple(percpu.count(before) for before, _ in hardware)
+        # Old source has only primitive seams; fixed adds two pre-sample saves.
+        assert counts in ((2, 2), (4, 2)), counts
+        for before, after in hardware:
+            percpu = percpu.replace(before, after)
+        assert percpu.count('asm volatile("pause");') == 1
+        assert 'asm volatile' not in percpu.replace('asm volatile("pause");', '')
+        code += PERCPU_HARDWARE + percpu + PERCPU_CASES
     code += r'''
 int main(){
  unsigned pipelines=0;
@@ -538,7 +672,7 @@ int main(){
   // The controlled migration endpoint models one transfer per pipeline.
   pipeline(kind,weight,tick,enabled,cancel,manual,migration,count);++pipelines;
  }
-''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + ('current_task_capture_fixture::cases();\n' if new else '') + r'''
+''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + ('current_task_capture_fixture::cases();\n' if new else '') + ('percpu_lock_capture_fixture::cases();\n' if new else '') + r'''
  std::printf("actual wait/accounting/RunHeap: %u pipelines, %u assertions PASS\n",pipelines,checks);
 }
 '''
