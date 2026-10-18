@@ -1891,7 +1891,8 @@ inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vrunt
 
     while (rq->runnable_heap.size != 0) {
         task::Task* next = rq->runnable_heap.pick_best_eligible(avg_vruntime);
-        if (next == current_task && current_task != nullptr && current_task->is_voluntary_blocked() && rq->runnable_heap.size > 1) {
+        if (next == current_task && current_task != nullptr && current_task->is_voluntary_blocked() &&
+            !current_task->wakeup_pending.load(std::memory_order_acquire) && rq->runnable_heap.size > 1) {
             task::Task* alternate = pick_best_eligible_excluding_locked(rq, avg_vruntime, current_task);
             if (alternate != nullptr) {
                 next = alternate;

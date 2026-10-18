@@ -7,6 +7,9 @@ subjects. That endpoint asserts real heap membership and cannot repair a waiter;
 the native scheduler tests exercise that separate transition. Actual arithmetic,
 wait wrappers, bookkeeping and heap methods are compiled under ASan/UBSan.
 --source-root tests saved pre-patch scheduler sources.
+The added continuation cases use actual picker/cancel bodies and real RunHeap;
+job-control/non-invalid publication endpoints are explicit finite refusals, not
+models of APIC/assembly timing or new scheduling policy.
 """
 import argparse
 import os
@@ -46,14 +49,25 @@ template<auto> struct logger;
 struct Silent {template<class... T>static void error(const char*,T...){assert(false);}};
 void panic_handler(const char*){assert(false);}
 }
+namespace ker::mod::mm::virt {
+int fixture_kernel_root;
+void* get_kernel_pagemap(){return &fixture_kernel_root;}
+}
 namespace ker::mod::sched {
 bool irq_enabled=true,query_ready=true;
 unsigned guard_depth=0;
 namespace task {
 enum class TaskType {PROCESS,DAEMON,IDLE};
 enum class WaitChannelKind {GENERIC,LOCAL_PIPE};
+enum class TaskState {ACTIVE,DEAD,EXITING};
 struct Task {
  TaskType type=TaskType::PROCESS;int sched_nice=0;HEAP_INDEX_DECLARATION
+ uint64_t pid=1;void* thread=nullptr;void* pagemap=nullptr;
+ struct {uint64_t syscall_kernel_stack=1,syscall_scratch_area=2;} context;
+ std::atomic<TaskState> state{TaskState::ACTIVE};
+ std::atomic<bool> gc_queued{false};
+ bool has_exited=false,jobctl_stopped=false,interrupting_signal=false;
+ bool has_interrupting_signal_pending() const{return interrupting_signal;}
  uint32_t sched_weight=1024,slice_ns=10000000,slice_used_ns=0;
  int64_t vruntime=0,vdeadline=10000000;
  bool blocked=false,wants_block=false;
@@ -125,6 +139,13 @@ void restore_process_syscall_park_interrupts(bool was_enabled,task::Task* p){
 constexpr uint64_t saturating_deadline_us(uint64_t a,uint64_t b){return b>UINT64_MAX-a?UINT64_MAX:a+b;}
 enum class SchedulerHaltWaitKind {YIELD,BLOCK,PROCESS_PARK};
 bool scheduler_wait_halt_once(task::Task*,SchedulerHaltWaitKind,bool);
+// These independent job-control/corruption transitions are outside this finite
+// ready-pair profile. Unexpected entry fails; no selector outcome is repaired.
+bool park_job_control_stopped_task_locked(RunQueue* rq,task::Task* p){
+ assert(rq && p && !p->jobctl_stopped);return false;
+}
+bool remove_from_heap_by_scan_locked(RunQueue*,task::Task*){assert(false);return false;}
+void transition_mark_detached_locked(RunQueue*,task::Task*){assert(false);}
 '''
 HARDWARE = r'''
 unsigned timer_mode=0,halt_calls=0;
@@ -288,6 +309,61 @@ void boundaries_and_guards(){
 '''
 
 
+
+WOKEN_WAIT_CASES = r'''
+void woken_wait_continuation(){
+ Queues q;task::Task worker,parent;initialise(q,worker,1024);auto& rq=q.rows[0];
+ worker.type=task::TaskType::DAEMON;worker.pid=8;
+ worker.pagemap=ker::mod::mm::virt::get_kernel_pagemap();
+ worker.vdeadline=1;rq.runnable_heap.update(&worker);
+ parent.pid=108;parent.thread=&parent;parent.pagemap=&parent;parent.heap_index=-1;
+ parent.vruntime=0;parent.vdeadline=2;
+ check(rq.runnable_heap.insert(&parent));rq.total_weight+=parent.sched_weight;
+ irq_enabled=false;
+ auto const accounting=begin_kernel_wait_accounting(&worker);
+ check(!accounting.was_blocked && worker.blocked && !worker.wants_block);
+ worker.wakeup_pending.store(true,std::memory_order_release);
+ // Model repeated timer selection BEFORE the resumed owner gets an instruction.
+ // The picker, real heap and token are production; hardware delivery is not.
+ for(unsigned early_tick=0;early_tick<64;++early_tick){
+  auto* selected=q.this_cpu_locked([&](RunQueue* locked){
+   return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
+  });
+  check(selected==&worker);
+  check(worker.wakeup_pending.load(std::memory_order_acquire));
+  check(worker.blocked && rq.runnable_heap.contains(&worker) && rq.runnable_heap.contains(&parent));
+ }
+ // Selection does not consume the event: actual owner cancellation does.
+ check(scheduler_wait_should_cancel(&worker,SchedulerHaltWaitKind::BLOCK));
+ check(!worker.wakeup_pending.load(std::memory_order_acquire));
+ finish_kernel_wait_accounting(&worker,accounting);
+ check(!worker.blocked && !worker.wants_block && rq.runnable_heap.contains(&worker));
+ // Preserve the old alternate rule for a genuinely unwoken voluntary owner.
+ worker.blocked=true;worker.wakeup_pending.store(false,std::memory_order_release);
+ auto* unwoken=q.this_cpu_locked([&](RunQueue* locked){
+  return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
+ });
+ check(unwoken==&parent && !worker.wakeup_pending.load(std::memory_order_acquire));
+ // Pending does not boost priority: a naturally earlier eligible peer wins.
+ worker.wakeup_pending.store(true,std::memory_order_release);
+ parent.vdeadline=0;rq.runnable_heap.update(&parent);
+ auto* earlier=q.this_cpu_locked([&](RunQueue* locked){
+  return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
+ });
+ check(earlier==&parent && worker.wakeup_pending.load(std::memory_order_acquire));
+ // Return the natural EEVDF win to worker; do not manufacture a new quantum.
+ parent.vdeadline=2;rq.runnable_heap.update(&parent);
+ auto* ready=q.this_cpu_locked([&](RunQueue* locked){
+  return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
+ });
+ check(ready==&worker && worker.wakeup_pending.load(std::memory_order_acquire));
+ check(scheduler_wait_should_cancel(&worker,SchedulerHaltWaitKind::BLOCK));
+ worker.blocked=false;
+ check(rq.runnable_heap.remove(&parent));check(rq.runnable_heap.remove(&worker));
+}
+'''
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source-root', type=Path, default=ROOT)
@@ -319,10 +395,17 @@ def main():
     if new:
         names += [('auto', 'scheduler_selftest_wait_boundaries_preserve_cpu_and_fairness'),
                   ('auto', 'scheduler_selftest_blocked_runtime_excludes_eevdf_and_irq')]
+    if new:
+        # Actual picker and eligibility bodies; no replacement selector is defined.
+        names += [('inline auto', 'has_kernel_scheduler_context'), ('inline auto', 'is_publishable_runnable_task'),
+                  ('inline auto', 'run_heap_entry'), ('inline auto', 'pick_best_eligible_excluding_locked'),
+                  ('inline auto', 'pick_best_eligible_for_switch_locked')]
     bodies = []
     for prefix, name in names:
         # Reject forward declarations; only current definitions are executable evidence.
         bodies.append(block(source, '^' + prefix + ' ' + name + r'\([^;{}]*?\)\s*(?:->[^;{]+)?\{'))
+    if new:
+        bodies.append(block(header, r'^inline auto scheduler_wait_should_cancel\([^;{}]*?\)\s*->[^;{]+\{'))
     token = block(header, r'^struct KernelWaitAccounting ') + ';\n' if new else ''
     start = source.index('        // Compute time delta since last tick\n')
     end = source.index('            // kern_yield() sleepers', start)
@@ -358,6 +441,8 @@ def main():
                             'else account_runtime_slice(&last,&p,time::now,time::now-last.last_tick_us,true,true);')
     else:
         code += NEW_CASES
+    if new:
+        code += WOKEN_WAIT_CASES
     code += r'''
 int main(){
  unsigned pipelines=0;
@@ -368,7 +453,7 @@ int main(){
   // The controlled migration endpoint models one transfer per pipeline.
   pipeline(kind,weight,tick,enabled,cancel,manual,migration,count);++pipelines;
  }
-''' + ('boundaries_and_guards();\n' if new else '') + r'''
+''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + r'''
  std::printf("actual wait/accounting/RunHeap: %u pipelines, %u assertions PASS\n",pipelines,checks);
 }
 '''
