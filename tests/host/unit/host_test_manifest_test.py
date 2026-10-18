@@ -245,6 +245,91 @@ def mask_cxx_non_code(source: str) -> str:
     return "".join(out)
 
 
+def managed_fixture_is_composed(tree: ast.Module) -> bool:
+    """Recognize the two current fixture sinks, not arbitrary Python data flow."""
+    mains = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main"]
+    if len(mains) != 1:
+        return False
+    nodes = list(ast.walk(mains[0]))
+    parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+    fixture_assignments = [node for node in nodes if isinstance(node, ast.Assign)
+                           and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                           and node.targets[0].id == "fixture"]
+    fixture_stores = [node for node in nodes if isinstance(node, ast.Name)
+                      and node.id == "fixture" and isinstance(node.ctx, (ast.Store, ast.Del))]
+    if (len(fixture_assignments) != 1 or len(fixture_stores) != 1
+            or ast.unparse(fixture_assignments[0].value) != "support / 'managed_huge_test.cpp'"):
+        return False
+    block = parents[fixture_assignments[0]]
+    if not (block is mains[0] or isinstance(block, ast.Try) and parents.get(block) is mains[0]):
+        return False
+    if fixture_assignments[0] not in block.body:
+        return False
+    assignments = sorted((node for node in nodes if isinstance(node, ast.Assign)
+                          and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                          and node.targets[0].id == "fixture_source"), key=lambda node: node.lineno)
+    stores = [node for node in nodes if isinstance(node, ast.Name)
+              and node.id == "fixture_source" and isinstance(node.ctx, (ast.Store, ast.Del))]
+    if len(stores) != len(assignments):
+        return False  # No augmented/destructuring/loop/delete rebinding.
+    if assignments:
+        if (ast.unparse(assignments[0].value) != "fixture.read_text()"
+                or parents[assignments[0]] is not block or assignments[0] not in block.body):
+            return False  # A read hidden in a dead/nested block cannot bind the live sinks.
+        for assignment in assignments[1:]:
+            loop = parents[assignment]
+            if (not isinstance(loop, ast.For) or parents.get(loop) is not block or assignment not in loop.body
+                    or not isinstance(loop.target, ast.Name) or loop.target.id != "anchor"):
+                return False
+            value = assignment.value
+            # The actual preparation port inserts text after an intact anchor;
+            # it cannot replace or discard the fixture string itself.
+            if not (isinstance(value, ast.Call) and ast.unparse(value.func) == "fixture_source.replace"
+                    and len(value.args) == 2 and not value.keywords
+                    and isinstance(value.args[0], ast.Name) and value.args[0].id == "anchor"
+                    and isinstance(value.args[1], ast.BinOp) and isinstance(value.args[1].op, ast.Add)
+                    and isinstance(value.args[1].left, ast.Name) and value.args[1].left.id == "anchor"
+                    and isinstance(value.args[1].right, ast.Constant) and isinstance(value.args[1].right.value, str)):
+                return False
+
+    def fixture_value(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Call) and ast.unparse(node) == "fixture.read_text()"
+                or bool(assignments) and isinstance(node, ast.Name) and node.id == "fixture_source")
+
+    sinks = []
+    for call in nodes:
+        if not isinstance(call, ast.Call) or ast.unparse(call.func) != "composite.write_text":
+            continue
+        if len(call.args) != 1 or call.keywords:
+            return False
+        value = call.args[0]
+        if isinstance(value, ast.Call) and ast.unparse(value.func) == "coordinator.compose":
+            if not value.args or not fixture_value(value.args[0]):
+                return False
+            sinks.append(("coordinator", call.lineno))
+        elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) and value.func.attr == "join"
+              and isinstance(value.func.value, ast.Constant) and value.func.value.value == "\n"):
+            if (len(value.args) != 1 or value.keywords or not isinstance(value.args[0], ast.List)
+                    or not any(fixture_value(element) for element in value.args[0].elts)):
+                return False
+            sinks.append(("ordinary", call.lineno))
+        elif fixture_value(value):
+            sinks.append(("direct", call.lineno))  # Original direct-read form remains valid.
+        elif (isinstance(value, ast.Call) and ast.unparse(value.func) in ("batch_fixture.compose", "policy_fixture.compose")
+              and len(value.args) == 1 and not value.keywords and ast.unparse(value.args[0]) == "composite.read_text()"):
+            continue  # Existing later adapters consume the already linked composite.
+        else:
+            return False
+    if not sinks or fixture_assignments[0].lineno >= min(line for _, line in sinks):
+        return False
+    if assignments:
+        if (fixture_assignments[0].lineno >= assignments[0].lineno
+                or assignments[-1].lineno >= min(line for _, line in sinks)
+                or {kind for kind, _ in sinks} != {"coordinator", "ordinary"}):
+            return False  # Both current branches must retain the actual fixture.
+    return True
+
+
 def require_companion_program(filename: str, cpp: str, driver: str) -> None:
     code = mask_cxx_non_code(cpp)
     if filename == "managed_huge_test.cpp":
@@ -299,9 +384,7 @@ def require_companion_program(filename: str, cpp: str, driver: str) -> None:
         fixture = any(isinstance(node, ast.Assign)
                       and any(isinstance(target, ast.Name) and target.id == "fixture" for target in node.targets)
                       and ast.unparse(node.value) == "support / 'managed_huge_test.cpp'" for node in ast.walk(tree))
-        composed = any(isinstance(call, ast.Call) and ast.unparse(call.func) == "composite.write_text"
-                       and any(isinstance(node, ast.Call) and ast.unparse(node.func) == "fixture.read_text"
-                               for node in ast.walk(call)) for call in ast.walk(tree))
+        composed = managed_fixture_is_composed(tree)
         selected = any(isinstance(node, ast.Assign)
                        and any(isinstance(target, ast.Name) and target.id == "sources" for target in node.targets)
                        and isinstance(node.value, ast.BinOp) and isinstance(node.value.left, ast.List)
@@ -318,6 +401,47 @@ def require_companion_program(filename: str, cpp: str, driver: str) -> None:
         fail(f"unowned standalone companion: {filename}")
     if not linked:
         fail(f"driver-owned companion {filename} is missing its actual compiler-source linkage")
+
+
+def require_managed_fixture_link_checks() -> None:
+    """The same checker must distinguish the actual driver from severed links."""
+    driver = (HOST_DIR / "unit" / "managed_huge_runtime_test.py").read_text()
+    cpp = (HOST_DIR / "unit" / "managed_huge_test.cpp").read_text()
+    require_companion_program("managed_huge_test.cpp", cpp, driver)
+    read = "        fixture_source = fixture.read_text()\n"
+    coordinator = "coordinator.compose(fixture_source,"
+    ordinary = "                    fixture_source,\n"
+    sources = "sources = [module, factory, composite]"
+    compile_call = 'run(f"compile-{index}", flags + ["-c", path, "-o", obj])'
+    fixture_path = 'fixture = support / "managed_huge_test.cpp"'
+    replacement = 'fixture_source = fixture_source.replace(anchor, anchor + "\\n    host_range::check_preparation_allocation();")'
+    for anchor in (read, coordinator, ordinary, sources, compile_call, fixture_path, replacement):
+        if driver.count(anchor) != 1:
+            fail("actual managed fixture self-check boundary changed: " + anchor)
+    # Genuine current source, with only the two fixture input expressions changed
+    # to the previous direct-read form, retains the actual compiler/source list.
+    direct = driver.replace(coordinator, "coordinator.compose(fixture.read_text(),").replace(ordinary,
+                            "                    fixture.read_text(),\n")
+    require_companion_program("managed_huge_test.cpp", cpp, direct)
+    mutations = {
+        "missing read": driver.replace(read, "        fixture_source = ''\n"),
+        "read hidden in dead branch": driver.replace(read, "        if False:\n    " + read),
+        "overwritten alias": driver.replace(read, read + "        fixture_source = ''\n"),
+        "ordinary branch drops fixture": driver.replace(ordinary, "                    '',\n"),
+        "coordinator branch drops fixture": driver.replace(coordinator, "coordinator.compose('',"),
+        "dead alias token": driver.replace(coordinator, "coordinator.compose('fixture_source',").replace(
+            ordinary, "                    'fixture_source',\n"),
+        "replacement discards anchor": driver.replace(replacement, 'fixture_source = fixture_source.replace(anchor, "")'),
+        "composite omitted": driver.replace(sources, "sources = [module, factory]"),
+        "compiler command missing": driver.replace(compile_call, "pass"),
+        "wrong fixture path": driver.replace(fixture_path, 'fixture = support / "unrelated.cpp"'),
+    }
+    for label, severed in mutations.items():
+        try:
+            require_companion_program("managed_huge_test.cpp", cpp, severed)
+        except AssertionError:
+            continue
+        fail("managed fixture linkage accepted " + label)
 
 
 def require_driver_owned_companions(unit_cpp_files: list[Path], py_regs: dict[str, str]) -> set[Path]:
@@ -480,6 +604,7 @@ def main() -> None:
     source = expand_literal_foreach(strip_comments(HOST_CMAKE.read_text()))
 
     require_composite_source_registration_checks()
+    require_managed_fixture_link_checks()
     require_discoverable_test_source_names()
 
     unit_cpp_files = sorted((HOST_DIR / "unit").glob("*_test.cpp"))
