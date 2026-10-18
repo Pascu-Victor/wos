@@ -200,6 +200,12 @@ class PreparedHugeMapBatch {
 [[nodiscard]] auto prepare_current_range_split(sched::task::Task&, const sys::SyscallPreparationScope&, uint64_t start, uint64_t end,
                                                RangeSplitSurvey& empty, PreparedTables& empty_tables,
                                                RangePrepareWitness* witness = nullptr) noexcept -> Error;
+// Fork-only ordinary preparation: no incoming PUB/root/IRQ owner. Each chunk
+// waits for PUB at IF-on/preempt0, revalidates after the wait, and releases all
+// owners before allocation/yield. Other current/unpublished routes stay try-only.
+[[nodiscard]] auto prepare_current_fork_range_split(sched::task::Task&, const sys::SyscallPreparationScope&, uint64_t start, uint64_t end,
+                                                    RangeSplitSurvey& empty, PreparedTables& empty_tables,
+                                                    RangePrepareWitness* witness = nullptr) noexcept -> Error;
 class CurrentRangeSplitAdmission {
    public:
     CurrentRangeSplitAdmission(sched::task::Task&, const sys::SyscallPreparationScope&,

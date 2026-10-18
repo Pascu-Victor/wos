@@ -334,9 +334,11 @@ auto range_tables_valid(const SplitPlanStorage& storage, uint16_t count) noexcep
 }
 }  // namespace
 struct detail::RangePreparationDriver {
+    enum class PublicationPolicy : uint8_t { TryOnly, ForkWait };
     static auto pass(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
                      RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage, RangePrepareWitness* witness,
-                     RangePreparePass phase, uint8_t attempt, uint16_t expected_count = 0) noexcept -> Error {
+                     RangePreparePass phase, uint8_t attempt, uint16_t expected_count = 0,
+                     PublicationPolicy publication_policy = PublicationPolicy::TryOnly) noexcept -> Error {
         while (!cursor.complete) {
             if (target != nullptr && (preparation == nullptr || !range_current_context(*target, *preparation, true))) {
                 record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Context, phase, attempt, &cursor, expected_count);
@@ -345,7 +347,27 @@ struct detail::RangePreparationDriver {
             CurrentRangeRootAccess access;
             RangePrepareSite site = RangePrepareSite::PublicationBusy;
             Error error = Error::Again;
-            {
+            if (publication_policy == PublicationPolicy::ForkWait) {
+                site = RangePrepareSite::Context;
+                // The full ordinary context was checked above before waiting.
+                // ForkWait is never valid for the unpublished/rootless route.
+                if (target == nullptr || preparation == nullptr) {
+                    error = Error::Invalid;
+                } else {
+                    ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                    if (!publication.acquired() || !range_current_context(*target, *preparation, true)) {
+                        error = Error::Invalid;
+                    } else {
+                        sched::PreemptGuard preempt;
+                        site = RangePrepareSite::Unreported;
+                        error = acquire_current_range_root(*target, access, witness != nullptr ? &site : nullptr);
+                        if (error == Error::None)
+                            error = survey_range_chunk(access.root, cursor, mode, storage, witness != nullptr ? &site : nullptr);
+                        // Drop the fresh reader/Task lease before preempt/PUB.
+                        release_current_range_root(access);
+                    }
+                }
+            } else {
                 sched::PreemptGuard preempt;
                 ker::syscall::vmem::SharedVmemPublicationTryGuard publication;
                 if (publication.acquired()) {
@@ -372,7 +394,8 @@ struct detail::RangePreparationDriver {
     }
     static auto prepare(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
                         uint64_t start, uint64_t end, RangeSplitSurvey& survey, PreparedTables& tables, uint16_t fail_before_table,
-                        RangePrepareWitness* witness = nullptr) noexcept -> Error {
+                        RangePrepareWitness* witness = nullptr, PublicationPolicy publication_policy = PublicationPolicy::TryOnly) noexcept
+        -> Error {
         constexpr uint64_t LIMIT = uint64_t{1} << 47;
         if (witness != nullptr) *witness = {};
         if (start >= end || end > LIMIT || ((start | end) & (PAGE_BYTES - 1)) != 0 || survey.complete_ ||
@@ -386,7 +409,7 @@ struct detail::RangePreparationDriver {
             count.start = start;
             count.end = end;
             Error error = pass(target, preparation, unpublished, count, RangeSurveyMode::Count, nullptr, witness, RangePreparePass::Count,
-                               static_cast<uint8_t>(attempt + 1));
+                               static_cast<uint8_t>(attempt + 1), 0, publication_policy);
             if (error != Error::None) {
                 if (error == Error::Again && count.epoch_changed) continue;
                 return error;  // Busy is immediate; no hidden contention retries.
@@ -418,7 +441,7 @@ struct detail::RangePreparationDriver {
             fill.start = start;
             fill.end = end;
             error = pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage,
-                         witness, RangePreparePass::Fill, static_cast<uint8_t>(attempt + 1), count.count);
+                         witness, RangePreparePass::Fill, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);
             if (error == Error::None && fill.count != count.count) {
                 error = Error::Again;
                 record_range_prepare_failure(witness, error, RangePrepareSite::CountMismatch, RangePreparePass::Fill,
@@ -440,8 +463,9 @@ struct detail::RangePreparationDriver {
             final.start = start;
             final.end = end;
             if (error == Error::None)
-                error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count,
-                             storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count);
+                error =
+                    pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count,
+                         storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);
             if (error == Error::None && final.count != count.count) {
                 error = Error::Again;
                 record_range_prepare_failure(witness, error, RangePrepareSite::CountMismatch, RangePreparePass::Verify,
@@ -485,6 +509,17 @@ auto prepare_current_range_split(sched::task::Task& target, const sys::SyscallPr
         return Error::Invalid;
     }
     return detail::RangePreparationDriver::prepare(&target, &preparation, nullptr, start, end, survey, tables, UINT16_MAX, witness);
+}
+auto prepare_current_fork_range_split(sched::task::Task& target, const sys::SyscallPreparationScope& preparation, uint64_t start,
+                                      uint64_t end, RangeSplitSurvey& survey, PreparedTables& tables, RangePrepareWitness* witness) noexcept
+    -> Error {
+    if (witness != nullptr) *witness = {};
+    if (!range_current_context(target, preparation, true)) {
+        record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Context, RangePreparePass::Entry, 0);
+        return Error::Invalid;
+    }
+    return detail::RangePreparationDriver::prepare(&target, &preparation, nullptr, start, end, survey, tables, UINT16_MAX, witness,
+                                                   detail::RangePreparationDriver::PublicationPolicy::ForkWait);
 }
 auto detail::prepare_unpublished_range_split(paging::PageTable* root, uint64_t start, uint64_t end, RangeSplitSurvey& survey,
                                              PreparedTables& tables, uint16_t fail_before_table) noexcept -> Error {

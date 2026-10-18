@@ -177,7 +177,7 @@ unsigned locks{}, retained_tasks{}, returned_tasks{}, vfs_puts{}, binding_reserv
 unsigned registry_tries{}, registry_fail_try{};
 bool enabled{}, fail_attach{}, fail_shm{}, fail_lazy{}, fail_binding_reserve{};
 unsigned child_attaches{}, queries{};
-unsigned pubs{};void(*on_pub)(){};
+unsigned pubs{};bool at_final_publication{};void(*on_pub)(){};
 void(*on_pin)(){},(*on_shm)(){},(*on_legacy)(){};
 void publication_acquire(){++pubs;if(on_pub)on_pub();}
 void pin_acquire(){if(enabled&&on_pin)on_pin();}
@@ -453,6 +453,15 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
         coordinator = self.body(
             "syscalls_impl/process/process.cpp", "auto prepare_fork_vm_snapshot("
         )
+        # External Host observation port: tag only the real final constructor,
+        # then restore immediately. No guard/matches or ownership logic changes.
+        final_guard = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        if (!lazy.matches(actor)"
+        if coordinator.count(final_guard) != 1:
+            raise RuntimeError("actual final publication observation boundary changed")
+        coordinator = coordinator.replace(
+            final_guard,
+            "host_fork_vm::at_final_publication = true;\n        ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        if (!lazy.matches(actor)",
+        )
         return "\n".join(
             [
                 declaration,
@@ -535,7 +544,7 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
             + "\nmm::huge::CurrentRangeSplitAdmission nested(actor,preparation,publication);",
         )
         yield "coordinator-nested-reader", nested, "ForkVmCoordinator.CountZeroUsesWholeSurveyAndOneOriginalExclusive"
-        anchor = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        if (!lazy.matches(actor)"
+        anchor = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        if (!lazy.matches(actor)"
         assert source.count(anchor) == 1
         bad = source.replace(
             old, "/* Legacy moved too early by compiled control. */"

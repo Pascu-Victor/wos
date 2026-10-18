@@ -28,6 +28,9 @@ auto get_virt_pointer(vaddr_t p) -> vaddr_t* {
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/syscall_preparation.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
+namespace ker::syscall::vmem {
+extern std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner;
+}
 namespace ker::mod::sched {
 auto preempt_count() -> uint32_t { return backend().preempt_depth; }
 void kern_yield() {
@@ -53,6 +56,10 @@ void Mutex::record_owner(uint64_t) {
     ++host_range::tries;
 }
 void Mutex::clear_owner() {
+    if (host_range::expect_fork_wait) {
+        EXPECT_EQ(root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);
+        if (host_range::current) EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 0U);
+    }
     if (host_range::concurrent) {
         EXPECT_EQ(host_range::active.fetch_sub(1), 1U);
         ++host_range::clears;
@@ -65,10 +72,22 @@ void Mutex::clear_owner() {
 }
 void Mutex::lock() {
     ++host_range::blocking;
+    if (host_range::expect_fork_wait) {
+        EXPECT_TRUE(host_range::interrupts);
+        EXPECT_EQ(root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);
+        if (host_range::current) EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 0U);
+    }
+    if (host_range::on_blocking) host_range::on_blocking();
+    if (host_range::expect_fork_wait) EXPECT_EQ(publication_depth, 0U);
     ASSERT_TRUE(try_lock());
 }
 }  // namespace ker::mod::sys
 namespace host_range {
+void check_preparation_allocation() {
+    if (!expect_fork_wait) return;
+    ++allocation_checks;
+    check_yield_boundary();
+}
 void check_yield_boundary() {
     EXPECT_EQ(publication_depth + cow_depth + pin_depth + root_readers + backend().preempt_depth, 0U);
     if (current) EXPECT_EQ(current->usercopy_pagemap_accesses.load(), 0U);
@@ -112,6 +131,16 @@ struct HostLock {
 };
 HostLock cow_pte_lock{cow_depth}, user_mapping_pin_lock{pin_depth};
 auto acquire_user_pagemap_access(PageTable* root, bool, size_t& index) -> bool {
+    if (host_range::expect_fork_wait) {
+        ++host_range::range_readers;
+        auto* owner = ker::syscall::vmem::g_shared_vmem_publication_owner.load(std::memory_order_acquire);
+        EXPECT_NE(owner, nullptr);
+        if (owner) EXPECT_TRUE(owner->acquired());
+        EXPECT_EQ(publication_depth, 1U);
+        EXPECT_EQ(backend().preempt_depth, 1U);
+        EXPECT_TRUE(host_range::interrupts);
+        if (host_range::current) EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 1U);
+    }
     EXPECT_EQ(cow_depth + pin_depth, 0U);
     if (fork_mode && host_range::exclusive) {
         ++fork_reader_attempts;

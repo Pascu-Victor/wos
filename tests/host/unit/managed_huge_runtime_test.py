@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import time
 
-EXPECTED_TESTS = 60
+EXPECTED_TESTS = 70
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -305,7 +305,12 @@ inline bool interrupts = true, queryable = true, reader_busy = false, exclusive 
 inline unsigned yields = 0, tries = 0, unlocks = 0, blocking = 0;
 inline ker::mod::sched::task::Task* current = nullptr;
 inline void (*on_yield)() = nullptr;
+// Finite Host wait action; not WOS Mutex parking or a progress guarantee.
+inline void (*on_blocking)() = nullptr;
+inline bool expect_fork_wait = false;
+inline unsigned range_readers = 0, allocation_checks = 0;
 void check_yield_boundary();
+void check_preparation_allocation();
 }
 namespace ker::mod::sched {
 void preempt_disable(); void preempt_enable(); auto preempt_count() -> uint32_t;
@@ -648,8 +653,17 @@ def main() -> int:
         selected.extend([pin(fork_support), pin(fork_cases)])
         selected.append(pin(range_cases))
         composite = scratch / "actual-source.cpp"
+        fixture_source = fixture.read_text()
+        for anchor in (
+            "if (bytes == sizeof(huge::SplitPlanStorage)) {",
+            "auto allocate_table() noexcept -> paging::PageTable* {",
+            "void release_table(paging::PageTable* p) noexcept {",
+        ):
+            if fixture_source.count(anchor) != 1:
+                raise RuntimeError("actual Host preparation allocation endpoint changed")
+            fixture_source = fixture_source.replace(anchor, anchor + "\n    host_range::check_preparation_allocation();")
         if coordinator is not None:
-            composite.write_text(coordinator.compose(fixture.read_text(), prelude.read_text(), context_methods,
+            composite.write_text(coordinator.compose(fixture_source, prelude.read_text(), context_methods,
                 fork_support.read_text(), user_pin, exclusive, epoch, index, resolver, private, copier, commit,
                 adapters, cases.read_text(), range_cases.read_text(), fork_cases.read_text()))
             public_source = scratch / "actual-public-caller.cpp"
@@ -659,7 +673,7 @@ def main() -> int:
             composite.write_text(
             "\n".join(
                 [
-                    fixture.read_text(),
+                    fixture_source,
                     prelude.read_text(),
                     context_methods,
                     fork_support.read_text(),
@@ -970,7 +984,7 @@ def main() -> int:
                 raise RuntimeError("actual blocking context boundary changed")
             module_mutant("blocking-forgets-context", module_text.replace(needle, ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired()) return;"),
                           "ManagedRange.BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof")
-            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count);"
+            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);"
             if module_text.count(needle) != 1:
                 raise RuntimeError("independent final pass mutation boundary changed")
             module_mutant(
@@ -989,11 +1003,48 @@ def main() -> int:
                 if label == "witness-retains-retry":
                     # Omit ALL genuine clears in the module, preserving every
                     # error/owner action; a successful retry must reject it.
-                    if module_text.count(needle) != 4:
+                    if module_text.count(needle) != 5:
                         raise RuntimeError("actual witness clear boundaries changed")
                 elif module_text.count(needle) != 1:
                     raise RuntimeError("actual witness copy boundary changed")
                 module_mutant(label, module_text.replace(needle, replacement), test)
+
+            # Mutate only the actual named-route module; all Host ownership,
+            # compiler and bounded command handling remain the original path.
+            needle = "ker::syscall::vmem::SharedVmemPublicationGuard publication; if (!publication.acquired() || !range_current_context(*target, *preparation, true))"
+            if module_text.count(needle) != 1:
+                raise RuntimeError("fork wait acquisition control boundary changed")
+            module_mutant(
+                "fork-wait-preempt-before-publication",
+                module_text.replace(needle, "sched::PreemptGuard premature; " + needle),
+                "ManagedForkRange.DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundaries",
+            )
+            needle = "if (!publication.acquired() || !range_current_context(*target, *preparation, true))"
+            if module_text.count(needle) != 1:
+                raise RuntimeError("fork postwait context control boundary changed")
+            module_mutant(
+                "fork-wait-omits-postwait-context",
+                module_text.replace(needle, "if (!publication.acquired())"),
+                "ManagedForkRange.PostwaitIfChangeRefusesBeforeAnyFreshReader",
+            )
+            boundary = "release_current_range_root(access); } } } else {"
+            ordinary_yield = "if (!cursor.complete && target != nullptr) sched::kern_yield();"
+            if module_text.count(boundary) != 1 or module_text.count(ordinary_yield) != 1:
+                raise RuntimeError("fork publication release/yield control boundary changed")
+            bad = module_text.replace(
+                boundary,
+                "release_current_range_root(access); } " + ordinary_yield + " } } else {",
+            )
+            # The inserted yield is inside PUB, after the inner PreemptGuard.
+            # Replace only the original common yield (the last occurrence).
+            pos = str(bad).rfind(ordinary_yield)
+            if pos < 0:
+                raise RuntimeError("common yield control boundary changed")
+            bad = str(bad)[:pos] + "if (publication_policy == PublicationPolicy::TryOnly && !cursor.complete && target != nullptr) sched::kern_yield();" + str(bad)[pos + len(ordinary_yield):]
+            module_mutant(
+                "fork-wait-retains-publication-over-yield", bad,
+                "ManagedForkRange.DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundaries",
+            )
 
             text = module.read_text()
             needle = "(void)owner.span_.release();"

@@ -72,6 +72,7 @@ class ForkVmCoordinator : public ManagedFork {
         actor.pid = 1;
         host_fork_vm::registry_tries = host_fork_vm::registry_fail_try = 0;
         host_fork_vm::pubs = 0;
+        host_fork_vm::at_final_publication = false;
         host_fork_vm::on_pub = nullptr;
         host_fork_vm::on_pin = host_fork_vm::on_shm = host_fork_vm::on_legacy = nullptr;
         host_fork_vm::fail_after = -1;
@@ -411,19 +412,24 @@ TEST_F(ForkVmCoordinator, ManagedSplitAckPrecedesEagerCowWithCallerStorage) {
     EXPECT_LT(ack, cow);
 }
 unsigned inject_at{}, inject_count{};
+bool injected_at_final{};
 ker::mod::sched::task::Task* inject_child{};
 TEST_F(ForkVmCoordinator, FinalTmpfsMatchesRefusesActualReaderWithoutExclusive) {
     tmpfs();
     ASSERT_EQ(run(), 0);
-    unsigned const publications = host_fork_vm::pubs;
     rollback();
-    inject_at = publications * 2;
+    injected_at_final = false;
     host_fork_vm::on_pub = +[] {
-        if (host_fork_vm::pubs == inject_at) host_range::reader_busy = true;
+        if (host_fork_vm::at_final_publication) {
+            injected_at_final = true;
+            host_range::reader_busy = true;
+        }
     };
     EXPECT_EQ(run(), -EAGAIN);
     host_range::reader_busy = false;
     host_fork_vm::on_pub = nullptr;
+    EXPECT_TRUE(injected_at_final);
+    EXPECT_FALSE(host_fork_vm::at_final_publication);
     EXPECT_TRUE(child_task.lazy_vmem_ranges.empty());
     EXPECT_EQ(fork_exclusives, 1U);
 }
@@ -515,15 +521,19 @@ TEST_F(ForkVmCoordinator, SwapFreshPreflightRejectsAfterLazyOwnershipWithoutChil
 TEST_F(ForkVmCoordinator, LateActorContextRefusesBeforeChildConsumption) {
     legacy();
     ASSERT_EQ(run(), 0);
-    unsigned const publications = host_fork_vm::pubs;
     rollback();
-    inject_at = publications * 2;
+    injected_at_final = false;
     host_fork_vm::on_pub = +[] {
-        if (host_fork_vm::pubs == inject_at) host_range::current->syscall_account_start_us = 0;
+        if (host_fork_vm::at_final_publication) {
+            injected_at_final = true;
+            host_range::current->syscall_account_start_us = 0;
+        }
     };
     EXPECT_EQ(run(), -EAGAIN);
     host_fork_vm::on_pub = nullptr;
     actor.syscall_account_start_us = 1;
+    EXPECT_TRUE(injected_at_final);
+    EXPECT_FALSE(host_fork_vm::at_final_publication);
     EXPECT_TRUE(child_task.lazy_vmem_ranges.empty());
     EXPECT_EQ(fork_exclusives, 1U);
 }

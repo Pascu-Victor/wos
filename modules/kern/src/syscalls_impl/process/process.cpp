@@ -897,7 +897,7 @@ auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sche
     if (status != 0) return status;
     constexpr uint64_t USER_END = uint64_t{1} << 47;
     fail_at(ForkVmFailurePoint::GeometryPrepare);
-    auto const GEOMETRY = mm::huge::prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables, geometry_failure);
+    auto const GEOMETRY = mm::huge::prepare_current_fork_range_split(actor, preparation, 0, USER_END, survey, tables, geometry_failure);
     if (GEOMETRY != mm::huge::Error::None) {
         switch (GEOMETRY) {
             case mm::huge::Error::Invalid:

@@ -658,3 +658,333 @@ TEST_F(ManagedRange, WitnessDescriptorMismatchComesFromActualFinalSurvey) {
     EXPECT_TRUE(tables.empty());
     EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
 }
+
+// Named fork-only preparation executes the actual module against a finite
+// wait-action endpoint. This does not prove WOS Mutex parking or progress.
+namespace {
+std::function<void()> fork_range_wait_action;
+class ManagedForkRange : public ManagedRange {
+   protected:
+    void SetUp() override {
+        ManagedRange::SetUp();
+        host_range::expect_fork_wait = false;
+        host_range::range_readers = host_range::allocation_checks = 0;
+        fork_range_wait_action = {};
+        host_range::on_blocking = [] {
+            if (host_range::expect_fork_wait && fork_range_wait_action) fork_range_wait_action();
+        };
+        host_range::on_yield = [] {
+            // The real yield boundary was checked before this finite external
+            // mutation callback. Its other APIs are not fork-wait chunks.
+            auto const previous = host_range::expect_fork_wait;
+            host_range::expect_fork_wait = false;
+            if (range_yield_action) range_yield_action();
+            host_range::expect_fork_wait = previous;
+        };
+    }
+    void TearDown() override {
+        host_range::on_blocking = nullptr;
+        fork_range_wait_action = {};
+        host_range::expect_fork_wait = false;
+        ManagedRange::TearDown();
+    }
+    auto fork_proof(uint64_t first, uint64_t end, huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                    huge::RangePrepareWitness* witness = nullptr) -> huge::Error {
+        ker::mod::sys::SyscallPreparationScope preparation(actor);
+        auto const previous = host_range::expect_fork_wait;
+        host_range::expect_fork_wait = true;
+        auto const result = huge::prepare_current_fork_range_split(actor, preparation, first, end, survey, tables, witness);
+        host_range::expect_fork_wait = previous;
+        return result;
+    }
+    void no_owners() {
+        EXPECT_EQ(publication_depth + root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+    }
+};
+TEST_F(ManagedForkRange, DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundaries) {
+    huge_core = {};  // The zero route still does not require managed caps.
+    huge::RangeSplitSurvey small;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    witness.valid = true;
+    auto before = host_range::blocking;
+    ASSERT_EQ(fork_proof(0, LARGE, small, tables, &witness), huge::Error::None);
+    EXPECT_EQ(host_range::blocking - before, 3U);  // Count, Fill and Verify.
+    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_TRUE(small.complete());
+    EXPECT_EQ(small.count(), 0U);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_TRUE(tables.empty());
+    for (uint64_t i = 0; i < 96; ++i) ordinary_path(TEST_VA + i * LARGE);
+    huge::RangeSplitSurvey dense;
+    before = host_range::blocking;
+    ASSERT_EQ(fork_proof(0, uint64_t{1} << 47, dense, tables), huge::Error::None);
+    EXPECT_GT(host_range::blocking - before, 3U);
+    EXPECT_GT(host_range::yields, 0U);
+    EXPECT_EQ(dense.count(), 0U);
+    EXPECT_EQ(table_attempt, 0U);
+    huge::Snapshot unready{};
+    huge_core.snapshot(unready);
+    EXPECT_FALSE(unready.ready);
+    no_owners();
+}
+TEST_F(ManagedForkRange, FiniteForeignReleaseAllowsTheRealBlockingGuardThenClearsItsIdentity) {
+    // A finite Host stand-in for an independent owner: release its actual
+    // try-guard in the wait port, then let the real blocking constructor run.
+    using Guard = ker::syscall::vmem::SharedVmemPublicationTryGuard;
+    auto foreign = std::make_unique<Guard>();
+    ASSERT_TRUE(foreign->acquired());
+    bool released = false;
+    fork_range_wait_action = [&] {
+        if (!foreign) return;
+        EXPECT_EQ(publication_depth, 1U);
+        foreign.reset();
+        released = true;
+    };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
+    EXPECT_TRUE(released);
+    EXPECT_EQ(host_range::blocking, 3U);
+    EXPECT_EQ(ker::syscall::vmem::g_shared_vmem_publication_owner.load(), nullptr);
+    no_owners();
+}
+TEST_F(ManagedForkRange, PostwaitIfChangeRefusesBeforeAnyFreshReader) {
+    bool changed = false;
+    fork_range_wait_action = [&] {
+        changed = true;
+        host_range::interrupts = false;
+    };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    EXPECT_TRUE(changed);
+    EXPECT_FALSE(host_range::interrupts);  // Not silently repaired by the API.
+    host_range::interrupts = true;
+    EXPECT_EQ(host_range::blocking, 1U);
+    EXPECT_EQ(host_range::range_readers, 0U);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Context);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+    EXPECT_EQ(witness.attempt, 1U);
+    EXPECT_FALSE(survey.complete());
+    EXPECT_EQ(table_attempt, 0U);
+    no_owners();
+}
+TEST_F(ManagedForkRange, PostwaitTaskIdentityAndOrdinaryStateRefuseBeforeReader) {
+    ker::mod::sched::task::Task other;
+    for (unsigned axis = 0; axis < 7; ++axis) {
+        SCOPED_TRACE(axis);
+        fork_range_wait_action = [&] {
+            switch (axis) {
+                case 0:
+                    host_range::queryable = false;
+                    break;
+                case 1:
+                    host_range::current = &other;
+                    break;
+                case 2:
+                    actor.type = ker::mod::sched::task::TaskType::DAEMON;
+                    break;
+                case 3:
+                    actor.state = ker::mod::sched::task::TaskState::EXITED;
+                    break;
+                case 4:
+                    actor.scheduler_transition_active = true;
+                    break;
+                case 5:
+                    actor.exit_in_progress = true;
+                    break;
+                case 6:
+                    actor.syscall_account_start_us = 0;
+                    break;
+            }
+        };
+        huge::RangeSplitSurvey survey;
+        huge::PreparedTables tables;
+        huge::RangePrepareWitness witness{};
+        auto before = host_range::blocking;
+        EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+        EXPECT_EQ(host_range::blocking - before, 1U);
+        EXPECT_EQ(host_range::range_readers, 0U);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::Context);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+        host_range::queryable = true;
+        host_range::current = &actor;
+        actor.type = ker::mod::sched::task::TaskType::PROCESS;
+        actor.state = ker::mod::sched::task::TaskState::ACTIVE;
+        actor.scheduler_transition_active = actor.exit_in_progress = false;
+        actor.syscall_account_start_us = 1;
+        no_owners();
+    }
+}
+TEST_F(ManagedForkRange, ReaderLeaseAndStaleRootStillRefuseWithoutHiddenRetryOrYield) {
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        SCOPED_TRACE(axis);
+        actor.usercopy_pagemap_closing = axis == 0;
+        host_range::reader_busy = axis == 1;
+        huge_root_live = axis != 2;
+        huge::RangeSplitSurvey survey;
+        huge::PreparedTables tables;
+        huge::RangePrepareWitness witness{};
+        auto before = host_range::blocking;
+        EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), axis == 2 ? huge::Error::Stale : huge::Error::Again);
+        EXPECT_EQ(host_range::blocking - before, 1U);
+        EXPECT_EQ(witness.site, axis == 0   ? huge::RangePrepareSite::TaskLease
+                                : axis == 1 ? huge::RangePrepareSite::StripedReader
+                                            : huge::RangePrepareSite::RootStale);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+        EXPECT_EQ(witness.attempt, 1U);
+        EXPECT_FALSE(witness.exhausted);
+        EXPECT_EQ(host_range::yields, 0U);
+        EXPECT_EQ(table_attempt, 0U);
+        no_owners();
+    }
+    actor.usercopy_pagemap_closing = false;
+    host_range::reader_busy = false;
+    huge_root_live = true;
+}
+TEST_F(ManagedForkRange, NonzeroPreparationAndActualAllocationFailuresRetireEveryChunkOwner) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    auto const original = slot_at(runtime_root, TEST_VA, 2);
+    huge::PlanHandle held[huge::MAX_PLANS]{};
+    size_t held_count = 0;
+    for (; held_count < huge::MAX_PLANS; ++held_count) {
+        auto const error = huge::detail::reserve_plan(1, held[held_count]);
+        if (error != huge::Error::None) {
+            EXPECT_EQ(error, huge::Error::Capacity);
+            break;
+        }
+    }
+    {
+        huge::RangeSplitSurvey survey;
+        huge::PreparedTables tables;
+        huge::RangePrepareWitness witness{};
+        EXPECT_EQ(fork_proof(TEST_VA, TEST_VA + LARGE, survey, tables, &witness), huge::Error::Capacity);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::PlanReserve);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Tables);
+        no_owners();
+    }
+    for (size_t i = 0; i < held_count; ++i) EXPECT_EQ(huge::detail::release_plan(held[i]), huge::Error::None);
+    for (bool heap : {false, true}) {
+        huge::RangeSplitSurvey survey;
+        huge::PreparedTables tables;
+        huge::RangePrepareWitness witness{};
+        fail_table_at = heap ? SIZE_MAX : table_attempt;
+        fail_plan_heap = heap;
+        EXPECT_EQ(fork_proof(TEST_VA, TEST_VA + LARGE, survey, tables, &witness), huge::Error::Exhausted);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::PlanAllocation);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Tables);
+        EXPECT_TRUE(tables.empty());
+        EXPECT_FALSE(survey.complete());
+        EXPECT_EQ(slot_at(runtime_root, TEST_VA, 2), original);
+        no_owners();
+    }
+    fail_table_at = SIZE_MAX;
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(TEST_VA, TEST_VA + LARGE, survey, tables), huge::Error::None);
+    EXPECT_EQ(survey.count(), 1U);
+    EXPECT_GT(host_range::allocation_checks, 0U);
+    EXPECT_EQ(arm(survey, tables), huge::Error::None);
+    mapped[0] = false;
+    cleanup[0].reset();
+    tables.reset();
+    no_owners();
+}
+TEST_F(ManagedForkRange, EpochOnlyRetriesStopAtThreeAndSuccessClearsTheWitness) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    unsigned changes = 0;
+    range_yield_action = [&] {
+        ++virt::host_root_control.ps_geometry_epoch;
+        ++changes;
+    };
+    EXPECT_EQ(fork_proof(0, uint64_t{1} << 47, survey, tables, &witness), huge::Error::Again);
+    EXPECT_EQ(changes, 3U);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::EpochChanged);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+    EXPECT_EQ(witness.attempt, 3U);
+    EXPECT_TRUE(witness.epoch_changed);
+    EXPECT_TRUE(witness.exhausted);
+    bool once = false;
+    range_yield_action = [&] {
+        if (!once) {
+            once = true;
+            ++virt::host_root_control.ps_geometry_epoch;
+        }
+    };
+    ASSERT_EQ(fork_proof(0, uint64_t{1} << 47, survey, tables, &witness), huge::Error::None);
+    EXPECT_TRUE(once);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_FALSE(witness.exhausted);
+    no_owners();
+}
+TEST_F(ManagedForkRange, IndependentFinalZeroPassStillDetectsPublicationAndRebuildsDescriptors) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    unsigned visits = 0;
+    bool added = false;
+    range_yield_action = [&] {
+        if (++visits == 31) {
+            ASSERT_EQ(prepare(0), huge::Error::None);
+            ASSERT_EQ(publish(0), huge::Error::None);
+            added = true;
+        }
+    };
+    ASSERT_EQ(fork_proof(0, uint64_t{1} << 47, survey, tables), huge::Error::None);
+    EXPECT_TRUE(added);
+    EXPECT_EQ(survey.count(), 1U);
+    EXPECT_NE(huge::detail::PreparationAccess::plan_storage(tables), nullptr);
+    no_owners();
+}
+TEST_F(ManagedForkRange, EntryInputAndUnsupportedGeometryKeepOriginalRefusals) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    actor.type = ker::mod::sched::task::TaskType::DAEMON;
+    EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Entry);
+    actor.type = ker::mod::sched::task::TaskType::PROCESS;
+    ++model.preempt_depth;
+    EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    --model.preempt_depth;
+    EXPECT_EQ(host_range::blocking, 0U);
+    EXPECT_EQ(fork_proof(1, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Input);
+    word(runtime_root, 0) = 0x40000087;
+    EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Unsupported);
+    word(runtime_root, 0) = 0;
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::GeometryEncoding);
+    EXPECT_FALSE(survey.complete());
+    EXPECT_EQ(table_attempt, 0U);
+    no_owners();
+}
+TEST_F(ManagedForkRange, ActualFinalDescriptorRefusalReleasesPublicationBeforeReset) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    bool altered = false;
+    range_yield_action = [&] {
+        auto* storage = huge::detail::PreparationAccess::plan_storage(tables);
+        if (!altered && storage != nullptr && storage->descriptors[0].handle.generation != 0) {
+            altered = true;
+            storage->descriptors[0].semantic_word ^= mm::paging::PAGE_WRITE;
+        }
+    };
+    auto const freed = table_freed;
+    EXPECT_EQ(fork_proof(TEST_VA, TEST_VA + 65 * LARGE, survey, tables, &witness), huge::Error::Again);
+    EXPECT_TRUE(altered);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::DescriptorMismatch);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Verify);
+    EXPECT_GT(table_freed, freed);
+    EXPECT_TRUE(tables.empty());
+    EXPECT_FALSE(survey.complete());
+    no_owners();
+}
+}  // namespace
