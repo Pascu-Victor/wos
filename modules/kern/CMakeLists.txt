@@ -280,6 +280,10 @@ if(WOS_KASAN)
         "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-mllvm -asan-instrumentation-with-call-threshold=0>"
     )
     target_compile_definitions(${KERNEL} PRIVATE WOS_KASAN=1)
+endif()
+
+# Early/MM/runtime exclusions also protect report UBSan and KCOV without ASan.
+if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
 
     # ---------------------------------------------------------------------------
     # Files that must NOT be sanitizer- or coverage-instrumented because they
@@ -372,7 +376,9 @@ if(WOS_KASAN)
             PROPERTIES COMPILE_OPTIONS "${KASAN_EXCLUDED_COMPILE_OPTIONS}"
         )
     endforeach()
+endif()
 
+if(WOS_KASAN)
     # The diagnostic walks PMM side metadata while holding every allocator
     # lock. A first KASAN shadow touch can allocate and re-enter those locks.
     # Keep this raw metadata reader outside KASAN, as with the allocator;

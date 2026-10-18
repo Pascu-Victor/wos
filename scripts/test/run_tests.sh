@@ -128,6 +128,7 @@ UNIT_TESTS=(
     build_isolation_test
     wos_artifacts_test
     modules_cmake_source_test
+    kernel_sanitizer_cmake_test
     qcow_common_source_test
     testd_manifest_test
     testprog_source_test

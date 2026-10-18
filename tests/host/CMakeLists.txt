@@ -695,6 +695,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/modules_cmake_source_test.py
 )
 add_test(
+    NAME kernel_sanitizer_cmake_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_sanitizer_cmake_test.py
+        --cmake "${CMAKE_COMMAND}"
+)
+set_tests_properties(kernel_sanitizer_cmake_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 150
+)
+add_test(
     NAME qcow_common_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/qcow_common_source_test.py
 )
