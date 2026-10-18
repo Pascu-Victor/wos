@@ -129,6 +129,35 @@ resumes, and none of these sites retains a runqueue pointer or treats a cached
 - `modules/kern/src/vfs/fs/xfs/xfs_vfs.cpp` — **refactored**.
 - `modules/kern/src/vfs/mount.cpp` — **refactored**.
 
+## Additional current-source acquisition and lifetime inventory
+
+The current-task getter masks IRQs before sampling its CPU/runqueue and copies
+only the executing Task identity before restoring entry IF. The entries below
+classify how callers use that identity; they do not grant a raw CPU/runqueue
+pointer lifetime, replace object ownership or imply NMI context-switch support.
+
+- `modules/kern/src/dev/block_request.cpp` — **refactored**. Caller, completion and worker pointers are Task identities. Queue IRQ-save locking and retained waiter/service/worker references protect publication; backend callbacks and parks run after queue unlock, with shutdown ownership held.
+- `modules/kern/src/net/wki/secure_rdma.cpp` — **refactored**. The retained worker and PROCESS/DAEMON frontend checks use executing Task identity. Engine locking protects worker publication; frontend parks retain no CPU-local pointer or engine lock.
+- `modules/kern/src/platform/mm/lifetime_retirement_executor.cpp` — **refactored**. Current-worker comparison and shutdown controller qualification use Task identity; the IRQ-save queue lock protects the retained worker/join reference, and callbacks or sleeps run unlocked.
+- `modules/kern/src/platform/mm/managed_huge.cpp` — **refactored**. Preparation and current-root admission compare the explicit executing actor; actual root/PTE access has separate short preempt/PUB/reader guards, with no retained CPU-local pointer.
+- `modules/kern/src/platform/mm/numa_alloc.cpp` — **preemption-protected**. CPU-to-immutable-NUMA-node capture is inside PreemptGuard. Later allocation consumes copied placement facts, not a retained CPU/runqueue reference.
+- `modules/kern/src/platform/sched/workqueue.cpp` — **refactored**. Executing worker/context identity is stable across callbacks and parks. Queue IRQ-save locking and retained published Task references protect ownership; callbacks and waits run unlocked.
+- `modules/kern/src/platform/sys/syscall_preparation.hpp` — **refactored**. Preparation qualifies its explicit executing actor and restores entry IF; it retains no CPU ID, runqueue pointer or CPU-local ownership across fallible work.
+- `modules/kern/src/test/anonymous_usercopy_runtime.cpp` — **refactored**. Admission and cleanup use the explicit current actor/root incarnation; mapped usercopy and prepared cleanup retain Task identity rather than CPU-local state.
+- `modules/kern/src/test/compartment_ktest.cpp` — **refactored**. Pending-submission checks use the executing executor identity, or the fixture-owned subject before task context exists; no CPU-local pointer survives submission/cancellation.
+- `modules/kern/src/test/compartment_lifecycle_runtime.cpp` — **refactored**. Actor/controller/NTP comparisons use Task identity under the IRQ-save state lock. Retained subjects and census/evidence leases protect park/observation lifetime; waits do not retain that lock.
+- `modules/kern/src/test/file_mapping_lifetime_runtime_ktest.cpp` — **refactored**. Real daemon/controller Task identity owns its retained mailbox and unpublished-child operations across ordinary waits; shutdown ownership and explicit DEAD joins protect retirement.
+- `modules/kern/src/test/numa_demand_ktest.cpp` — **preemption-protected**. The test converts a CPU snapshot to an immutable topology node inside PreemptGuard, then retains only the copied node value.
+- `modules/kern/src/test/numa_lifecycle_census.cpp` — **refactored**. Census scope/admission compare the explicit executing actor and root incarnation. Resource/session locks and census permissions govern observation, without a retained CPU-local pointer.
+- `modules/kern/src/test/numa_pressure_runtime_ktest.cpp` — **re-read / refactored**. Independent before/after CPU samples are diagnostic scalars; the initial scalar selects copied immutable NUMA placement. The executing daemon is a Task identity, not a cached CPU proxy.
+- `modules/kern/src/vfs/advisory.hpp` — **refactored**. The scanner match is comment-only: the declaration takes an explicit retained subject and states that it never resolves executing-task identity itself. No runtime CPU-local access occurs here.
+
+Source-known follow-up: PerCpuCrossAccess::this_cpu_locked() and
+this_cpu_locked_void() still sample CPU before acquiring their IRQ-save lock.
+This416 change closes only Task acquisition, not that separate selection
+interval or all CPU-local lifetimes. No observed failure or broader preemption
+certification is inferred from this ledger or the focused native test.
+
 ## Enforcement and qualified migration boundary
 
 `tests/host/unit/kernel_preemption_cpu_local_audit_test.py` reconstructs the

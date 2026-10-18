@@ -364,6 +364,76 @@ void woken_wait_continuation(){
 '''
 
 
+
+GETTER_HARDWARE = r'''
+// Isolated real-getter profile: the existing accounting mock remains untouched.
+namespace current_task_capture_fixture {
+namespace task=ker::mod::sched::task;
+namespace cpu {constexpr uint64_t GATE_IF_MASK=0x200;}
+bool irq_enabled=true,migrate_during_lookup=true,migrate_after_restore=true;
+unsigned current_cpu=0,lookup_calls=0,lookup_migrations=0,blocked_lookup_migrations=0;
+unsigned save_calls=0,restore_calls=0,lock_calls=0,migration_depth=0;
+task::Task* executing=nullptr;task::Task* foreign=nullptr;
+void migrate();
+struct Queues {
+ struct Row {task::Task* current_task=nullptr;};
+ std::array<Row,2> rows;
+ Row* this_cpu(){
+  ++lookup_calls;
+  check(ker::mod::sched::guard_depth==0 && migration_depth==0 && lock_calls==0);
+  auto const sampled_cpu=current_cpu;
+  // Exact hardware boundary: interrupt/migration after CPU sample, before load.
+  if(migrate_during_lookup){
+   if(irq_enabled){++lookup_migrations;migrate();}
+   else ++blocked_lookup_migrations;
+  }
+  return &rows[sampled_cpu];
+ }
+};
+Queues* run_queues=nullptr;
+void migrate(){
+ check(irq_enabled && run_queues && executing && foreign);
+ run_queues->rows[current_cpu].current_task=foreign;
+ current_cpu^=1;
+ run_queues->rows[current_cpu].current_task=executing;
+}
+uint64_t fixture_save_flags_and_cli(){
+ ++save_calls;
+ auto const flags=uint64_t{2} | (irq_enabled?cpu::GATE_IF_MASK:0);
+ irq_enabled=false;
+ return flags;
+}
+void fixture_restore_enabled(){
+ check(!irq_enabled);++restore_calls;irq_enabled=true;
+ // A migration AFTER Task capture must not invalidate executing Task identity.
+ if(migrate_after_restore)migrate();
+}
+'''
+GETTER_CASES = r'''
+void cases(){
+ for(bool entry_if:{true,false}){
+  Queues q;task::Task self,other;
+  self.type=other.type=task::TaskType::DAEMON;
+  executing=&self;foreign=&other;run_queues=&q;
+  q.rows[0].current_task=&self;q.rows[1].current_task=&other;
+  irq_enabled=entry_if;current_cpu=0;
+  lookup_calls=lookup_migrations=blocked_lookup_migrations=save_calls=restore_calls=lock_calls=0;
+  migration_depth=0;migrate_during_lookup=migrate_after_restore=true;
+  check(ker::mod::sched::guard_depth==0);
+  auto* selected=get_current_task();
+  // Old production getter returns other here for entry_if=true: real failure.
+  check(selected==&self);
+  check(irq_enabled==entry_if && lookup_calls==1 && lookup_migrations==0);
+  check(save_calls==1 && blocked_lookup_migrations==1);
+  check(lock_calls==0 && migration_depth==0 && ker::mod::sched::guard_depth==0);
+  check(restore_calls==(entry_if?1U:0U) && current_cpu==(entry_if?1U:0U));
+  check(q.rows[current_cpu].current_task==&self);
+ }
+ run_queues=nullptr;executing=foreign=nullptr;
+}
+}
+'''
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source-root', type=Path, default=ROOT)
@@ -443,6 +513,21 @@ def main():
         code += NEW_CASES
     if new:
         code += WOKEN_WAIT_CASES
+    if new:
+        # Compile the real getter in its own namespace, keeping the old mock.
+        getter = block(source, r'^auto get_current_task\([^;{}]*?\)\s*->[^;{]+\{')
+        hardware = (
+            ('asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");',
+             'flags = fixture_save_flags_and_cli();'),
+            ('asm volatile("sti" ::: "memory");', 'fixture_restore_enabled();'),
+        )
+        counts = tuple(getter.count(before) for before, _ in hardware)
+        # Zero seams is the actual pre-fix getter for the negative control.
+        assert counts in ((0, 0), (1, 1)), counts
+        for before, after in hardware:
+            getter = getter.replace(before, after)
+        assert 'asm volatile' not in getter
+        code += GETTER_HARDWARE + getter + GETTER_CASES
     code += r'''
 int main(){
  unsigned pipelines=0;
@@ -453,7 +538,7 @@ int main(){
   // The controlled migration endpoint models one transfer per pipeline.
   pipeline(kind,weight,tick,enabled,cancel,manual,migration,count);++pipelines;
  }
-''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + r'''
+''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + ('current_task_capture_fixture::cases();\n' if new else '') + r'''
  std::printf("actual wait/accounting/RunHeap: %u pipelines, %u assertions PASS\n",pipelines,checks);
 }
 '''

@@ -3999,7 +3999,14 @@ auto post_task_balanced(task::Task* task) -> bool {
 // Current task access
 // ============================================================================
 
-auto get_current_task() -> task::Task* { return run_queues->this_cpu()->current_task; }
+auto get_current_task() -> task::Task* {
+    // Guards bootstrap through this getter; exclude migration before sampling CPU.
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
+    auto* const CURRENT = run_queues->this_cpu()->current_task;
+    if ((flags & cpu::GATE_IF_MASK) != 0) asm volatile("sti" ::: "memory");
+    return CURRENT;
+}
 
 auto get_return_task() -> task::Task* {
     auto* rq = run_queues->this_cpu();
