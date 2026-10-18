@@ -4537,22 +4537,35 @@ auto managed_plan_owners_valid(const huge::SplitPlanStorage& storage) -> bool {
 // At most16 steps per call; each step skips an absent ancestor or visits one
 // PML2 slot. A dense lower half can require2^26 steps in TOTAL, not per lock.
 auto survey_managed_range_chunk_locked(PageTable* root, huge::RangeSplitCursor& cursor, huge::RangeSurveyMode mode,
-                                       huge::SplitPlanStorage* storage) noexcept -> huge::Error {
+                                       huge::SplitPlanStorage* storage, huge::RangePrepareSite* failure_site = nullptr) noexcept
+    -> huge::Error {
     constexpr uint64_t LIMIT = uint64_t{1} << 47;
     constexpr uint64_t PS = uint64_t{1} << 7;
     constexpr uint64_t PARENT_ALLOWED = PTE_FRAME_MASK | uint64_t{0x7f} | paging::PAGE_NX;
     if (root == nullptr || root == kernel_pagemap || cursor.start >= cursor.end || cursor.end > LIMIT ||
         ((cursor.start | cursor.end) & (paging::PAGE_SIZE - 1)) != 0 || cursor.complete ||
-        (mode != huge::RangeSurveyMode::Count && mode != huge::RangeSurveyMode::Fill && mode != huge::RangeSurveyMode::Verify))
+        (mode != huge::RangeSurveyMode::Count && mode != huge::RangeSurveyMode::Fill && mode != huge::RangeSurveyMode::Verify)) {
+        if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::Input;
         return huge::Error::Invalid;
+    }
     auto const* control = find_user_root_control_locked(root);
-    if (control == nullptr || control->serial == 0 || control->ps_geometry_epoch == 0) return huge::Error::Stale;
-    if (control->ps_geometry_epoch == UINT64_MAX) return huge::Error::GenerationExhausted;
+    if (control == nullptr || control->serial == 0 || control->ps_geometry_epoch == 0) {
+        if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::RootStale;
+        return huge::Error::Stale;
+    }
+    if (control->ps_geometry_epoch == UINT64_MAX) {
+        if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::EpochSaturated;
+        return huge::Error::GenerationExhausted;
+    }
     huge::RootKey const key{reinterpret_cast<uint64_t>(root), control->serial};
     if (cursor.stamp.root.incarnation == 0) cursor.stamp = {key, control->ps_geometry_epoch};
-    if (!huge::RegistryCore::same_root(cursor.stamp.root, key)) return huge::Error::Stale;
+    if (!huge::RegistryCore::same_root(cursor.stamp.root, key)) {
+        if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::RootStale;
+        return huge::Error::Stale;
+    }
     if (cursor.stamp.epoch != control->ps_geometry_epoch) {
         cursor.epoch_changed = true;
+        if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::EpochChanged;
         return huge::Error::Again;
     }
     uint64_t const FINISH = (cursor.end + huge::LEAF_BYTES - 1) & ~(huge::LEAF_BYTES - 1);
@@ -4561,17 +4574,25 @@ auto survey_managed_range_chunk_locked(PageTable* root, huge::RangeSplitCursor& 
         cursor.started = true;
     }
     if (cursor.next < (cursor.start & ~(huge::LEAF_BYTES - 1)) || cursor.next > FINISH || (cursor.next & (huge::LEAF_BYTES - 1)) != 0 ||
-        cursor.count > huge::MAX_ROOT_LEAVES)
+        cursor.count > huge::MAX_ROOT_LEAVES) {
+        if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::Input;
         return huge::Error::Invalid;
+    }
     for (unsigned step = 0; step < 16 && cursor.next < FINISH; ++step) {
         auto* table = root;
         bool skipped = false;
         for (int level = 4; level >= 3; --level) {
             MutableUserEntrySlot slot;
-            if (!MutableUserEntrySlot::from(table, index_of(cursor.next, level), slot)) return huge::Error::Unsupported;
+            if (!MutableUserEntrySlot::from(table, index_of(cursor.next, level), slot)) {
+                if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
+                return huge::Error::Unsupported;
+            }
             uint64_t const RAW = slot.load();
             if ((RAW & paging::PAGE_PRESENT) == 0) {
-                if (RAW != 0) return huge::Error::Unsupported;
+                if (RAW != 0) {
+                    if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
+                    return huge::Error::Unsupported;
+                }
                 unsigned const SHIFT = level == 4 ? 39U : 30U;
                 uint64_t const NEXT = ((cursor.next >> SHIFT) + 1) << SHIFT;
                 cursor.next = NEXT < FINISH ? NEXT : FINISH;
@@ -4580,31 +4601,53 @@ auto survey_managed_range_chunk_locked(PageTable* root, huge::RangeSplitCursor& 
             }
             // Reject PML4PS/1GiB and reserved/software encodings BEFORE following
             // frame bits. USER/W/NX are NOT access filters for geometry.
-            if ((RAW & PS) != 0 || (RAW & ~PARENT_ALLOWED) != 0) return huge::Error::Unsupported;
+            if ((RAW & PS) != 0 || (RAW & ~PARENT_ALLOWED) != 0) {
+                if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
+                return huge::Error::Unsupported;
+            }
             table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(RAW & PTE_FRAME_MASK));
         }
         if (skipped) continue;
         MutableUserEntrySlot slot;
-        if (!MutableUserEntrySlot::from(table, index_of(cursor.next, 2), slot)) return huge::Error::Unsupported;
+        if (!MutableUserEntrySlot::from(table, index_of(cursor.next, 2), slot)) {
+            if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
+            return huge::Error::Unsupported;
+        }
         uint64_t const RAW = slot.load();
         if ((RAW & paging::PAGE_PRESENT) == 0) {
-            if (RAW != 0) return huge::Error::Unsupported;
+            if (RAW != 0) {
+                if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
+                return huge::Error::Unsupported;
+            }
         } else if ((RAW & PS) != 0) {
             huge::MappedLeaf leaf{};
-            if (managed_huge_registry.lookup_mapped(key, cursor.next, RAW, leaf) != huge::Error::None) return huge::Error::Unsupported;
-            if (cursor.count == huge::MAX_ROOT_LEAVES) return huge::Error::Capacity;
+            if (managed_huge_registry.lookup_mapped(key, cursor.next, RAW, leaf) != huge::Error::None) {
+                if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
+                return huge::Error::Unsupported;
+            }
+            if (cursor.count == huge::MAX_ROOT_LEAVES) {
+                if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::RootCapacity;
+                return huge::Error::Capacity;
+            }
             if (mode != huge::RangeSurveyMode::Count) {
-                if (storage == nullptr || cursor.count >= storage->table_count) return huge::Error::Again;
+                if (storage == nullptr || cursor.count >= storage->table_count) {
+                    if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::DescriptorStorage;
+                    return huge::Error::Again;
+                }
                 auto& descriptor = storage->descriptors[cursor.count];
                 if (mode == huge::RangeSurveyMode::Fill)
                     descriptor = {leaf.key, leaf.handle, leaf.semantic_word};
                 else if (!huge::RegistryCore::same_key(descriptor.key, leaf.key) || descriptor.handle.slot != leaf.handle.slot ||
-                         descriptor.handle.generation != leaf.handle.generation || descriptor.semantic_word != leaf.semantic_word)
+                         descriptor.handle.generation != leaf.handle.generation || descriptor.semantic_word != leaf.semantic_word) {
+                    if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::DescriptorMismatch;
                     return huge::Error::Again;
+                }
             }
             ++cursor.count;
-        } else if ((RAW & ~PARENT_ALLOWED) != 0)
+        } else if ((RAW & ~PARENT_ALLOWED) != 0) {
+            if (failure_site != nullptr) *failure_site = huge::RangePrepareSite::GeometryEncoding;
             return huge::Error::Unsupported;
+        }
         cursor.next += huge::LEAF_BYTES;
     }
     cursor.complete = cursor.next == FINISH;
@@ -11897,17 +11940,31 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
     return 0;
 }
 
-auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAccess& empty) noexcept -> Error {
-    if (empty.subject != nullptr || empty.root != nullptr || empty.local || empty.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE)
+auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAccess& empty, RangePrepareSite* failure_site) noexcept
+    -> Error {
+    if (empty.subject != nullptr || empty.root != nullptr || empty.local || empty.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Input;
         return Error::Invalid;
+    }
     if (!sched::can_query_current_task() || sched::get_current_task() != &subject || subject.type != sched::task::TaskType::PROCESS ||
-        subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || subject.syscall_account_start_us == 0)
+        subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || subject.syscall_account_start_us == 0) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
         return Error::Invalid;
+    }
     empty.subject = &subject;
     empty.local = subject.try_acquire_usercopy_pagemap(empty.root);  // Record successful lease before any later refusal.
-    if (!empty.local) return Error::Again;
-    if (empty.root == nullptr || empty.root != subject.pagemap || empty.root == virt::kernel_pagemap) return Error::Stale;
-    if (!virt::acquire_user_pagemap_access(empty.root, false, empty.gate)) return Error::Again;
+    if (!empty.local) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::TaskLease;
+        return Error::Again;
+    }
+    if (empty.root == nullptr || empty.root != subject.pagemap || empty.root == virt::kernel_pagemap) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::RootStale;
+        return Error::Stale;
+    }
+    if (!virt::acquire_user_pagemap_access(empty.root, false, empty.gate)) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::StripedReader;
+        return Error::Again;
+    }
     return Error::None;
 }
 void release_current_range_root(CurrentRangeRootAccess& access) noexcept {
@@ -12042,11 +12099,11 @@ void release_mremap_ps_policy(RootKey& owned) noexcept {
     virt::user_mapping_pin_lock.unlock_irqrestore(pin);
 }
 
-auto survey_range_chunk(paging::PageTable* root, RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage) noexcept
-    -> Error {
+auto survey_range_chunk(paging::PageTable* root, RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage,
+                        RangePrepareSite* failure_site) noexcept -> Error {
     uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
     uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
-    auto const error = virt::survey_managed_range_chunk_locked(root, cursor, mode, storage);
+    auto const error = virt::survey_managed_range_chunk_locked(root, cursor, mode, storage, failure_site);
     virt::user_mapping_pin_lock.unlock_irqrestore(pin);
     virt::cow_pte_lock.unlock_irqrestore(cow);
     return error;

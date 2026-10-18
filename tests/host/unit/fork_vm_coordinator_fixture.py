@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class Builder:
-    test_count = 20
+    test_count = 21
 
     def __init__(self, kernel_file, support, definition):
         self.path = kernel_file

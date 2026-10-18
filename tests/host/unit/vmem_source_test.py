@@ -1163,7 +1163,7 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
                       "ProcessReservation process_reservation", "placement capture before pressure/owners")
     require_cpp_tokens(fork, ["if (EAGER_COPY)",
         "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,",
-        "EAGER_COPY ? &fork_page : nullptr, &point)"], "prepared route borrows caller-born eager storage only when requested")
+        "EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure)"], "prepared route borrows caller-born eager storage only when requested")
     coordinator = function_body(source, "prepare_fork_vm_snapshot")
     require_cpp_tokens(coordinator, [
         "deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap)"
@@ -1210,7 +1210,7 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
         "lazy.prepare(actor)", "tmpfs.prepare(actor, lazy)",
         "legacy_file.prepare(actor, child, preparation)", "swap.prepare(actor, child, preparation)",
         "shm.prepare(actor, child, preparation)",
-        "prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables)",
+        "prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables, geometry_failure)",
         "SharedVmemPublicationGuard publication;",
         "!lazy.matches(actor) || !tmpfs.matches(actor)",
         "legacy_file.matches(actor, child, preparation, publication)",
@@ -1229,8 +1229,8 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
             fail(f"coordinator must leave reader/exclusive ownership and caller rollback to their actual owners: {forbidden}")
     caller = block_between(fork, "sys::SyscallPreparationScope preparation(*parent);",
                            "// --- Clone thread metadata ---", "ordinary regular fork VM caller")
-    require_cpp_tokens(caller, ["detail::ForkVmFailurePoint point{};",
-        "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr, EAGER_COPY ? &fork_page : nullptr, &point)",
+    require_cpp_tokens(caller, ["detail::ForkVmFailurePoint point{};", "mm::huge::RangePrepareWitness geometry_failure{};",
+        "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr, EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure)",
         'return finish_fork(detail::public_fork_vm_error(point, FORK_VM_ERROR), 0, "vm-snapshot");'],
         "public caller passes borrowed storage and translates the witnessed private refusal")
     require_ordered_tokens(caller, ["detail::prepare_fork_vm_snapshot(", "if (FORK_VM_ERROR != 0)",

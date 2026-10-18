@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import time
 
-EXPECTED_TESTS = 54
+EXPECTED_TESTS = 60
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -970,7 +970,7 @@ def main() -> int:
                 raise RuntimeError("actual blocking context boundary changed")
             module_mutant("blocking-forgets-context", module_text.replace(needle, ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired()) return;"),
                           "ManagedRange.BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof")
-            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage);"
+            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count);"
             if module_text.count(needle) != 1:
                 raise RuntimeError("independent final pass mutation boundary changed")
             module_mutant(
@@ -978,6 +978,22 @@ def main() -> int:
                 module_text.replace(needle, "{ error = Error::None; final.count = count.count; }"),
                 "ManagedRange.IndependentFinalZeroPassDetectsPublicationAndRebuildsAllDescriptors",
             )
+
+            module_text = CppText(module.read_text())
+            for label, needle, replacement, test in (
+                ("witness-missing", "*witness = {cursor != nullptr ? cursor->next : 0, cursor != nullptr ? cursor->count : uint16_t{0}, expected_count, error, site, pass, attempt, true, cursor != nullptr && cursor->epoch_changed, false};",
+                 "*witness = {};", "ManagedRange.WitnessSeparatesPublicationLeaseReaderAndRootRefusals"),
+                ("witness-retains-retry", "if (witness != nullptr) *witness = {};", "if (false) *witness = {};",
+                 "ManagedRange.WitnessEpochRetryKeepsOnlyTheLastActualFailureOrClearsOnSuccess"),
+            ):
+                if label == "witness-retains-retry":
+                    # Omit ALL genuine clears in the module, preserving every
+                    # error/owner action; a successful retry must reject it.
+                    if module_text.count(needle) != 4:
+                        raise RuntimeError("actual witness clear boundaries changed")
+                elif module_text.count(needle) != 1:
+                    raise RuntimeError("actual witness copy boundary changed")
+                module_mutant(label, module_text.replace(needle, replacement), test)
 
             text = module.read_text()
             needle = "(void)owner.span_.release();"

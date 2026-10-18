@@ -717,15 +717,19 @@ struct ForkRefusalDiagnostic {
     // No VM phase is UINT32_MAX; preparation_ready=2 means no scope was created.
     uint32_t point{UINT32_MAX}, preparation_ready{2}, preempt{}, type{}, state{};
     bool if_enabled{}, current_actor{}, transition{}, accounted{};
+    ker::mod::mm::huge::RangePrepareWitness geometry{};
 
     void capture(ker::mod::sched::task::Task& actor, const char* label, int raw, int mapped, uint32_t vm_point = UINT32_MAX,
-                 uint32_t ready = 2, const char* observed_context = "reservation-return") noexcept {
+                 uint32_t ready = 2, const char* observed_context = "reservation-return",
+                 const ker::mod::mm::huge::RangePrepareWitness* geometry_failure = nullptr) noexcept {
         if (raw >= 0 || mapped >= 0) return;
         stage = label;
         context = observed_context;
         raw_status = raw;
         public_status = mapped;
         point = vm_point;
+        geometry = {};
+        if (vm_point == 6 && geometry_failure != nullptr && geometry_failure->valid) geometry = *geometry_failure;
         preparation_ready = ready;
         current_actor = ker::mod::sched::can_query_current_task() && ker::mod::sched::get_current_task() == &actor;
         if_enabled = ker::mod::sched::interrupts_enabled();
@@ -743,6 +747,16 @@ struct ForkRefusalDiagnostic {
             stage, raw_status, public_status, parent_pid, point, preparation_ready, static_cast<unsigned>(if_enabled), preempt,
             static_cast<unsigned>(current_actor), type, state, static_cast<unsigned>(transition), static_cast<unsigned>(accounted),
             context);
+        if (geometry.valid) {
+            // Separate record; no atomic pairing or later owner/root read.
+            process_log::warn(
+                "fork_geometry_refusal_v1 parent=%lu raw=%d public=%d point=%u error=%u site=%u pass=%u attempt=%u next=%lu "
+                "count=%u expected=%u epoch_changed=%u exhausted=%u",
+                parent_pid, raw_status, public_status, point, static_cast<unsigned>(geometry.error), static_cast<unsigned>(geometry.site),
+                static_cast<unsigned>(geometry.pass), static_cast<unsigned>(geometry.attempt), geometry.next,
+                static_cast<unsigned>(geometry.count), static_cast<unsigned>(geometry.expected_count),
+                static_cast<unsigned>(geometry.epoch_changed), static_cast<unsigned>(geometry.exhausted));
+        }
     }
 };
 
@@ -843,11 +857,13 @@ auto public_fork_vm_error(ForkVmFailurePoint point, int status) -> int {
 auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
                               const ker::mod::sys::SyscallPreparationScope& preparation,
                               ker::mod::mm::numa::AllocationContext* eager_context, ker::mod::mm::numa::AllocationResult* empty_result,
-                              ForkVmFailurePoint* failure_point = nullptr) -> int {
+                              ForkVmFailurePoint* failure_point = nullptr,
+                              ker::mod::mm::huge::RangePrepareWitness* geometry_failure = nullptr) -> int {
     using namespace ker::mod;
     auto fail_at = [failure_point](ForkVmFailurePoint point) {
         if (failure_point != nullptr) *failure_point = point;
     };
+    if (geometry_failure != nullptr) *geometry_failure = {};
     fail_at(ForkVmFailurePoint::Context);
     if (!preparation.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor ||
         actor.type != sched::task::TaskType::PROCESS || actor.syscall_account_start_us == 0 ||
@@ -881,7 +897,7 @@ auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sche
     if (status != 0) return status;
     constexpr uint64_t USER_END = uint64_t{1} << 47;
     fail_at(ForkVmFailurePoint::GeometryPrepare);
-    auto const GEOMETRY = mm::huge::prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables);
+    auto const GEOMETRY = mm::huge::prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables, geometry_failure);
     if (GEOMETRY != mm::huge::Error::None) {
         switch (GEOMETRY) {
             case mm::huge::Error::Invalid:
@@ -1161,11 +1177,12 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     {
         sys::SyscallPreparationScope preparation(*parent);
         detail::ForkVmFailurePoint point{};
+        mm::huge::RangePrepareWitness geometry_failure{};
         int const FORK_VM_ERROR = detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,
-                                                                   EAGER_COPY ? &fork_page : nullptr, &point);
+                                                                   EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure);
         if (FORK_VM_ERROR != 0) {
             refusal.capture(*parent, "vm-snapshot", FORK_VM_ERROR, detail::public_fork_vm_error(point, FORK_VM_ERROR),
-                            static_cast<uint32_t>(point), preparation.ready() ? 1U : 0U, "coordinator-return");
+                            static_cast<uint32_t>(point), preparation.ready() ? 1U : 0U, "coordinator-return", &geometry_failure);
             ker::syscall::shm::shm_cleanup_for_task(child);
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
             sched::task::release_lazy_vmem_ranges(*child);

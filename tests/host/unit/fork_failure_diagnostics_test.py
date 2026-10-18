@@ -11,6 +11,7 @@ from exec_trace_ownership_test import block, function
 
 ROOT = Path(os.environ.get("WOS_FORK_DIAGNOSTICS_ROOT", Path(__file__).resolve().parents[3]))
 PROCESS_SOURCE = Path(os.environ.get("WOS_FORK_DIAGNOSTICS_SOURCE", ROOT / "modules/kern/src/syscalls_impl/process/process.cpp"))
+MANAGED_HUGE_SOURCE = PROCESS_SOURCE.parents[2] / "platform/mm/managed_huge.hpp"
 STAGES = (
     'pressure-admission', 'kernel-stack', 'task', 'name', 'vfs-rules', 'credentials',
     'pagemap', 'vm-snapshot', 'thread', 'per-cpu', 'fd-table', 'child-publication',
@@ -26,6 +27,7 @@ PRELUDE = r'''
 #include <cstring>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 std::vector<std::string> calls;
 bool held=false;
@@ -33,6 +35,7 @@ unsigned lock_count=0, logs=0, ends=0;
 uint64_t recorded_bytes=0;
 int32_t recorded_status=0;
 std::string message;
+std::vector<std::string> messages;
 unsigned diagnostic_owners=0;
 bool allow_context=true, diagnostic_irq=true, discard_refusal_log=false;
 uint32_t diagnostic_preempt=0;
@@ -74,6 +77,9 @@ uint64_t deferred=9;
 SchedulerTraceStats get_scheduler_trace_stats(uint64_t cpu) {
  assert(!held && cpu==0 && ker::mod::smt::cores>0); calls.emplace_back("deferred"); return {deferred}; }
 }
+namespace ker::mod::mm::huge {
+GEOMETRY_TYPES
+}
 namespace ker::mod::perf { enum class WkiPerfLocalProcOp { FORK }; }
 #define WOS_PERF_CALLSITE() 123ULL
 namespace ker::syscall::process {
@@ -81,11 +87,13 @@ struct process_log {
  static void warn(const char* format, ...) {
   assert(!held);
   bool const refusal=std::strstr(format,"fork_refusal_v1")==format;
-  if(refusal){assert(diagnostic_owners==0);if(discard_refusal_log)return;}
+  bool const geometry=std::strstr(format,"fork_geometry_refusal_v1")==format;
+  if(refusal || geometry){assert(diagnostic_owners==0);if(discard_refusal_log)return;}
   ++logs; calls.emplace_back("journal");
   char data[512]; va_list args; va_start(args,format);
   int length=vsnprintf(data,sizeof(data),format,args); va_end(args);
   assert(length>=0 && static_cast<size_t>(length)<sizeof(data)); message=data;
+  messages.emplace_back(data);
  }
 };
 namespace detail {
@@ -183,6 +191,87 @@ void refusal_cases() {
  }
  allow_context=true;diagnostic_preempt=0;
 }
+void geometry_refusal_cases() {
+ using namespace ker::mod; using namespace mm::huge;
+ using Recorder=ker::syscall::process::ForkRefusalDiagnostic;
+ using Point=ker::syscall::process::detail::ForkVmFailurePoint;
+ // Actual recorder copies source-owned scalars before their lifetime ends.
+ {
+  sched::task::Task parent;sched::diagnostic_current=&parent;
+  logs=0;messages.clear();calls.clear();allow_context=true;diagnostic_irq=true;diagnostic_preempt=0;
+  {
+   Recorder diagnostic{parent.pid};
+   DiagnosticOwner owner;
+   {
+    RangePrepareWitness witness{};
+    witness.next=0x4000;witness.count=2;witness.expected_count=3;
+    witness.error=Error::Again;witness.site=RangePrepareSite::PublicationBusy;
+    witness.pass=RangePreparePass::Count;witness.attempt=3;
+    witness.valid=true;witness.epoch_changed=true;witness.exhausted=true;
+    int const mapped=ker::syscall::process::detail::public_fork_vm_error(Point::GeometryPrepare,-EAGAIN);
+    assert(mapped==-EAGAIN);
+    diagnostic.capture(parent,"vm-snapshot",-EAGAIN,mapped,static_cast<uint32_t>(Point::GeometryPrepare),1,"coordinator-return",&witness);
+    assert(logs==0);
+    witness={}; // Neither later overwrite nor destruction can alter the copy.
+   }
+   parent.pid=0;parent.type=sched::task::TaskType::DAEMON;
+   parent.state.store(sched::task::TaskState::WAITING);
+   allow_context=false;
+  }
+  assert(logs==2 && diagnostic_owners==0 && !diagnostic_irq && messages.size()==2);
+  assert((calls==std::vector<std::string>{"journal","journal"}));
+  assert(messages[0]=="fork_refusal_v1 stage=vm-snapshot raw=-11 public=-11 parent=8589934599 point=6 prep=1 if=1 preempt=0 current=1 type=1 state=1 transition=0 accounted=1 context=coordinator-return");
+  assert(messages[1]=="fork_geometry_refusal_v1 parent=8589934599 raw=-11 public=-11 point=6 error="+
+   std::to_string(static_cast<unsigned>(Error::Again))+" site="+
+   std::to_string(static_cast<unsigned>(RangePrepareSite::PublicationBusy))+" pass="+
+   std::to_string(static_cast<unsigned>(RangePreparePass::Count))+
+   " attempt=3 next=16384 count=2 expected=3 epoch_changed=1 exhausted=1");
+ }
+ // Null, invalid and non-geometry captures cannot emit a companion. A later
+ // actual negative capture also clears an earlier copied geometry witness.
+ for(unsigned mode:{0U,1U,2U,3U}) {
+  sched::task::Task parent;sched::diagnostic_current=&parent;
+  logs=0;messages.clear();allow_context=true;diagnostic_irq=true;diagnostic_preempt=0;
+  {
+   Recorder diagnostic{parent.pid};DiagnosticOwner owner;
+   RangePrepareWitness witness{};witness.valid=true;witness.error=Error::Again;
+   witness.site=RangePrepareSite::StripedReader;
+   if(mode==3)diagnostic.capture(parent,"vm-snapshot",-EAGAIN,-EAGAIN,6,1,"coordinator-return",&witness);
+   if(mode==1 || mode==3)witness.valid=false;
+   auto const point=mode==2?Point::Copy:Point::GeometryPrepare;
+   diagnostic.capture(parent,"vm-snapshot",-EAGAIN,-EAGAIN,static_cast<uint32_t>(point),1,"coordinator-return",mode==0?nullptr:&witness);
+   assert(logs==0);allow_context=false;
+  }
+  assert(logs==1 && messages.size()==1 && messages[0].starts_with("fork_refusal_v1 ") && diagnostic_owners==0);
+ }
+ // Successful capture is unarmed even if a valid source witness was supplied.
+ {
+  sched::task::Task parent;logs=0;messages.clear();allow_context=false;
+  Recorder diagnostic{parent.pid};RangePrepareWitness witness{};witness.valid=true;
+  diagnostic.capture(parent,"success",0,0,6,1,"coordinator-return",&witness);
+ }
+ assert(logs==0 && messages.empty());
+ // Maximum representable scalar fields fit separate existing512B records.
+ // Geometry's point is6 by contract; the old case still covers UINT32_MAX point.
+ {
+  sched::task::Task parent;parent.pid=UINT64_MAX;sched::diagnostic_current=&parent;
+  logs=0;messages.clear();allow_context=true;diagnostic_irq=true;diagnostic_preempt=UINT32_MAX;
+  {
+   Recorder diagnostic{parent.pid};DiagnosticOwner owner;
+   RangePrepareWitness witness{};witness.next=UINT64_MAX;
+   witness.count=UINT16_MAX;witness.expected_count=UINT16_MAX;
+   witness.error=static_cast<Error>(UINT8_MAX);witness.site=static_cast<RangePrepareSite>(UINT8_MAX);
+   witness.pass=static_cast<RangePreparePass>(UINT8_MAX);witness.attempt=UINT8_MAX;
+   witness.valid=true;witness.epoch_changed=true;witness.exhausted=true;
+   diagnostic.capture(parent,"vm-snapshot",INT32_MIN,INT32_MIN,6,UINT32_MAX,"coordinator-return",&witness);
+   allow_context=false;
+  }
+  assert(logs==2 && messages.size()==2 && messages[0].size()<512 && messages[1].size()<512);
+  assert(messages[0].starts_with("fork_refusal_v1 stage=vm-snapshot raw=-2147483648 public=-2147483648 parent=18446744073709551615"));
+  assert(messages[1]=="fork_geometry_refusal_v1 parent=18446744073709551615 raw=-2147483648 public=-2147483648 point=6 error=255 site=255 pass=255 attempt=255 next=18446744073709551615 count=65535 expected=65535 epoch_changed=1 exhausted=1");
+ }
+ allow_context=true;diagnostic_preempt=0;
+}
 int main() {
  using namespace ker::mod; using ker::syscall::process::finish;
  auto& pool=mm::phys::kernel_stack_pool; sched::task::Task parent;
@@ -242,6 +331,7 @@ int main() {
  finish(&parent,-ENOMEM,0,"scheduler-publication");
  assert(message.size()<512 && message.ends_with("gc_deferred=18446744073709551615"));
  refusal_cases();
+ geometry_refusal_cases();
  puts("PASS actual fork failure getter/helper/finish: 13 stages + 6 dynamic VM cases, errno/bytes, success silence, lock ordering, CPU bounds, 512-byte journal bound");
 }
 '''
@@ -250,13 +340,16 @@ int main() {
 def validate_dynamic_vm_route(fork):
     """Keep the one explicit dynamic status alongside the exact literal labels."""
     exact = re.sub(r"\s+", "", fork)
-    call = "detail::prepare_fork_vm_snapshot(*parent,*child,preparation,EAGER_COPY?&fork_placement:nullptr,EAGER_COPY?&fork_page:nullptr,&point)"
+    call = "detail::prepare_fork_vm_snapshot(*parent,*child,preparation,EAGER_COPY?&fork_placement:nullptr,EAGER_COPY?&fork_page:nullptr,&point,&geometry_failure)"
     result = 'returnfinish_fork(detail::public_fork_vm_error(point,FORK_VM_ERROR),0,"vm-snapshot");'
     assert exact.count("detail::ForkVmFailurePointpoint{};") == 1
+    assert exact.count("mm::huge::RangePrepareWitnessgeometry_failure{};") == 1
+    assert exact.count('refusal.capture(*parent,"vm-snapshot",FORK_VM_ERROR,detail::public_fork_vm_error(point,FORK_VM_ERROR),static_cast<uint32_t>(point),preparation.ready()?1U:0U,"coordinator-return",&geometry_failure);') == 1
     assert exact.count(call) == 1
     assert exact.count(result) == 1
     cursor = 0
     for token in ("sys::SyscallPreparationScopepreparation(*parent);", "detail::ForkVmFailurePointpoint{};",
+                  "mm::huge::RangePrepareWitnessgeometry_failure{};",
                   "intconstFORK_VM_ERROR=" + call, "if(FORK_VM_ERROR!=0)",
                   "shm_cleanup_for_task(child)", "release_file_mmap_ranges_for_pagemap(child->pagemap)",
                   "release_lazy_vmem_ranges(*child)", "destroy_user_space(child->pagemap", "deletechild;", result):
@@ -278,6 +371,16 @@ def main():
     getter = function((ROOT / 'modules/kern/src/platform/mm/phys.opt.cpp').read_text(),
                       'get_kernel_stack_pool_stats')
     source = PRELUDE.replace('SNAPSHOT', snapshot).replace('GETTER', getter)
+    managed = MANAGED_HUGE_SOURCE.read_text()
+    core = (ROOT / 'modules/kern/src/platform/mm/managed_huge_core.hpp').read_text()
+    geometry_types = block(core, r'^enum class Error :') + ';\n'
+    for name in ('RangePrepareSite', 'RangePreparePass'):
+        geometry_types += block(managed, r'^enum class ' + name + ' :') + ';\n'
+    geometry_types += block(managed, r'^struct RangePrepareWitness \{') + ';\n'
+    bound = re.search(r'^static_assert\(sizeof\(RangePrepareWitness\).*;$', managed, re.M)
+    assert bound is not None
+    geometry_types += bound.group(0)
+    source = source.replace('GEOMETRY_TYPES', geometry_types)
     translator = block(process, r'^enum class ForkVmFailurePoint :') + ';\n' + function(process, 'public_fork_vm_error')
     source = source.replace('TRANSLATOR', translator)
     recorder = block(process, r'^struct ForkRefusalDiagnostic \{') + ';'
@@ -293,9 +396,16 @@ def main():
         capture_body = block(recorder, r'^    void capture\(')
         destructor = block(recorder, r'^    ~ForkRefusalDiagnostic\(')
         early = capture_body[:-1] + destructor[destructor.index('{') + 1:-1] + '}'
+        geometry_emit = block(destructor, r'^        if \(geometry.valid\)')
+        early_geometry = capture_body[:-1] + geometry_emit + '}'
+        site = 'static_cast<unsigned>(geometry.site)'
+        assert source.count(site) == 1 and source.count(geometry_emit) == 1
         variants = {'actual': source,
                     'suppress-refusal': source.replace(destructor, destructor[:destructor.index('{')] + '{}', 1),
-                    'early-refusal': source.replace(capture_body, early, 1)}
+                    'early-refusal': source.replace(capture_body, early, 1),
+                    'suppress-geometry': source.replace(geometry_emit, '', 1),
+                    'mislabel-geometry': source.replace(site, 'static_cast<unsigned>(ker::mod::mm::huge::RangePrepareSite::Unreported)', 1),
+                    'early-geometry': source.replace(capture_body, early_geometry, 1)}
         for label, content in variants.items():
             if label != 'actual': assert content != source
             cpp, binary = temp / (label + '.cpp'), temp / label

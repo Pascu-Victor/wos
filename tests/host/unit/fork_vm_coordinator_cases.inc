@@ -136,10 +136,12 @@ class ForkVmCoordinator : public ManagedFork {
                 while (block.refs[page] > 1) (void)mm::phys::page_ref_dec(static_cast<uint8_t*>(block.storage.get()) + page * PAGE);
         ManagedFork::TearDown();
     }
-    auto run(numa::AllocationContext* placement = nullptr, numa::AllocationResult* output = nullptr) -> int {
+    auto run(numa::AllocationContext* placement = nullptr, numa::AllocationResult* output = nullptr,
+             huge::RangePrepareWitness* witness = nullptr, ker::syscall::process::detail::ForkVmFailurePoint* point = nullptr) -> int {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
         host_fork_vm::enabled = true;
-        auto status = ker::syscall::process::detail::prepare_fork_vm_snapshot(actor, child_task, preparation, placement, output);
+        auto status =
+            ker::syscall::process::detail::prepare_fork_vm_snapshot(actor, child_task, preparation, placement, output, point, witness);
         host_fork_vm::enabled = false;
         EXPECT_TRUE(host_fork_vm::ordinary());
         EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
@@ -526,3 +528,34 @@ TEST_F(ForkVmCoordinator, LateActorContextRefusesBeforeChildConsumption) {
     EXPECT_EQ(fork_exclusives, 1U);
 }
 }  // namespace
+
+TEST_F(ForkVmCoordinator, GeometryWitnessIsCopiedAfterOwnersAndClearedBeforeOtherFailures) {
+    huge::RangePrepareWitness witness{};
+    ker::syscall::process::detail::ForkVmFailurePoint point{};
+    auto* next = table();
+    word(runtime_root, virt::index_of(TEST_VA, 4)) = reinterpret_cast<uint64_t>(next) | 7;
+    word(next, virt::index_of(TEST_VA, 3)) = 0x87;
+    EXPECT_EQ(run(nullptr, nullptr, &witness, &point), -EOPNOTSUPP);
+    EXPECT_EQ(point, ker::syscall::process::detail::ForkVmFailurePoint::GeometryPrepare);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.error, huge::Error::Unsupported);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::GeometryEncoding);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+    word(runtime_root, virt::index_of(TEST_VA, 4)) = 0;
+    virt::host_root_control.ps_geometry_epoch = UINT64_MAX;
+    EXPECT_EQ(run(nullptr, nullptr, &witness, &point), -EOVERFLOW);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::EpochSaturated);
+    EXPECT_EQ(witness.error, huge::Error::GenerationExhausted);
+    virt::host_root_control.ps_geometry_epoch = 1;
+    ASSERT_EQ(run(nullptr, nullptr, &witness, &point), 0);
+    EXPECT_FALSE(witness.valid);
+    rollback();
+    witness.valid = true;
+    actor.type = ker::mod::sched::task::TaskType::THREAD;
+    EXPECT_EQ(run(nullptr, nullptr, &witness, &point), -EWOULDBLOCK);
+    actor.type = ker::mod::sched::task::TaskType::PROCESS;
+    EXPECT_EQ(point, ker::syscall::process::detail::ForkVmFailurePoint::Context);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+    EXPECT_EQ(root_readers + publication_depth + cow_depth + pin_depth, 0U);
+}

@@ -76,6 +76,7 @@ namespace child_events {void abort_publication(ker::mod::sched::task::Task&t){ho
 #include <new>
 #include <platform/asm/cpu.hpp>
 #include <platform/mm/numa_alloc.hpp>
+#include <platform/mm/managed_huge.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/syscall_preparation.hpp>
 namespace host_fork_vm {auto ordinary()->bool;}
@@ -99,7 +100,7 @@ namespace detail {
         declaration = """
 auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task&,ker::mod::sched::task::Task&,
  const ker::mod::sys::SyscallPreparationScope&,ker::mod::mm::numa::AllocationContext*,
- ker::mod::mm::numa::AllocationResult*,ForkVmFailurePoint*)->int;
+ ker::mod::mm::numa::AllocationResult*,ForkVmFailurePoint*,ker::mod::mm::huge::RangePrepareWitness* = nullptr)->int;
 }
 """
         start = self.fork.index("    // Preparation and every unpublished VM rollback remain ordinary.")
@@ -113,7 +114,8 @@ auto host_public_vm_stage(ker::mod::sched::task::Task*parent,ker::mod::sched::ta
  // Diagnostic-only capture endpoint; actual recorder/unwind is exercised by
  // the existing fork_failure_diagnostics_test. Rollback and statuses stay real.
  struct DiagnosticPort {
-  void capture(sched::task::Task&,const char*,int,int,uint32_t,uint32_t,const char*) {
+  void capture(sched::task::Task&,const char*,int,int,uint32_t,uint32_t,const char*,
+               const mm::huge::RangePrepareWitness*) {
    EXPECT_TRUE(host_fork_vm::ordinary());
   }
  } refusal;

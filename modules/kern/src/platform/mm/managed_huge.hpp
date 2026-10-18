@@ -78,6 +78,38 @@ struct GeometryStamp {
     RootKey root{};
     uint64_t epoch{};
 };
+// Optional refusal-only scalars. No pointer, root key or owner is retained.
+// Instrumented callers construct these before any excluded helper writes.
+enum class RangePrepareSite : uint8_t {
+    Unreported,
+    Context,
+    Input,
+    PublicationBusy,
+    TaskLease,
+    StripedReader,
+    RootStale,
+    EpochChanged,
+    EpochSaturated,
+    GeometryEncoding,
+    RootCapacity,
+    DescriptorStorage,
+    DescriptorMismatch,
+    CountMismatch,
+    PlanReserve,
+    PlanAllocation,
+    TableValidation
+};
+enum class RangePreparePass : uint8_t { Entry, Count, Fill, Verify, Tables };
+struct RangePrepareWitness {
+    uint64_t next{};
+    uint16_t count{}, expected_count{};
+    Error error{Error::None};
+    RangePrepareSite site{RangePrepareSite::Unreported};
+    RangePreparePass pass{RangePreparePass::Entry};
+    uint8_t attempt{};  // Entry0; the existing preparation attempts are1..3.
+    bool valid{}, epoch_changed{}, exhausted{};
+};
+static_assert(sizeof(RangePrepareWitness) <= 32 && std::is_trivially_copyable_v<RangePrepareWitness>);
 // Plain VA-only progress. No table/control/Task/entry pointer persists between
 // chunks. Storage is instrumented-caller constructed before any exclusion.
 struct RangeSplitCursor {
@@ -124,7 +156,7 @@ class PreparedTables {
     auto operator=(const PreparedTables&) -> PreparedTables& = delete;
     PreparedTables(PreparedTables&&) noexcept;
     auto operator=(PreparedTables&&) noexcept -> PreparedTables&;
-    [[nodiscard]] auto prepare(uint16_t count) noexcept -> Error;
+    [[nodiscard]] auto prepare(uint16_t count, RangePrepareSite* failure_site = nullptr) noexcept -> Error;
     void reset() noexcept;
     [[nodiscard]] auto empty() const noexcept -> bool { return ticket_.generation == 0; }
     [[nodiscard]] auto count() const noexcept -> uint16_t { return storage_ != nullptr ? storage_->table_count : 0; }
@@ -134,7 +166,7 @@ class PreparedTables {
 
    private:
     friend struct detail::PreparationAccess;
-    [[nodiscard]] auto prepare_impl(uint16_t count
+    [[nodiscard]] auto prepare_impl(uint16_t count, RangePrepareSite* failure_site
 #ifdef WOS_SELFTEST
                                     ,
                                     uint16_t fail_before_table
@@ -166,7 +198,8 @@ class PreparedHugeMapBatch {
 // Fallible preparation owns no root/PUB/MM lease across allocations or yields.
 // Caller owns ordinary PROCESS execution; no public syscall is wired here.
 [[nodiscard]] auto prepare_current_range_split(sched::task::Task&, const sys::SyscallPreparationScope&, uint64_t start, uint64_t end,
-                                               RangeSplitSurvey& empty, PreparedTables& empty_tables) noexcept -> Error;
+                                               RangeSplitSurvey& empty, PreparedTables& empty_tables,
+                                               RangePrepareWitness* witness = nullptr) noexcept -> Error;
 class CurrentRangeSplitAdmission {
    public:
     CurrentRangeSplitAdmission(sched::task::Task&, const sys::SyscallPreparationScope&,
@@ -204,7 +237,8 @@ struct CurrentRangeRootAccess {
     size_t gate{static_cast<size_t>(-1)};
     bool local{};
 };
-[[nodiscard]] auto acquire_current_range_root(sched::task::Task&, CurrentRangeRootAccess& empty) noexcept -> Error;
+[[nodiscard]] auto acquire_current_range_root(sched::task::Task&, CurrentRangeRootAccess& empty,
+                                              RangePrepareSite* failure_site = nullptr) noexcept -> Error;
 void release_current_range_root(CurrentRangeRootAccess&) noexcept;
 // Bounded Count and complete supported-geometry validation under the actual
 // blocking PUB. Caller-born cursor/access precede its one PreemptGuard.
@@ -235,7 +269,8 @@ void release_mremap_ps_policy(RootKey& owned) noexcept;
                                                        PreparedTables&, numa::AllocationContext*, numa::AllocationResult*,
                                                        virt::PreparedAnonymousSwapFork* = nullptr) noexcept -> int;
 // At most16 cursor steps/48 raw hierarchy loads; owns COW->pin only internally.
-[[nodiscard]] auto survey_range_chunk(paging::PageTable*, RangeSplitCursor&, RangeSurveyMode, SplitPlanStorage*) noexcept -> Error;
+[[nodiscard]] auto survey_range_chunk(paging::PageTable*, RangeSplitCursor&, RangeSurveyMode, SplitPlanStorage*,
+                                      RangePrepareSite* failure_site = nullptr) noexcept -> Error;
 // Incoming actual lifetime/PUB authority; no nested reader or fallible work.
 [[nodiscard]] auto commit_range_split(paging::PageTable*, const RangeSplitSurvey&, PreparedTables&) noexcept -> Error;
 // Private legacy/native route: caller owns an exclusively unpublished root.
@@ -288,7 +323,8 @@ struct PreparationAccess {
     [[nodiscard]] static auto plan_storage(PreparedTables&) noexcept -> SplitPlanStorage*;
     static void tables_transferred_after_publish(PreparedTables&, uint64_t adopted_mask) noexcept;
 #ifdef WOS_SELFTEST
-    [[nodiscard]] static auto prepare_tables_for_test(PreparedTables&, uint16_t count, uint16_t fail_before_table) noexcept -> Error;
+    [[nodiscard]] static auto prepare_tables_for_test(PreparedTables&, uint16_t count, uint16_t fail_before_table,
+                                                      RangePrepareSite* failure_site = nullptr) noexcept -> Error;
 #endif
 };
 // These rows are constructed/addressable in managed_huge.cpp BEFORE excluded

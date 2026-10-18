@@ -128,38 +128,47 @@ void PreparedTables::reset() noexcept {
     auto const TICKET = std::exchange(ticket_, {});
     if (TICKET.generation != 0 && detail::release_plan(TICKET) != Error::None) __builtin_trap();
 }
-auto PreparedTables::prepare(uint16_t count) noexcept -> Error {
-    return prepare_impl(count
+auto PreparedTables::prepare(uint16_t count, RangePrepareSite* failure_site) noexcept -> Error {
+    return prepare_impl(count, failure_site
 #ifdef WOS_SELFTEST
                         ,
                         UINT16_MAX
 #endif
     );
 }
-auto PreparedTables::prepare_impl(uint16_t count
+auto PreparedTables::prepare_impl(uint16_t count, RangePrepareSite* failure_site
 #ifdef WOS_SELFTEST
                                   ,
                                   uint16_t fail_before_table
 #endif
                                   ) noexcept -> Error {
-    if (!empty() || storage_ != nullptr || count == 0 || count > MAX_PLAN_TABLES) return Error::Invalid;
+    if (!empty() || storage_ != nullptr || count == 0 || count > MAX_PLAN_TABLES) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Input;
+        return Error::Invalid;
+    }
     PlanHandle ticket{};
-    if (auto const error = detail::reserve_plan(count, ticket); error != Error::None) return error;
+    if (auto const error = detail::reserve_plan(count, ticket); error != Error::None) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::PlanReserve;
+        return error;
+    }
     ticket_ = ticket;
     storage_ = new (std::nothrow) SplitPlanStorage{};
     if (storage_ == nullptr) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::PlanAllocation;
         reset();
         return Error::Exhausted;
     }
     for (uint16_t i = 0; i < count; ++i) {
 #ifdef WOS_SELFTEST
         if (i == fail_before_table) {
+            if (failure_site != nullptr) *failure_site = RangePrepareSite::PlanAllocation;
             reset();
             return Error::Exhausted;
         }
 #endif
         auto* table = detail::allocate_table();
         if (table == nullptr) {
+            if (failure_site != nullptr) *failure_site = RangePrepareSite::PlanAllocation;
             reset();
             return Error::Exhausted;
         }
@@ -170,8 +179,9 @@ auto PreparedTables::prepare_impl(uint16_t count
     return Error::None;
 }
 #ifdef WOS_SELFTEST
-auto detail::PreparationAccess::prepare_tables_for_test(PreparedTables& owner, uint16_t count, uint16_t before) noexcept -> Error {
-    return owner.prepare_impl(count, before);
+auto detail::PreparationAccess::prepare_tables_for_test(PreparedTables& owner, uint16_t count, uint16_t before,
+                                                        RangePrepareSite* failure_site) noexcept -> Error {
+    return owner.prepare_impl(count, failure_site, before);
 }
 #endif
 auto detail::PreparationAccess::span_view(const PreparedSpan& owner, SpanPublicationView& empty) noexcept -> bool {
@@ -292,6 +302,21 @@ auto range_current_context(sched::task::Task& target, const sys::SyscallPreparat
            !target.exit_in_progress.load(std::memory_order_acquire) && target.syscall_account_start_us != 0 &&
            sched::preempt_count() == 0 && sched::interrupts_enabled() == interrupts;
 }
+// Called only after each chunk has retired root/PUB/preempt owners.
+void record_range_prepare_failure(RangePrepareWitness* witness, Error error, RangePrepareSite site, RangePreparePass pass, uint8_t attempt,
+                                  const RangeSplitCursor* cursor = nullptr, uint16_t expected_count = 0) noexcept {
+    if (witness == nullptr) return;
+    *witness = {cursor != nullptr ? cursor->next : 0,
+                cursor != nullptr ? cursor->count : uint16_t{0},
+                expected_count,
+                error,
+                site,
+                pass,
+                attempt,
+                true,
+                cursor != nullptr && cursor->epoch_changed,
+                false};
+}
 auto range_tables_valid(const SplitPlanStorage& storage, uint16_t count) noexcept -> bool {
     constexpr uint64_t FRAME = 0x000ffffffffff000ULL;
     if (storage.table_count != count || count == 0 || count > MAX_PLAN_TABLES) return false;
@@ -310,68 +335,95 @@ auto range_tables_valid(const SplitPlanStorage& storage, uint16_t count) noexcep
 }  // namespace
 struct detail::RangePreparationDriver {
     static auto pass(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
-                     RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage) noexcept -> Error {
+                     RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage, RangePrepareWitness* witness,
+                     RangePreparePass phase, uint8_t attempt, uint16_t expected_count = 0) noexcept -> Error {
         while (!cursor.complete) {
-            if (target != nullptr && (preparation == nullptr || !range_current_context(*target, *preparation, true))) return Error::Invalid;
+            if (target != nullptr && (preparation == nullptr || !range_current_context(*target, *preparation, true))) {
+                record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Context, phase, attempt, &cursor, expected_count);
+                return Error::Invalid;
+            }
             CurrentRangeRootAccess access;
+            RangePrepareSite site = RangePrepareSite::PublicationBusy;
             Error error = Error::Again;
             {
                 sched::PreemptGuard preempt;
                 ker::syscall::vmem::SharedVmemPublicationTryGuard publication;
                 if (publication.acquired()) {
+                    site = RangePrepareSite::Unreported;
                     if (target == nullptr)
-                        error = survey_range_chunk(unpublished, cursor, mode, storage);
+                        error = survey_range_chunk(unpublished, cursor, mode, storage, witness != nullptr ? &site : nullptr);
                     else {
-                        error = acquire_current_range_root(*target, access);
-                        if (error == Error::None) error = survey_range_chunk(access.root, cursor, mode, storage);
+                        error = acquire_current_range_root(*target, access, witness != nullptr ? &site : nullptr);
+                        if (error == Error::None)
+                            error = survey_range_chunk(access.root, cursor, mode, storage, witness != nullptr ? &site : nullptr);
                         // Even a post-acquire identity refusal owns the local lease.
                         release_current_range_root(access);
                     }
                 }
             }
             // No actual Task/control/PT/PTE/root-reader/PUB/preempt owner remains.
-            if (error != Error::None) return error;
+            if (error != Error::None) {
+                record_range_prepare_failure(witness, error, site, phase, attempt, &cursor, expected_count);
+                return error;
+            }
             if (!cursor.complete && target != nullptr) sched::kern_yield();
         }
         return Error::None;
     }
     static auto prepare(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
-                        uint64_t start, uint64_t end, RangeSplitSurvey& survey, PreparedTables& tables, uint16_t fail_before_table) noexcept
-        -> Error {
+                        uint64_t start, uint64_t end, RangeSplitSurvey& survey, PreparedTables& tables, uint16_t fail_before_table,
+                        RangePrepareWitness* witness = nullptr) noexcept -> Error {
         constexpr uint64_t LIMIT = uint64_t{1} << 47;
+        if (witness != nullptr) *witness = {};
         if (start >= end || end > LIMIT || ((start | end) & (PAGE_BYTES - 1)) != 0 || survey.complete_ ||
-            survey.stamp_.root.incarnation != 0 || !tables.empty() || PreparationAccess::plan_storage(tables) != nullptr)
+            survey.stamp_.root.incarnation != 0 || !tables.empty() || PreparationAccess::plan_storage(tables) != nullptr) {
+            record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Input, RangePreparePass::Entry, 0);
             return Error::Invalid;
+        }
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            if (witness != nullptr) *witness = {};
             RangeSplitCursor count{};
             count.start = start;
             count.end = end;
-            Error error = pass(target, preparation, unpublished, count, RangeSurveyMode::Count, nullptr);
+            Error error = pass(target, preparation, unpublished, count, RangeSurveyMode::Count, nullptr, witness, RangePreparePass::Count,
+                               static_cast<uint8_t>(attempt + 1));
             if (error != Error::None) {
                 if (error == Error::Again && count.epoch_changed) continue;
                 return error;  // Busy is immediate; no hidden contention retries.
             }
             if (count.count != 0) {
+                RangePrepareSite site = RangePrepareSite::Unreported;
 #ifdef WOS_SELFTEST
-                error = PreparationAccess::prepare_tables_for_test(tables, count.count, fail_before_table);
+                error = PreparationAccess::prepare_tables_for_test(tables, count.count, fail_before_table,
+                                                                   witness != nullptr ? &site : nullptr);
 #else
                 (void)fail_before_table;
-                error = tables.prepare(count.count);
+                error = tables.prepare(count.count, witness != nullptr ? &site : nullptr);
 #endif
-                if (error != Error::None) return error;
+                if (error != Error::None) {
+                    record_range_prepare_failure(witness, error, site, RangePreparePass::Tables, static_cast<uint8_t>(attempt + 1), &count,
+                                                 count.count);
+                    return error;
+                }
             }
             auto* storage = PreparationAccess::plan_storage(tables);
             if (count.count != 0 && (storage == nullptr || !range_tables_valid(*storage, count.count))) {
                 tables.reset();
+                record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::TableValidation, RangePreparePass::Tables,
+                                             static_cast<uint8_t>(attempt + 1), &count, count.count);
                 return Error::Invalid;
             }
             RangeSplitCursor fill{};
             fill.stamp = count.stamp;
             fill.start = start;
             fill.end = end;
-            error =
-                pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage);
-            if (error == Error::None && fill.count != count.count) error = Error::Again;
+            error = pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage,
+                         witness, RangePreparePass::Fill, static_cast<uint8_t>(attempt + 1), count.count);
+            if (error == Error::None && fill.count != count.count) {
+                error = Error::Again;
+                record_range_prepare_failure(witness, error, RangePrepareSite::CountMismatch, RangePreparePass::Fill,
+                                             static_cast<uint8_t>(attempt + 1), &fill, count.count);
+            }
             if (error == Error::None && storage != nullptr) {
                 constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
                 constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
@@ -389,8 +441,12 @@ struct detail::RangePreparationDriver {
             final.end = end;
             if (error == Error::None)
                 error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count,
-                             storage);
-            if (error == Error::None && final.count != count.count) error = Error::Again;
+                             storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count);
+            if (error == Error::None && final.count != count.count) {
+                error = Error::Again;
+                record_range_prepare_failure(witness, error, RangePrepareSite::CountMismatch, RangePreparePass::Verify,
+                                             static_cast<uint8_t>(attempt + 1), &final, count.count);
+            }
             if (error != Error::None) {
                 tables.reset();  // All chunk guards ended before actual owner resets.
                 if (error == Error::Again && (fill.epoch_changed || final.epoch_changed)) continue;
@@ -410,8 +466,10 @@ struct detail::RangePreparationDriver {
             survey.end_ = end;
             survey.count_ = count.count;
             survey.complete_ = true;
+            if (witness != nullptr) *witness = {};
             return Error::None;
         }
+        if (witness != nullptr && witness->valid) witness->exhausted = true;
         return Error::Again;
     }
 };
@@ -420,9 +478,13 @@ auto detail::current_fork_context_valid(sched::task::Task& target, const sys::Sy
     return publication.acquired() && range_current_context(target, preparation, false);
 }
 auto prepare_current_range_split(sched::task::Task& target, const sys::SyscallPreparationScope& preparation, uint64_t start, uint64_t end,
-                                 RangeSplitSurvey& survey, PreparedTables& tables) noexcept -> Error {
-    if (!range_current_context(target, preparation, true)) return Error::Invalid;
-    return detail::RangePreparationDriver::prepare(&target, &preparation, nullptr, start, end, survey, tables, UINT16_MAX);
+                                 RangeSplitSurvey& survey, PreparedTables& tables, RangePrepareWitness* witness) noexcept -> Error {
+    if (witness != nullptr) *witness = {};
+    if (!range_current_context(target, preparation, true)) {
+        record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Context, RangePreparePass::Entry, 0);
+        return Error::Invalid;
+    }
+    return detail::RangePreparationDriver::prepare(&target, &preparation, nullptr, start, end, survey, tables, UINT16_MAX, witness);
 }
 auto detail::prepare_unpublished_range_split(paging::PageTable* root, uint64_t start, uint64_t end, RangeSplitSurvey& survey,
                                              PreparedTables& tables, uint16_t fail_before_table) noexcept -> Error {

@@ -31,9 +31,10 @@ class ManagedRange : public ManagedResolver {
         host_range::interrupts = true;
         ManagedResolver::TearDown();
     }
-    auto proof(uint64_t first, uint64_t end, huge::RangeSplitSurvey& survey, huge::PreparedTables& tables) -> huge::Error {
+    auto proof(uint64_t first, uint64_t end, huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+               huge::RangePrepareWitness* witness = nullptr) -> huge::Error {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
-        return huge::prepare_current_range_split(actor, preparation, first, end, survey, tables);
+        return huge::prepare_current_range_split(actor, preparation, first, end, survey, tables, witness);
     }
     auto arm(const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables, bool expect_allow = true) -> huge::Error {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
@@ -481,4 +482,179 @@ TEST_F(ManagedRange, BlockingOwnerIdentityIsEmptyExactAndClearedBeforeTryOwner) 
         EXPECT_FALSE(blocking_publication_owner_matches(other_identity));
     }
     EXPECT_EQ(g_shared_vmem_publication_owner.load(), nullptr);
+}
+
+// Refusal-only observations of the actual preparation bodies above. Host
+// controls select real original failures; they grant no runtime root authority.
+TEST_F(ManagedRange, WitnessEntryFailureAndSuccessNeverReuseAnEarlierFailure) {
+    huge::RangePrepareWitness witness{};
+    witness.valid = true;
+    witness.site = huge::RangePrepareSite::PublicationBusy;
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    actor.type = ker::mod::sched::task::TaskType::THREAD;
+    EXPECT_EQ(proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.error, huge::Error::Invalid);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Context);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Entry);
+    EXPECT_EQ(witness.attempt, 0U);
+    actor.type = ker::mod::sched::task::TaskType::PROCESS;
+    EXPECT_EQ(proof(1, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Input);
+    ASSERT_EQ(proof(0, LARGE, survey, tables, &witness), huge::Error::None);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_EQ(witness.error, huge::Error::None);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Unreported);
+}
+TEST_F(ManagedRange, WitnessSeparatesPublicationLeaseReaderAndRootRefusals) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    {
+        ker::syscall::vmem::SharedVmemPublicationTryGuard held;
+        ASSERT_TRUE(held.acquired());
+        EXPECT_EQ(proof(0, LARGE, survey, tables, &witness), huge::Error::Again);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::PublicationBusy);
+        EXPECT_EQ(publication_depth, 1U);  // Only the independently held outer owner.
+    }
+    actor.usercopy_pagemap_closing = true;
+    EXPECT_EQ(proof(0, LARGE, survey, tables, &witness), huge::Error::Again);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::TaskLease);
+    actor.usercopy_pagemap_closing = false;
+    host_range::reader_busy = true;
+    EXPECT_EQ(proof(0, LARGE, survey, tables, &witness), huge::Error::Again);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::StripedReader);
+    host_range::reader_busy = false;
+    huge_root_live = false;
+    EXPECT_EQ(proof(0, LARGE, survey, tables, &witness), huge::Error::Stale);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::RootStale);
+    huge_root_live = true;
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+    EXPECT_EQ(witness.attempt, 1U);
+    EXPECT_FALSE(witness.exhausted);
+    EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+    EXPECT_EQ(root_readers + publication_depth + cow_depth + pin_depth, 0U);
+    EXPECT_EQ(host_range::yields + host_range::blocking, 0U);
+}
+TEST_F(ManagedRange, WitnessEpochRetryKeepsOnlyTheLastActualFailureOrClearsOnSuccess) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    unsigned changes = 0;
+    range_yield_action = [&] {
+        ++virt::host_root_control.ps_geometry_epoch;
+        ++changes;
+    };
+    EXPECT_EQ(proof(0, uint64_t{1} << 47, survey, tables, &witness), huge::Error::Again);
+    EXPECT_EQ(changes, 3U);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.error, huge::Error::Again);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::EpochChanged);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+    EXPECT_EQ(witness.attempt, 3U);
+    EXPECT_TRUE(witness.epoch_changed);
+    EXPECT_TRUE(witness.exhausted);
+    bool once = false;
+    range_yield_action = [&] {
+        if (!once) {
+            once = true;
+            ++virt::host_root_control.ps_geometry_epoch;
+        }
+    };
+    ASSERT_EQ(proof(0, uint64_t{1} << 47, survey, tables, &witness), huge::Error::None);
+    EXPECT_TRUE(once);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_FALSE(witness.exhausted);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Unreported);
+}
+TEST_F(ManagedRange, WitnessPlanReserveAndAllocationDoNotChangeOwnersOrErrors) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    huge::PlanHandle held[huge::MAX_PLANS]{};
+    size_t held_count = 0;
+    for (; held_count < huge::MAX_PLANS; ++held_count) {
+        auto const error = huge::detail::reserve_plan(1, held[held_count]);
+        if (error != huge::Error::None) {
+            EXPECT_EQ(error, huge::Error::Capacity);
+            break;
+        }
+    }
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    EXPECT_EQ(proof(TEST_VA, TEST_VA + LARGE, survey, tables, &witness), huge::Error::Capacity);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::PlanReserve);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Tables);
+    EXPECT_EQ(witness.count, 1U);
+    EXPECT_EQ(witness.expected_count, 1U);
+    for (size_t i = 0; i < held_count; ++i) EXPECT_EQ(huge::detail::release_plan(held[i]), huge::Error::None);
+    auto const original = slot_at(runtime_root, TEST_VA, 2);
+    for (bool heap : {false, true}) {
+        table_attempt = 0;
+        fail_table_at = heap ? SIZE_MAX : 0;
+        fail_plan_heap = heap;
+        EXPECT_EQ(proof(TEST_VA, TEST_VA + LARGE, survey, tables, &witness), huge::Error::Exhausted);
+        EXPECT_EQ(witness.error, huge::Error::Exhausted);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::PlanAllocation);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Tables);
+        EXPECT_TRUE(tables.empty());
+        EXPECT_FALSE(survey.complete());
+        EXPECT_EQ(slot_at(runtime_root, TEST_VA, 2), original);
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+    }
+    fail_table_at = SIZE_MAX;
+}
+TEST_F(ManagedRange, WitnessFinalCountMismatchIsNotAnEpochOrPublicationClaim) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    auto const original = slot_at(runtime_root, TEST_VA, 2);
+    auto const before = table_attempt;
+    bool removed = false;
+    // Deliberately corrupt only this finite Host image without its normal
+    // epoch update, after Fill has counted its first leaf. Verify must notice.
+    range_yield_action = [&] {
+        if (!removed && table_attempt > before) {
+            removed = true;
+            slot_at(runtime_root, TEST_VA, 2) = 0;
+        }
+    };
+    EXPECT_EQ(proof(TEST_VA, TEST_VA + 65 * LARGE, survey, tables, &witness), huge::Error::Again);
+    slot_at(runtime_root, TEST_VA, 2) = original;
+    EXPECT_TRUE(removed);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::CountMismatch);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Verify);
+    EXPECT_EQ(witness.count, 0U);
+    EXPECT_EQ(witness.expected_count, 1U);
+    EXPECT_FALSE(witness.epoch_changed);
+    EXPECT_FALSE(witness.exhausted);
+    EXPECT_TRUE(tables.empty());
+}
+TEST_F(ManagedRange, WitnessDescriptorMismatchComesFromActualFinalSurvey) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    bool altered = false;
+    range_yield_action = [&] {
+        auto* storage = huge::detail::PreparationAccess::plan_storage(tables);
+        if (!altered && storage != nullptr && storage->descriptors[0].handle.generation != 0) {
+            altered = true;
+            storage->descriptors[0].semantic_word ^= mm::paging::PAGE_WRITE;
+        }
+    };
+    EXPECT_EQ(proof(TEST_VA, TEST_VA + 65 * LARGE, survey, tables, &witness), huge::Error::Again);
+    EXPECT_TRUE(altered);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::DescriptorMismatch);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Verify);
+    EXPECT_FALSE(witness.epoch_changed);
+    EXPECT_FALSE(witness.exhausted);
+    EXPECT_TRUE(tables.empty());
+    EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
 }
