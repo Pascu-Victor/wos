@@ -80,10 +80,19 @@ def test_fixed_abi_is_mirrored_and_append_only() -> None:
 
 def test_broker_authenticates_and_keeps_usercopy_outside_lock() -> None:
     source = BROKER.read_text()
-    submit = function_body(source, "wos_proc_init_control_submit")
-    receive = function_body(source, "wos_proc_init_control_receive")
-    publish = function_body(source, "wos_proc_init_status_publish")
-    read = function_body(source, "wos_proc_init_status_read")
+    submit = function_body(source, "init_control_submit_for_subject")
+    receive = function_body(source, "init_control_receive_for_subject")
+    publish = function_body(source, "init_status_publish_for_subject")
+    read = function_body(source, "init_status_read_for_subject")
+
+    for wrapper, subject, address in [
+        ("wos_proc_init_control_submit", "init_control_submit_for_subject", "request_addr"),
+        ("wos_proc_init_control_receive", "init_control_receive_for_subject", "request_addr"),
+        ("wos_proc_init_status_publish", "init_status_publish_for_subject", "status_addr"),
+        ("wos_proc_init_status_read", "init_status_read_for_subject", "status_addr"),
+    ]:
+        require(function_body(source, wrapper), f"return {subject}(current_task(), {address});",
+                f"{wrapper} delegates to the checked subject body")
 
     require(submit, "!CREDENTIALS.allows(ker::mod::security::Authority::INIT_CONTROL)", "central INIT_CONTROL authority for request submission")
     require(submit, "request.sender_pid = ker::mod::sched::task::process_pid(*task);", "authenticated sender PID")
@@ -167,7 +176,7 @@ def test_service_resources_preserve_privilege_lock_and_restart_boundaries() -> N
     init = (ROOT / "modules/init/src/services.cpp").read_text()
     configure = function_body(source, "configure_service_for")
     select = function_body(source, "select_service_for")
-    read = function_body(source, "syscall_service_read")
+    read = function_body(source, "service_read_for_subject")
     if not (configure.index("if (AUTHORIZATION != 0)") < configure.index("copy_value_from_task") <
             configure.index("validate_configuration(config)") < configure.index("service_lock.lock_irqsave()")):
         fail("service configuration must authenticate, snapshot and validate before locking")
@@ -179,8 +188,14 @@ def test_service_resources_preserve_privilege_lock_and_restart_boundaries() -> N
     require(status, "authorize_service_resource_management(CREDENTIALS, is_init(caller))", "role and credential authority")
     if select.index("if (AUTHORIZATION != 0)") > select.index("caller->selected_child_service ="):
         fail("authorization denial must preserve pending service selection")
-    require(function_body(source, "syscall_service_configure"), "configure_service_for(get_current_task(), address)", "configure syscall delegates to tested adapter")
-    require(function_body(source, "syscall_service_select"), "select_service_for(get_current_task(), slot)", "select syscall delegates to tested adapter")
+    require(function_body(source, "syscall_service_configure"), "service_configure_for_subject(get_current_task(), address)", "configure syscall delegates to tested subject adapter")
+    require(function_body(source, "service_configure_for_subject"), "configure_service_for(caller, address)", "configure subject delegates to tested internal body")
+    require(function_body(source, "syscall_service_select"), "service_select_for_subject(get_current_task(), slot)", "select syscall delegates to tested subject adapter")
+    require(function_body(source, "service_select_for_subject"), "select_service_for(caller, slot)", "select subject delegates to tested internal body")
+    read_syscall = function_body(source, "syscall_service_read")
+    require(read_syscall, "return service_read_for_subject(get_current_task(), slot, address, version);", "ordinary read syscall delegates to tested subject body")
+    require(read_syscall, "auto* caller = get_current_task();", "selftest read syscall captures its caller")
+    require(read_syscall, "auto const result = service_read_for_subject(caller, slot, address, version);", "selftest read syscall delegates to tested subject body")
     require(select, "caller->selected_child_service = service_abi::NO_SELECTION", "failed selection clears stale policy")
     require(select, "state.admit_start()", "restart admission retains cumulative CPU usage")
     if not (read.index("!caller->credentials().allows(ker::mod::security::Authority::RESOURCE_LIMIT)") < read.index("service_lock.lock_irqsave()") <
