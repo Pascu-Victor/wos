@@ -5,6 +5,7 @@
 #include <limits>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/numa_balance.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
@@ -384,6 +385,50 @@ void export_values() noexcept {
         for (size_t i = 0; i < plain.physical_b.node_count; ++i) physical_row(out.physical[i + 1], i, plain.physical_b.nodes[i]);
     }
 }
+// This permits the existing full census after an ATTEMPT; it is never a drain receipt.
+auto prepare_endpoint(Task& actor, const Session& local, Reason& reason) noexcept -> Outcome {
+    namespace reclaim = mod::mm::reclaim;
+    auto valid_actor = [&] {
+        uint64_t serial = 0;
+        return admitted(actor, serial) && serial == local.root_serial;
+    };
+    auto frontier = [&]() -> Outcome {
+        if (mod::time::get_us() >= local.deadline) {
+            reason = Reason::DEADLINE;
+            return Outcome::REFUSE;
+        }
+        if (!valid_actor()) {
+            reason = Reason::ROOT_CHANGED;
+            return Outcome::REFUSE;
+        }
+        return Outcome::ACCEPT;
+    };
+    for (unsigned index = 0; index < 2; ++index) {
+        if (frontier() != Outcome::ACCEPT) return Outcome::REFUSE;
+        reclaim::ReclaimRequest const request{
+            .context = reclaim::ReclaimContext::EXPLICIT,
+            .priority = reclaim::ReclaimPriority::CRITICAL,
+            .requested_order = 0,
+            .target_pages = 128,
+            .budget_units = index == 0 ? uint64_t{128} : uint64_t{64} * 1024 * 1024,
+            .scan_budget_units = index == 0 ? uint64_t{4096} : uint64_t{8192},
+            .deadline_us = local.deadline,
+            .may_block = true,
+            .may_io = false,
+            .may_allocate = false,
+            .node_mask = 0,
+        };
+        auto const result = reclaim::run(request, index == 0 ? "file_mmap_cache" : "buffer_cache");
+        if (frontier() != Outcome::ACCEPT) return Outcome::REFUSE;
+        reason = Reason::PROVIDER_DEBT;
+        if (result.unsafe_context || result.recursion_avoided || result.node_status != reclaim::NodeReclaimStatus::NONE)
+            return Outcome::REFUSE;
+        if (result.lease_contended || (result.has_more && result.made_progress)) return Outcome::WAIT;
+        // has_more includes held clean buffers; no progress is NOT proof of drain.
+        // ReclaimRunResult cannot certify callback coverage or individual failure.
+    }
+    return frontier();
+}
 void request_progress() noexcept {
     // No scope/owner/pin/session lock survives here. Do not close providers.
     sched::request_gc();
@@ -468,8 +513,11 @@ class CensusHandler final {
             } else if (ntp != lifecycle60::GateResult::ACCEPT || writeback != vfs::SelftestWritebackPreparation::READY) {
                 reason = Reason::PROVIDER_DEBT;
             } else {
-                collected = true;
-                result = collect(actor, local, reason);
+                result = request.phase == static_cast<uint32_t>(Phase::PREPARE) ? Outcome::ACCEPT : prepare_endpoint(actor, local, reason);
+                if (result == Outcome::ACCEPT) {
+                    collected = true;
+                    result = collect(actor, local, reason);
+                }
             }
         }
         if (mod::time::get_us() >= local.deadline && result != Outcome::REFUSE) {

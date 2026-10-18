@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <platform/mm/reclaim.hpp>
 #include <type_traits>
 #include <vector>
 namespace fixture {
@@ -343,6 +344,45 @@ auto drain_kernel_vmap_frees_bounded(size_t n) {
     return 0;
 }
 }  // namespace ker::mod::mm::virt
+namespace fixture {
+std::array<ker::mod::mm::reclaim::ReclaimRunResult, 2> reclaim_results{};
+std::array<unsigned, 2> reclaim_effects{};
+std::vector<std::string_view> reclaim_calls;
+uint64_t reclaim_deadline{}, reclaim_late{};
+}  // namespace fixture
+namespace ker::mod::mm::reclaim {
+auto run(const ReclaimRequest& request, std::string_view name) -> ReclaimRunResult {
+    fixture::outside();
+    fixture::check(fixture::irq && fixture::preempt == 0 && fixture::current != nullptr);
+    bool const file = name == "file_mmap_cache";
+    fixture::check(file || name == "buffer_cache");
+    fixture::check(request.context == ReclaimContext::EXPLICIT && request.priority == ReclaimPriority::CRITICAL &&
+                   request.requested_order == 0 && request.target_pages == 128 && request.node_mask == 0 && request.may_block &&
+                   !request.may_io && !request.may_allocate);
+    fixture::check(request.budget_units == (file ? uint64_t{128} : uint64_t{64} * 1024 * 1024) &&
+                   request.scan_budget_units == (file ? 4096 : 8192));
+    fixture::check(fixture::reclaim_deadline == 0 || request.deadline_us == fixture::reclaim_deadline);
+    fixture::reclaim_calls.push_back(name);
+    unsigned const index = file ? 0 : 1;
+    switch (fixture::reclaim_effects[index]) {
+        case 1:
+            ++fixture::root_serial;
+            break;
+        case 2:
+            fixture::irq = false;
+            break;
+        case 3:
+            fixture::preempt = 1;
+            break;
+        case 4:
+            fixture::now = fixture::reclaim_late;
+            break;
+        default:
+            break;
+    }
+    return fixture::reclaim_results[index];
+}
+}  // namespace ker::mod::mm::reclaim
 /* @OWNER@ */
 namespace ker::mod::mm::file_mapping {
 class LifetimeRetirementExecutor {
@@ -611,6 +651,10 @@ ker::mod::sched::task::Task actor;
 Report output;
 Request request;
 void reset() {
+    reclaim_results = {};
+    reclaim_effects = {};
+    reclaim_calls.clear();
+    reclaim_deadline = reclaim_late = 0;
     for (auto& id : ids) id = 0;
     current = &actor;
     can_query = true;
@@ -716,6 +760,56 @@ void begin() {
     accept(Phase::BEGIN);
     ++now;
 }
+void endpoint_attempt_cases() {
+    reset();
+    accept(Phase::PREPARE);
+    check(reclaim_calls.empty());
+    reclaim_deadline = session.deadline;
+    unsigned before = physical_calls;
+    accept(Phase::BEGIN);
+    check(reclaim_calls == std::vector<std::string_view>{"file_mmap_cache", "buffer_cache"});
+    check(physical_calls == before + 2);
+    reclaim_calls.clear();
+    accept(Phase::END);
+    check(reclaim_calls == std::vector<std::string_view>{"file_mmap_cache", "buffer_cache"});
+    for (unsigned target = 0; target < 2; ++target) {
+        for (unsigned kind = 0; kind < 5; ++kind) {
+            reset();
+            accept(Phase::PREPARE);
+            reclaim_deadline = session.deadline;
+            auto& response = reclaim_results[target];
+            if (kind == 0) response.lease_contended = true;
+            if (kind == 1) response.has_more = response.made_progress = true;
+            if (kind == 2) response.unsafe_context = true;
+            if (kind == 3) response.recursion_avoided = true;
+            if (kind == 4) response.node_status = ker::mod::mm::reclaim::NodeReclaimStatus::SOURCE_FAILED;
+            before = physical_calls;
+            check(call(Phase::BEGIN) == 0);
+            check(output.header.outcome == static_cast<uint64_t>(kind < 2 ? Outcome::WAIT : Outcome::REFUSE));
+            check(output.header.coverage == 0 && physical_calls == before && !(session.flags & SESSION_BASELINE));
+            check(reclaim_calls.size() == target + 1);
+        }
+        for (unsigned change = 1; change <= 4; ++change) {
+            reset();
+            accept(Phase::PREPARE);
+            reclaim_deadline = session.deadline;
+            reclaim_late = session.deadline;
+            reclaim_effects[target] = change;
+            before = physical_calls;
+            check(call(Phase::BEGIN) == (change == 4 ? 0 : -EPERM));
+            check(output.header.outcome == static_cast<uint64_t>(Outcome::REFUSE) && output.header.coverage == 0);
+            check(output.header.reason == static_cast<uint64_t>(change == 4 ? Reason::DEADLINE : Reason::ROOT_CHANGED));
+            check(physical_calls == before && !(session.flags & SESSION_BASELINE));
+        }
+    }
+    reset();
+    accept(Phase::PREPARE);
+    reclaim_results[0].has_more = reclaim_results[1].has_more = true;
+    accept(Phase::BEGIN);  // No-progress is permission to collect, never a drain receipt.
+    ++active_tasks;
+    check(call(Phase::END) == 0 && output.header.outcome == static_cast<uint64_t>(Outcome::WAIT));
+    check(output.header.coverage == 0 && !(session.flags & SESSION_ENDED));  // Full baseline oracle still rejects.
+}
 void mremap_policy_presence_census_case() {
     reset();
     check(actor.pending_mremap_ps_policies == nullptr);
@@ -765,6 +859,7 @@ int main() {
     check(session.flags & SESSION_ENDED);
     check(physical_calls == 6);
     check(lock_depth == 0 && copy_pins == 0);
+    endpoint_attempt_cases();
     mremap_policy_presence_census_case();
     reset();
     check(!std::is_constructible_v<CurrentCensusScope, ker::mod::sched::task::Task&, uint64_t, uint64_t>);

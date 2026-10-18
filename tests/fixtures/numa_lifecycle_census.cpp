@@ -2,6 +2,7 @@
 #define WOS_SELFTEST 1
 #include <fcntl.h>
 #include <grp.h>
+#include <link.h>
 #include <signal.h>
 #include <sys/process.h>
 #include <sys/stat.h>
@@ -136,6 +137,47 @@ void prefault_transport() {
         bytes[i] = value;
     }
 }
+constexpr size_t ENDPOINT_MAX_OBJECTS = 64, ENDPOINT_MAX_HEADERS = 4096, ENDPOINT_MAX_PAGES = 65536;
+constexpr uintptr_t ENDPOINT_PAGE = 4096;
+struct EndpointPrefault {
+    size_t objects{}, headers{}, pages{};
+};
+auto prefault_loaded_object(dl_phdr_info* info, size_t bytes, void* opaque) -> int {
+    if (info == nullptr || opaque == nullptr || bytes < sizeof(dl_phdr_info) || !time_left()) return 1;
+    auto& scan = *static_cast<EndpointPrefault*>(opaque);
+    if (scan.objects >= ENDPOINT_MAX_OBJECTS || scan.headers > ENDPOINT_MAX_HEADERS ||
+        info->dlpi_phnum > ENDPOINT_MAX_HEADERS - scan.headers || (info->dlpi_phnum != 0 && info->dlpi_phdr == nullptr))
+        return 1;
+    ++scan.objects;
+    scan.headers += info->dlpi_phnum;
+    for (size_t i = 0; i < info->dlpi_phnum; ++i) {
+        auto const& phdr = info->dlpi_phdr[i];
+        if (phdr.p_type != PT_LOAD || (phdr.p_flags & PF_R) == 0 || phdr.p_memsz == 0) continue;
+        uintptr_t const BASE = info->dlpi_addr;
+        if (phdr.p_vaddr > UINTPTR_MAX - BASE) return 1;
+        uintptr_t address = BASE + phdr.p_vaddr;
+        if (phdr.p_memsz > UINTPTR_MAX - address) return 1;
+        uintptr_t const END = address + phdr.p_memsz;
+        while (address < END) {
+            if (scan.pages >= ENDPOINT_MAX_PAGES || !time_left()) return 1;
+            (void)*reinterpret_cast<const volatile unsigned char*>(address);
+            ++scan.pages;
+            uintptr_t const STEP = ENDPOINT_PAGE - (address & (ENDPOINT_PAGE - 1));
+            if (END - address <= STEP) break;
+            address += STEP;
+        }
+    }
+    return time_left() ? 0 : 1;
+}
+auto prepare_endpoint() -> bool {
+    for (int fd : files) {
+        if (fd < 0 || !time_left() || ::fsync(fd) != 0 || !time_left()) return false;
+    }
+    prefault_transport();
+    EndpointPrefault scan{};
+    return time_left() && ::dl_iterate_phdr(prefault_loaded_object, &scan) == 0 && scan.objects != 0 && scan.pages != 0 && time_left();
+}
+
 auto prepare_files() -> bool {
     if (::mkdir(DIRECTORY, 0700) != 0 && errno != EEXIST) return false;
     for (size_t i = 0; i < 5; ++i) {
@@ -278,9 +320,11 @@ auto main(int argc, char** argv) -> int {
     prefault_transport();
     if (!prepare_files() || !poll_census(nl::Phase::PREPARE)) return finish_failure(73, "prepare-files");
     int64_t warm_pid{}, measured_pid{};
-    if (!child(0, parent, argv[2], warm_pid) || !poll_census(nl::Phase::BEGIN)) return finish_failure(74, "warm-BEGIN");
+    if (!child(0, parent, argv[2], warm_pid) || !prepare_endpoint() || !poll_census(nl::Phase::BEGIN))
+        return finish_failure(74, "warm-BEGIN");
     transport.begin = transport.output;
-    if (!child(1, parent, argv[2], measured_pid) || !poll_census(nl::Phase::END)) return finish_failure(75, "measured-END");
+    if (!child(1, parent, argv[2], measured_pid) || !prepare_endpoint() || !poll_census(nl::Phase::END))
+        return finish_failure(75, "measured-END");
     transport.end = transport.output;
     if (!identity(0, INITIAL) || ker::process::getppid() != 1 || !save_record(files[2], transport.begin) ||
         !save_record(files[3], transport.end))

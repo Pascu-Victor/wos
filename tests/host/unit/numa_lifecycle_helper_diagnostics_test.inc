@@ -1,5 +1,6 @@
 // Actual helper bodies use explicit raw syscall, clock and owned-file ports.
 // No WOS process, credential transition, native context or VM is constructed.
+#include <link.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -33,11 +34,31 @@ int header_case{};
 bool wait_once{};
 ssize_t short_write{-1};
 std::string record;
+std::vector<int> endpoint_fds;
+unsigned endpoint_syncs{}, image_walks{};
+int endpoint_fail_index{-1}, endpoint_late_index{-1}, iterate_error{};
+bool iterate_empty{};
+uint64_t endpoint_late_at{};
+size_t observed_pages{};
+alignas(4096) unsigned char loaded_pages[3 * 4096]{};
+auto iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void*) -> int;
 
 void check(bool value, const char* why) {
     ++assertions;
     if (!value && failures++ < 24) std::fprintf(stderr, "FAIL: %s\n", why);
 }
+auto endpoint_fsync(int fd) -> int {
+    unsigned const index = endpoint_syncs++;
+    check(fd == 5 + static_cast<int>(index % 5), "actual fixed five-FD endpoint fsync order");
+    endpoint_fds.push_back(fd);
+    if (endpoint_late_index == static_cast<int>(index)) now = endpoint_late_at;
+    if (endpoint_fail_index == static_cast<int>(index)) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 auto clock_gettime(clockid_t, timespec* output) -> int {
     ++clocks;
     if (clock_error) {
@@ -196,6 +217,7 @@ namespace {
 namespace nl = ker::test::numa_lifecycle;
 /* @ACTUAL_STORAGE_AND_DIAGNOSTIC@ */
 /* @ACTUAL_CLOCK_AND_PREFAULT@ */
+/* @ACTUAL_ENDPOINT_PREPARATION@ */
 [[noreturn]] void run_child(int, uint64_t, const char*) { std::abort(); }  // Declared unexecuted CPL3/exec endpoint.
 /* @ACTUAL_CHILD@ */
 /* @ACTUAL_CHILD_CALL@ */
@@ -207,9 +229,37 @@ auto after_prepare() -> int {
     /* @ACTUAL_WARM_BEGIN_BRANCH@ */
     return 0;
 }
+auto after_both_endpoints() -> int {
+    constexpr uint64_t parent = 50;
+    char seed[] = "11";
+    char* argv[]{nullptr, nullptr, seed};
+    /* @ACTUAL_BOTH_ENDPOINT_BRANCH@ */
+    return 0;
+}
 }  // namespace
 
 namespace fixture {
+auto iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void* opaque) -> int {
+    ++image_walks;
+    if (iterate_error != 0) return iterate_error;
+    if (iterate_empty) return 0;
+    ElfW(Phdr) headers[2]{};
+    headers[0].p_type = PT_LOAD;
+    headers[0].p_flags = PF_R;
+    headers[0].p_vaddr = 3;
+    headers[0].p_memsz = 8190;
+    headers[1].p_type = PT_LOAD;
+    headers[1].p_flags = PF_W;
+    headers[1].p_vaddr = UINTPTR_MAX;
+    headers[1].p_memsz = UINTPTR_MAX;
+    dl_phdr_info info{};
+    info.dlpi_addr = reinterpret_cast<uintptr_t>(loaded_pages);
+    info.dlpi_phdr = headers;
+    info.dlpi_phnum = 2;
+    int const result = callback(&info, sizeof(info), opaque);
+    observed_pages = static_cast<EndpointPrefault*>(opaque)->pages;
+    return result;
+}
 void reset() {
     ++cases;
     waits.clear();
@@ -223,19 +273,120 @@ void reset() {
     wait_once = false;
     short_write = -1;
     record.clear();
+    endpoint_fds.clear();
+    endpoint_syncs = image_walks = 0;
+    endpoint_fail_index = endpoint_late_index = -1;
+    endpoint_late_at = 0;
+    iterate_error = 0;
+    iterate_empty = false;
+    observed_pages = 0;
     failure = {};
     nonce = 11;
     cookie = 0;
     diagnostic_parent = 50;
     deadline_ns = 850'000'000'000;
-    for (auto& fd : files) fd = -1;
-    files[4] = 9;
+    for (unsigned i = 0; i < 5; ++i) files[i] = 5 + static_cast<int>(i);
     transport = {};
     errno = EACCES;
 }
 void expect_stage(const char* phase, const char* stage) {
     check(failure.phase != nullptr && std::strcmp(failure.phase, phase) == 0, "exact failure phase");
     check(failure.stage != nullptr && std::strcmp(failure.stage, stage) == 0, "exact failure stage");
+}
+void endpoint_cases() {
+    reset();
+    waits = {{41, 0}, {41, 0}};
+    check(after_both_endpoints() == 0 && census_calls == 2 && image_walks == 2, "actual both endpoint caller branches");
+    check(endpoint_fds == std::vector<int>{5, 6, 7, 8, 9, 5, 6, 7, 8, 9} && endpoint_syncs == 10 && observed_pages == 3,
+          "identical five owned FDs plus actual unaligned multi-page readable PT_LOAD at both endpoints");
+    check(syncs == 0 && seeks == 0 && writes == 0, "endpoint maintenance adds no failure diagnostic writes");
+    for (int fail = 0; fail < 5; ++fail) {
+        reset();
+        waits = {{41, 0}};
+        endpoint_fail_index = fail;
+        check(after_prepare() == 74 && census_calls == 0 && image_walks == 0 && endpoint_syncs == static_cast<unsigned>(fail + 1),
+              "actual endpoint fsync refusal prevents BEGIN");
+    }
+    reset();
+    waits = {{41, 0}, {41, 0}};
+    endpoint_fail_index = 7;
+    check(after_both_endpoints() == 75 && census_calls == 1 && image_walks == 1, "measured endpoint failure prevents END");
+    reset();
+    waits = {{41, 256}};
+    check(after_prepare() == 74 && endpoint_syncs == 0 && image_walks == 0 && census_calls == 0,
+          "actual nonzero child raw status prevents endpoint work");
+    reset();
+    waits = {{41, 0}};
+    iterate_empty = true;
+    check(after_prepare() == 74 && census_calls == 0 && endpoint_syncs == 5 && image_walks == 1,
+          "empty actual object enumeration cannot admit BEGIN");
+    reset();
+    files[0] = -1;
+    check(!prepare_endpoint() && endpoint_syncs == 0 && image_walks == 0, "invalid owned FD refuses before endpoint work");
+    reset();
+    waits = {{41, 0}};
+    iterate_error = 1;
+    check(after_prepare() == 74 && census_calls == 0, "enumeration refusal prevents BEGIN");
+    reset();
+    deadline_ns = now;
+    check(!prepare_endpoint() && endpoint_syncs == 0, "original endpoint deadline never renewed");
+    reset();
+    endpoint_late_index = 0;
+    endpoint_late_at = deadline_ns;
+    check(!prepare_endpoint() && endpoint_syncs == 1 && image_walks == 0, "late actual fsync completion cannot renew deadline");
+    reset();
+    clock_error = EIO;
+    check(!prepare_endpoint() && endpoint_syncs == 0, "invalid endpoint clock refuses before I/O");
+    reset();
+    ElfW(Phdr) header{};
+    header.p_type = PT_LOAD;
+    header.p_flags = PF_R;
+    header.p_memsz = 1;
+    dl_phdr_info info{};
+    info.dlpi_addr = reinterpret_cast<uintptr_t>(loaded_pages);
+    info.dlpi_phdr = &header;
+    info.dlpi_phnum = 1;
+    EndpointPrefault scan{};
+    check(prefault_loaded_object(&info, sizeof(info), &scan) == 0 && scan.pages == 1, "actual one-page readable callback");
+    static const unsigned char readonly_page[] = {0x41};
+    header.p_flags = PF_R | PF_W;
+    info.dlpi_addr = reinterpret_cast<uintptr_t>(readonly_page);
+    scan = {};
+    check(prefault_loaded_object(&info, sizeof(info), &scan) == 0 && readonly_page[0] == 0x41,
+          "PF_W metadata does not write a final read-only object");
+    header.p_flags = PF_R;
+    info.dlpi_addr = reinterpret_cast<uintptr_t>(loaded_pages);
+    scan = {};
+    scan.objects = ENDPOINT_MAX_OBJECTS;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == 0, "object cap refuses before read");
+    scan = {};
+    scan.headers = ENDPOINT_MAX_HEADERS;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == 0, "header cap refuses before read");
+    scan = {};
+    scan.pages = ENDPOINT_MAX_PAGES;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == ENDPOINT_MAX_PAGES, "page cap refuses before read");
+    scan = {};
+    info.dlpi_addr = UINTPTR_MAX;
+    header.p_vaddr = 1;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == 0, "base plus vaddr overflow refuses before read");
+    scan = {};
+    info.dlpi_addr = UINTPTR_MAX - 1;
+    header.p_vaddr = 0;
+    header.p_memsz = 2;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == 0, "segment end overflow refuses before read");
+    scan = {};
+    check(prefault_loaded_object(&info, sizeof(info) - 1, &scan) != 0 && scan.objects == 0, "short phdr-info refusal");
+    info.dlpi_addr = reinterpret_cast<uintptr_t>(loaded_pages);
+    header.p_memsz = 1;
+    scan = {};
+    step = deadline_ns - now;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == 0,
+          "page read refuses original deadline after object check");
+    step = 0;
+    now = 1'000'000'000;
+    info.dlpi_addr = reinterpret_cast<uintptr_t>(loaded_pages);
+    info.dlpi_phdr = nullptr;
+    check(prefault_loaded_object(&info, sizeof(info), &scan) != 0 && scan.pages == 0, "missing actual phdr pointer refusal");
 }
 void writer_cases() {
     reset();
@@ -388,6 +539,7 @@ void census_cases() {
 }  // namespace fixture
 
 auto main() -> int {
+    fixture::endpoint_cases();
     fixture::writer_cases();
     fixture::child_cases();
     fixture::census_cases();

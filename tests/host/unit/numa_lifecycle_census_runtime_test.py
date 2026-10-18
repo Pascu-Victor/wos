@@ -219,6 +219,8 @@ def main():
         "test/lifecycle_owner_census.hpp",
         "test/compartment_lifecycle_census.hpp",
         "platform/mm/lifecycle_storage.hpp",
+        "platform/mm/reclaim.hpp",
+        "platform/mm/reclaim_policy.hpp",
         "vfs/fd_reservation.hpp",
         "vfs/mount.hpp",
         "platform/sched/resource_process.hpp",
@@ -286,6 +288,7 @@ def main():
         ]
         generated = source.read_text()
         registry_function = capture(generated, "auto same_registry_rows(")
+        endpoint_function = capture(generated, "auto prepare_endpoint(")
         mm_function = capture(generated, "auto same_mm_debt(")
         tail_before = "    adjust_native_return_tail(true);"
         assert generated.count(tail_before) == 2
@@ -297,6 +300,8 @@ def main():
         assert generated.count(policy_presence) == 1
         variants = {
             "actual": generated,
+            "omit-endpoint-maintenance": generated.replace(
+                endpoint_function, endpoint_function[:endpoint_function.index("{")] + "{ return Outcome::ACCEPT; }", 1),
             "omit-mremap-policy-presence": generated.replace(
                 policy_presence, "    // deliberately omitted actual mremap policy presence row", 1
             ),

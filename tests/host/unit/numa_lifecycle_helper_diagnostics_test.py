@@ -462,6 +462,10 @@ def main():
             begin = main_body.index("    int64_t warm_pid{}, measured_pid{};")
             end = main_body.index("    transport.begin = transport.output;", begin)
             branch = main_body[begin:end]
+            both_end = main_body.index("    transport.end = transport.output;", end) + len("    transport.end = transport.output;")
+            both_branch = main_body[begin:both_end]
+            endpoint = actual[actual.index("constexpr size_t ENDPOINT_MAX_OBJECTS"):actual.index("auto prepare_files(")]
+            endpoint = endpoint.replace("::fsync(", "::fixture::endpoint_fsync(").replace("::dl_iterate_phdr(", "::fixture::iterate_phdr(")
             result["extractions"] = extracted
             result["storage_source"] = dict(bytes=len(storage.encode()), sha256=hashlib.sha256(storage.encode()).hexdigest())
             result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
@@ -479,10 +483,12 @@ def main():
                 "ACTUAL_STORAGE_AND_DIAGNOSTIC": ported(storage),
                 "ACTUAL_CLOCK_AND_PREFAULT": ported("\n".join(take(anchor) for anchor in
                                                 ["auto now_ns(", "auto pause_poll(", "auto time_left(", "void prefault_transport("])),
+                "ACTUAL_ENDPOINT_PREPARATION": ported(endpoint),
                 "ACTUAL_CHILD": take("struct Child {", True),
                 "ACTUAL_CHILD_CALL": child,
                 "ACTUAL_CENSUS_CALL": ported(poll),
                 "ACTUAL_WARM_BEGIN_BRANCH": branch,
+                "ACTUAL_BOTH_ENDPOINT_BRANCH": both_branch,
             }
             generated = shell.read_text()
             for name, body in replacements.items():
@@ -492,6 +498,7 @@ def main():
                 generated = generated.replace(marker, body)
             variants = {"actual": generated}
             for name, old, new in [
+                ("omit-endpoint-fsync", "::fixture::endpoint_fsync(fd) != 0", "false"),
                 ("lost-child-status", ".wait_status = status,", ".wait_status = 0,"),
                 ("stale-transport-header", '"census-transport", result, CENSUS_RESULT)',
                  '"census-transport", result, CENSUS_RESULT | HEADER)'),
