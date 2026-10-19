@@ -243,6 +243,39 @@ void poison_range(const void* ptr, size_t size, int8_t value) {
     }
 }
 
+// An absent demand-zero shadow page already represents full accessibility.
+// Query only under the existing mapping flag. Never wait for it here: callers
+// can hold locks taken by the shadow fault's page-table publication path.
+static auto clear_aligned_shadow_without_materializing(uintptr_t start, size_t size) -> bool {
+    if (start < 0xffff800000000000ULL) return false;
+    uintptr_t shadow = reinterpret_cast<uintptr_t>(addr_to_shadow(start));
+    size_t remaining = size / 8;
+    if (shadow < SHADOW_REGION_BASE || shadow >= SHADOW_REGION_END || remaining > SHADOW_REGION_END - shadow) return false;
+    auto* const kernel_pt = mm::virt::get_kernel_pagemap();
+    if (kernel_pt == nullptr) return false;
+
+    while (remaining != 0) {
+        size_t const PAGE_REMAINING = mm::paging::PAGE_SIZE - (shadow & (mm::paging::PAGE_SIZE - 1));
+        size_t const CHUNK = remaining < PAGE_REMAINING ? remaining : PAGE_REMAINING;
+        uint64_t irq_flags = 0;
+        asm volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
+        bool absent = false;
+        if (!s_shadow_map_lock.test_and_set(std::memory_order_acquire)) {
+            absent = mm::virt::translate(kernel_pt, shadow & ~(mm::paging::PAGE_SIZE - 1)) == mm::virt::PADDR_INVALID;
+            s_shadow_map_lock.clear(std::memory_order_release);
+        }
+        if ((irq_flags & 0x200U) != 0U) asm volatile("sti" : : : "memory");
+        // Kernel shadow mappings persist. An absence observation linearizes
+        // before a racing demand-zero publication and its subsequent poison.
+        // A present kernel PTE can still be absent in the current PML4: retain
+        // the original virtual write/fault path only after dropping the flag.
+        if (!absent) std::memset(reinterpret_cast<void*>(shadow), SHADOW_ACCESSIBLE, CHUNK);
+        shadow += CHUNK;
+        remaining -= CHUNK;
+    }
+    return true;
+}
+
 void unpoison_range(const void* ptr, size_t size) {
     if (size == 0) {
         return;
@@ -254,7 +287,9 @@ void unpoison_range(const void* ptr, size_t size) {
     // Kernel resume clears a large retired-stack extent with interrupts off;
     // use the excluded scalar/rep-stos runtime instead of an O0 per-granule walk.
     if ((START & 7U) == 0 && (size & 7U) == 0 && END > START) {
-        std::memset(addr_to_shadow(START), SHADOW_ACCESSIBLE, size / 8);
+        if (!clear_aligned_shadow_without_materializing(START, size)) {
+            std::memset(addr_to_shadow(START), SHADOW_ACCESSIBLE, size / 8);
+        }
         return;
     }
     for (uintptr_t granule = START & ~0x7ULL; granule < END; granule += 8) {

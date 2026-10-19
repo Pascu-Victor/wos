@@ -407,6 +407,7 @@ UNIT_TESTS=(
     ivshmem_ring_test
     lazy_file_fault_runtime_test
     native_lazy_file_fault_runtime_test
+    kasan_shadow_runtime_test
     netd_resolver_test
     pci_ecam_test
     reclaim_runtime_test

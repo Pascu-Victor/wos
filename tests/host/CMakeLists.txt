@@ -1125,6 +1125,13 @@ add_test(
     NAME kasan_bootstrap_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kasan_bootstrap_source_test.py
 )
+add_test(NAME kasan_shadow_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kasan_shadow_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(kasan_shadow_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 120
+)
 add_test(
     NAME signal_atomic_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/signal_atomic_source_test.py
