@@ -367,11 +367,12 @@ auto get_kernel_pagemap()->PageTable*{return kernel_pagemap;}
         ]:
             out += [d("platform/mm/virt.opt.cpp", anchor)]
         out += [
-            self.span(
-                "platform/mm/virt.opt.cpp",
-                "struct PreparedAnonymousSwapFork::Storage",
-                "\nnamespace {\nauto clone_anonymous_swap_mappings",
-            ),
+            d("platform/mm/virt.opt.cpp", "struct PreparedAnonymousSwapFork::Storage"),
+            "namespace detail {\n",
+            d("platform/mm/virt.opt.cpp", "struct PreparedSwapForkAccess {"),
+            d("platform/mm/virt.opt.cpp", "auto prepare_anonymous_swap_fork("),
+            d("platform/mm/virt.opt.cpp", "void reset_anonymous_swap_fork("),
+            "}\n",
             d("platform/mm/virt.opt.cpp", "void purge_anonymous_swap_mappings("),
         ]
         header = self.sources["platform/mm/virt.hpp"]

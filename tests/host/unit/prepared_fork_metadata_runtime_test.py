@@ -144,10 +144,13 @@ def generate(root: Path, scratch: Path, mode: str, helper) -> list:
             "} namespace ker::mod::mm::virt {",
             (unit / "prepared_fork_swap_endpoints.inc").read_text(),
         ]
-        a = source.index("struct PreparedAnonymousSwapFork::Storage")
-        b = source.index("\nnamespace {\nauto clone_anonymous_swap_mappings", a)
         chunks += [
-            source[a:b],
+            body(source, "struct PreparedAnonymousSwapFork::Storage", True),
+            "namespace detail {\n",
+            body(source, "struct PreparedSwapForkAccess {", True),
+            body(source, "auto prepare_anonymous_swap_fork("),
+            body(source, "void reset_anonymous_swap_fork("),
+            "}\n",
             body(source, "auto clone_anonymous_swap_mappings("),
             body(source, "void purge_anonymous_swap_mappings("),
         ]
