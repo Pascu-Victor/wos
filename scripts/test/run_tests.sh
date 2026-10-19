@@ -214,6 +214,7 @@ UNIT_TESTS=(
     gc_epoch_progress_test
     userspace_startup_test
     scheduler_source_test
+    kernel_bootstrap_idle_runtime_test
     kernel_wait_accounting_runtime_test
     preempt_guard_timing_test
     kernel_preemption_cpu_local_audit_test

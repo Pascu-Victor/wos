@@ -6283,47 +6283,11 @@ void start_scheduler() {
     });
 
     if (first_task == nullptr || first_task->type == task::TaskType::IDLE) {
-        // Set idle task as current while waiting
-        publish_current_task_boot_exception(rq, rq->idle_task);
+        // Keep the bootstrap continuation masked until the idle handoff installs
+        // the allocated stack and commits its owner before entering the ASM loop.
+        asm volatile("cli" ::: "memory");
         scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::current_cpu(), std::memory_order_acq_rel);
-
-        for (;;) {
-            rq->is_idle.store(true, std::memory_order_release);
-            arm_idle_timer_for_this_cpu();
-            asm volatile("sti");
-            asm volatile("hlt");
-            asm volatile("cli");
-            rq->is_idle.store(false, std::memory_order_release);
-
-            // Check under lock if we have a non-idle task
-            first_task = run_queues->this_cpu_locked([](RunQueue* rq) -> task::Task* {
-                if (rq->runnable_heap.size == 0) {
-                    return nullptr;
-                }
-
-                // Scan heap for a non-idle, ready task
-                int64_t const AVG = compute_avg_vruntime(rq);
-                task::Task* candidate = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
-                if (candidate == nullptr) {
-                    return nullptr;
-                }
-                if (candidate->type == task::TaskType::IDLE) {
-                    return nullptr;
-                }
-                if (candidate->type == task::TaskType::PROCESS && candidate->thread == nullptr) {
-                    return nullptr;
-                }
-
-                candidate->store_cpu(cpu::current_cpu());
-                transition_publish_current_locked(rq, candidate);
-                return candidate;
-            });
-
-            if (first_task != nullptr) {
-                dbg::log("CPU %d: Found task PID %x, starting", cpu::current_cpu(), first_task->pid);
-                break;
-            }
-        }
+        enter_idle_loop(rq);
     } else {
         scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::current_cpu(), std::memory_order_acq_rel);
     }

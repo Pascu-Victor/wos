@@ -1089,6 +1089,13 @@ add_test(
     NAME scheduler_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_source_test.py
 )
+add_test(NAME kernel_bootstrap_idle_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_bootstrap_idle_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(kernel_bootstrap_idle_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 120
+)
 add_test(
     NAME preempt_guard_timing_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/preempt_guard_timing_test.py
