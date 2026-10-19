@@ -10,6 +10,13 @@
 #include <test/ktest.hpp>
 #include <type_traits>
 
+#ifdef WOS_KASAN
+#include <array>
+#include <platform/mm/mm.hpp>
+#include <platform/mm/virt.hpp>
+#include <sanitizer/kasan.hpp>
+#endif
+
 namespace {
 namespace mm = ker::mod::mm;
 namespace numa = mm::numa;
@@ -135,6 +142,103 @@ auto collect_comparable() -> bool {
     KEXPECT_EQ(buddy, cheap.global.buddy_free);
     return true;
 }
+
+#ifdef WOS_KASAN
+constexpr size_t KASAN_REUSE_ITERATIONS = 32;
+constexpr size_t KASAN_VMAP_PAGES = 16;
+constexpr uint64_t KASAN_VMAP_BYTES = KASAN_VMAP_PAGES * mm::paging::PAGE_SIZE;
+constexpr size_t KASAN_DRAIN_PAGES = 128;
+// Match the allocator's existing256MiB warm-pool policy; setup only.
+constexpr size_t KASAN_SETUP_MAX_PAGES = (size_t{256} * 1024 * 1024) / mm::paging::PAGE_SIZE;
+constinit balance::Snapshot kasan_reuse_baseline{};
+constinit std::array<mm::addr::paddr_t, KASAN_VMAP_PAGES> kasan_reuse_frames{};
+static_assert(sizeof(kasan_reuse_baseline) + sizeof(kasan_reuse_frames) <= 96 * 1024);
+
+void prepare_kasan_reuse_storage() {
+    prepare_observation_storage();
+    prepare_observation_buffer(kasan_reuse_baseline);
+    prepare_observation_buffer(kasan_reuse_frames);
+}
+
+void expect_owner_rows_same(const balance::Counts& actual, const balance::Counts& expected) {
+    KEXPECT_EQ(actual.managed_pages, expected.managed_pages);
+    KEXPECT_EQ(actual.free_pages, expected.free_pages);
+    KEXPECT_EQ(actual.allocator_metadata_pages, expected.allocator_metadata_pages);
+    KEXPECT_EQ(actual.zone_descriptor_pages, expected.zone_descriptor_pages);
+    KEXPECT_EQ(actual.owner_pages, expected.owner_pages);
+    for (size_t owner = 0; owner < mm::PHYSICAL_PAGE_OWNER_COUNT; ++owner) {
+        KEXPECT_EQ(actual.owners[owner].pages, expected.owners[owner].pages);
+        KEXPECT_EQ(actual.owners[owner].objects, expected.owners[owner].objects);
+    }
+}
+
+void expect_kasan_reuse_owners_same() {
+    KEXPECT_EQ(scanned.node_count, kasan_reuse_baseline.node_count);
+    KEXPECT_EQ(scanned.zone_count, kasan_reuse_baseline.zone_count);
+    expect_owner_rows_same(scanned.scanned, kasan_reuse_baseline.scanned);
+    for (size_t node = 0; node < scanned.node_count; ++node) expect_owner_rows_same(scanned.nodes[node], kasan_reuse_baseline.nodes[node]);
+}
+
+struct KasanStackSlot {
+    void* value{};
+    KasanStackSlot() = default;
+    KasanStackSlot(const KasanStackSlot&) = delete;
+    auto operator=(const KasanStackSlot&) -> KasanStackSlot& = delete;
+    ~KasanStackSlot() { reset(); }
+    void reset() {
+        if (value != nullptr) {
+            void* const STACK = value;
+            value = nullptr;
+            mm::phys::page_free(STACK);
+        }
+    }
+};
+
+// One sequential test owner. Free transfers the mapping to the existing warm
+// pool; it does not drain between iterations or release the reused backing.
+struct KasanVmapSpan {
+    void* value{};
+    bool acquired{};
+    bool finished{};
+    KasanVmapSpan() = default;
+    KasanVmapSpan(const KasanVmapSpan&) = delete;
+    auto operator=(const KasanVmapSpan&) -> KasanVmapSpan& = delete;
+    ~KasanVmapSpan() {
+        if (acquired && !finished) (void)finish();
+    }
+    void adopt(void* address) {
+        value = address;
+        acquired = acquired || address != nullptr;
+    }
+    void park() {
+        if (value != nullptr) {
+            void* const SPAN = value;
+            value = nullptr;
+            ker::mod::kasan::poison_range(SPAN, KASAN_VMAP_BYTES, ker::mod::kasan::SHADOW_HEAP_FREED);
+            mm::virt::kernel_vmap_free(SPAN, KASAN_VMAP_BYTES);
+        }
+    }
+    auto finish() -> bool {
+        park();
+        finished = true;  // Exactly one bounded attempt, including assertion exits.
+        auto const PENDING = mm::virt::kernel_vmap_pending_free_pages();
+        auto const DRAIN = mm::virt::drain_kernel_vmap_frees_bounded(KASAN_DRAIN_PAGES);
+        bool const OK = PENDING == KASAN_VMAP_PAGES && !DRAIN.failed && !DRAIN.unsafe_context && !DRAIN.has_more &&
+                        DRAIN.scanned_pages == PENDING && DRAIN.reclaimed_pages == PENDING &&
+                        mm::virt::kernel_vmap_pending_free_pages() == 0;
+        KEXPECT_TRUE(OK);
+        return OK;
+    }
+};
+
+void touch_kasan_vmap_span(void* address) {
+    ker::mod::kasan::unpoison_range(address, KASAN_VMAP_BYTES);
+    auto* bytes = static_cast<volatile uint8_t*>(address);
+    for (size_t page = 0; page < KASAN_VMAP_PAGES; ++page) bytes[page * mm::paging::PAGE_SIZE] = static_cast<uint8_t>(page);
+    bytes[KASAN_VMAP_BYTES - 1] = 0x5a;
+}
+#endif
+
 }  // namespace
 
 KTEST(NumaNodeCounters, BootBindingAndDiagnosticDenominatorsAgree) {
@@ -266,5 +370,151 @@ KTEST(NumaNodeCounters, ActualPerNodeSpansCloseCountersAndOwners) {
         "actual per-memory-node512 independent warmed-frame counter/owner transitions; BIND512 factory warmup; no scheduled pressure or "
         "SMP race claim");
 }
+
+#ifdef WOS_KASAN
+KTEST(Kasan, WarmedKernelStackSlotKeepsPhysicalOwners) {
+    prepare_kasan_reuse_storage();
+    KREQUIRE_TRUE(ker::mod::kasan::is_enabled());
+    KREQUIRE_TRUE(mm::phys::node_counters_ready());
+    KREQUIRE_TRUE(collect_comparable());
+
+    KasanStackSlot slot;
+    slot.value = mm::phys::kernel_stack_alloc("kasan_reuse_warm_stack");
+    KREQUIRE_NE(slot.value, nullptr);
+    uintptr_t const WARM_ADDRESS = reinterpret_cast<uintptr_t>(slot.value);
+    slot.reset();  // Allocator already unpoisoned and zeroed the entire slot.
+    auto const POOL = mm::phys::get_kernel_stack_pool_stats();
+    KREQUIRE_TRUE(POOL.capacity != 0 && POOL.free_slots != 0);
+    KREQUIRE_TRUE(collect_comparable());
+    kasan_reuse_baseline = scanned;
+    expect_kasan_reuse_owners_same();  // Warm this same comparator before measuring.
+    KREQUIRE_TRUE(collect_comparable());
+    kasan_reuse_baseline = scanned;
+
+    size_t completed = 0;
+    for (; completed < KASAN_REUSE_ITERATIONS; ++completed) {
+        slot.value = mm::phys::kernel_stack_alloc("kasan_reuse_stack");
+        bool const SAME = slot.value != nullptr && reinterpret_cast<uintptr_t>(slot.value) == WARM_ADDRESS;
+        slot.reset();
+        if (!SAME) break;
+    }
+    KEXPECT_EQ(completed, KASAN_REUSE_ITERATIONS);
+    auto const AFTER = mm::phys::get_kernel_stack_pool_stats();
+    KEXPECT_EQ(AFTER.capacity, POOL.capacity);
+    KEXPECT_EQ(AFTER.free_slots, POOL.free_slots);
+    KEXPECT_EQ(AFTER.high_watermark, POOL.high_watermark);
+    KREQUIRE_TRUE(collect_comparable());
+    expect_kasan_reuse_owners_same();
+}
+
+KTEST(Kasan, WarmedVmapSpanKeepsPhysicalOwners) {
+    prepare_kasan_reuse_storage();
+    KREQUIRE_TRUE(ker::mod::kasan::is_enabled());
+    KREQUIRE_TRUE(mm::phys::node_counters_ready());
+    KREQUIRE_TRUE(collect_comparable());
+
+    // Empty the captured legitimate warm pool before this test owns a span.
+    // Setup is bounded by the existing256MiB policy and128-page operations;
+    // every mismatch refuses before a measured baseline or own allocation.
+    auto const SETUP_PENDING = mm::virt::kernel_vmap_pending_free_pages();
+    log::info("kasan vmap reuse setup: captured=%zu cap=%zu quantum=%zu", SETUP_PENDING, KASAN_SETUP_MAX_PAGES, KASAN_DRAIN_PAGES);
+    KREQUIRE_TRUE(SETUP_PENDING <= KASAN_SETUP_MAX_PAGES);
+    size_t const SETUP_CALLS = (SETUP_PENDING + KASAN_DRAIN_PAGES - 1) / KASAN_DRAIN_PAGES;
+    size_t remaining = SETUP_PENDING;
+    for (size_t call = 0; call < SETUP_CALLS; ++call) {
+        KREQUIRE_TRUE(remaining != 0);
+        auto const BEFORE = mm::virt::kernel_vmap_pending_free_pages();
+        KREQUIRE_EQ(BEFORE, remaining);
+        size_t const BUDGET = remaining < KASAN_DRAIN_PAGES ? remaining : KASAN_DRAIN_PAGES;
+        auto const SETUP = mm::virt::drain_kernel_vmap_frees_bounded(BUDGET);
+        auto const AFTER = mm::virt::kernel_vmap_pending_free_pages();
+        log::info(
+            "kasan vmap reuse setup: call=%zu/%zu before=%zu budget=%zu scanned=%zu reclaimed=%zu after=%zu "
+            "failed=%u unsafe=%u has_more=%u",
+            call + 1, SETUP_CALLS, BEFORE, BUDGET, SETUP.scanned_pages, SETUP.reclaimed_pages, AFTER, static_cast<unsigned>(SETUP.failed),
+            static_cast<unsigned>(SETUP.unsafe_context), static_cast<unsigned>(SETUP.has_more));
+        KREQUIRE_TRUE(!SETUP.failed);
+        KREQUIRE_TRUE(!SETUP.unsafe_context);
+        KREQUIRE_TRUE(SETUP.scanned_pages <= BUDGET);
+        KREQUIRE_TRUE(SETUP.reclaimed_pages <= BUDGET);
+        KREQUIRE_TRUE(SETUP.reclaimed_pages != 0);
+        KREQUIRE_EQ(SETUP.scanned_pages, SETUP.reclaimed_pages);
+        KREQUIRE_EQ(SETUP.reclaimed_pages, BUDGET);
+        KREQUIRE_TRUE(SETUP.reclaimed_pages <= remaining);
+        KREQUIRE_EQ(AFTER, remaining - SETUP.reclaimed_pages);
+        KREQUIRE_EQ(SETUP.has_more, AFTER != 0);
+        remaining = AFTER;
+    }
+    KREQUIRE_EQ(remaining, 0U);
+    KREQUIRE_EQ(mm::virt::kernel_vmap_pending_free_pages(), 0U);
+    {
+        // Exercise actual teardown before measuring too: its first stack/data
+        // shadow must not be confused with a warmed-address reuse failure.
+        KasanVmapSpan teardown_warm;
+        teardown_warm.adopt(mm::virt::kernel_vmap_alloc(mm::PhysicalPageOwner::SELFTEST, KASAN_VMAP_BYTES, "kasan_reuse_teardown_warm"));
+        KREQUIRE_NE(teardown_warm.value, nullptr);
+        touch_kasan_vmap_span(teardown_warm.value);
+        KREQUIRE_TRUE(teardown_warm.finish());
+    }
+    KREQUIRE_TRUE(collect_comparable());
+    warm_owners_before[OWNER] = scanned.scanned.owners[OWNER];
+    for (size_t node = 0; node < scanned.node_count; ++node) owner_baseline[node] = scanned.nodes[node].owners[OWNER];
+
+    KasanVmapSpan span;
+    span.adopt(mm::virt::kernel_vmap_alloc(mm::PhysicalPageOwner::SELFTEST, KASAN_VMAP_BYTES, "kasan_reuse_warm_vmap"));
+    KREQUIRE_NE(span.value, nullptr);
+    KREQUIRE_TRUE(mm::virt::kernel_vmap_contains(span.value));
+    uintptr_t const WARM_ADDRESS = reinterpret_cast<uintptr_t>(span.value);
+    for (size_t page = 0; page < KASAN_VMAP_PAGES; ++page) {
+        kasan_reuse_frames[page] = mm::virt::translate(mm::virt::get_kernel_pagemap(), WARM_ADDRESS + page * mm::paging::PAGE_SIZE);
+        KREQUIRE_NE(kasan_reuse_frames[page], mm::virt::PADDR_INVALID);
+    }
+    touch_kasan_vmap_span(span.value);
+    span.park();
+    KREQUIRE_EQ(mm::virt::kernel_vmap_pending_free_pages(), KASAN_VMAP_PAGES);
+    KREQUIRE_TRUE(collect_comparable());
+    kasan_reuse_baseline = scanned;
+    KEXPECT_EQ(scanned.scanned.owners[OWNER].pages, warm_owners_before[OWNER].pages + KASAN_VMAP_PAGES);
+    KEXPECT_EQ(scanned.scanned.owners[OWNER].objects, warm_owners_before[OWNER].objects + KASAN_VMAP_PAGES);
+    expect_kasan_reuse_owners_same();
+    KREQUIRE_TRUE(collect_comparable());
+    kasan_reuse_baseline = scanned;
+
+    size_t completed = 0;
+    for (; completed < KASAN_REUSE_ITERATIONS; ++completed) {
+        span.adopt(mm::virt::kernel_vmap_alloc(mm::PhysicalPageOwner::SELFTEST, KASAN_VMAP_BYTES, "kasan_reuse_vmap"));
+        bool same = span.value != nullptr && reinterpret_cast<uintptr_t>(span.value) == WARM_ADDRESS;
+        if (same) {
+            for (size_t page = 0; page < KASAN_VMAP_PAGES; ++page)
+                same = same && mm::virt::translate(mm::virt::get_kernel_pagemap(), WARM_ADDRESS + page * mm::paging::PAGE_SIZE) ==
+                                   kasan_reuse_frames[page];
+        }
+        if (same) touch_kasan_vmap_span(span.value);
+        span.park();
+        if (!same || mm::virt::kernel_vmap_pending_free_pages() != KASAN_VMAP_PAGES) break;
+    }
+    KEXPECT_EQ(completed, KASAN_REUSE_ITERATIONS);
+    KREQUIRE_TRUE(collect_comparable());
+    expect_kasan_reuse_owners_same();  // All41 owners, including shadow, exactly.
+
+    KREQUIRE_TRUE(span.finish());
+    for (size_t page = 0; page < KASAN_VMAP_PAGES; ++page)
+        KEXPECT_EQ(mm::virt::translate(mm::virt::get_kernel_pagemap(), WARM_ADDRESS + page * mm::paging::PAGE_SIZE),
+                   mm::virt::PADDR_INVALID);
+    KREQUIRE_TRUE(collect_comparable());
+    // Only this span's16 explicit SELFTEST frames were returned. Every other
+    // owner, including KASAN_SHADOW, must still equal the actual warm baseline.
+    for (size_t owner = 0; owner < mm::PHYSICAL_PAGE_OWNER_COUNT; ++owner) {
+        auto const& EXPECTED = owner == OWNER ? warm_owners_before[OWNER] : kasan_reuse_baseline.scanned.owners[owner];
+        KEXPECT_EQ(scanned.scanned.owners[owner].pages, EXPECTED.pages);
+        KEXPECT_EQ(scanned.scanned.owners[owner].objects, EXPECTED.objects);
+        for (size_t node = 0; node < scanned.node_count; ++node) {
+            auto const& NODE_EXPECTED = owner == OWNER ? owner_baseline[node] : kasan_reuse_baseline.nodes[node].owners[owner];
+            KEXPECT_EQ(scanned.nodes[node].owners[owner].pages, NODE_EXPECTED.pages);
+            KEXPECT_EQ(scanned.nodes[node].owners[owner].objects, NODE_EXPECTED.objects);
+        }
+    }
+}
+#endif
 
 #endif
