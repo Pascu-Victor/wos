@@ -496,7 +496,8 @@ void service_user_pagemap_gate_wait(uint64_t& service_spins) {
     }
 }
 
-[[nodiscard]] auto acquire_user_pagemap_access(PageTable* pagemap, bool wait_for_teardown, size_t& gate_index) -> bool {
+template <typename WaitForTeardown>
+[[nodiscard]] auto admit_user_pagemap_reader(PageTable* pagemap, size_t& gate_index, WaitForTeardown&& wait_for_teardown) -> bool {
     gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
     if (pagemap == nullptr) {
         return false;
@@ -504,14 +505,11 @@ void service_user_pagemap_gate_wait(uint64_t& service_spins) {
 
     size_t const INDEX = user_pagemap_access_gate_index(pagemap);
     auto& gate = user_pagemap_access_gates.at(INDEX);
-    uint64_t service_spins = 0;
     for (;;) {
         while (gate.teardown.load(std::memory_order_acquire)) {
-            if (!wait_for_teardown) {
+            if (!wait_for_teardown(true)) {
                 return false;
             }
-            service_user_pagemap_gate_wait(service_spins);
-            asm volatile("pause" ::: "memory");
         }
 
 #ifdef WOS_SELFTEST
@@ -542,10 +540,25 @@ void service_user_pagemap_gate_wait(uint64_t& service_spins) {
 #ifdef WOS_SELFTEST
         debt::end_change();
 #endif
-        if (!wait_for_teardown) {
+        if (!wait_for_teardown(false)) {
             return false;
         }
     }
+}
+
+// Raw callers preserve their original try-only or cooperative spin policy.
+// The fork-only ordinary adapter supplies an ordinary wait operation;
+// the reader CAS, rollback and debt protocol above remain one shared body.
+[[nodiscard]] auto acquire_user_pagemap_access(PageTable* pagemap, bool wait_for_teardown, size_t& gate_index) -> bool {
+    uint64_t service_spins = 0;
+    return admit_user_pagemap_reader(pagemap, gate_index, [wait_for_teardown, &service_spins](bool spinning) {
+        if (!wait_for_teardown) return false;
+        if (spinning) {
+            service_user_pagemap_gate_wait(service_spins);
+            asm volatile("pause" ::: "memory");
+        }
+        return true;
+    });
 }
 
 void release_user_pagemap_access(size_t gate_index) {
@@ -11940,7 +11953,8 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
     return 0;
 }
 
-auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAccess& empty, RangePrepareSite* failure_site) noexcept
+namespace {
+auto acquire_current_range_task(sched::task::Task& subject, CurrentRangeRootAccess& empty, RangePrepareSite* failure_site) noexcept
     -> Error {
     if (empty.subject != nullptr || empty.root != nullptr || empty.local || empty.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE) {
         if (failure_site != nullptr) *failure_site = RangePrepareSite::Input;
@@ -11961,12 +11975,91 @@ auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAcce
         if (failure_site != nullptr) *failure_site = RangePrepareSite::RootStale;
         return Error::Stale;
     }
+    return Error::None;
+}
+auto current_fork_range_context_matches(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                        const ker::syscall::vmem::SharedVmemPublicationGuard& publication, uint32_t preempt_depth) noexcept
+    -> bool {
+    return preparation.ready() && publication.acquired() && sched::can_query_current_task() && sched::get_current_task() == &subject &&
+           subject.type == sched::task::TaskType::PROCESS &&
+           subject.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !subject.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !subject.exit_in_progress.load(std::memory_order_acquire) && subject.syscall_account_start_us != 0 &&
+           sched::preempt_count() == preempt_depth && sched::interrupts_enabled();
+}
+auto current_fork_range_root_matches(sched::task::Task& subject, const CurrentRangeRootAccess& access) noexcept -> bool {
+    return access.subject == &subject && access.local && !subject.usercopy_pagemap_closing.load(std::memory_order_acquire) &&
+           access.root != nullptr && access.root == subject.pagemap && access.root != virt::kernel_pagemap;
+}
+}  // namespace
+
+auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAccess& empty, RangePrepareSite* failure_site) noexcept
+    -> Error {
+    auto const error = acquire_current_range_task(subject, empty, failure_site);
+    if (error != Error::None) return error;
     if (!virt::acquire_user_pagemap_access(empty.root, false, empty.gate)) {
         if (failure_site != nullptr) *failure_site = RangePrepareSite::StripedReader;
         return Error::Again;
     }
     return Error::None;
 }
+
+auto acquire_current_fork_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                     const ker::syscall::vmem::SharedVmemPublicationGuard& publication, CurrentRangeRootAccess& empty,
+                                     RangePrepareSite* failure_site) noexcept -> Error {
+    if (!current_fork_range_context_matches(subject, preparation, publication, 0)) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
+        return Error::Invalid;
+    }
+    auto const error = acquire_current_range_task(subject, empty, failure_site);
+    if (error != Error::None) return error;
+    auto const valid = [&] {
+        return current_fork_range_context_matches(subject, preparation, publication, 0) && current_fork_range_root_matches(subject, empty);
+    };
+    if (!valid()) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
+        return Error::Invalid;
+    }
+    bool context_changed = false;
+    bool const acquired = virt::admit_user_pagemap_reader(empty.root, empty.gate, [&](bool) {
+        // The shared body rolled back any speculative reader/debt epoch before
+        // calling this operation. PUB and the Task lease survive this wait.
+        if (!valid()) {
+            context_changed = true;
+            return false;
+        }
+        // Refuse observed saturation even when teardown was sampled first.
+        // This scalar check creates no reader or coherent owner snapshot.
+        auto const index = virt::user_pagemap_access_gate_index(empty.root);
+        if (virt::user_pagemap_access_gates.at(index).readers.load(std::memory_order_acquire) == UINT32_MAX) return false;
+        sched::kern_yield();
+        if (!valid()) {
+            context_changed = true;
+            return false;
+        }
+        return true;
+    });
+    if (!acquired) {
+        if (failure_site != nullptr) *failure_site = context_changed ? RangePrepareSite::Context : RangePrepareSite::StripedReader;
+        return context_changed ? Error::Invalid : Error::Again;
+    }
+    if (!valid()) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
+        return Error::Invalid;
+    }
+    return Error::None;
+}
+auto validate_current_fork_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                      const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                      const CurrentRangeRootAccess& access, RangePrepareSite* failure_site) noexcept -> Error {
+    if (!current_fork_range_context_matches(subject, preparation, publication, 1) || !current_fork_range_root_matches(subject, access) ||
+        access.gate == virt::USER_PAGEMAP_ACCESS_GATE_NONE || access.gate != virt::user_pagemap_access_gate_index(access.root)) {
+        if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
+        return Error::Invalid;
+    }
+    return Error::None;
+}
+
 void release_current_range_root(CurrentRangeRootAccess& access) noexcept {
     virt::release_user_pagemap_access(access.gate);
     access.gate = virt::USER_PAGEMAP_ACCESS_GATE_NONE;

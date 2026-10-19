@@ -79,7 +79,8 @@ struct Index{auto retain_for_pin_locked(PageTable*,uint64_t,uint64_t,file_mappin
 auto find_user_root_control_locked(PageTable*){return &control;}
 auto page_align_down(uint64_t p){return p&~uint64_t{4095};}
 bool snapshot_user_page_mapping_locked(PageTable* r,uint64_t,bool w,uint64_t& pa,bool* dirty=nullptr){++snapshots;pa=reinterpret_cast<uint64_t>(phys::frame.bytes.data());if(dirty)*dirty=true;if(change_second_snapshot&&snapshots%2==0)return false;return r&&r->present&&(!w||r->writable);}
-void service_user_pagemap_gate_wait(uint64_t& n){++n;std::this_thread::yield();}
+unsigned raw_gate_services{};std::atomic<bool>* raw_gate_release{};
+void service_user_pagemap_gate_wait(uint64_t& n){++n;++raw_gate_services;auto x=snap();CHECK(x.inflight==0&&x.access_readers==0);if(raw_gate_release){raw_gate_release->store(false);raw_gate_release=nullptr;}std::this_thread::yield();}
 '''+extract(vh,'struct UserPagePin {',True)+extract(vh,'struct UserFutexIdentity {',True)+r'''
 }
 }
@@ -96,7 +97,7 @@ struct Task {
 }
 namespace ker::mod::mm::virt {
 '''
- access=[extract(v,x) for x in ['[[nodiscard]] auto user_pagemap_access_gate_index','[[nodiscard]] auto acquire_user_pagemap_access','void release_user_pagemap_access','auto census_try_exclusive_flag','[[nodiscard]] auto begin_user_pagemap_exclusive','[[nodiscard]] auto try_begin_user_pagemap_exclusive','void end_user_pagemap_exclusive','auto try_pin_current_user_page_mapping','void unpin_user_page']]
+ access=[extract(v,x) for x in ['[[nodiscard]] auto user_pagemap_access_gate_index','template <typename WaitForTeardown>\n[[nodiscard]] auto admit_user_pagemap_reader','[[nodiscard]] auto acquire_user_pagemap_access','void release_user_pagemap_access','auto census_try_exclusive_flag','[[nodiscard]] auto begin_user_pagemap_exclusive','[[nodiscard]] auto try_begin_user_pagemap_exclusive','void end_user_pagemap_exclusive','auto try_pin_current_user_page_mapping','void unpin_user_page']]
  setup+='\n'.join(access)+r'''
 enum class PublicReadPrepareResult:uint8_t{NOT_TRACKED,READY,REFUSED};
 bool refuse_prepare{},refuse_pin{};
@@ -129,6 +130,13 @@ void tests(){
  CHECK(virt::acquire_user_pagemap_access(&root,false,out));CHECK(out==index&&snap().access_readers==1);CHECK(virt::try_begin_user_pagemap_exclusive(&root)==virt::USER_PAGEMAP_ACCESS_GATE_NONE);CHECK(!gate.teardown.load()&&snap().access_exclusives==0&&snap().access_readers==1);virt::release_user_pagemap_access(out);virt::release_user_pagemap_access(virt::USER_PAGEMAP_ACCESS_GATE_NONE);clean();
  gate.readers.store(UINT32_MAX,std::memory_order_release);CHECK(!virt::acquire_user_pagemap_access(&root,false,out));CHECK(snap().valid&&snap().inflight==0&&snap().access_readers==0);gate.readers.store(0,std::memory_order_release);clean();
  gate.readers.close_after_cas=&gate.teardown;CHECK(!virt::acquire_user_pagemap_access(&root,false,out));CHECK(gate.readers.load(std::memory_order_acquire)==0&&snap().inflight==0&&snap().access_readers==0);gate.teardown.store(false);clean();
+ // Raw false remains immediate; raw true still reaches its cooperative TLB-service port.
+ gate.teardown.store(true);auto raw_before=virt::raw_gate_services;CHECK(!virt::acquire_user_pagemap_access(&root,false,out));CHECK(virt::raw_gate_services==raw_before);virt::raw_gate_release=&gate.teardown;CHECK(virt::acquire_user_pagemap_access(&root,true,out));CHECK(virt::raw_gate_services==raw_before+1&&virt::raw_gate_release==nullptr);virt::release_user_pagemap_access(out);clean();
+ // Finite wait ports execute the production atomic/debt body unchanged.
+ // They assert that no speculative reader/debt epoch survives a wait.
+ for(bool race:{false,true}){unsigned waits=0;if(race)gate.readers.close_after_cas=&gate.teardown;else gate.teardown.store(true);CHECK(virt::admit_user_pagemap_reader(&root,out,[&](bool spinning){++waits;auto x=snap();CHECK(x.valid&&x.inflight==0&&x.access_readers==0&&gate.readers.load(std::memory_order_acquire)==0);CHECK(spinning!=race);gate.teardown.store(false);return true;}));CHECK(waits==1&&snap().access_readers==1);virt::release_user_pagemap_access(out);clean();}
+ gate.teardown.store(true);unsigned refused=0;CHECK(!virt::admit_user_pagemap_reader(&root,out,[&](bool spinning){++refused;CHECK(spinning&&snap().inflight==0&&gate.readers.load(std::memory_order_acquire)==0);return false;}));CHECK(refused==1&&out==virt::USER_PAGEMAP_ACCESS_GATE_NONE);gate.teardown.store(false);clean();
+ gate.readers.store(UINT32_MAX,std::memory_order_release);unsigned saturated_waits=0;CHECK(!virt::admit_user_pagemap_reader(&root,out,[&](bool){++saturated_waits;return false;}));CHECK(saturated_waits==0&&snap().inflight==0&&snap().access_readers==0);gate.readers.store(0,std::memory_order_release);clean();
  auto exclusive=virt::begin_user_pagemap_exclusive(&root);CHECK(exclusive==index&&snap().access_exclusives==1);CHECK(!virt::acquire_user_pagemap_access(&root,false,out));CHECK(virt::try_begin_user_pagemap_exclusive(&root)==virt::USER_PAGEMAP_ACCESS_GATE_NONE);CHECK(snap().access_exclusives==1);virt::end_user_pagemap_exclusive(exclusive);clean();
  exclusive=virt::try_begin_user_pagemap_exclusive(&root);CHECK(exclusive==index&&snap().access_exclusives==1);virt::end_user_pagemap_exclusive(exclusive);clean();
  task::Task actor;actor.pagemap=&root;mm::virt::PageTable* observed=nullptr;CHECK(actor.try_acquire_usercopy_pagemap(observed)&&observed==&root);CHECK(snap().task_usercopy_accesses==1);actor.release_usercopy_pagemap();clean();

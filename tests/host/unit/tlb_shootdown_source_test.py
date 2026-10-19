@@ -347,10 +347,17 @@ def main() -> None:
     require_generation_publication_is_quiescent(virt)
     require_cooperative_service_remains_raw_context_safe(virt)
     require_bounded_cooperative_service(function_body(virt, "service_user_pagemap_gate_wait"), "user pagemap gate wait", True)
-    reader = function_body(virt, "acquire_user_pagemap_access")
+    reader = function_body(virt, "admit_user_pagemap_reader")
     teardown_wait = reader[reader.index("while (gate.teardown.load"):reader.index("uint32_t readers")]
-    if "service_user_pagemap_gate_wait(service_spins);" not in teardown_wait:
-        fail("user pagemap readers must service TLB acknowledgements while awaiting the exclusive holder")
+    if "wait_for_teardown(true)" not in teardown_wait:
+        fail("shared reader admission must invoke the chosen wait policy on observed teardown")
+    wrapper = function_body(virt, "acquire_user_pagemap_access")
+    if "admit_user_pagemap_reader(pagemap, gate_index" not in wrapper or "if (!wait_for_teardown) return false;" not in wrapper:
+        fail("raw reader API must preserve try-only refusal and select the shared protocol")
+    if "if (spinning)" not in wrapper or "service_user_pagemap_gate_wait(service_spins);" not in wrapper:
+        fail("raw waiting reader policy must retain cooperative TLB service on teardown")
+    if 'asm volatile("pause" ::: "memory");' not in wrapper or "kern_yield" in wrapper:
+        fail("raw reader wait must preserve its nonblocking pause policy")
     exclusive = function_body(virt, "begin_user_pagemap_exclusive")
     if exclusive.count("service_user_pagemap_gate_wait(service_spins);") != 2:
         fail("both exclusive acquisition and reader drain must service TLB acknowledgements")

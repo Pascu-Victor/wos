@@ -130,7 +130,7 @@ def test_current_maintained_case_inventories():
         "managed_huge_test.cpp", "managed_huge_resolver_cases.inc", "managed_huge_range_cases.inc", "managed_huge_fork_cases.inc"))
     coordinator = base + "\n" + (unit / "fork_vm_coordinator_cases.inc").read_text() + "\n" + (unit / "fork_public_wiring_cases.inc").read_text()
     anonymous = coordinator + "\n" + (unit / "managed_anonymous_remove_cases.inc").read_text()
-    assert [len(CppText(text).gtest_cases()) for text in (base, coordinator, anonymous)] == [70, 110, 128]
+    assert [len(CppText(text).gtest_cases()) for text in (base, coordinator, anonymous)] == [76, 116, 134]
 
 
 def main():

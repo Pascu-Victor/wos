@@ -358,13 +358,21 @@ struct detail::RangePreparationDriver {
                     if (!publication.acquired() || !range_current_context(*target, *preparation, true)) {
                         error = Error::Invalid;
                     } else {
-                        sched::PreemptGuard preempt;
                         site = RangePrepareSite::Unreported;
-                        error = acquire_current_range_root(*target, access, witness != nullptr ? &site : nullptr);
-                        if (error == Error::None)
-                            error = survey_range_chunk(access.root, cursor, mode, storage, witness != nullptr ? &site : nullptr);
-                        // Drop the fresh reader/Task lease before preempt/PUB.
-                        release_current_range_root(access);
+                        error = acquire_current_fork_range_root(*target, *preparation, publication, access,
+                                                                witness != nullptr ? &site : nullptr);
+                        if (error == Error::None) {
+                            sched::PreemptGuard preempt;
+                            error = validate_current_fork_range_root(*target, *preparation, publication, access,
+                                                                     witness != nullptr ? &site : nullptr);
+                            if (error == Error::None)
+                                error = survey_range_chunk(access.root, cursor, mode, storage, witness != nullptr ? &site : nullptr);
+                            // Drop the fresh reader/Task lease before preempt/PUB.
+                            release_current_range_root(access);
+                        } else {
+                            // A failed wait may still own the original Task lease.
+                            release_current_range_root(access);
+                        }
                     }
                 }
             } else {

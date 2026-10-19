@@ -34,9 +34,22 @@ extern std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_
 namespace ker::mod::sched {
 auto preempt_count() -> uint32_t { return backend().preempt_depth; }
 void kern_yield() {
-    host_range::check_yield_boundary();
-    ++host_range::yields;
-    if (host_range::on_yield) host_range::on_yield();
+    if (host_range::expect_fork_wait && publication_depth != 0) {
+        EXPECT_EQ(publication_depth, 1U);
+        EXPECT_EQ(root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);
+        EXPECT_TRUE(host_range::interrupts);
+        ASSERT_NE(host_range::current, nullptr);
+        EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 1U);
+        ++host_range::gate_yields;
+        // Finite external owner/context endpoint; actual gate/adapter logic
+        // decides whether to continue. This is not WOS scheduling evidence.
+        ASSERT_NE(host_range::on_gate_wait, nullptr);
+        host_range::on_gate_wait();
+    } else {
+        host_range::check_yield_boundary();
+        ++host_range::yields;
+        if (host_range::on_yield) host_range::on_yield();
+    }
 }
 }  // namespace ker::mod::sched
 ker::mod::sys::Mutex g_shared_vmem_publication_lock;
@@ -130,6 +143,50 @@ struct HostLock {
     }
 };
 HostLock cow_pte_lock{cow_depth}, user_mapping_pin_lock{pin_depth};
+// One colliding stripe is a finite Host atomic/context endpoint. The CAS,
+// speculative rollback, saturation and retry algorithm is actual production.
+struct HostRangeReaderCount {
+    std::atomic<bool>* close_after_cas{};
+    bool saturated{};
+    auto load(std::memory_order) const -> uint32_t { return saturated ? UINT32_MAX : root_readers; }
+    void store(uint32_t value, std::memory_order) { root_readers = value; }
+    auto fetch_sub(uint32_t count, std::memory_order) -> uint32_t {
+        auto const previous = root_readers;
+        EXPECT_GE(previous, count);
+        root_readers -= count;
+        return previous;
+    }
+    auto compare_exchange_weak(uint32_t& expected, uint32_t desired, std::memory_order, std::memory_order) -> bool {
+        if (root_readers != expected) {
+            expected = root_readers;
+            return false;
+        }
+        if (host_range::expect_fork_wait) {
+            ++host_range::range_readers;
+            auto* owner = ker::syscall::vmem::g_shared_vmem_publication_owner.load(std::memory_order_acquire);
+            EXPECT_NE(owner, nullptr);
+            if (owner) EXPECT_TRUE(owner->acquired());
+            EXPECT_EQ(publication_depth, 1U);
+            EXPECT_EQ(backend().preempt_depth, 0U);
+            EXPECT_EQ(cow_depth + pin_depth, 0U);
+            EXPECT_TRUE(host_range::interrupts);
+            if (host_range::current) EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 1U);
+        }
+        root_readers = desired;
+        if (close_after_cas) {
+            close_after_cas->store(true);
+            close_after_cas = nullptr;
+        }
+        return true;
+    }
+};
+struct UserPagemapAccessGate {
+    HostRangeReaderCount readers;
+    std::atomic<bool> teardown{false};
+};
+std::array<UserPagemapAccessGate, 1> user_pagemap_access_gates{};
+auto user_pagemap_access_gate_index(PageTable*) -> size_t { return 0; }
+// ACTUAL_SHARED_READER_ADMISSION625
 auto acquire_user_pagemap_access(PageTable* root, bool, size_t& index) -> bool {
     if (host_range::expect_fork_wait) {
         ++host_range::range_readers;

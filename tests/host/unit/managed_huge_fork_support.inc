@@ -3,6 +3,7 @@
 namespace {
 size_t fork_fail_table_at = SIZE_MAX, fork_table_attempts{};
 void before_fork_preempt() {
+    if (host_range::expect_fork_wait && root_readers != 0 && host_range::on_range_preempt) host_range::on_range_preempt();
     if (!fork_mode) return;
     huge::Snapshot snapshot{};
     huge_core.snapshot(snapshot);

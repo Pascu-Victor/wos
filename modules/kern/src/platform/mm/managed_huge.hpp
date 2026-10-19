@@ -245,6 +245,15 @@ struct CurrentRangeRootAccess {
 };
 [[nodiscard]] auto acquire_current_range_root(sched::task::Task&, CurrentRangeRootAccess& empty,
                                               RangePrepareSite* failure_site = nullptr) noexcept -> Error;
+// Named ordinary fork acquisition retains the actual PUB and Task lease while
+// waiting with IF enabled/depth0. No striped reader/debt epoch crosses a wait.
+[[nodiscard]] auto acquire_current_fork_range_root(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                                   const ker::syscall::vmem::SharedVmemPublicationGuard&, CurrentRangeRootAccess& empty,
+                                                   RangePrepareSite* failure_site = nullptr) noexcept -> Error;
+// Recheck the same borrowed authority after the caller enters depth1.
+[[nodiscard]] auto validate_current_fork_range_root(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                                    const ker::syscall::vmem::SharedVmemPublicationGuard&, const CurrentRangeRootAccess&,
+                                                    RangePrepareSite* failure_site = nullptr) noexcept -> Error;
 void release_current_range_root(CurrentRangeRootAccess&) noexcept;
 // Bounded Count and complete supported-geometry validation under the actual
 // blocking PUB. Caller-born cursor/access precede its one PreemptGuard.

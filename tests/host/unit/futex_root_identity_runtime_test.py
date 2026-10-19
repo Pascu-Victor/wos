@@ -534,6 +534,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     private_anchors = [
         "[[nodiscard]] auto user_pagemap_access_gate_index",
         "void service_user_pagemap_gate_wait",
+        "template <typename WaitForTeardown>\n[[nodiscard]] auto admit_user_pagemap_reader",
         "[[nodiscard]] auto acquire_user_pagemap_access",
         "void release_user_pagemap_access",
         "[[nodiscard]] auto begin_user_pagemap_exclusive",

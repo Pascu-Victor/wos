@@ -662,14 +662,24 @@ TEST_F(ManagedRange, WitnessDescriptorMismatchComesFromActualFinalSurvey) {
 // Named fork-only preparation executes the actual module against a finite
 // wait-action endpoint. This does not prove WOS Mutex parking or progress.
 namespace {
-std::function<void()> fork_range_wait_action;
+std::function<void()> fork_range_wait_action, fork_range_gate_action, fork_range_preempt_action;
 class ManagedForkRange : public ManagedRange {
    protected:
     void SetUp() override {
         ManagedRange::SetUp();
         host_range::expect_fork_wait = false;
         host_range::range_readers = host_range::allocation_checks = 0;
-        fork_range_wait_action = {};
+        fork_range_wait_action = fork_range_gate_action = fork_range_preempt_action = {};
+        host_range::gate_yields = 0;
+        virt::user_pagemap_access_gates[0].teardown.store(false);
+        virt::user_pagemap_access_gates[0].readers.close_after_cas = nullptr;
+        virt::user_pagemap_access_gates[0].readers.saturated = false;
+        host_range::on_gate_wait = [] {
+            if (fork_range_gate_action) fork_range_gate_action();
+        };
+        host_range::on_range_preempt = [] {
+            if (fork_range_preempt_action) fork_range_preempt_action();
+        };
         host_range::on_blocking = [] {
             if (host_range::expect_fork_wait && fork_range_wait_action) fork_range_wait_action();
         };
@@ -684,7 +694,11 @@ class ManagedForkRange : public ManagedRange {
     }
     void TearDown() override {
         host_range::on_blocking = nullptr;
-        fork_range_wait_action = {};
+        host_range::on_gate_wait = host_range::on_range_preempt = nullptr;
+        fork_range_wait_action = fork_range_gate_action = fork_range_preempt_action = {};
+        virt::user_pagemap_access_gates[0].teardown.store(false);
+        virt::user_pagemap_access_gates[0].readers.close_after_cas = nullptr;
+        virt::user_pagemap_access_gates[0].readers.saturated = false;
         host_range::expect_fork_wait = false;
         ManagedRange::TearDown();
     }
@@ -820,10 +834,17 @@ TEST_F(ManagedForkRange, PostwaitTaskIdentityAndOrdinaryStateRefuseBeforeReader)
     }
 }
 TEST_F(ManagedForkRange, ReaderLeaseAndStaleRootStillRefuseWithoutHiddenRetryOrYield) {
-    for (unsigned axis = 0; axis < 3; ++axis) {
+    for (unsigned axis = 0; axis < 4; ++axis) {
         SCOPED_TRACE(axis);
         actor.usercopy_pagemap_closing = axis == 0;
-        host_range::reader_busy = axis == 1;
+        // The fourth vector combines an actual shared-body teardown wait
+        // with an observed MAX count. The named production policy must refuse
+        // before kern_yield; this fixture supplies only the atomic endpoints.
+        virt::user_pagemap_access_gates[0].readers.saturated = axis == 1 || axis == 3;
+        virt::user_pagemap_access_gates[0].teardown.store(axis == 3);
+        // A missing saturation guard must fail the zero-yield assertion,
+        // rather than leave the finite foreign teardown held forever.
+        fork_range_gate_action = [] { virt::user_pagemap_access_gates[0].teardown.store(false); };
         huge_root_live = axis != 2;
         huge::RangeSplitSurvey survey;
         huge::PreparedTables tables;
@@ -831,19 +852,199 @@ TEST_F(ManagedForkRange, ReaderLeaseAndStaleRootStillRefuseWithoutHiddenRetryOrY
         auto before = host_range::blocking;
         EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), axis == 2 ? huge::Error::Stale : huge::Error::Again);
         EXPECT_EQ(host_range::blocking - before, 1U);
-        EXPECT_EQ(witness.site, axis == 0   ? huge::RangePrepareSite::TaskLease
-                                : axis == 1 ? huge::RangePrepareSite::StripedReader
-                                            : huge::RangePrepareSite::RootStale);
+        EXPECT_EQ(witness.site, axis == 0                ? huge::RangePrepareSite::TaskLease
+                                : axis == 1 || axis == 3 ? huge::RangePrepareSite::StripedReader
+                                                         : huge::RangePrepareSite::RootStale);
         EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
         EXPECT_EQ(witness.attempt, 1U);
         EXPECT_FALSE(witness.exhausted);
-        EXPECT_EQ(host_range::yields, 0U);
+        EXPECT_EQ(host_range::yields + host_range::gate_yields, 0U);
         EXPECT_EQ(table_attempt, 0U);
+        virt::user_pagemap_access_gates[0].readers.saturated = false;
+        virt::user_pagemap_access_gates[0].teardown.store(false);
         no_owners();
     }
     actor.usercopy_pagemap_closing = false;
     host_range::reader_busy = false;
     huge_root_live = true;
+}
+// Three independent public preparation passes must all tolerate an unrelated
+// foreign teardown without dropping the proof or waiting under PreemptGuard.
+TEST_F(ManagedForkRange, CountContentionYieldsWithOnlyPublicationAndTaskLease) {
+    unsigned publications = 0;
+    fork_range_wait_action = [&] {
+        if (++publications == 1) virt::user_pagemap_access_gates[0].teardown.store(true);
+    };
+    fork_range_gate_action = [] { virt::user_pagemap_access_gates[0].teardown.store(false); };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    ASSERT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::None);
+    EXPECT_EQ(publications, 3U);
+    EXPECT_EQ(host_range::gate_yields, 1U);
+    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_TRUE(survey.complete());
+    no_owners();
+}
+TEST_F(ManagedForkRange, FillContentionYieldsAndKeepsTheCompleteZeroProof) {
+    unsigned publications = 0;
+    fork_range_wait_action = [&] {
+        if (++publications == 2) virt::user_pagemap_access_gates[0].teardown.store(true);
+    };
+    fork_range_gate_action = [] { virt::user_pagemap_access_gates[0].teardown.store(false); };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
+    EXPECT_EQ(publications, 3U);
+    EXPECT_EQ(host_range::gate_yields, 1U);
+    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_TRUE(survey.complete());
+    EXPECT_EQ(survey.count(), 0U);
+    no_owners();
+}
+TEST_F(ManagedForkRange, VerifyContentionYieldsAndStillExecutesTheIndependentPass) {
+    unsigned publications = 0;
+    fork_range_wait_action = [&] {
+        if (++publications == 3) virt::user_pagemap_access_gates[0].teardown.store(true);
+    };
+    fork_range_gate_action = [] { virt::user_pagemap_access_gates[0].teardown.store(false); };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
+    EXPECT_EQ(publications, 3U);
+    EXPECT_EQ(host_range::gate_yields, 1U);
+    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_TRUE(survey.complete());
+    no_owners();
+}
+TEST_F(ManagedForkRange, TeardownRacingReaderCasRollsBackBeforeTheOrdinaryWait) {
+    auto& gate = virt::user_pagemap_access_gates[0];
+    unsigned publications = 0;
+    fork_range_wait_action = [&] {
+        if (++publications == 2) gate.readers.close_after_cas = &gate.teardown;
+    };
+    fork_range_gate_action = [&] {
+        EXPECT_EQ(root_readers, 0U);
+        EXPECT_TRUE(gate.teardown.load());
+        gate.teardown.store(false);
+    };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
+    EXPECT_EQ(host_range::gate_yields, 1U);
+    EXPECT_EQ(host_range::range_readers, 4U);  // One rolled-back CAS, then all three passes.
+    EXPECT_TRUE(survey.complete());
+    no_owners();
+}
+TEST_F(ManagedForkRange, OrdinaryWaitRevalidatesEveryContextAndRootAxis) {
+    ker::mod::sched::task::Task other;
+    auto* changed_root = table();
+    for (unsigned axis = 0; axis < 12; ++axis) {
+        SCOPED_TRACE(axis);
+        auto const waits = host_range::gate_yields;
+        fork_range_wait_action = [] { virt::user_pagemap_access_gates[0].teardown.store(true); };
+        fork_range_gate_action = [&] {
+            switch (axis) {
+                case 0:
+                    host_range::queryable = false;
+                    break;
+                case 1:
+                    host_range::current = &other;
+                    break;
+                case 2:
+                    actor.type = ker::mod::sched::task::TaskType::DAEMON;
+                    break;
+                case 3:
+                    actor.state = ker::mod::sched::task::TaskState::EXITED;
+                    break;
+                case 4:
+                    actor.scheduler_transition_active = true;
+                    break;
+                case 5:
+                    actor.exit_in_progress = true;
+                    break;
+                case 6:
+                    actor.syscall_account_start_us = 0;
+                    break;
+                case 7:
+                    actor.usercopy_pagemap_closing = true;
+                    break;
+                case 8:
+                    host_range::interrupts = false;
+                    break;
+                case 9:
+                    actor.pagemap = changed_root;
+                    break;
+                case 10:
+                    actor.pagemap = nullptr;
+                    break;
+                case 11:
+                    ker::syscall::vmem::g_shared_vmem_publication_owner.store(nullptr);
+                    break;
+            }
+            // Release the finite foreign owner even under a mutant missing a
+            // context check. Such a mutant must fail assertions, not loop forever.
+            virt::user_pagemap_access_gates[0].teardown.store(false);
+        };
+        huge::RangeSplitSurvey survey;
+        huge::PreparedTables tables;
+        huge::RangePrepareWitness witness{};
+        EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+        EXPECT_EQ(host_range::gate_yields - waits, 1U);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::Context);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+        EXPECT_FALSE(survey.complete());
+        EXPECT_EQ(table_attempt, 0U);
+        host_range::queryable = true;
+        host_range::current = &actor;
+        actor.type = ker::mod::sched::task::TaskType::PROCESS;
+        actor.state = ker::mod::sched::task::TaskState::ACTIVE;
+        actor.scheduler_transition_active = actor.exit_in_progress = actor.usercopy_pagemap_closing = false;
+        actor.syscall_account_start_us = 1;
+        host_range::interrupts = true;
+        backend().preempt_depth = 0;
+        actor.pagemap = runtime_root;
+        virt::user_pagemap_access_gates[0].teardown.store(false);
+        no_owners();
+    }
+}
+TEST_F(ManagedForkRange, EnteringPreemptGuardRevalidatesTheAcquiredRootBeforeSurvey) {
+    fork_range_preempt_action = [&] {
+        EXPECT_EQ(root_readers, 1U);
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 1U);
+        actor.usercopy_pagemap_closing = true;
+    };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    huge::RangePrepareWitness witness{};
+    EXPECT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::Invalid);
+    EXPECT_EQ(witness.site, huge::RangePrepareSite::Context);
+    EXPECT_EQ(witness.pass, huge::RangePreparePass::Count);
+    EXPECT_EQ(host_range::range_readers, 1U);
+    EXPECT_EQ(host_range::gate_yields, 0U);
+    EXPECT_FALSE(survey.complete());
+    actor.usercopy_pagemap_closing = false;
+    no_owners();
+    // Wrong incoming depth is refused by the actual ordinary adapter before
+    // a Task/reader acquisition. The finite caller restores its own depth
+    // before letting its separately held publication guard unwind.
+    fork_range_preempt_action = {};
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        huge::detail::CurrentRangeRootAccess access;
+        huge::RangePrepareSite site = huge::RangePrepareSite::Unreported;
+        {
+            ker::mod::sched::PreemptGuard preempt;
+            EXPECT_EQ(huge::detail::acquire_current_fork_range_root(actor, preparation, publication, access, &site), huge::Error::Invalid);
+            EXPECT_EQ(site, huge::RangePrepareSite::Context);
+            EXPECT_FALSE(access.local);
+            EXPECT_EQ(root_readers, 0U);
+        }
+        huge::detail::release_current_range_root(access);
+    }
+    no_owners();
 }
 TEST_F(ManagedForkRange, NonzeroPreparationAndActualAllocationFailuresRetireEveryChunkOwner) {
     ASSERT_EQ(prepare(0), huge::Error::None);

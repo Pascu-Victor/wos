@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import time
 
-EXPECTED_TESTS = 70
+EXPECTED_TESTS = 76
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -305,6 +305,8 @@ inline bool interrupts = true, queryable = true, reader_busy = false, exclusive 
 inline unsigned yields = 0, tries = 0, unlocks = 0, blocking = 0;
 inline ker::mod::sched::task::Task* current = nullptr;
 inline void (*on_yield)() = nullptr;
+inline void (*on_gate_wait)() = nullptr, (*on_range_preempt)() = nullptr;
+inline unsigned gate_yields = 0;
 // Finite Host wait action; not WOS Mutex parking or a progress guarantee.
 inline void (*on_blocking)() = nullptr;
 inline bool expect_fork_wait = false;
@@ -628,11 +630,17 @@ def main() -> int:
         copier += "\n" + header.read_text()[declaration_start:declaration_end]
 
         epoch = definition(source, "[[gnu::always_inline]] void advance_ps_geometry_epoch_locked(")
+        reader_admission = definition(source, "template <typename WaitForTeardown>\n[[nodiscard]] auto admit_user_pagemap_reader(")
         adapters = "\n".join(
             definition(source, anchor)
             for anchor in (
                 "auto copy_current_user_pagemap_exclusive(sched::task::Task&",
+                "auto acquire_current_range_task(sched::task::Task&",
+                "auto current_fork_range_context_matches(",
+                "auto current_fork_range_root_matches(",
                 "auto acquire_current_range_root(sched::task::Task&",
+                "auto acquire_current_fork_range_root(sched::task::Task&",
+                "auto validate_current_fork_range_root(sched::task::Task&",
                 "void release_current_range_root(CurrentRangeRootAccess&",
                 "auto current_mutation_access_matches(",
                 "auto survey_current_range_chunk(",
@@ -654,6 +662,11 @@ def main() -> int:
         selected.append(pin(range_cases))
         composite = scratch / "actual-source.cpp"
         fixture_source = fixture.read_text()
+        prelude_source = prelude.read_text()
+        reader_marker = "// ACTUAL_SHARED_READER_ADMISSION625"
+        if prelude_source.count(reader_marker) != 1:
+            raise RuntimeError("shared production reader admission extraction marker changed")
+        prelude_source = prelude_source.replace(reader_marker, reader_admission)
         for anchor in (
             "if (bytes == sizeof(huge::SplitPlanStorage)) {",
             "auto allocate_table() noexcept -> paging::PageTable* {",
@@ -663,7 +676,7 @@ def main() -> int:
                 raise RuntimeError("actual Host preparation allocation endpoint changed")
             fixture_source = fixture_source.replace(anchor, anchor + "\n    host_range::check_preparation_allocation();")
         if coordinator is not None:
-            composite.write_text(coordinator.compose(fixture_source, prelude.read_text(), context_methods,
+            composite.write_text(coordinator.compose(fixture_source, prelude_source, context_methods,
                 fork_support.read_text(), user_pin, exclusive, epoch, index, resolver, private, copier, commit,
                 adapters, cases.read_text(), range_cases.read_text(), fork_cases.read_text()))
             public_source = scratch / "actual-public-caller.cpp"
@@ -674,7 +687,7 @@ def main() -> int:
             "\n".join(
                 [
                     fixture_source,
-                    prelude.read_text(),
+                    prelude_source,
                     context_methods,
                     fork_support.read_text(),
                     "namespace ker::mod::mm::virt {",
@@ -718,6 +731,7 @@ def main() -> int:
             "copier": copier,
             "epoch": epoch,
             "adapters": adapters,
+            "shared_reader_admission": reader_admission,
             **context_map,
             **({"public_huge_mapper": coordinator.batch.mapper, "public_huge_adapter": coordinator.batch.adapter} if options.public_huge_map_only else {}),
             **({"mremap_policy": policy_fixture.manifest_text} if policy_fixture is not None else {}),
@@ -1019,21 +1033,33 @@ def main() -> int:
                 module_text.replace(needle, "sched::PreemptGuard premature; " + needle),
                 "ManagedForkRange.DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundaries",
             )
-            needle = "if (!publication.acquired() || !range_current_context(*target, *preparation, true))"
-            if module_text.count(needle) != 1:
-                raise RuntimeError("fork postwait context control boundary changed")
-            module_mutant(
-                "fork-wait-omits-postwait-context",
-                module_text.replace(needle, "if (!publication.acquired())"),
-                "ManagedForkRange.PostwaitIfChangeRefusesBeforeAnyFreshReader",
+            # Both the driver and named adapter validate the post-PUB context.
+            # Mutate the actual adapter's wait-context IF predicate, where the
+            # finite owner changes IF during the reader wait after driver entry.
+            actual = CppText(composite.read_text())
+            needle = "sched::preempt_count() == preempt_depth && sched::interrupts_enabled();"
+            if actual.count(needle) != 1:
+                raise RuntimeError("fork ordinary-reader context predicate changed")
+            mutant(
+                "fork-reader-omits-wait-irq-context",
+                actual.replace(needle, "sched::preempt_count() == preempt_depth;"),
+                "ManagedForkRange.OrdinaryWaitRevalidatesEveryContextAndRootAxis",
             )
-            boundary = "release_current_range_root(access); } } } else {"
+            needle = "error = validate_current_fork_range_root(*target, *preparation, publication, access, witness != nullptr ? &site : nullptr);"
+            if module_text.count(needle) != 1:
+                raise RuntimeError("fork depth1 reader validation boundary changed")
+            module_mutant(
+                "fork-reader-omits-depth1-validation",
+                module_text.replace(needle, "error = Error::None;"),
+                "ManagedForkRange.EnteringPreemptGuardRevalidatesTheAcquiredRootBeforeSurvey",
+            )
+            boundary = "release_current_range_root(access); } } } } else {"
             ordinary_yield = "if (!cursor.complete && target != nullptr) sched::kern_yield();"
             if module_text.count(boundary) != 1 or module_text.count(ordinary_yield) != 1:
                 raise RuntimeError("fork publication release/yield control boundary changed")
             bad = module_text.replace(
                 boundary,
-                "release_current_range_root(access); } " + ordinary_yield + " } } else {",
+                "release_current_range_root(access); } " + ordinary_yield + " } } } else {",
             )
             # The inserted yield is inside PUB, after the inner PreemptGuard.
             # Replace only the original common yield (the last occurrence).
