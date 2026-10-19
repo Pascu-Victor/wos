@@ -19,6 +19,10 @@ namespace ker::mod::mm::numa {
 struct AllocationContext;
 }
 
+namespace ker::mod::mm::virt {
+class BorrowedFileMappingRootAccess;
+}
+
 namespace ker::vfs {
 struct File;
 }
@@ -174,6 +178,12 @@ void file_mmap_cache_register_shrinker();
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault, const ker::mod::mm::numa::AllocationContext& placement)
     -> bool;
+// Only actual issued NATIVE work can supply this non-owning synchronous proof.
+// The caller retains every original work lease until this function returns.
+auto materialize_native_file_page_borrowing_root(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range,
+                                                 uint64_t page_vaddr, const ker::mod::mm::paging::PageFault& fault,
+                                                 const ker::mod::mm::numa::AllocationContext& placement,
+                                                 const ker::mod::mm::virt::BorrowedFileMappingRootAccess& access) -> bool;
 // Internal/native compatibility capture before installer/root acquisition.
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault) -> bool;

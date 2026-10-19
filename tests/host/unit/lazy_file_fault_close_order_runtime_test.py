@@ -494,7 +494,9 @@ auto capture_demand_context(sched::task::Task* target, uint64_t address,
     text = PRELUDE.replace("// ACTUAL_RAW_RANGE_TYPES", types)
     text = text.replace("// ACTUAL_ALLOCATION_CONTEXT", context).replace("// ACTUAL_DEMAND_DECLARATIONS", demand)
     text += "namespace ker::mod::sched::task { namespace mm = ker::mod::mm;\n" + "\n".join(task_bodies) + "\n}\n"
-    text += "namespace ker::mod::mm::virt {\n" + declarations + "\n" + "\n\n".join(bodies) + "\n}\n"
+    text += "namespace ker::mod::mm::virt {\n" + declarations + "\n" + "\n\n".join(bodies) + "\n"
+    # All legacy vectors are RAW. Do not simulate the new NATIVE authority.
+    text += "bool materialize_issued_native_file_fault(const LazyFileFaultWork&,size_t){std::abort();}\n}\n"
     return text + CASES, actual
 
 

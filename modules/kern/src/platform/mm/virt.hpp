@@ -44,7 +44,8 @@ using namespace ker::mod::mm::paging;
 
 namespace detail {
 struct PreparedSwapForkAccess;
-}
+struct IssuedNativeFileFaultAccess;
+}  // namespace detail
 // Private caller-born swap metadata owner. Prepare/destroy only ordinary context;
 // no source Mapping/Object/slot pointer survives an allocation or wait.
 class PreparedAnonymousSwapFork {
@@ -89,6 +90,31 @@ struct PageMapBatch {
     bool dirty{};
 };
 
+// Non-owning proof for one synchronous continuation of actual issued NATIVE
+// work. Only its cpp-local issued-work adapter can construct it. The original
+// work retains Task/local-root/stripe/backing ownership through the call.
+class BorrowedFileMappingRootAccess {
+   public:
+    BorrowedFileMappingRootAccess(const BorrowedFileMappingRootAccess&) = delete;
+    BorrowedFileMappingRootAccess(BorrowedFileMappingRootAccess&&) = delete;
+    auto operator=(const BorrowedFileMappingRootAccess&) -> BorrowedFileMappingRootAccess& = delete;
+    auto operator=(BorrowedFileMappingRootAccess&&) -> BorrowedFileMappingRootAccess& = delete;
+    [[nodiscard]] auto matches(const sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                               uint64_t root_serial) const noexcept -> bool;
+
+   private:
+    friend struct detail::IssuedNativeFileFaultAccess;
+    BorrowedFileMappingRootAccess(sched::task::Task& task, PageTable* root, const sched::task::LazyVmemRange& range, uint64_t address,
+                                  uint64_t serial, size_t gate) noexcept
+        : task_(&task), root_(root), range_(&range), address_(address), serial_(serial), gate_(gate) {}
+    sched::task::Task* const task_;
+    PageTable* const root_;
+    const sched::task::LazyVmemRange* const range_;
+    uint64_t const address_;
+    uint64_t const serial_;
+    size_t const gate_;
+};
+
 class FileMappingInstallerLease {
    public:
     FileMappingInstallerLease() = default;
@@ -96,9 +122,13 @@ class FileMappingInstallerLease {
     FileMappingInstallerLease(const FileMappingInstallerLease&) = delete;
     auto operator=(const FileMappingInstallerLease&) -> FileMappingInstallerLease& = delete;
     [[nodiscard]] auto acquire(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address) -> bool;
+    [[nodiscard]] auto acquire_borrowed(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                                        const BorrowedFileMappingRootAccess& access) -> bool;
     [[nodiscard]] auto binding() const -> file_mapping::FileMappingBinding* { return binding_; }
 
    private:
+    [[nodiscard]] auto acquire_binding(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address, PageTable* root,
+                                       const BorrowedFileMappingRootAccess* borrowed) -> bool;
     file_mapping::FileMappingBinding* binding_{};
     size_t access_gate_{static_cast<size_t>(-1)};
 };

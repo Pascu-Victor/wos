@@ -219,15 +219,17 @@ bool file_mmap_cached_page_for_file(ker::vfs::File*,const ker::vfs::Stat&,uint64
 bool read_file_mapping_exact(ker::vfs::File*f,void*p,size_t n,uint64_t){assert(guards==0&&f->refs>0);++reads;
  if(read_hook)read_hook();if(fail_read)return false;std::memset(p,f->id,n);return true;}
 uint64_t file_mapping_page_flags(uint64_t prot,uint64_t flags){return prot|flags;}
-bool materialize_lazy_file_page_impl(ker::mod::sched::task::Task*,const LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&,const ker::mod::mm::numa::AllocationContext&);
+bool materialize_lazy_file_page_impl(ker::mod::sched::task::Task*,const LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&,const ker::mod::mm::numa::AllocationContext&,const ker::mod::mm::virt::BorrowedFileMappingRootAccess*);
 bool materialize_lazy_file_page(ker::mod::sched::task::Task*t,const LazyVmemRange&r,uint64_t a,const ker::mod::mm::paging::PageFault&f,const ker::mod::mm::numa::AllocationContext&context){
  assert(guards==0&&((software_prefault&&ker::mod::sched::current==t)||
  (ker::mod::sched::current!=t&&t->pins==1&&ker::mod::mm::virt::reader_count(t->pagemap)==1)));
- return materialize_lazy_file_page_impl(t,r,a,f,context);}
+ return materialize_lazy_file_page_impl(t,r,a,f,context,nullptr);}
 }}
 namespace ker::mod::mm::virt{
 @MATCH@
 @REGION@
+// Explicit RAW-only boundary: the actual NATIVE route is tested separately.
+bool materialize_issued_native_file_fault(const LazyFileFaultWork&,size_t){std::abort();}
 @INSTALL@
 @ANONYMOUS_RANGE@
 @LAZY_HELPER@

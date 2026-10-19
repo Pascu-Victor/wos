@@ -205,6 +205,13 @@ if(WOS_HOST_TEST_DISABLE_LSAN)
     set_property(TEST lazy_file_fault_runtime_test APPEND PROPERTY ENVIRONMENT
         "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
 endif()
+add_test(NAME native_lazy_file_fault_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/native_lazy_file_fault_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(native_lazy_file_fault_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 120
+)
 add_test(NAME lazy_file_fault_close_order_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/lazy_file_fault_close_order_runtime_test.py
 )

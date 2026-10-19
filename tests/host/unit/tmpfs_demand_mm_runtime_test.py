@@ -221,8 +221,12 @@ inline auto fixture_leaf(PageTable*p,uint64_t a)->PageTableEntry*{for(int l=4;l>
 inline uint64_t translate(PageTable*p,uint64_t a){auto*e=fixture_leaf(p,a);return e&&e->present?(e->frame<<12):PADDR_INVALID;}
 inline bool snapshot_user_page_mapping_locked(PageTable*p,uint64_t a,bool write,paddr_t&out){auto*e=fixture_leaf(p,a);if(!e||!e->present||!e->user||(write&&!e->writable))return false;out=e->frame<<12;return true;}
 inline void flush_pagemap_after_update(PageTable*,uint64_t,bool){fixture::check(!fixture::irq,"ACK outside IRQ locks");++fixture::acks;}
+// Public TMPFS never receives a borrowed NATIVE authority.
+class BorrowedFileMappingRootAccess{public:bool matches(const sched::task::Task&,const sched::task::LazyVmemRange&,uint64_t,uint64_t)const noexcept{std::abort();}};
 class FileMappingInstallerLease{public:~FileMappingInstallerLease();bool acquire(sched::task::Task&,const sched::task::LazyVmemRange&,uint64_t);
- auto binding(){return binding_;}private:file_mapping::FileMappingBinding*binding_{};size_t access_gate_{SIZE_MAX};};
+ auto binding(){return binding_;}private:
+ bool acquire_binding(sched::task::Task&,const sched::task::LazyVmemRange&,uint64_t,PageTable*,const BorrowedFileMappingRootAccess*);
+ file_mapping::FileMappingBinding*binding_{};size_t access_gate_{SIZE_MAX};};
 bool capture_user_root_incarnation(PageTable*,uint64_t&)noexcept;
 bool prepare_captured_tmpfs_read_shared_page(sched::task::Task&,const sched::task::LazyVmemRange&,uint64_t,uint64_t,file_mapping::FileMappingBinding&);
 // ACTUAL_MM_BODIES
@@ -373,6 +377,7 @@ def generate(virt_source: Path) -> tuple[str, list[dict]]:
     bodies = []
     for anchor in ['auto lazy_file_range_matches(', 'auto file_binding_matches_range(', 'auto demand_range_policy_valid(',
                    'FileMappingInstallerLease::~FileMappingInstallerLease()', 'auto FileMappingInstallerLease::acquire(',
+                   'auto FileMappingInstallerLease::acquire_binding(',
                    'class DemandRootAccess {', 'struct DemandPageSnapshot {', 'auto capture_demand_page(',
                    'struct DemandTableSpares {', 'auto demand_leaf_locked(', 'auto prepare_captured_tmpfs_read_shared_page(',
                    'auto current_process_root(', 'auto prepare_tmpfs_read_shared_page(', 'auto capture_user_root_incarnation(',
@@ -430,6 +435,8 @@ def generate(virt_source: Path) -> tuple[str, list[dict]]:
         body, row = definition(virt, anchor)
         async_bodies.append(body)
         actual.append(row)
+    # Public TMPFS vectors must retain their original prepare-before-reader path.
+    async_bodies.append('bool materialize_issued_native_file_fault(const LazyFileFaultWork&,size_t){std::abort();}')
     code = code.replace('// ACTUAL_ASYNC_BODIES', '\n\n'.join(async_bodies))
     user = (KERN / 'platform/sys/usercopy.cpp').read_text()
     body, row = definition(user, 'auto pin_task_user_page(')

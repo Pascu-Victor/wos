@@ -1103,6 +1103,12 @@ auto demand_range_policy_valid(const sched::task::LazyVmemRange& range) -> bool 
 auto prepare_captured_tmpfs_read_shared_page(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
                                              uint64_t root_incarnation, file_mapping::FileMappingBinding& binding) -> bool;
 
+auto borrowed_native_file_root_current(const sched::task::Task& task, PageTable* root) -> bool {
+    return root != nullptr && root != get_kernel_pagemap() && task.pagemap == root && task.type == sched::task::TaskType::PROCESS &&
+           task.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !task.usercopy_pagemap_closing.load(std::memory_order_acquire);
+}
+
 #ifdef WOS_ASYNC_BLOCK_IO
 // This is still a try-only reader. The shared algorithm calls the callback only
 // after observing teardown, including after rolling back a raced reader. Never
@@ -1145,6 +1151,8 @@ struct LazyFileFaultWork {
     file_mapping::FileMappingBinding* demand_binding{};  // One exact SNAPSHOT, no root lease.
     numa::AllocationContext placement{};                 // Copied initiating actor value for this generation only.
 };
+auto materialize_issued_native_file_fault(const LazyFileFaultWork& taken, size_t index) -> bool;
+
 constexpr size_t LAZY_FILE_FAULT_CAPACITY = 64;
 std::array<LazyFileFaultWork, LAZY_FILE_FAULT_CAPACITY> lazy_file_fault_work;
 sys::Spinlock lazy_file_fault_lock;
@@ -1393,8 +1401,10 @@ void lazy_file_fault_worker_loop() {
             bool const OK = LIVE && (DEMAND ? work.demand_binding != nullptr &&
                                                   prepare_captured_tmpfs_read_shared_page(*work.task, work.range, work.vaddr,
                                                                                           work.root_incarnation, *work.demand_binding)
-                                            : ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault,
-                                                                                             work.placement));
+                                     : work.range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED
+                                         ? materialize_issued_native_file_fault(work, index)
+                                         : ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault,
+                                                                                          work.placement));
             // finish may release the final Task/backing owners. Keep only
             // scalar copies for a failure record after all work leases end.
             uint64_t const SUBJECT_PID = work.task->pid;
@@ -2782,6 +2792,39 @@ struct PreparedAnonymousSwapFork::Storage {
 };
 
 namespace detail {
+#ifdef WOS_ASYNC_BLOCK_IO
+// This type is deliberately defined only in this TU. No generic caller can
+// mint a borrow from a root pointer, reader count or copied work record.
+struct IssuedNativeFileFaultAccess {
+    static auto materialize(const LazyFileFaultWork& taken, size_t index) -> bool {
+        const LazyFileFaultWork* issued = nullptr;
+        uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
+        if (index < lazy_file_fault_work.size() && lazy_file_fault_worker != nullptr && sched::can_query_current_task() &&
+            sched::get_current_task() == lazy_file_fault_worker) {
+            auto const& slot = lazy_file_fault_work[index];
+            if (slot.task != nullptr && slot.issued && taken.issued && slot.task == taken.task && slot.pagemap == taken.pagemap &&
+                slot.access_gate != USER_PAGEMAP_ACCESS_GATE_NONE && slot.access_gate == taken.access_gate && slot.pagemap != nullptr &&
+                slot.access_gate == user_pagemap_access_gate_index(slot.pagemap) && slot.vaddr == taken.vaddr && slot.generation != 0 &&
+                slot.generation == taken.generation && slot.sequence != 0 && slot.sequence == taken.sequence &&
+                slot.range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED && slot.range.lifetime != nullptr &&
+                lazy_file_range_matches(slot.range, taken.range, slot.vaddr))
+                issued = &slot;
+        }
+        lazy_file_fault_lock.unlock_irqrestore(FLAGS);
+        if (issued == nullptr || !borrowed_native_file_root_current(*issued->task, issued->pagemap)) return false;
+        // Only this synchronous worker's finish clears its issued slot. Consume
+        // actual slot values, not authority-field-matching caller payloads.
+        uint64_t serial = 0;
+        if (!capture_user_root_incarnation(issued->pagemap, serial) || !borrowed_native_file_root_current(*issued->task, issued->pagemap))
+            return false;
+        BorrowedFileMappingRootAccess const access(*issued->task, issued->pagemap, issued->range, issued->vaddr, serial,
+                                                   issued->access_gate);
+        return ker::syscall::vmem::materialize_native_file_page_borrowing_root(issued->task, issued->range, issued->vaddr, issued->fault,
+                                                                               issued->placement, access);
+    }
+};
+#endif
+
 struct PreparedSwapForkAccess {
     static auto ready_actor(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation) -> bool {
         return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
@@ -2985,6 +3028,12 @@ void reset_anonymous_swap_fork(PreparedAnonymousSwapFork& plan) noexcept { Prepa
 }  // namespace detail
 
 namespace {
+#ifdef WOS_ASYNC_BLOCK_IO
+auto materialize_issued_native_file_fault(const LazyFileFaultWork& taken, size_t index) -> bool {
+    return detail::IssuedNativeFileFaultAccess::materialize(taken, index);
+}
+#endif
+
 auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
     uint64_t last_vaddr = 0;
     bool have_last = false;
@@ -7131,6 +7180,14 @@ auto snapshot_file_mapping_bindings(PageTable* root, file_mapping::FileMappingBi
     return CAPTURED;
 }
 
+auto BorrowedFileMappingRootAccess::matches(const sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                                            uint64_t root_serial) const noexcept -> bool {
+    return task_ == &task && range_ == &range && address_ == address && serial_ != 0 && serial_ == root_serial &&
+           range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED && range.lifetime != nullptr &&
+           gate_ != USER_PAGEMAP_ACCESS_GATE_NONE && gate_ == user_pagemap_access_gate_index(root_) &&
+           borrowed_native_file_root_current(task, root_);
+}
+
 FileMappingInstallerLease::~FileMappingInstallerLease() {
     release_user_pagemap_access(access_gate_);
     if (binding_ != nullptr) binding_->release(file_mapping::BindingOwner::INSTALLER);
@@ -7140,14 +7197,27 @@ auto FileMappingInstallerLease::acquire(sched::task::Task& task, const sched::ta
     if (binding_ != nullptr || access_gate_ != USER_PAGEMAP_ACCESS_GATE_NONE || !sched::task::lazy_vmem_has_lifetime(range)) return false;
     auto* root = task.pagemap;
     if (!acquire_user_pagemap_access(root, false, access_gate_)) return false;
+    return acquire_binding(task, range, address, root, nullptr);
+}
+
+auto FileMappingInstallerLease::acquire_borrowed(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                                                 const BorrowedFileMappingRootAccess& access) -> bool {
+    if (binding_ != nullptr || access_gate_ != USER_PAGEMAP_ACCESS_GATE_NONE || range.kind != sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
+        return false;
+    return acquire_binding(task, range, address, task.pagemap, &access);
+}
+
+auto FileMappingInstallerLease::acquire_binding(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                                                PageTable* root, const BorrowedFileMappingRootAccess* borrowed) -> bool {
     uint64_t const RANGE_FLAGS = task.lazy_vmem_lock.lock_irqsave();
     bool current = false;
     for (auto const& candidate : task.lazy_vmem_ranges) {
         if (task.pagemap != root || !lazy_file_range_matches(candidate, range, address)) continue;
         uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
         auto* control = find_user_root_control_locked(root);
-        auto const RESULT = control != nullptr ? file_mapping_index.retain_for_pin_locked(root, control->serial, address, binding_)
-                                               : file_mapping::FileMappingPinResult::REFUSE;
+        auto const RESULT = control != nullptr && (borrowed == nullptr || borrowed->matches(task, range, address, control->serial))
+                                ? file_mapping_index.retain_for_pin_locked(root, control->serial, address, binding_)
+                                : file_mapping::FileMappingPinResult::REFUSE;
         if (RESULT == file_mapping::FileMappingPinResult::ACQUIRED) {
             current = file_binding_matches_range(*binding_, candidate) &&
                       binding_->reclassify(file_mapping::BindingOwner::PIN, file_mapping::BindingOwner::INSTALLER);

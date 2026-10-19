@@ -33,6 +33,8 @@ code = r'''
 #include <cstring>
 #include <cerrno>
 #include <memory>
+#include <optional>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <new>
@@ -86,6 +88,15 @@ struct Task{TaskType type=TaskType::PROCESS;const char*name="fixture";uint64_t p
  ker::mod::mm::numa::Policy memory_policy_snapshot(){assert(model::pub==0&&model::locks.empty());return {policy_nodes,static_cast<ker::mod::mm::numa::Mode>(policy_mode)};}
  struct Retirement{void*load(std::memory_order)const{return nullptr;}}native_file_mapping_retirement;
  void*pagemap=reinterpret_cast<void*>(1);uint64_t pid=42;model::Lock lazy_vmem_lock{2};std::vector<LazyVmemRange>lazy_vmem_ranges;};
+}
+namespace sys {
+// Public ordinary preparation is excluded from these fixed Legacy RAW vectors.
+class SyscallPreparationScope {
+ public:
+ explicit SyscallPreparationScope(sched::task::Task&){std::abort();}
+ SyscallPreparationScope(const SyscallPreparationScope&)=delete;
+ auto operator=(const SyscallPreparationScope&)->SyscallPreparationScope& = delete;
+};
 }
 namespace sched::resource{struct AddressSpaceObservation{template<class T>explicit AddressSpaceObservation(T*){}
  bool admit_mapping(void*,uint64_t,uint64_t=0,uint64_t=0){return !model::fail_admit;}void commit_mapping(){}};}
@@ -195,6 +206,26 @@ ker::mod::sched::task::Task*get_current_task(){return nullptr;}
 bool file_mapping_offset_range_valid(uint64_t o,uint64_t n){return o<=UINT64_MAX-n;}
 bool lazy_file_mmap_enabled(){return model::lazy_enabled;}
 struct SharedVmemPublicationGuard{SharedVmemPublicationGuard(){assert(model::pub++==0);}~SharedVmemPublicationGuard(){assert(--model::pub==0);}};
+LEGACY_MUTATION_TYPES
+// Compile the WHOLE current mmap body. Legacy nonfixed/null-scope construction
+// is inert; every Public/prepared operation below is explicitly excluded.
+class PreparedRangeDemotion {
+ public:
+ PreparedRangeDemotion(ker::mod::sched::task::Task&,const ker::mod::sys::SyscallPreparationScope&){std::abort();}
+ PreparedRangeDemotion(const PreparedRangeDemotion&)=delete;
+ auto operator=(const PreparedRangeDemotion&)->PreparedRangeDemotion& = delete;
+ auto prepare(uint64_t,uint64_t)->int{std::abort();}
+};
+auto demote_prepared_range_locked(ker::mod::sched::task::Task&,uint64_t,uint64_t,const SharedVmemPublicationGuard&,PreparedRangeDemotion&)->int{std::abort();}
+class PublicRangeMutation {
+ public:
+ PublicRangeMutation(ker::mod::sched::task::Task&,const ker::mod::sys::SyscallPreparationScope* preparation,uint64_t,uint64_t){
+  if(preparation!=nullptr)std::abort();
+ }
+ auto inspect(const SharedVmemPublicationGuard&)->MutationAttempt{std::abort();}
+ auto demote(const SharedVmemPublicationGuard&)->int{std::abort();}
+ auto prepare_next(MutationStage)->int{std::abort();}
+};
 struct RetainedEndpoint{ker::vfs::File* file{};ker::vfs::Stat stat;};RetainedEndpoint endpoint;
 uint64_t allocate_public_shared_tmpfs(ker::mod::sched::task::Task&,ker::vfs::File&,const ker::vfs::Stat&,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t){std::abort();}
 bool overlaps_kernel_managed_user_layout_locked(ker::mod::sched::task::Task*,uint64_t,uint64_t){return false;}
@@ -339,13 +370,22 @@ actual_fault = function(virt, 'handle_lazy_vmem_fault')
 demand_argument = ', demand' if 'DemandContext' in actual_fault[:actual_fault.index('{')] else ''
 code = '#include "' + str(ROOT / 'modules/kern/src/platform/mm/numa_policy.hpp') + '"\n' + code
 code = extend_raw_fixture(code, 'model::Lock user_mapping_pin_lock{3};')
+# Pure types are selected from current Root source even for an old-body control.
+mutation_source = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
+mutation_types = '\n'.join(block(mutation_source, rf'^(?:enum class|struct) {name}[^;{{]*\{{') + ';'
+                           for name in ('MutationRoute', 'MutationStage', 'MutationAttempt'))
+file_allocate_body = function(vmem, 'file_allocate')
+if 'SyscallPreparationScope' in file_allocate_body[:file_allocate_body.index('{')]:
+    # Preserve actual default-Legacy delegation; never rewrite the main body.
+    file_allocate_body += '\n' + block(vmem, r'^auto file_allocate\([^;{]*uint64_t offset\)\s*-> uint64_t\s*\{')
 replacements = {
     'PREPARE': function(phys, 'prepare_allocated_block'),
     'WRAPPERS': '\n'.join(function(phys, n) for n in ['page_alloc_may_fail', 'page_alloc_full_overwrite_may_fail', 'page_alloc_full_overwrite_page_may_fail', 'page_alloc_with_reclaim_may_fail', 'page_alloc_full_overwrite_page_with_reclaim_may_fail']),
     'ANON_REVALIDATE': function(virt, 'anonymous_lazy_range_allows_fault'),
     'FILE_MATCH': function(virt, 'lazy_file_range_matches'),
     'INSTALL': function(virt, 'install_lazy_file_page_if_current'),
-    'FILE_ALLOCATE': function(vmem, 'file_allocate'),
+    'FILE_ALLOCATE': file_allocate_body,
+    'LEGACY_MUTATION_TYPES': mutation_types,
     'FILE_MATERIALIZE': function(vmem, 'materialize_lazy_file_page_impl'),
     'FAULT': actual_fault,
     'NUMA_DECLARATIONS': numa_declarations,

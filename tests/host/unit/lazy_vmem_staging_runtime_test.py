@@ -32,6 +32,7 @@ FILE_BUDGET = 8 << 20
 
 COMMON = r'''
 #pragma once
+#include <abi/callnums/vmem.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -647,7 +648,7 @@ def generate(scratch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(data)
     write("fixture_common.hpp", COMMON)
-    for name in ["util/smallvec.hpp", "platform/sched/lazy_vmem.hpp", "platform/mm/file_mapping_lifetime.hpp", "platform/sys/syscall_preparation.hpp"]:
+    for name in ["util/smallvec.hpp", "platform/sched/lazy_vmem.hpp", "platform/mm/file_mapping_lifetime.hpp", "platform/sys/syscall_preparation.hpp", "abi/callnums/vmem.h"]:
         write(name, (KERN / name).read_text())
     task = (KERN / "platform/sched/task.hpp").read_text()
     begin = task.index("enum class LazyVmemKind")
@@ -888,7 +889,7 @@ def main():
             "platform/sched/task.hpp", "platform/sched/task.cpp", "syscalls_impl/process/exec.cpp",
             "platform/mm/file_mapping_lifetime.hpp", "platform/mm/file_mapping_lifetime.cpp", "vfs/core.cpp",
             "syscalls_impl/vmem/sys_vmem.cpp", "syscalls_impl/vmem/sys_vmem.hpp", "platform/sched/scheduler.cpp",
-            "platform/sys/syscall_preparation.hpp"])]
+            "platform/sys/syscall_preparation.hpp", "abi/callnums/vmem.h"])]
         before = [pin(p) for p in watched]
         result["source_before"] = before
         result["primitive_seams"] = ["Task lifetime/state", "MM scalar root identity", "publication and IRQ locks",

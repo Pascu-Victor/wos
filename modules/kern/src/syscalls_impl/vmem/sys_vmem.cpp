@@ -2068,7 +2068,8 @@ auto file_mapping_page_flags(uint64_t prot, uint64_t mmap_flags) -> uint64_t {
 }
 
 auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const LazyVmemRange& range, uint64_t page_vaddr,
-                                     const ker::mod::mm::paging::PageFault& fault, const numa::AllocationContext& placement) -> bool {
+                                     const ker::mod::mm::paging::PageFault& fault, const numa::AllocationContext& placement,
+                                     const ker::mod::mm::virt::BorrowedFileMappingRootAccess* borrowed = nullptr) -> bool {
     if (task == nullptr || task->pagemap == nullptr || !ker::mod::sched::task::lazy_vmem_is_file(range)) {
         return false;
     }
@@ -2080,7 +2081,10 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
     numa::AllocationResult allocation;
     ker::mod::mm::virt::FileMappingInstallerLease installer;
     bool const NATIVE = range.kind == LazyVmemKind::NATIVE_FILE_BACKED;
-    if (NATIVE && !installer.acquire(*task, range, page_vaddr)) return false;
+    if (borrowed != nullptr && !NATIVE) return false;
+    if (NATIVE && !(borrowed != nullptr ? installer.acquire_borrowed(*task, range, page_vaddr, *borrowed)
+                                        : installer.acquire(*task, range, page_vaddr)))
+        return false;
     auto* file = ker::mod::sched::task::lazy_vmem_file(range);
     if (file == nullptr) return false;
     if (page_vaddr < range.start || page_vaddr >= range.end || (page_vaddr & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0) {
@@ -5438,6 +5442,14 @@ auto prepare_unpublished_read_shared_tmpfs_mapping(ker::mod::sched::task::Task& 
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault, const numa::AllocationContext& placement) -> bool {
     return materialize_lazy_file_page_impl(task, range, page_vaddr, fault, placement);
+}
+
+auto materialize_native_file_page_borrowing_root(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range,
+                                                 uint64_t page_vaddr, const ker::mod::mm::paging::PageFault& fault,
+                                                 const ker::mod::mm::numa::AllocationContext& placement,
+                                                 const ker::mod::mm::virt::BorrowedFileMappingRootAccess& access) -> bool {
+    if (range.kind != LazyVmemKind::NATIVE_FILE_BACKED) return false;
+    return materialize_lazy_file_page_impl(task, range, page_vaddr, fault, placement, &access);
 }
 
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,

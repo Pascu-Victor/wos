@@ -59,8 +59,10 @@ struct RawExcludedRootControl { uint64_t serial{}; };
 template<class Root> RawExcludedRootControl* find_user_root_control_locked(Root*) { std::abort(); }
 file_mapping::FileMappingIndex file_mapping_index;
 template<class Binding,class Range> bool file_binding_matches_range(const Binding&,const Range&) { std::abort(); }
+class BorrowedFileMappingRootAccess;
 class FileMappingInstallerLease { public:
  template<class Task,class Range> bool acquire(Task&,const Range&,uint64_t) { std::abort(); }
+ template<class Task,class Range> bool acquire_borrowed(Task&,const Range&,uint64_t,const BorrowedFileMappingRootAccess&) { std::abort(); }
  // RAW materialization legitimately queries its never-acquired empty lease.
  file_mapping::FileMappingBinding* binding() const { return nullptr; }
 };
