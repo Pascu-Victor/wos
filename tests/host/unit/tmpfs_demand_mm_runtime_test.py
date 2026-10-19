@@ -61,10 +61,12 @@ PRELUDE = r'''
 #include <functional>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
 #include <platform/mm/paging.hpp>
+#include <platform/mm/numa_policy.hpp>
 namespace fixture {
 inline unsigned assertions{},cases{},irq{},preempt{},task_leases{},root_leases{},io_calls{},metadata_calls{},table_allocs{},table_frees{},acks{},yields{};
 inline unsigned fail_table_at{},refuse_readers{};
@@ -82,6 +84,9 @@ inline std::map<void*,bool> tables;
 namespace ker::abi::vmem {constexpr uint64_t PROT_READ=1,PROT_WRITE=2,MAP_SHARED=1;}
 namespace ker::vfs {struct File;}
 namespace ker::mod::mm {using vaddr_t=uint64_t;using paddr_t=uint64_t;enum class PageKind{PAGE_TABLE,NORMAL};}
+namespace ker::mod::mm::numa {
+// ACTUAL_PRIVATE_ALLOCATION_CONTEXT
+}
 namespace ker::mod::mm::addr {
 inline uint64_t get_phys_pointer(uint64_t p){return p;}
 inline uint64_t get_virt_pointer(uint64_t p){return p;}
@@ -147,7 +152,8 @@ namespace ker::mod::sched::task {
 enum class TaskType{PROCESS,DAEMON};enum class TaskState{ACTIVE,EXITING};
 // ACTUAL_RANGE_TYPES
 struct Task{TaskType type=TaskType::PROCESS;std::atomic<TaskState>state{TaskState::ACTIVE};mm::paging::PageTable*pagemap{};
- std::atomic<bool>scheduler_transition_active{};uint64_t syscall_account_start_us{};
+ std::atomic<bool>scheduler_transition_active{},exit_in_progress{},process_exit_requested{},usercopy_pagemap_closing{};
+ bool has_exited{},deferred_task_switch{},wants_block{};uint64_t syscall_account_start_us{};
  fixture::Lock lazy_vmem_lock;std::vector<LazyVmemRange>lazy_vmem_ranges;unsigned refs=1,preempt_disable_depth{},local{};
  uint64_t lazy_file_fault_generation{},lazy_file_fault_vaddr{};int lazy_file_fault_status{};std::atomic<uint64_t>lazy_file_fault_completion_generation{};
  bool try_acquire(){if(state!=TaskState::ACTIVE)return false;++refs;return true;}void release(){fixture::check(refs>1,"retained Task released once");--refs;}
@@ -158,6 +164,7 @@ struct Task{TaskType type=TaskType::PROCESS;std::atomic<TaskState>state{TaskStat
 namespace ker::mod::sched {
 inline task::Task*current{};inline unsigned holds{},wakes{};
 inline bool can_query_current_task(){return current!=nullptr;}inline auto get_current_task(){return current;}
+inline auto get_return_task(){return current;}
 inline void preempt_disable(){++fixture::preempt;}inline void preempt_enable(){fixture::check(fixture::preempt>0,"preempt balanced");--fixture::preempt;}
 inline unsigned preempt_count(){return fixture::preempt;}inline bool interrupts_enabled(){return fixture::interrupts&&fixture::irq==0;}
 struct PreemptGuard{PreemptGuard(){preempt_disable();}~PreemptGuard(){preempt_enable();}};
@@ -178,15 +185,24 @@ namespace fixture {inline void interrupt_instruction(const char*instruction){che
 #undef asm
 namespace ker::mod::dbg {[[noreturn]]inline void panic_handler(const char*s){std::fprintf(stderr,"PANIC %s\n",s);std::abort();}}
 namespace ker::vfs {struct File{};inline void vfs_retain_file(File*){std::abort();}inline void vfs_put_file(File*){std::abort();}}
-namespace ker::syscall::vmem {inline bool materialize_lazy_file_page(ker::mod::sched::task::Task*,const ker::mod::sched::task::LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&){std::abort();}}
+namespace ker::syscall::vmem {
+// ACTUAL_PRIVATE_MATERIALIZER_BOUNDARY
+}
 namespace ker::mod::mm::virt {
 using namespace paging;namespace sched=ker::mod::sched;namespace sys=ker::mod::sys;namespace dbg=ker::mod::dbg;
 constexpr uint64_t PADDR_INVALID=UINT64_MAX;constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE=SIZE_MAX;
+// Actual layout/construction only; private FILE policy capture must abort.
+// ACTUAL_PRIVATE_DEMAND_CONTEXT
+// ACTUAL_PRIVATE_CAPTURE_BOUNDARY
 enum class PublicReadPrepareResult:uint8_t{NOT_TRACKED,READY,REFUSED};
 inline sys::Spinlock cow_pte_lock,user_mapping_pin_lock;inline file_mapping::FileMappingIndex file_mapping_index;
 inline PageTable*kernel_pagemap{};
+inline auto get_kernel_pagemap(){return kernel_pagemap;}
 struct Control{uint64_t serial{};};inline std::map<PageTable*,Control>controls;
 inline auto find_user_root_control_locked(PageTable*r)->Control*{auto i=controls.find(r);return i==controls.end()?nullptr:&i->second;}
+// Every vector selects public TMPFS. The new private FILE/NATIVE retry adapter
+// must remain unreachable; existing public reader refusal/PARK tests stay exact.
+inline bool try_acquire_lazy_file_fault_reader(PageTable*,size_t&,bool&){std::abort();}
 inline bool acquire_user_pagemap_access(PageTable*,bool,size_t&g){if(fixture::refuse_readers){--fixture::refuse_readers;return false;}++fixture::root_leases;g=0;return true;}
 inline void release_user_pagemap_access(size_t g){if(g!=SIZE_MAX){fixture::check(fixture::root_leases>0,"reader balanced");--fixture::root_leases;}}
 struct PageTableReleaseOrigin{void*caller;uint64_t pid;};
@@ -372,6 +388,34 @@ def generate(virt_source: Path) -> tuple[str, list[dict]]:
     # All fixture fields are explicit seams; actual production definitions above
     # are inserted whole, without replacing any body fragment.
     code = PRELUDE.replace('// ACTUAL_RANGE_TYPES', types)
+    allocation = (KERN / 'platform/mm/numa_alloc.hpp').read_text()
+    body, row = definition(allocation, 'struct AllocationContext {', True)
+    actual.append(dict(row, source='platform/mm/numa_alloc.hpp'))
+    code = code.replace('// ACTUAL_PRIVATE_ALLOCATION_CONTEXT', body)
+    declarations = []
+    interface = (KERN / 'platform/mm/virt.hpp').read_text()
+    body, row = definition(interface, 'enum class DemandOrigin', True)
+    declarations.append(body); actual.append(dict(row, source='platform/mm/virt.hpp'))
+    for anchor in ('struct DemandContext {', 'class DemandContextStorage {'):
+        body, row = definition(virt, anchor, True)
+        declarations.append(body); actual.append(row)
+    code = code.replace('// ACTUAL_PRIVATE_DEMAND_CONTEXT', '\n'.join(declarations))
+    # These exact signatures type-check the WHOLE actual probe/worker. Their
+    # private FILE implementations are outside this public TMPFS test domain.
+    start = virt.index('auto capture_demand_context(')
+    signature = virt[start:virt.index('{', start)]
+    code = code.replace('// ACTUAL_PRIVATE_CAPTURE_BOUNDARY', signature +
+                        '{ (void)target; (void)address; (void)origin; (void)hardware_user; (void)output; std::abort(); }')
+    actual.append(dict(anchor='actual-private-capture-signature-aborting-Host-boundary',
+                       bytes=len(signature.encode()), sha256=hashlib.sha256(signature.encode()).hexdigest()))
+    materializer = (KERN / 'syscalls_impl/vmem/sys_vmem.hpp').read_text()
+    start = materializer.index('auto materialize_lazy_file_page(')
+    signature = materializer[start:materializer.index(';', start)]
+    code = code.replace('// ACTUAL_PRIVATE_MATERIALIZER_BOUNDARY', signature +
+                        '{ (void)task; (void)range; (void)page_vaddr; (void)fault; (void)placement; std::abort(); }')
+    actual.append(dict(anchor='actual-private-five-argument-materializer-signature-aborting-Host-boundary',
+                       bytes=len(signature.encode()), sha256=hashlib.sha256(signature.encode()).hexdigest(),
+                       source='syscalls_impl/vmem/sys_vmem.hpp'))
     code = code.replace('// ACTUAL_MM_BODIES', '\n\n'.join(bodies))
     begin = virt.index('enum class LazyFileFaultDisposition')
     end = virt.index('void wake_lazy_file_fault_worker()', begin)
@@ -410,7 +454,10 @@ def main() -> int:
                args.virt_source.resolve(strict=True), KERN / 'platform/mm/virt.hpp', KERN / 'platform/sched/task.hpp',
                KERN / 'platform/sys/usercopy.cpp',
                KERN / 'platform/sys/syscall_preparation.hpp',
-               KERN / 'platform/mm/paging.hpp', KERN / 'platform/mm/paging.opt.cpp']
+               KERN / 'platform/mm/paging.hpp', KERN / 'platform/mm/paging.opt.cpp',
+               KERN / 'platform/mm/numa_alloc.hpp', KERN / 'platform/mm/numa_policy.hpp',
+               KERN / 'platform/acpi/numa_topology.hpp', KERN / 'platform/acpi/bounded_tables.hpp',
+               KERN / 'syscalls_impl/vmem/sys_vmem.hpp']
     before = []
     try:
         compiler = Path(args.cxx).resolve(strict=True)
@@ -423,7 +470,9 @@ def main() -> int:
         scratch = Path(tempfile.mkdtemp(prefix='wos-demand-mm-', dir='/tmp'))
         source, binary = scratch / 'demand.cpp', scratch / 'demand-test'
         include = scratch / 'include'
-        for original, target in [(KERN / 'platform/mm/paging.hpp', include / 'platform/mm/paging.hpp')]:
+        for original, target in [(KERN / name, include / name) for name in
+                                 ('platform/mm/paging.hpp', 'platform/mm/numa_policy.hpp',
+                                  'platform/acpi/numa_topology.hpp', 'platform/acpi/bounded_tables.hpp')]:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(original.read_bytes())
         definitions = include / 'defines/defines.hpp'

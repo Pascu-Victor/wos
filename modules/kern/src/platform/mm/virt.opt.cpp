@@ -1104,7 +1104,32 @@ auto prepare_captured_tmpfs_read_shared_page(sched::task::Task& task, const sche
                                              uint64_t root_incarnation, file_mapping::FileMappingBinding& binding) -> bool;
 
 #ifdef WOS_ASYNC_BLOCK_IO
-enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAILED };
+// This is still a try-only reader. The shared algorithm calls the callback only
+// after observing teardown, including after rolling back a raced reader. Never
+// infer that cause from a later sample after an untyped acquisition failure.
+auto try_acquire_lazy_file_fault_reader(PageTable* pagemap, size_t& gate_index, bool& teardown_refusal) -> bool {
+    teardown_refusal = false;
+    return admit_user_pagemap_reader(pagemap, gate_index, [pagemap, &teardown_refusal](bool) {
+        auto const& gate = user_pagemap_access_gates.at(user_pagemap_access_gate_index(pagemap));
+        teardown_refusal = gate.readers.load(std::memory_order_acquire) != UINT32_MAX;
+        return false;
+    });
+}
+
+enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAILED, RETRY };
+
+// The probe checks this while retaining Task/root leases; the handler checks
+// the return context again after releasing them. No root is dereferenced here.
+// Retrying preserves the user frame, so closing or return transitions refuse.
+auto lazy_file_fault_retry_context(sched::task::Task* task, PageTable* pagemap) -> bool {
+    return task != nullptr && pagemap != nullptr && pagemap != get_kernel_pagemap() && sched::can_query_current_task() &&
+           sched::get_current_task() == task && sched::get_return_task() == task && task->type == sched::task::TaskType::PROCESS &&
+           task->preempt_disable_depth == 0 && task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !task->has_exited && !task->exit_in_progress.load(std::memory_order_acquire) &&
+           !task->process_exit_requested.load(std::memory_order_acquire) &&
+           !task->scheduler_transition_active.load(std::memory_order_acquire) && !task->deferred_task_switch && !task->wants_block &&
+           !task->usercopy_pagemap_closing.load(std::memory_order_acquire) && task->pagemap == pagemap;
+}
 
 struct LazyFileFaultWork {
     sched::task::Task* task{};
@@ -1139,8 +1164,8 @@ void wake_lazy_file_fault_worker() {
     }
 }
 
-auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, bool user_frame, uint64_t& generation)
-    -> LazyFileFaultDisposition {
+auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, bool user_frame, uint64_t& generation,
+                           bool retry_user_if = false) -> LazyFileFaultDisposition {
     if (task == nullptr || task->pagemap == nullptr) return LazyFileFaultDisposition::NOT_TRACKED;
     uint64_t const PAGE_VADDR = page_align_down(vaddr);
     sched::task::LazyVmemRange snapshot;
@@ -1176,7 +1201,15 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         return LazyFileFaultDisposition::FAILED;
     }
     size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(pagemap, false, gate) && !sched::task::lazy_vmem_is_tmpfs_shared(snapshot)) {
+    bool teardown_refusal = false;
+    bool const PRIVATE_FILE =
+        snapshot.kind == sched::task::LazyVmemKind::FILE_BACKED || snapshot.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED;
+    bool const ACQUIRED = retry_user_if && PRIVATE_FILE ? try_acquire_lazy_file_fault_reader(pagemap, gate, teardown_refusal)
+                                                        : acquire_user_pagemap_access(pagemap, false, gate);
+    bool const RETRY_GATE = !ACQUIRED && teardown_refusal && retry_user_if && PRIVATE_FILE && fault.present == 0U && fault.user != 0U &&
+                            fault.reserved == 0U && fault.protection_key == 0U && fault.shadow_stack == 0U &&
+                            lazy_file_fault_retry_context(task, pagemap);
+    if (!ACQUIRED && !sched::task::lazy_vmem_is_tmpfs_shared(snapshot) && !RETRY_GATE) {
         task->release_usercopy_pagemap();
         task->release();
         return LazyFileFaultDisposition::FAILED;
@@ -1237,6 +1270,17 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     for (auto const& range : task->lazy_vmem_ranges) {
         if (task->pagemap == pagemap && lazy_file_range_matches(range, snapshot, PAGE_VADDR)) {
             snapshot = range;
+            if (RETRY_GATE) {
+                // The unchanged pool checks above refused sticky completion,
+                // worker, generation and capacity errors. Validate the exact
+                // live range under pool -> range before acquiring any backing
+                // owner or publishing work for this transient retry.
+                bool const RETRY = lazy_file_fault_retry_context(task, pagemap);
+                task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+                lazy_file_fault_lock.unlock_irqrestore(flags);
+                release_leases();
+                return RETRY ? LazyFileFaultDisposition::RETRY : LazyFileFaultDisposition::FAILED;
+            }
             if (sched::task::lazy_vmem_has_lifetime(snapshot)) {
                 current = family_owned =
                     snapshot.lifetime != nullptr && snapshot.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT);
@@ -7964,7 +8008,9 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             return false;
         }
 #ifdef WOS_ASYNC_BLOCK_IO
-        auto const FILE_FAULT = probe_lazy_file_fault(current_task, control_register, PAGEFAULT, (frame.cs & 3U) == 3U, wait_generation);
+        auto* const FILE_FAULT_ROOT = current_task != nullptr ? current_task->pagemap : nullptr;
+        auto const FILE_FAULT = probe_lazy_file_fault(current_task, control_register, PAGEFAULT, (frame.cs & 3U) == 3U, wait_generation,
+                                                      (frame.flags & cpu::GATE_IF_MASK) != 0);
         if (FILE_FAULT == LazyFileFaultDisposition::PARK) {
             while (current_task->lazy_file_fault_completion_generation.load(std::memory_order_acquire) != wait_generation) {
                 auto const WAIT = sched::place_task_in_wait_queue_if_pending(
@@ -7975,6 +8021,13 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
                    translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
         }
         if (FILE_FAULT == LazyFileFaultDisposition::RESOLVED) return true;
+        if (FILE_FAULT == LazyFileFaultDisposition::RETRY) {
+            // No mapping is claimed resolved. IRET restores the original IF1
+            // user frame and instruction; ordinary IRQ/timer scheduling may
+            // run a preempted exclusive owner before the fault is retried.
+            return (frame.cs & 3U) == 3U && (frame.flags & cpu::GATE_IF_MASK) != 0 &&
+                   lazy_file_fault_retry_context(current_task, FILE_FAULT_ROOT);
+        }
         if (FILE_FAULT == LazyFileFaultDisposition::FAILED) return false;
 #endif
 #ifdef WOS_ASYNC_BLOCK_IO

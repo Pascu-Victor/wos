@@ -105,7 +105,7 @@ auto FileMappingIndex::retain_for_pin_locked(paging::PageTable*, uint64_t, uint6
 }
 namespace ker::mod::sys { using Spinlock = fixture::Lock; }
 namespace ker::vfs { struct File; void vfs_retain_file(File*); void vfs_put_file(File*); }
-namespace ker::mod::mm::paging { struct PageFault { unsigned writable{}, fetch{}; }; }
+namespace ker::mod::mm::paging { struct PageFault { unsigned writable{}, fetch{}, present{}, user{1}, reserved{}, protection_key{}, shadow_stack{}; }; }
 namespace ker::mod::sched::task {
 enum class TaskType { PROCESS, DAEMON };
 enum class TaskState { ACTIVE, EXITING, DEAD };
@@ -119,6 +119,8 @@ struct Task {
     fixture::Lock lazy_vmem_lock;
     std::vector<LazyVmemRange> lazy_vmem_ranges;
     uint32_t preempt_disable_depth{};
+    std::atomic<bool> scheduler_transition_active{}, exit_in_progress{}, process_exit_requested{};
+    bool has_exited{}, deferred_task_switch{}, wants_block{};
     uint64_t lazy_file_fault_generation{}, lazy_file_fault_vaddr{};
     int lazy_file_fault_status{777};
     std::atomic<uint64_t> lazy_file_fault_completion_generation{};
@@ -134,6 +136,8 @@ struct Task {
 namespace ker::mod::sched {
 thread_local task::Task* current{};
 task::Task* get_current_task() { return current; }
+task::Task* get_return_task() { return current; }
+bool can_query_current_task() { return current != nullptr; }
 bool kernel_threads_shutdown_requested();
 struct Hold {
     task::Task* owner{};
@@ -149,6 +153,8 @@ namespace sched = ker::mod::sched;
 namespace sys = ker::mod::sys;
 // ACTUAL_DEMAND_DECLARATIONS
 using PageTable = fixture::PageTable;
+PageTable* kernel_pagemap{};
+auto get_kernel_pagemap() { return kernel_pagemap; }
 constexpr uint64_t PADDR_INVALID = UINT64_MAX;
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = SIZE_MAX;
 std::array<fixture::Gate, 2> user_pagemap_access_gates;
@@ -168,6 +174,10 @@ bool acquire_user_pagemap_access(PageTable* root, bool, size_t& index) {
     if (gate.teardown.load()) { --gate.readers; return false; }
     index = root->gate_index; return true;
 }
+// This RAW close-order driver supplies no saved-IF retry argument. Its actual
+// probe takes the unchanged original reader boundary above; the new hardware
+// retry adapter is deliberately unreachable, not a modeled gate algorithm.
+bool try_acquire_lazy_file_fault_reader(PageTable*, size_t&, bool&) { std::abort(); }
 void release_user_pagemap_access(size_t);
 }
 namespace ker::syscall::vmem {
