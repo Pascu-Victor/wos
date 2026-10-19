@@ -38,8 +38,10 @@ auto observe(const char* nonce) -> int {
             if (!arm::snapshot_valid(final, selected) || final.sequence < sequence || final.published_mono_ns < published) return 82;
             sequence = final.sequence;
             published = final.published_mono_ns;
-            if (arm::consumed(final)) break;
-            if (selected.state != arm::init::ServiceState::RUNNING && selected.state != arm::init::ServiceState::STARTING) return 82;
+            if (arm::consumed(final, ::getpid())) break;
+            if (!arm::awaiting_exec(final, ::getpid()) && selected.state != arm::init::ServiceState::RUNNING &&
+                selected.state != arm::init::ServiceState::STARTING)
+                return 82;
         }
         timespec delay{0, 10'000'000};
         if (::nanosleep(&delay, nullptr) && errno != EINTR) return 82;

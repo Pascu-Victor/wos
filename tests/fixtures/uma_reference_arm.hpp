@@ -45,7 +45,9 @@ struct Profile {
 [[nodiscard]] auto snapshot_read(init::StatusSnapshot&) -> int64_t;
 [[nodiscard]] auto snapshot_valid(const init::StatusSnapshot&, init::ServiceStatus& selected) -> bool;
 [[nodiscard]] auto running(const init::StatusSnapshot&, pid_t controller, uint64_t& deadline) -> bool;
-[[nodiscard]] auto consumed(const init::StatusSnapshot&) -> bool;
+[[nodiscard]] auto consumed(const init::StatusSnapshot&, pid_t observer) -> bool;
+// Pending exec publication permits only another bounded poll, never final credit.
+[[nodiscard]] auto awaiting_exec(const init::StatusSnapshot&, pid_t observer) -> bool;
 [[nodiscard]] auto now(uint64_t&) -> bool;
 [[nodiscard]] auto save(const char* name, const void*, size_t) -> bool;
 [[nodiscard]] auto read(const char* name, void*, size_t capacity, size_t& bytes) -> bool;

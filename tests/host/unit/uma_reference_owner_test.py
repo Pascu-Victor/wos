@@ -62,7 +62,10 @@ def main():
     support=[owner.with_name('uma_reference_arm.cpp'),owner.with_name('uma_reference_arm.hpp'),owner.with_name('uma_reference_stamp.cpp'),
              source_root/'tests/host/unit/uma_reference_arm_host.cpp']
     abi=args.root.resolve()/'toolchain/src/mlibc/sysdeps/wos/include/sys/init_control.h'
-    sources = [owner, header, catalog, cases, suite, Path(__file__), helper_path,abi]+support
+    init_root=args.root.resolve()/'modules/init/src'
+    init_sources=[init_root/'services.cpp',init_root/'supervisor_model.h',init_root/'service_manifest.h',
+                  args.root.resolve()/'configs/wos-services-uma-reference.conf']
+    sources = [owner, header, catalog, cases, suite, Path(__file__), helper_path,abi]+support+init_sources
     before = [pin(path) for path in sources]
     started = time.monotonic()
     active, uncertain, commands, checks, errors = {}, [], [], [], []
@@ -155,18 +158,36 @@ def main():
         shim=scratch/'abi/sys'
         shim.mkdir(parents=True)
         shutil.copyfile(abi,shim/'init_control.h')
+        # Select the WHOLE actual producer. The finite TU supplies only its
+        # runtime object using genuine init model/manifest types; no copied
+        # aggregate-state formula or preferred RUNNING value is used.
+        producer=init_sources[0].read_text()
+        begin='auto supervisor_status_state() -> control_abi::SupervisorState {'
+        end='\nvoid publish_status(uint64_t now_ms) {'
+        check('one whole actual aggregate producer',producer.count(begin)==1 and producer.count(end)==1)
+        a=producer.index(begin);b=producer.index(end,a)
+        aggregate=scratch/'aggregate.cpp'
+        aggregate.write_text('#include "uma_reference_arm.hpp"\n#include "supervisor_model.h"\n'
+            'namespace {\nnamespace control_abi=ker::abi::init_control;\n'
+            'using wos::init::ServiceState; using wos::init::SupervisorShutdownPhase;\n'
+            'struct Runtime { bool failed{}, model_ready{true}, shutdown_complete{}; '
+            'wos::init::ServiceManifest manifest{}; wos::init::SupervisorModel model{}; } runtime;\n'
+            +producer[a:b]+'\n}\n'
+            'auto uma_arm_host_aggregate(const wos::init::SupervisorModel& value) -> control_abi::SupervisorState {\n'
+            'runtime={}; runtime.model_ready=true; runtime.manifest.service_count=value.service_count; '
+            'runtime.model=value; return supervisor_status_state();\n}\n')
         common = [args.cxx, '-std=c++23', '-O2', '-g', '-Wall', '-Wextra', '-Werror', '-DWOS_UMA_OWNER_HOST=1','-DWOS_UMA_ARM_HOST=1','-DWOS_UMA_TIMING_HOST=1','-DWOS_UMA_LINKED_AUDIT=1',
-                  '-I',str(shim.parent),'-I', str(owner.parent)]
+                  '-I',str(shim.parent),'-I', str(owner.parent),'-I',str(init_root)]
         binary = scratch / 'owner-cases'
         command('compile-owner', common + ['-MD', '-MF', str(out / 'owner.d'), '-c', owner, '-o', scratch / 'owner.o'])
         command('compile-cases', common + ['-MD', '-MF', str(out / 'cases.d'), '-c', cases, '-o', scratch / 'cases.o'])
         lib=[]
-        for label,source in [('arm',support[0]),('stamp',support[2]),('host',support[3])]:
+        for label,source in [('arm',support[0]),('stamp',support[2]),('host',support[3]),('aggregate',aggregate)]:
             obj=scratch/(label+'.o');lib.append(obj)
             command('compile-'+label,common+['-MD','-MF',out/(label+'.d'),'-c',source,'-o',obj])
         command('link-owner', [args.cxx, scratch / 'owner.o', scratch / 'cases.o']+lib+['-o', binary])
         dependencies = set()
-        for dep in [out/(label+'.d')for label in ('owner','cases','arm','stamp','host')]:
+        for dep in [out/(label+'.d')for label in ('owner','cases','arm','stamp','host','aggregate')]:
             text = dep.read_text().replace('\\\n', '')
             dependencies.update(Path(value).resolve() for value in shlex.split(text.split(':', 1)[1]))
         emitted_before = [pin(path) for path in sorted(dependencies)]

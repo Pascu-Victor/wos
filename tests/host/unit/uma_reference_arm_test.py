@@ -62,7 +62,10 @@ def main():
     abi=args.root.resolve()/'toolchain/src/mlibc/sysdeps/wos/include/sys/init_control.h'
     decoder=owner.with_name('validate_uma_reference.py')
     audit=source_root/'scripts/test/runtime_test_audit.py'
-    sources = [owner, header, catalog, cases, suite, Path(__file__), helper_path, baseline,abi,decoder,audit]+support
+    init_root=args.root.resolve()/'modules/init/src'
+    init_sources=[init_root/'services.cpp',init_root/'supervisor_model.h',init_root/'service_manifest.h',
+                  args.root.resolve()/'configs/wos-services-uma-reference.conf']
+    sources = [owner, header, catalog, cases, suite, Path(__file__), helper_path, baseline,abi,decoder,audit]+support+init_sources
     spec=importlib.util.spec_from_file_location('uma_whole_arm_decoder',decoder)
     codec=importlib.util.module_from_spec(spec);spec.loader.exec_module(codec)
     before = [pin(path) for path in sources]
@@ -157,11 +160,30 @@ def main():
         shim=scratch/'abi/sys'
         shim.mkdir(parents=True)
         shutil.copyfile(abi,shim/'init_control.h')
+        # Select the WHOLE actual producer. The finite TU supplies only its
+        # runtime object using genuine init model/manifest types; no copied
+        # aggregate-state formula or preferred RUNNING value is used.
+        producer=init_sources[0].read_text()
+        begin='auto supervisor_status_state() -> control_abi::SupervisorState {'
+        end='\nvoid publish_status(uint64_t now_ms) {'
+        check('one whole actual aggregate producer',producer.count(begin)==1 and producer.count(end)==1)
+        a=producer.index(begin);b=producer.index(end,a)
+        aggregate=scratch/'aggregate.cpp'
+        aggregate.write_text('#include "uma_reference_arm.hpp"\n#include "supervisor_model.h"\n'
+            'namespace {\nnamespace control_abi=ker::abi::init_control;\n'
+            'using wos::init::ServiceState; using wos::init::SupervisorShutdownPhase;\n'
+            'struct Runtime { bool failed{}, model_ready{true}, shutdown_complete{}; '
+            'wos::init::ServiceManifest manifest{}; wos::init::SupervisorModel model{}; } runtime;\n'
+            +producer[a:b]+'\n}\n'
+            'auto uma_arm_host_aggregate(const wos::init::SupervisorModel& value) -> control_abi::SupervisorState {\n'
+            'runtime={}; runtime.model_ready=true; runtime.manifest.service_count=value.service_count; '
+            'runtime.model=value; return supervisor_status_state();\n}\n')
         common = [args.cxx, '-std=c++23', '-O2', '-g', '-Wall', '-Wextra', '-Werror', '-DWOS_UMA_OWNER_HOST=1','-DWOS_UMA_ARM_HOST=1','-DWOS_UMA_TIMING_HOST=1','-DWOS_UMA_LINKED_AUDIT=1',
-                  '-I',str(shim.parent),'-I', str(owner.parent)]
+                  '-I',str(shim.parent),'-I', str(owner.parent),'-I',str(init_root)]
         objects=[]
         units=[('owner',owner,None),('arm',support[0],None),('stamp',support[2],None),('host',support[3],None),
-               ('controller',support[4],'uma_controller_main'),('observer',support[5],'uma_witness_main'),('cases',cases,None)]
+               ('controller',support[4],'uma_controller_main'),('observer',support[5],'uma_witness_main'),('cases',cases,None),
+               ('aggregate',aggregate,None)]
         for label,source,rename in units:
             obj=scratch/(label+'.o');objects.append(obj)
             extra=['-Dmain='+rename]if rename else[]
@@ -178,11 +200,17 @@ def main():
             root=scratch/mode
             root.with_suffix('.clock').write_text(clock)
             return root
-        for mode in ('validators','positive','eintr','cancel','child-refuse','bad-warm','bad-init','storm'):
+        for mode in ('validators','consumed','positive','pending-exec','eintr','cancel','child-refuse','bad-warm','bad-init','storm'):
             case_root=tree(mode)
             text=command('arm-'+mode,[binary,mode,case_root])
             check(mode+' actual compiled controller/audit/observer assertions',
                   re.search(r'ARM_CASE mode='+mode+r' checks=[1-9][0-9]* failures=0\n',text)is not None)
+            if mode=='pending-exec':
+                check('actual pending observer reaches final0', 'PENDING_EXEC_OBSERVER_EXIT=0\n'in text)
+                shutil.copyfile(case_root/'host-poweroff.txt',out/'pending-host-poweroff.txt')
+                (case_root/'host-poweroff.txt').unlink()
+                codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
+                check('pending path publishes only final strict saved wire',True)
             if mode=='positive':
                 shutil.copyfile(case_root/'host-poweroff.txt',out/'actual-host-poweroff.txt')
                 (case_root/'host-poweroff.txt').unlink()
@@ -192,6 +220,28 @@ def main():
                           ('raw-completion-CR',case_root/'completion.txt',lambda raw:raw[:-1]+b'\r'),
                           ('source-work-fallback',case_root/'warmup/logs/make_large_file.log',lambda raw:raw.replace(b'using /dev/zero',b'using /dev/none')),
                           ('phase-log-missing-case',case_root/'warmup/phase.log',lambda raw:raw.replace(b'PASS shell_validate (0s)\n',b''))]
+                # Same actual saved decoder oracle, with exact ABI offsets.
+                import struct
+                def wire_field(raw,row,offset,fmt,value):
+                    changed=bytearray(raw);struct.pack_into(fmt,changed,64+row*256+offset,value);return bytes(changed)
+                final_raw=(case_root/'init-exit.bin').read_bytes()
+                observer=struct.unpack_from('<q',final_raw,64+7*256+80)[0]
+                controls.extend([
+                    ('aggregate-running',case_root/'init-exit.bin',lambda raw:raw[:8]+(2).to_bytes(4,'little')+raw[12:]),
+                    ('aggregate-stopping',case_root/'init-exit.bin',lambda raw:raw[:8]+(3).to_bytes(4,'little')+raw[12:]),
+                    ('observer-PID',case_root/'init-exit.bin',lambda raw:wire_field(raw,7,80,'<q',observer+1)),
+                    ('observer-generation',case_root/'init-exit.bin',lambda raw:wire_field(raw,7,96,'<Q',2)),
+                    ('observer-restart',case_root/'init-exit.bin',lambda raw:wire_field(raw,7,104,'<Q',1)),
+                    ('observer-deadline',case_root/'init-exit.bin',lambda raw:wire_field(raw,7,128,'<Q',struct.unpack_from('<Q',raw,64+7*256+128)[0]+1)),
+                    ('observer-history',case_root/'init-exit.bin',lambda raw:wire_field(raw,7,176,'<I',4)),
+                    ('other-pending',case_root/'init-exit.bin',lambda raw:wire_field(raw,0,64,'<I',1)),
+                    ('other-failed',case_root/'init-exit.bin',lambda raw:wire_field(raw,0,64,'<I',7)),
+                    ('other-restarted',case_root/'init-exit.bin',lambda raw:wire_field(raw,0,104,'<Q',1)),
+                    ('keygen-pending',case_root/'init-exit.bin',lambda raw:wire_field(raw,1,64,'<I',3)),
+                    ('testd-active',case_root/'init-exit.bin',lambda raw:wire_field(raw,5,64,'<I',3)),
+                    ('controller-nonzero',case_root/'init-exit.bin',lambda raw:wire_field(raw,6,112,'<i',1)),
+                    ('observer-text-join',case_root/'init-exit.txt',lambda raw:raw.replace((' observer='+str(observer)+' ').encode(),(' observer='+str(observer+1)+' ').encode())),
+                ])
                 for label,path,mutate in controls:
                     old=path.read_bytes();path.write_bytes(mutate(old))
                     try:
@@ -200,19 +250,32 @@ def main():
                     else:raise AssertionError('decoder accepted '+label)
                     finally:path.write_bytes(old)
 
+        # The exact prior consumed body (only the new unused argument is
+        # adapted) must FAIL the SAME composed active-observer positive.
+        arm_text=support[0].read_text()
+        a=arm_text.index('auto consumed(');b=arm_text.index('auto awaiting_exec(',a)
+        previous_consumed='auto consumed(const init::StatusSnapshot& s, pid_t) -> bool {\n    init::ServiceStatus row{};\n    if (!snapshot_valid(s, row) || s.state != init::SupervisorState::RUNNING || row.state != init::ServiceState::EXITED ||\n        row.readiness != init::ReadinessState::READY || row.flags != 3 || row.generation != 1 || row.restart_count || row.pid != -1 ||\n        row.pgid != -1 || row.last_wait_status || row.last_error || row.deadline_mono_ns)\n        return false;\n    for (size_t i = 0; i < row.history_count; ++i)\n        if (row.history[i].reason == init::TransitionReason::EXIT && row.history[i].to_state == init::ServiceState::EXITED &&\n            row.history[i].timestamp_mono_ns >= row.state_since_mono_ns)\n            return true;\n    return false;\n}\n'
         for name,source,old,new,mode,object_label in (
+            ('old-aggregate-premise',support[0],arm_text[a:b],previous_consumed,'consumed','arm'),
+            ('old-pending-exec-guard',support[5],'!arm::awaiting_exec(final, ::getpid()) &&','','pending-exec','observer'),
             ('missing-child-profile',owner,'if (!arm::process_admitted(expected_parent))','if (false)','child-refuse','owner'),
             ('wrong-daemon-readiness',support[0],'row.readiness != init::ReadinessState::READY','row.readiness != init::ReadinessState::NOT_READY','bad-init','arm')):
             text=source.read_text()
             check(name+' one actual control site',text.count(old)==1)
             changed=out/(name+'.cpp');changed.write_text(text.replace(old,new))
             obj=scratch/(name+'.o')
-            command('compile-'+name,common+['-Wno-unused-parameter','-c',changed,'-o',obj])
+            # The old-body control adds only an unnamed ABI argument. Keep
+            # existing suppression solely for the two unchanged legacy controls.
+            warnings=[] if name in('old-aggregate-premise','old-pending-exec-guard') else ['-Wno-unused-parameter']
+            rename=['-Dmain=uma_witness_main'] if object_label=='observer' else []
+            command('compile-'+name,common+warnings+rename+['-c',changed,'-o',obj])
             mutant=scratch/name
             linked=[obj if p.name==object_label+'.o'else p for p in objects]
             command('link-'+name,[args.cxx]+linked+['-o',mutant])
-            refused=command('reject-'+name,[mutant,mode,tree(name)],expected=1)
+            refused=command('reject-'+name,[mutant,mode,tree(name+'-case')],expected=1)
             check(name+' compiled real oracle rejects','FAIL actual 'in refused)
+            if name=='old-pending-exec-guard':
+                check('actual old pending guard refuses82', 'PENDING_EXEC_OBSERVER_EXIT=82\n'in refused)
     except BaseException as error:
         errors.append(type(error).__name__ + ': ' + str(error))
         if output_owned:

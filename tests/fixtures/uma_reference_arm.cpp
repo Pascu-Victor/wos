@@ -323,18 +323,80 @@ auto running(const init::StatusSnapshot& s, pid_t controller, uint64_t& deadline
     deadline = row.deadline_mono_ns;
     return true;
 }
-auto consumed(const init::StatusSnapshot& s) -> bool {
+namespace {
+auto completed_context(const init::StatusSnapshot& s, pid_t observer, bool pending_exec) -> bool {
     init::ServiceStatus row{};
-    if (!snapshot_valid(s, row) || s.state != init::SupervisorState::RUNNING || row.state != init::ServiceState::EXITED ||
+    // The enabled exit-witness is itself an unfinished oneshot. Init therefore
+    // correctly publishes STARTING until this observer returns; only its exact
+    // live row may account for that aggregate state.
+    if (!snapshot_valid(s, row) || s.state != init::SupervisorState::STARTING || observer <= 1 || row.state != init::ServiceState::EXITED ||
         row.readiness != init::ReadinessState::READY || row.flags != 3 || row.generation != 1 || row.restart_count || row.pid != -1 ||
         row.pgid != -1 || row.last_wait_status || row.last_error || row.deadline_mono_ns)
         return false;
+    auto history = [](const init::ServiceStatus& service, init::TransitionReason reason, init::ServiceState state) {
+        for (size_t i = 0; i < service.history_count; ++i)
+            if (service.history[i].reason == reason && service.history[i].to_state == state &&
+                service.history[i].timestamp_mono_ns == service.state_since_mono_ns)
+                return true;
+        return false;
+    };
+    bool exited = false;
     for (size_t i = 0; i < row.history_count; ++i)
         if (row.history[i].reason == init::TransitionReason::EXIT && row.history[i].to_state == init::ServiceState::EXITED &&
             row.history[i].timestamp_mono_ns >= row.state_since_mono_ns)
-            return true;
-    return false;
+            exited = true;
+    if (!exited) return false;
+    for (size_t i = 0; i < s.service_count; ++i) {
+        auto const& service = s.services[i];
+        if (service.restart_count || service.last_wait_status || service.last_error) return false;
+        for (size_t j = 0; j < service.history_count; ++j) {
+            auto const reason = service.history[j].reason;
+            if (reason == init::TransitionReason::RESTART || reason == init::TransitionReason::STOP_REQUEST ||
+                reason == init::TransitionReason::SHUTDOWN || reason == init::TransitionReason::TIMEOUT)
+                return false;
+        }
+        if (!std::strcmp(service.service, SERVICE)) continue;
+        if (!std::strcmp(service.service, OBSERVER)) {
+            if (service.state != (pending_exec ? init::ServiceState::STARTING : init::ServiceState::RUNNING) ||
+                service.readiness != init::ReadinessState::NOT_READY || service.flags != 3 || service.generation != 1 ||
+                service.pid != observer || service.pgid != observer || service.state_since_mono_ns < row.state_since_mono_ns ||
+                service.deadline_mono_ns <= service.state_since_mono_ns ||
+                service.deadline_mono_ns - service.state_since_mono_ns != MARGIN || s.published_mono_ns >= service.deadline_mono_ns)
+                return false;
+            bool exec = false;
+            for (size_t j = 0; j < service.history_count; ++j)
+                if (service.history[j].reason == (pending_exec ? init::TransitionReason::DEPENDENCY : init::TransitionReason::SPAWN) &&
+                    service.history[j].from_state == (pending_exec ? init::ServiceState::WAITING : init::ServiceState::STARTING) &&
+                    service.history[j].to_state == (pending_exec ? init::ServiceState::STARTING : init::ServiceState::RUNNING) &&
+                    service.history[j].timestamp_mono_ns == service.state_since_mono_ns)
+                    exec = true;
+            if (!exec) return false;
+        } else if (!std::strcmp(service.service, "dropbear-keygen")) {
+            if (service.state != init::ServiceState::EXITED || service.readiness != init::ReadinessState::READY || service.pid != -1 ||
+                service.pgid != -1 || service.deadline_mono_ns ||
+                !((service.generation == 0 && service.flags == 0 &&
+                   history(service, init::TransitionReason::START_REQUEST, init::ServiceState::EXITED)) ||
+                  (service.generation == 1 && service.flags == 1 &&
+                   history(service, init::TransitionReason::EXIT, init::ServiceState::EXITED))))
+                return false;
+        } else if (!std::strcmp(service.service, "testd")) {
+            if (service.state != init::ServiceState::DISABLED || service.readiness != init::ReadinessState::NOT_READY || service.flags ||
+                service.generation || service.pid != -1 || service.pgid != -1 || service.deadline_mono_ns ||
+                !history(service, init::TransitionReason::START_REQUEST, init::ServiceState::DISABLED))
+                return false;
+        } else if (service.state != init::ServiceState::RUNNING || service.readiness != init::ReadinessState::READY || service.flags != 3 ||
+                   service.generation != 1 || service.pid <= 1 || service.pgid != service.pid || service.pid == observer ||
+                   service.deadline_mono_ns ||
+                   !(history(service, init::TransitionReason::SPAWN, init::ServiceState::RUNNING) ||
+                     history(service, init::TransitionReason::READINESS, init::ServiceState::RUNNING))) {
+            return false;
+        }
+    }
+    return true;
 }
+}  // namespace
+auto consumed(const init::StatusSnapshot& s, pid_t observer) -> bool { return completed_context(s, observer, false); }
+auto awaiting_exec(const init::StatusSnapshot& s, pid_t observer) -> bool { return completed_context(s, observer, true); }
 auto now(uint64_t& out) -> bool {
     timespec t{};
     if (::clock_gettime(CLOCK_MONOTONIC, &t) || t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= long(SECOND) ||

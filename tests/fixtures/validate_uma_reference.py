@@ -268,7 +268,7 @@ def init_wire(data,final=False):
     if len(data)!=4160:raise ValueError('complete4160 wire')
     h=struct.unpack_from('<4I2Q2I3Q',data)
     if h[0:2]!=(4160,1)or h[2]not in(1,2)or h[3]or not h[4]or not h[5]or h[6]!=8 or any(h[7:]):raise ValueError('eight-service init header')
-    seen=set();selected=None
+    seen=set();selected=None;services={}
     for i in range(16):
         raw=data[64+i*256:64+(i+1)*256]
         if i>=8:
@@ -292,13 +292,33 @@ def init_wire(data,final=False):
                 stamp,before,after,reason,reserved=t
                 if not(0<stamp<=h[5]and stamp>=previous and before<=8 and after<=8 and 1<=reason<=9 and reserved==0):raise ValueError('transition wire')
                 previous=stamp;history.append(t)
+        services[name]=dict(state=state,ready=ready,flags=flags,pid=pid,pgid=pgid,generation=generation,restarts=restarts,wait=wait,error=error,since=since,deadline=deadline,history=history)
         if name=='uma-reference':
             if final:
-                if h[2]!=2 or(state,ready,flags,pid,pgid,generation,restarts,wait,error,deadline)!=(6,2,3,-1,-1,1,0,0,0,0)or not any(t[3]==5 and t[2]==6 and t[0]>=since for t in history):raise ValueError('actual consumed EXITED/READY/raw0')
+                if h[2]!=1 or(state,ready,flags,pid,pgid,generation,restarts,wait,error,deadline)!=(6,2,3,-1,-1,1,0,0,0,0)or not any(t[3]==5 and t[2]==6 and t[0]>=since for t in history):raise ValueError('actual consumed EXITED/READY/raw0')
             else:
                 if(state,ready,flags,generation,restarts,wait,error)!=(3,1,3,1,0,0,0)or pid<=1 or pgid!=pid or deadline-since!=600_000_000_000 or not any(t[3]==3 and t[2]==3 and t[0]==since for t in history):raise ValueError('actual EXEC600s authority')
             selected=dict(pid=pid,deadline=deadline,since=since)
     if seen!=set(SERVICES)or selected is None:raise ValueError('complete init services')
+    if final:
+        # The live exit-witness is the sole unfinished oneshot behind STARTING.
+        # All other rows must match the actual manifest's settled dispositions.
+        def history(row,reason,state):
+            return any(t[3]==reason and t[2]==state and t[0]==row['since']for t in row['history'])
+        observer=services['uma-reference-exit-witness']
+        observer_pid=observer['pid']
+        if not 1<observer_pid<1<<63:raise ValueError('actual live observer PID')
+        for name,row in services.items():
+            if row['restarts']or row['wait']or row['error']or any(t[3]in(6,7,8,9)for t in row['history']):raise ValueError('unrestarted successful final services')
+            if name=='uma-reference':continue
+            if name=='uma-reference-exit-witness':
+                if(row['state'],row['ready'],row['flags'],row['generation'],row['pgid'])!=(3,1,3,1,observer_pid)or row['since']<selected['since']or row['deadline']<=row['since']or row['deadline']-row['since']!=30_000_000_000 or h[5]>=row['deadline']or not any(t[3]==3 and t[1:3]==(2,3)and t[0]==row['since']for t in row['history']):raise ValueError('actual observer EXEC30s authority')
+            elif name=='dropbear-keygen':
+                if(row['state'],row['ready'],row['pid'],row['pgid'],row['deadline'])!=(6,2,-1,-1,0)or not((row['generation'],row['flags'])==(0,0)and history(row,2,6)or(row['generation'],row['flags'])==(1,1)and history(row,5,6)):raise ValueError('actual successful or skipped keygen')
+            elif name=='testd':
+                if(row['state'],row['ready'],row['flags'],row['generation'],row['pid'],row['pgid'],row['deadline'])!=(8,1,0,0,-1,-1,0)or not history(row,2,8):raise ValueError('actual disabled testd')
+            elif(row['state'],row['ready'],row['flags'],row['generation'],row['deadline'])!=(3,2,3,1,0)or row['pid']<=1 or row['pgid']!=row['pid']or row['pid']==observer_pid or not(history(row,3,3)or history(row,4,3)):raise ValueError('actual ready daemon')
+        selected['observer']=observer_pid
     return dict(sequence=h[4],published=h[5],**selected)
 
 CLOCK_KEYS=('version','source','invariant_tsc','frequency_hz','resolution_ns','conversion_multiplier','conversion_divisor','calibration_spread_ppm','watchdog_deviation_ns','kvm_registered_cpus','kvm_expected_cpus','kvm_watchdog_checks','rtc_valid','wall_steps','wall_slews','wall_rejected','wall_pending_ns','slew_limit_ppm','process_timer_real_depth','process_timer_wake_depth','process_timer_expirations','process_timer_late_us_max','process_timer_work_budget','clockevent')
@@ -361,6 +381,6 @@ def decode_complete_arm(root,nonce,*,audit_source,suite_source,uid=0,gid=0):
     stable=('source','invariant_tsc','frequency_hz','resolution_ns','conversion_multiplier','conversion_divisor','calibration_spread_ppm','kvm_registered_cpus','kvm_expected_cpus')
     if any(clocks[0][key]!=clocks[1][key]for key in stable):raise ValueError('clock source/scale transition')
     status=re.fullmatch(re.escape(f'UMA_INIT_EXIT v=1 nonce={nonce} controller={c["controller"]}')+r' observer=([1-9][0-9]{0,18}) sequence='+str(final['sequence'])+r' state=6 readiness=2 wait=0 error=0 generation=1 restarts=0 history_exit=1 snapshot_bytes=4160\n',blobs['init-exit.txt'].decode('ascii'),re.ASCII)
-    if not status or not 1<int(status.group(1))<1<<63 or int(status.group(1))in(c['controller'],c['warm'],c['measure']):raise ValueError('independent observer raw join')
+    if not status or not 1<int(status.group(1))<1<<63 or int(status.group(1))!=final['observer']or int(status.group(1))in(c['controller'],c['warm'],c['measure']):raise ValueError('independent observer raw join')
     return dict(**result,controller=c,init_start=initial,init_exit=final,clock_before=clocks[0],clock_after=clocks[1],
                 saved_guest_evidence='COMPLETE_REQUIRES_SEPARATE_BUNDLE_NATURAL_STOP_LINUX_READBACK_AND_PHYSICAL_ZERO')

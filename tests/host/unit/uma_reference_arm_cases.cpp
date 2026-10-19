@@ -19,6 +19,9 @@
 extern auto uma_controller_main(int, char**) -> int;
 extern auto uma_witness_main(int, char**) -> int;
 extern auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot&) -> int64_t;
+extern void uma_arm_host_complete(ker::abi::init_control::StatusSnapshot&, pid_t);
+extern void uma_arm_host_state(ker::abi::init_control::StatusSnapshot&);
+extern void uma_arm_host_pending(ker::abi::init_control::StatusSnapshot&);
 namespace {
 namespace arm = uma_reference::arm;
 unsigned checks{}, failures{}, consuming{}, interrupted{};
@@ -210,6 +213,142 @@ void validators() {
     text[size_t(n) - 1] = '\r';
     check(!arm::parse_completion(text.data(), size_t(n), original.nonce.data(), out), "raw CR refusal");
 }
+void consumed_rows() {
+    arm::init::StatusSnapshot s{};
+    check(uma_arm_host_snapshot(s) == 0, "actual composed initial snapshot");
+    uma_arm_host_complete(s, ::getpid());
+    check(s.state == arm::init::SupervisorState::STARTING, "actual production classifier sees unfinished observer");
+    check(arm::consumed(s, ::getpid()), "actual consumed controller with live observer positive");
+    auto pending = s;
+    uma_arm_host_pending(pending);
+    check(pending.state == arm::init::SupervisorState::STARTING && arm::awaiting_exec(pending, ::getpid()) &&
+              !arm::consumed(pending, ::getpid()),
+          "actual own pending EXEC is polling only");
+    check(!arm::awaiting_exec(s, ::getpid()), "final EXEC row is not pending");
+    auto invalid = pending;
+    invalid.services[7].history[0].reason = arm::init::TransitionReason::SPAWN;
+    check(!arm::awaiting_exec(invalid, ::getpid()), "pending requires real dependency transition");
+    invalid = pending;
+    ++invalid.services[7].deadline_mono_ns;
+    check(!arm::awaiting_exec(invalid, ::getpid()), "pending cannot refresh original deadline");
+    check(!arm::awaiting_exec(pending, ::getpid() + 1), "pending requires actual observer PID");
+    auto keygen = s;
+    keygen.services[1].flags = 1;
+    keygen.services[1].generation = 1;
+    keygen.services[1].history[0].from_state = arm::init::ServiceState::STOPPING;
+    keygen.services[1].history[0].reason = arm::init::TransitionReason::EXIT;
+    check(arm::consumed(keygen, ::getpid()), "actual consumed keygen alternative positive");
+    for (unsigned i = 0; i < 32; ++i) {
+        auto x = s;
+        auto& observer = x.services[7];
+        auto& controller = x.services[6];
+        switch (i) {
+            case 0:
+                x.state = arm::init::SupervisorState::RUNNING;
+                break;
+            case 1:
+                x.state = arm::init::SupervisorState::STOPPING;
+                break;
+            case 2:
+                x.state = arm::init::SupervisorState::FAILED;
+                break;
+            case 3:
+                ++observer.pid;
+                break;
+            case 4:
+                ++observer.pgid;
+                break;
+            case 5:
+                observer.generation = 2;
+                break;
+            case 6:
+                observer.restart_count = 1;
+                break;
+            case 7:
+                observer.state = arm::init::ServiceState::STARTING;
+                break;
+            case 8:
+                observer.readiness = arm::init::ReadinessState::READY;
+                break;
+            case 9:
+                observer.flags = 7;
+                break;
+            case 10:
+                ++observer.deadline_mono_ns;
+                break;
+            case 11:
+                x.published_mono_ns = observer.deadline_mono_ns;
+                break;
+            case 12:
+                observer.state_since_mono_ns = controller.state_since_mono_ns - 1;
+                break;
+            case 13:
+                observer.history_count = 0;
+                std::memset(observer.history, 0, sizeof(observer.history));
+                break;
+            case 14:
+                observer.history[0].from_state = arm::init::ServiceState::RUNNING;
+                break;
+            case 15:
+                observer.history[0].reason = arm::init::TransitionReason::READINESS;
+                break;
+            case 16:
+                --observer.history[0].timestamp_mono_ns;
+                break;
+            case 17:
+                x.services[0].state = arm::init::ServiceState::WAITING;
+                x.services[0].readiness = arm::init::ReadinessState::NOT_READY;
+                uma_arm_host_state(x);
+                break;
+            case 18:
+                x.services[0].state = arm::init::ServiceState::FAILED;
+                break;
+            case 19:
+                x.services[0].restart_count = 1;
+                break;
+            case 20:
+                x.services[0].deadline_mono_ns = 1;
+                break;
+            case 21:
+                x.services[1].state = arm::init::ServiceState::RUNNING;
+                x.services[1].readiness = arm::init::ReadinessState::NOT_READY;
+                break;
+            case 22:
+                x.services[1].generation = 2;
+                break;
+            case 23:
+                x.services[5].state = arm::init::ServiceState::RUNNING;
+                break;
+            case 24:
+                controller.last_wait_status = 1;
+                break;
+            case 25:
+                controller.pid = ::getpid();
+                break;
+            case 26:
+                controller.history[0].reason = arm::init::TransitionReason::SPAWN;
+                break;
+            case 27:
+                controller.deadline_mono_ns = 1;
+                break;
+            case 28:
+                controller.generation = 2;
+                break;
+            case 29:
+                x.services[0].history[0].reason = arm::init::TransitionReason::TIMEOUT;
+                break;
+            case 30:
+                observer.last_error = 1;
+                break;
+            case 31:
+                observer.history[0].timestamp_mono_ns = x.published_mono_ns + 1;
+                break;
+        }
+        check(!arm::consumed(x, ::getpid()), "actual final service authority rejects mutation");
+    }
+    check(!arm::consumed(s, ::getpid() + 1), "actual caller PID must own observer row");
+}
+
 }  // namespace
 auto uma_owner_host_waitpid(pid_t pid, int* raw, int options) -> pid_t {
     if (after_consume) {
@@ -276,6 +415,8 @@ auto main(int argc, char** argv) -> int {
     const char* mode = argv[1];
     if (!std::strcmp(mode, "validators")) {
         validators();
+    } else if (!std::strcmp(mode, "consumed")) {
+        consumed_rows();
     } else {
         ::setenv("WOS_UMA_TEST_ROOT", root.c_str(), 1);
         ::setenv("USER", "root", 1);
@@ -301,6 +442,7 @@ auto main(int argc, char** argv) -> int {
             check(present(root + "/completion.txt"), "actual both-phase completion saved");
             if (eintr) check(interrupted >= 3 && consuming == 5, "actual consuming EINTR retries bounded and then succeeds");
             ::setenv("UMA_HOST_CONSUMED", "1", 1);
+            if (!std::strcmp(mode, "pending-exec")) ::setenv("UMA_HOST_PENDING_EXEC", "1", 1);
             if (!std::strcmp(mode, "bad-init")) ::setenv("UMA_HOST_BAD_INIT", "1", 1);
             pid_t observer = ::fork();
             if (observer == 0) {
@@ -323,6 +465,7 @@ auto main(int argc, char** argv) -> int {
                 if (!got) ::usleep(1000);
             }
             int observed = got == observer && WIFEXITED(raw) ? WEXITSTATUS(raw) : -1;
+            if (!std::strcmp(mode, "pending-exec")) std::fprintf(stderr, "PENDING_EXEC_OBSERVER_EXIT=%d\n", observed);
             check(observed == (!std::strcmp(mode, "bad-init") ? 82 : 0), "actual independent observer enforces consumed READY");
             check(present(root + "/host-poweroff.txt") == (std::strcmp(mode, "bad-init") != 0),
                   "only validated observer requests Host-only poweroff seam");
