@@ -907,6 +907,11 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_vmap_source_test.py
 )
 add_test(
+    NAME kernel_vmap_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_vmap_runtime_test.py
+)
+set_tests_properties(kernel_vmap_runtime_test PROPERTIES LABELS "host;unit;runtime" TIMEOUT 120)
+add_test(
     NAME udp_bind_device_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/udp_bind_device_source_test.py
 )

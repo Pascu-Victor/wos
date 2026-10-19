@@ -1395,7 +1395,28 @@ void lazy_file_fault_worker_loop() {
                                                                                           work.root_incarnation, *work.demand_binding)
                                             : ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault,
                                                                                              work.placement));
+            // finish may release the final Task/backing owners. Keep only
+            // scalar copies for a failure record after all work leases end.
+            uint64_t const SUBJECT_PID = work.task->pid;
+            unsigned const KIND = static_cast<unsigned>(work.range.kind);
+            uint64_t const VADDR = work.vaddr;
+            uint64_t const GENERATION = work.generation;
+            uint64_t const FILE_OFFSET = work.range.file_offset;
+            uint64_t const FILE_DEV = work.range.file_dev;
+            uint64_t const FILE_INO = work.range.file_ino;
+            uint64_t const FILE_SIZE = work.range.file_size;
+            char const* const FAILURE_STAGE = !LIVE ? "target" : DEMAND ? "shared-demand" : "materialize";
             finish_lazy_file_fault(work, index, OK ? 0 : -EFAULT);
+            if (!OK) {
+                // This names the failed dispatch, not a backend substep.
+                log::error(
+                    "lazy file fault failed: pid=%llu kind=%u vaddr=0x%llx generation=%llu stage=%s status=%d "
+                    "file_offset=%llu dev=%llu ino=%llu size=%llu",
+                    static_cast<unsigned long long>(SUBJECT_PID), KIND, static_cast<unsigned long long>(VADDR),
+                    static_cast<unsigned long long>(GENERATION), FAILURE_STAGE, -EFAULT, static_cast<unsigned long long>(FILE_OFFSET),
+                    static_cast<unsigned long long>(FILE_DEV), static_cast<unsigned long long>(FILE_INO),
+                    static_cast<unsigned long long>(FILE_SIZE));
+            }
             continue;
         }
         flags = lazy_file_fault_lock.lock_irqsave();
@@ -9863,6 +9884,28 @@ auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t 
 
 namespace {
 
+auto rollback_kernel_vmap_reservation(size_t first_page, size_t page_count) -> bool {
+    // The whole reservation is still ours, including warm mappings beyond an
+    // allocation/owner-transfer refusal. Queue only backed runs; cold holes
+    // carry no physical debt and only return their reserved virtual slots.
+    auto has_backing = [first_page](size_t offset) {
+        vaddr_t const VADDR = KERNEL_VMAP_BASE + ((first_page + offset) * paging::PAGE_SIZE);
+        PageTableEntry const* const ENTRY = leaf_entry(kernel_pagemap, VADDR);
+        return ENTRY != nullptr && ENTRY->present != 0 && ENTRY->frame != 0;
+    };
+    size_t offset = 0;
+    while (offset < page_count) {
+        bool const BACKED = has_backing(offset);
+        size_t run = 1;
+        while (run < page_count - offset && has_backing(offset + run) == BACKED) ++run;
+        bool const RETURNED =
+            BACKED ? queue_kernel_vmap_free(first_page + offset, run) : release_kernel_vmap_span(first_page + offset, run);
+        if (!RETURNED) return false;
+        offset += run;
+    }
+    return true;
+}
+
 auto release_kernel_vmap_mappings(vaddr_t start, size_t page_count) -> bool {
     if (kernel_pagemap == nullptr || page_count == 0) {
         return false;
@@ -10130,7 +10173,7 @@ auto kernel_vmap_contains(const void* ptr) -> bool {
 }
 
 auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
-    if (!kernel_vmap_initialized || size == 0 || size > UINT64_MAX - (paging::PAGE_SIZE - 1)) {
+    if (!physical_page_owner_is_valid(owner) || !kernel_vmap_initialized || size == 0 || size > UINT64_MAX - (paging::PAGE_SIZE - 1)) {
         return nullptr;
     }
 
@@ -10147,6 +10190,8 @@ auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view 
         vaddr_t const VADDR = START + (mapped_pages * paging::PAGE_SIZE);
         PageTableEntry* entry = leaf_entry(kernel_pagemap, VADDR);
         if (entry != nullptr && entry->present != 0 && entry->frame != 0) {
+            auto* const FRAME = reinterpret_cast<void*>(addr::get_virt_pointer(static_cast<paddr_t>(entry->frame) << paging::PAGE_SHIFT));
+            if (!phys::page_reassign_owner(FRAME, owner)) break;
             continue;
         }
         void* frame = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(owner, name);
@@ -10158,12 +10203,7 @@ auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view 
     }
 
     if (mapped_pages != PAGE_COUNT) {
-        if (mapped_pages != 0) {
-            static_cast<void>(queue_kernel_vmap_free(first_page, mapped_pages));
-        }
-        if (mapped_pages < PAGE_COUNT) {
-            static_cast<void>(release_kernel_vmap_span(first_page + mapped_pages, PAGE_COUNT - mapped_pages));
-        }
+        if (!rollback_kernel_vmap_reservation(first_page, PAGE_COUNT)) dbg::panic_handler("kernel vmap rollback lost reserved ownership");
         drain_kernel_vmap_frees();
         return nullptr;
     }

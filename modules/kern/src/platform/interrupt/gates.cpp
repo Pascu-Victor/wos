@@ -147,7 +147,10 @@ void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t 
                   HAS_SHADOW_APP ? shadow_app : 0UL);
 
     if (found_hit) {
-        journal::warn("  lazy_hit: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx", hit.start, hit.end, hit.prot, hit.flags);
+        journal::warn("  lazy_hit: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx kind=%u file_offset=%llu dev=%llu ino=%llu size=%llu", hit.start,
+                      hit.end, hit.prot, hit.flags, static_cast<unsigned>(hit.kind), static_cast<unsigned long long>(hit.file_offset),
+                      static_cast<unsigned long long>(hit.file_dev), static_cast<unsigned long long>(hit.file_ino),
+                      static_cast<unsigned long long>(hit.file_size));
         return;
     }
 

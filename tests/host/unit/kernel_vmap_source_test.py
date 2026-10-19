@@ -87,17 +87,32 @@ def main() -> None:
     require_order(
         function_body(source, "kernel_vmap_alloc"),
         [
+            "physical_page_owner_is_valid(owner)",
             "reserve_kernel_vmap_span(PAGE_COUNT, first_page)",
             "entry->present != 0 && entry->frame != 0",
+            "phys::page_reassign_owner(FRAME, owner)",
             "continue",
             "page_alloc_full_overwrite_page_with_reclaim_may_fail(owner, name)",
             "map_page(kernel_pagemap",
             "if (mapped_pages != PAGE_COUNT)",
-            "queue_kernel_vmap_free(first_page, mapped_pages)",
-            "release_kernel_vmap_span(first_page + mapped_pages, PAGE_COUNT - mapped_pages)",
+            "rollback_kernel_vmap_reservation(first_page, PAGE_COUNT)",
             "drain_kernel_vmap_frees()",
         ],
         "vmap allocation must reuse cached mappings and reclaim partial failures",
+    )
+
+    require_order(
+        function_body(source, "rollback_kernel_vmap_reservation"),
+        [
+            "while (offset < page_count)",
+            "has_backing(offset)",
+            "has_backing(offset + run) == BACKED",
+            "queue_kernel_vmap_free(first_page + offset, run)",
+            "release_kernel_vmap_span(first_page + offset, run)",
+            "if (!RETURNED) return false",
+            "offset += run",
+        ],
+        "whole reservation rollback must distinguish retained backing from cold holes",
     )
 
     require_order(

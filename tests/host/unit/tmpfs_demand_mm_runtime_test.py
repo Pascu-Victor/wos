@@ -152,6 +152,7 @@ namespace ker::mod::sched::task {
 enum class TaskType{PROCESS,DAEMON};enum class TaskState{ACTIVE,EXITING};
 // ACTUAL_RANGE_TYPES
 struct Task{TaskType type=TaskType::PROCESS;std::atomic<TaskState>state{TaskState::ACTIVE};mm::paging::PageTable*pagemap{};
+ uint64_t pid=23; // Finite subject identity for copied worker diagnostics.
  std::atomic<bool>scheduler_transition_active{},exit_in_progress{},process_exit_requested{},usercopy_pagemap_closing{};
  bool has_exited{},deferred_task_switch{},wants_block{};uint64_t syscall_account_start_us{};
  fixture::Lock lazy_vmem_lock;std::vector<LazyVmemRange>lazy_vmem_ranges;unsigned refs=1,preempt_disable_depth{},local{};
@@ -189,6 +190,8 @@ namespace ker::syscall::vmem {
 // ACTUAL_PRIVATE_MATERIALIZER_BOUNDARY
 }
 namespace ker::mod::mm::virt {
+// Diagnostic endpoint only; actual journal IO is outside this demand MM fixture.
+namespace log {template<class... Args>void error(const char*,Args...) {}}
 using namespace paging;namespace sched=ker::mod::sched;namespace sys=ker::mod::sys;namespace dbg=ker::mod::dbg;
 constexpr uint64_t PADDR_INVALID=UINT64_MAX;constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE=SIZE_MAX;
 // Actual layout/construction only; private FILE policy capture must abort.

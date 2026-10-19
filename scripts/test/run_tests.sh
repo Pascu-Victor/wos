@@ -161,6 +161,7 @@ UNIT_TESTS=(
     debugserver_source_test
     wosdbg_interface_source_test
     kernel_vmap_source_test
+    kernel_vmap_runtime_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
     napi_handoff_test

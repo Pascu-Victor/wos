@@ -112,6 +112,7 @@ enum class TaskState { ACTIVE, EXITING, DEAD };
 // ACTUAL_RAW_RANGE_TYPES
 struct Task {
     TaskType type{TaskType::PROCESS};
+    uint64_t pid{23};  // Finite subject identity for copied worker diagnostics.
     std::atomic<TaskState> state{TaskState::ACTIVE};
     std::atomic<uint32_t> ref_count{1}, usercopy_pagemap_accesses{}, holds{};
     std::atomic<bool> usercopy_pagemap_closing{};
@@ -149,6 +150,8 @@ void wake_task_from_event(task::Task*);
 void kern_block();
 }
 namespace ker::mod::mm::virt {
+// Diagnostic endpoint only; this close-order fixture does not execute journal IO.
+namespace log { template <typename... Args> void error(const char*, Args...) {} }
 namespace sched = ker::mod::sched;
 namespace sys = ker::mod::sys;
 // ACTUAL_DEMAND_DECLARATIONS
