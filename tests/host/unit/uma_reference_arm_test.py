@@ -250,6 +250,67 @@ def main():
                     else:raise AssertionError('decoder accepted '+label)
                     finally:path.write_bytes(old)
 
+                # Exercise the actual full decoder without changing the genuine
+                # completion's retained-byte totals or any protocol record.
+                codec_text=decoder.read_text()
+                utf8_call='text=raw.decode("utf-8",errors="strict")'
+                check('one actual UTF-8 conversion for prior-ASCII control',codec_text.count(utf8_call)==1)
+                prior_spec=importlib.util.spec_from_file_location('uma_prior_ascii_decoder',decoder)
+                prior_codec=importlib.util.module_from_spec(prior_spec)
+                exec(compile(codec_text.replace(utf8_call,'text=raw.decode("ascii")'),str(decoder),'exec'),prior_codec.__dict__)
+                for phase in ('warmup','measure'):
+                    path=case_root/phase/'phase.log';original=path.read_bytes()
+                    progress=b'PASS shell_validate (0s)\n'
+                    sample='[perf] best=0.1µs'.encode('utf-8')
+                    padding=b' '*(len(progress)-len(sample)-1)
+                    token=sample+padding;prose=token+b'\n'
+                    check(phase+' unique equal-byte prose seam',original.count(progress)==1 and len(prose)==len(progress) and len(padding)>=3)
+                    valid=original.replace(progress,prose,1)
+                    def adjusted(before,after):
+                        check(phase+' unique structured mutation seam',valid.count(before)==1)
+                        changed=valid.replace(before,after,1)
+                        spaces=len(padding)-(len(changed)-len(valid))
+                        check(phase+' compensation remains only prose padding',spaces>=0 and changed.count(token)==1)
+                        changed=changed.replace(token,sample+b' '*spaces,1)
+                        check(phase+' control retains exact completion byte count',len(changed)==len(original))
+                        return changed
+                    try:
+                        path.write_bytes(valid)
+                        decoded=codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
+                        check(phase+' valid UTF-8 prose preserves all raw234 and init joins',decoded==result)
+                        try:
+                            prior_codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
+                        except UnicodeDecodeError as error:check(phase+' prior ASCII conversion fails same UTF-8 positive',error.encoding=='ascii')
+                        else:raise AssertionError('prior ASCII conversion accepted UTF-8 prose')
+                        malformed=(('invalid-byte',valid.replace(prose,b'\xff'+prose[1:],1)),
+                                   ('truncated-at-EOF',valid[:-2]+b'\xe2\x82'))
+                        for label,bad in malformed:
+                            check(phase+' '+label+' exact-byte control',len(bad)==len(original))
+                            path.write_bytes(bad)
+                            try:
+                                codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
+                            except UnicodeDecodeError as error:
+                                check(phase+' rejects '+label+' as strict UTF-8',error.encoding=='utf-8' and (label!='truncated-at-EOF' or error.end==len(bad)))
+                            else:raise AssertionError('decoder accepted '+label)
+                            finally:path.write_bytes(valid)
+                        controls=[
+                            ('Unicode-counts',adjusted(b'PASS=117 FAIL=0 SKIP=0', 'PASS=١١٧ FAIL=0 SKIP=0'.encode('utf-8')),'ASCII phase log summary'),
+                            ('Unicode-count-space',adjusted(b'PASS=117 FAIL=0 SKIP=0','PASS=117\u00a0FAIL=0 SKIP=0'.encode('utf-8')),'ASCII phase log summary'),
+                            ('Unicode-summary-detail',adjusted(b'shell_validate\tPASS\t0s','shell_validate\tPASS\tµs'.encode('utf-8')),'ASCII phase log summary'),
+                            ('wrong-count',adjusted(b'PASS=117 FAIL=0 SKIP=0',b'PASS=116 FAIL=0 SKIP=0'),'count mismatch'),
+                            ('missing-summary-row',adjusted(b'shell_validate\tPASS\t0s\n',b''),'missing case rows'),
+                        ]
+                        for separator in ('\u0085','\u2028','\u2029'):
+                            controls.append(('Unicode-separator-'+hex(ord(separator)),adjusted(prose,token+separator.encode('utf-8')),'non-ASCII phase log line separator'))
+                        for label,bad,reason in controls:
+                            path.write_bytes(bad)
+                            try:
+                                codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
+                            except (ValueError,RuntimeError) as error:check(phase+' UTF-8 keeps strict '+label,reason in str(error))
+                            else:raise AssertionError('decoder accepted '+label)
+                            finally:path.write_bytes(valid)
+                    finally:path.write_bytes(original)
+
         # The exact prior consumed body (only the new unused argument is
         # adapted) must FAIL the SAME composed active-observer positive.
         arm_text=support[0].read_text()

@@ -372,7 +372,14 @@ def decode_complete_arm(root,nonce,*,audit_source,suite_source,uid=0,gid=0):
         if(c[short+'_first'],c[short+'_last'],c['res'],c[short+'_transport'],c[short+'_output'])!=(row['cases'][0]['start_ns'],row['cases'][-1]['end_ns'],row['cases'][0]['resolution_ns'],row['transport_bytes'],row['retained_output_bytes']):raise ValueError('completion must equal all actual raw rows/totals')
         if any(r['resolution_ns']!=c['res']for r in row['cases']):raise ValueError('all234 stable resolution')
         raw=regular(root/name/'phase.log',16<<20,uid,gid)
-        audited=audit.audit_userland_text(raw.decode('ascii'),userland_timing_version=1)
+        # Utility prose is UTF-8; structured summary syntax stays ASCII.
+        text=raw.decode("utf-8",errors="strict")
+        if any(separator in text for separator in ("\u0085","\u2028","\u2029")):
+            raise ValueError('non-ASCII phase log line separator')
+        for line in text.splitlines():
+            if (audit.USERLAND_ROW_RE.search(line) or audit.USERLAND_COUNTS_RE.search(line)) and not line.isascii():
+                raise ValueError('ASCII phase log summary')
+        audited=audit.audit_userland_text(text,userland_timing_version=1)
         if(audited.passed,audited.failed)!=(117,0):raise ValueError('actual full117 phase log')
         work=regular(root/name/'logs/make_large_file.log',16<<20,uid,gid,0o644).decode('ascii')
         expected=f'created 67108864 bytes at /var/lib/uma-reference/{name}/work/large-input.bin using /dev/zero\n'
