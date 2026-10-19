@@ -11,7 +11,10 @@ namespace {
 
 alignas(0x10) std::array<IdtEntry, IDT_ENTRIES> idt{};  // at most 256 interrupts
 IdtPtr idt_ptr;
-uint8_t idt_ready_state = 0;
+constexpr uint8_t IDT_UNINITIALIZED = 0;
+constexpr uint8_t IDT_BUILDING = 1;
+constexpr uint8_t IDT_READY = 2;
+uint8_t idt_ready_state = IDT_UNINITIALIZED;
 
 inline auto calc_idt_entry(uint8_t int_number) -> IdtEntry* { return &idt.at(int_number); }
 
@@ -301,19 +304,29 @@ void map_isr_entries() {
 }  // namespace
 
 void idt_init() {
-    map_isr_entries();
+    uint8_t expected = IDT_UNINITIALIZED;
+    if (__atomic_compare_exchange_n(&idt_ready_state, &expected, IDT_BUILDING, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+        map_isr_entries();
 
-    idt_ptr.limit = static_cast<uint16_t>(sizeof(idt)) - 1;
-    idt_ptr.base = reinterpret_cast<uint64_t>(idt.data());
+        idt_ptr.limit = static_cast<uint16_t>(sizeof(idt)) - 1;
+        idt_ptr.base = reinterpret_cast<uint64_t>(idt.data());
 
+        load_idt();
+        __atomic_store_n(&idt_ready_state, IDT_READY, __ATOMIC_RELEASE);
+        return;
+    }
+
+    // CPUs share the immutable descriptors, but each must load its own IDTR.
+    while (__atomic_load_n(&idt_ready_state, __ATOMIC_ACQUIRE) != IDT_READY) {
+        __asm__ volatile("pause" ::: "memory");
+    }
     load_idt();
-    __atomic_store_n(&idt_ready_state, static_cast<uint8_t>(1), __ATOMIC_RELEASE);
 }
 
 void load_idt() {
-    __asm__ volatile("lidt %0" : : "m"(idt_ptr));  // load the new IDT
+    __asm__ volatile("lidt %0" : : "m"(idt_ptr) : "memory");  // load the new IDT
 }
 
-auto is_idt_ready() -> bool { return __atomic_load_n(&idt_ready_state, __ATOMIC_ACQUIRE) != 0; }
+auto is_idt_ready() -> bool { return __atomic_load_n(&idt_ready_state, __ATOMIC_ACQUIRE) == IDT_READY; }
 
 }  // namespace ker::mod::desc::idt
