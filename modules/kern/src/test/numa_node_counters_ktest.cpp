@@ -372,6 +372,47 @@ KTEST(NumaNodeCounters, ActualPerNodeSpansCloseCountersAndOwners) {
 }
 
 #ifdef WOS_KASAN
+KTEST(Kasan, PermanentStackPoolIsFullyBackedAndReensureKeepsOwners) {
+    prepare_kasan_reuse_storage();
+    KREQUIRE_TRUE(ker::mod::kasan::is_enabled());
+    KREQUIRE_TRUE(mm::phys::node_counters_ready());
+    auto const POOL = mm::phys::get_kernel_stack_pool_stats();
+    KREQUIRE_TRUE(POOL.capacity != 0 && POOL.capacity <= mm::KERNEL_STACK_POOL_CAPACITY);
+    auto* const ROOT = mm::virt::get_kernel_pagemap();
+    KREQUIRE_NE(ROOT, nullptr);
+    uintptr_t const ARENA = mm::GUARDED_KERNEL_STACK_ARENA_BASE;
+    size_t const ARENA_BYTES = static_cast<size_t>(POOL.capacity) * mm::KERNEL_STACK_SLOT_STRIDE;
+    uintptr_t const FIRST = reinterpret_cast<uintptr_t>(ker::mod::kasan::addr_to_shadow(ARENA)) & ~(mm::paging::PAGE_SIZE - 1);
+    uintptr_t const LAST =
+        reinterpret_cast<uintptr_t>(ker::mod::kasan::addr_to_shadow(ARENA + ARENA_BYTES - 1)) & ~(mm::paging::PAGE_SIZE - 1);
+    // Inspect every covering PTE before any ensure or explicit pool-data access.
+    // This must fail missing boot preparation, rather than prepare the baseline.
+    for (uintptr_t page = FIRST;; page += mm::paging::PAGE_SIZE) {
+        KREQUIRE_TRUE(mm::virt::translate(ROOT, page) != mm::virt::PADDR_INVALID);
+        if (page == LAST) break;
+    }
+    for (size_t slot = 0; slot < POOL.capacity; ++slot) {
+        auto* const STACK = mm::virt::guarded_kernel_stack_slot(slot);
+        KREQUIRE_NE(STACK, nullptr);
+        KEXPECT_TRUE(mm::virt::audit_guarded_kernel_stack(STACK));
+    }
+    KREQUIRE_TRUE(collect_comparable());
+    baseline = cheap;
+    kasan_reuse_baseline = scanned;
+
+    // The full published arena is already backed; neither call may allocate.
+    for (size_t repeat = 0; repeat < 2; ++repeat)
+        KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(reinterpret_cast<const void*>(ARENA), ARENA_BYTES));
+    auto const AFTER = mm::phys::get_kernel_stack_pool_stats();
+    KEXPECT_EQ(AFTER.capacity, POOL.capacity);
+    KEXPECT_EQ(AFTER.free_slots, POOL.free_slots);
+    KEXPECT_EQ(AFTER.high_watermark, POOL.high_watermark);
+    for (size_t slot = 0; slot < AFTER.capacity; ++slot)
+        KEXPECT_TRUE(mm::virt::audit_guarded_kernel_stack(mm::virt::guarded_kernel_stack_slot(slot)));
+    KREQUIRE_TRUE(collect_comparable());
+    expect_same(cheap, baseline);
+    expect_kasan_reuse_owners_same();
+}
 KTEST(Kasan, WarmedKernelStackSlotKeepsPhysicalOwners) {
     prepare_kasan_reuse_storage();
     KREQUIRE_TRUE(ker::mod::kasan::is_enabled());

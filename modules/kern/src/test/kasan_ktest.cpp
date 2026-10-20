@@ -64,4 +64,22 @@ KTEST(Kasan, AlignedUnpoisonPreservesAdjacentShadowAcrossPages) {
     KEXPECT_TRUE(__asan_address_is_poisoned(BEGIN + storage.size() - 1) != 0);
     ker::mod::kasan::unpoison_range(BEGIN, storage.size());
 }
+KTEST(Kasan, EnsureBackingPreservesExistingPartialPoison) {
+    alignas(8) std::array<uint8_t, 32> storage{};
+    std::array<bool, 32> before{};
+    ker::mod::kasan::poison_range(storage.data(), storage.size(), ker::mod::kasan::SHADOW_HEAP_FREED);
+    ker::mod::kasan::unpoison_range(storage.data(), 17);
+    for (size_t offset = 0; offset < storage.size(); ++offset) before[offset] = is_poisoned(storage, offset);
+    KEXPECT_FALSE(before[0]);
+    KEXPECT_FALSE(before[16]);
+    KEXPECT_TRUE(before[17]);
+    KEXPECT_TRUE(before[31]);
+
+    for (size_t repeat = 0; repeat < 2; ++repeat) {
+        KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(storage.data(), storage.size()));
+        for (size_t offset = 0; offset < storage.size(); ++offset) KEXPECT_EQ(is_poisoned(storage, offset), before[offset]);
+    }
+    ker::mod::kasan::unpoison_range(storage.data(), storage.size());
+}
+
 #endif

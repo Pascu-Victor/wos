@@ -10126,6 +10126,14 @@ auto init_guarded_kernel_stack_pool(void* backing, size_t capacity) -> bool {
         }
     }
     flush_page_map_batch(&batch);
+#ifdef WOS_KASAN
+    // The pool is permanent: back its complete actual-capacity shadow before
+    // either pool publishes a slot. Explicit mapping is safe before the IDT;
+    // touching shadow here to trigger a fault would not be. Preserve poison.
+    if (!kasan::ensure_shadow_backing(reinterpret_cast<void*>(GUARDED_KERNEL_STACK_ARENA_BASE), ARENA_BYTES)) {
+        return false;
+    }
+#endif
     guarded_kernel_stack_capacity = capacity;
     guarded_kernel_stack_initialized = true;
 

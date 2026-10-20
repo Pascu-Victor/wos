@@ -22,6 +22,8 @@ from file_mmap_registry_runtime_test import command, pin, subreaper
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'modules/kern/src').is_dir())
 SOURCE = ROOT / 'modules/kern/src/sanitizer/kasan.cpp'
 HEADER = ROOT / 'modules/kern/src/sanitizer/kasan.hpp'
+VIRT_SOURCE = ROOT / 'modules/kern/src/platform/mm/virt.opt.cpp'
+MM_HEADER = ROOT / 'modules/kern/src/platform/mm/mm.hpp'
 ORIGINAL_UNPOISON = r'''void unpoison_range(const void* ptr, size_t size) {
     if (size == 0) {
         return;
@@ -338,9 +340,240 @@ def generate(source: str, header: str, control: str) -> tuple[str, dict]:
     return text + CASES, actual
 
 
+
+# Separate group: the new backing policy and complete actual pool publication
+# body execute with finite page-mapping, physical-address and IRQ endpoints.
+# These endpoints do not claim privileged instructions, real PTEs or owner charge.
+BACKING_PRELUDE = r'''
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#define WOS_KASAN 1
+#define WOS_SELFTEST 1
+namespace fixture {
+constexpr size_t PAGE=4096,PAGES=80;
+unsigned failures{},assertions{},cases{},calls{},materializations{},saves{},restores{},data_pages{},register_calls{},fail_call{};
+bool irq=true,early_null{},flushed{},expect_unpublished{};
+std::array<bool,PAGES>present{};
+std::array<std::array<int8_t,PAGE>,PAGES>shadow{};
+std::array<bool,520>data_present{};
+std::array<uint64_t,256>addresses{};
+void check(bool v,const char*why){++assertions;if(!v&&failures++<32)std::fprintf(stderr,"FAIL %s\n",why);}
+uint64_t irq_save_disable(){++saves;uint64_t f=irq?0x200:0;irq=false;return f;}
+void irq_restore_enable(){check(!irq,"backing IF masked until exact restore");++restores;irq=true;}
+void clear_existing(uint64_t);
+}
+namespace ker::mod::mm {
+// ACTUAL_MM_CONSTANTS
+namespace addr {using vaddr_t=uint64_t;using paddr_t=uint64_t;
+auto get_phys_pointer(vaddr_t p)->void*{return reinterpret_cast<void*>(p);}}
+namespace paging {constexpr uint64_t PAGE_SIZE=4096;struct PageTable{};}
+namespace virt {
+using vaddr_t=addr::vaddr_t;using paddr_t=addr::paddr_t;
+constexpr vaddr_t GUARDED_KERNEL_STACK_ARENA_BASE=ker::mod::mm::GUARDED_KERNEL_STACK_ARENA_BASE;
+constexpr uint64_t GUARDED_KERNEL_STACK_STRIDE=ker::mod::mm::KERNEL_STACK_SLOT_STRIDE;
+struct PageMapBatch{};
+paging::PageTable root;
+paging::PageTable*kernel_pagemap=&root;
+bool guarded_kernel_stack_initialized=false;size_t guarded_kernel_stack_capacity=0;
+auto get_kernel_pagemap()->paging::PageTable*{return fixture::early_null?nullptr:kernel_pagemap;}
+auto kernel_data_page_flags()->uint64_t{return 3;}
+void init_page_map_batch(PageMapBatch*,paging::PageTable*pt,uint64_t flags){fixture::check(pt==&root&&flags==3,"actual integration finite root/flags");}
+void map_page_batched(PageMapBatch*,vaddr_t address,paddr_t,uint64_t){
+ fixture::check(!guarded_kernel_stack_initialized&&guarded_kernel_stack_capacity==0,"data mapping precedes pool publication");
+ if(address<GUARDED_KERNEL_STACK_ARENA_BASE||(address-GUARDED_KERNEL_STACK_ARENA_BASE)%4096){fixture::check(false,"bounded data mapping address");return;}
+ size_t index=(address-GUARDED_KERNEL_STACK_ARENA_BASE)/4096;
+ fixture::check(index<fixture::data_present.size(),"finite data map bound");
+ if(index<fixture::data_present.size()){fixture::check(!fixture::data_present[index],"each actual data page mapped once");fixture::data_present[index]=true;++fixture::data_pages;}
+}
+void flush_page_map_batch(PageMapBatch*){fixture::flushed=true;}
+void selftest_register_kernel_page_tables(){++fixture::register_calls;}
+struct log {template<class...T>static void info(const char*,T...){}};
+}
+}
+namespace ker::mod::kasan {
+// ACTUAL_SHADOW_CONSTANTS
+// ACTUAL_BACKING_FORMULA
+auto handle_shadow_fault(uint64_t)->bool;
+// ACTUAL_BACKING_HELPER
+}
+namespace fixture {
+namespace mm=ker::mod::mm;namespace kasan=ker::mod::kasan;
+uintptr_t app(size_t shadow_offset){return mm::GUARDED_KERNEL_STACK_ARENA_BASE+shadow_offset*8;}
+uintptr_t base(){return reinterpret_cast<uintptr_t>(kasan::addr_to_shadow(mm::GUARDED_KERNEL_STACK_ARENA_BASE));}
+size_t index(uint64_t address){
+ check(address>=base()&&(address-base())%PAGE==0,"page-aligned real-formula shadow endpoint");
+ auto result=static_cast<size_t>((address-base())/PAGE);check(result<PAGES,"finite backing address bound");return result;
+}
+void clear_existing(uint64_t address){auto i=index(address);if(i<PAGES)shadow[i].fill(0);}
+void reset(){
+ ++cases;irq=true;early_null=flushed=expect_unpublished=false;
+ calls=materializations=saves=restores=data_pages=register_calls=fail_call=0;
+ present.fill(false);for(auto&p:shadow)p.fill(0);data_present.fill(false);addresses.fill(0);
+ mm::virt::kernel_pagemap=&mm::virt::root;mm::virt::guarded_kernel_stack_initialized=false;mm::virt::guarded_kernel_stack_capacity=0;
+}
+void set_present(size_t i,int8_t value){present[i]=true;shadow[i].fill(value);}
+bool covers(size_t n){for(size_t i=0;i<n;++i)if(!present[i])return false;return true;}
+bool ensure(uintptr_t start,size_t size){return kasan::ensure_shadow_backing(reinterpret_cast<void*>(start),size);}
+}
+namespace ker::mod::kasan {
+auto handle_shadow_fault(uint64_t address)->bool{
+ fixture::check(!fixture::irq,"backing mapper called with IF disabled");++fixture::calls;
+ if(fixture::calls<=fixture::addresses.size())fixture::addresses[fixture::calls-1]=address;
+ if(fixture::expect_unpublished){fixture::check(fixture::flushed,"shadow backing follows actual data batch flush");
+ fixture::check(!mm::virt::guarded_kernel_stack_initialized&&mm::virt::guarded_kernel_stack_capacity==0,"shadow backing precedes pool publication");}
+ auto i=fixture::index(address);if(i>=fixture::PAGES||fixture::calls==fixture::fail_call)return false;
+ if(!fixture::present[i]){fixture::shadow[i].fill(0);fixture::present[i]=true;++fixture::materializations;}
+ return true;
+}
+}
+namespace ker::mod::mm::virt {
+// ACTUAL_GUARDED_INTEGRATION
+}
+'''
+
+BACKING_CASES = r'''
+namespace fixture {
+void run(){
+ // 1: a two-byte application span crosses exactly one shadow-page boundary.
+ reset();check(ensure(app(PAGE-1)+7,2),"cross-page backing succeeds");
+ check(calls==2&&materializations==2&&covers(2)&&!present[2],"backing covers exact page edge");
+ check(addresses[0]==base()&&addresses[1]==base()+PAGE,"backing uses exact real-formula page addresses");
+ check(irq&&saves==2&&restores==2,"successful backing restores prior IF");
+ // 2: unaligned application bytes retain existing partial-granule poison.
+ reset();set_present(0,kasan::SHADOW_HEAP_FREED);shadow[0][1]=3;
+ check(ensure(app(0)+7,2),"unaligned backing succeeds");
+ check(calls==1&&materializations==0&&shadow[0][0]==kasan::SHADOW_HEAP_FREED&&shadow[0][1]==3,"backing retains partial-granule poison");
+ // 3: the same poison oracle rejects a destructive whole-shadow clear.
+ reset();set_present(0,kasan::SHADOW_HEAP_FREED);set_present(1,kasan::SHADOW_HEAP_RREDZONE);shadow[1][31]=3;
+ check(ensure(app(0),PAGE*16),"present range backing succeeds");
+ check(materializations==0&&shadow[0][0]==kasan::SHADOW_HEAP_FREED&&shadow[0][PAGE-1]==kasan::SHADOW_HEAP_FREED&&
+       shadow[1][0]==kasan::SHADOW_HEAP_RREDZONE&&shadow[1][31]==3,"range backing preserves present poison");
+ // 4: repeating a fully backed range allocates no further endpoint pages.
+ reset();check(ensure(app(0),PAGE*24)&&ensure(app(0),PAGE*24),"repeated backing succeeds");
+ check(calls==6&&materializations==3&&covers(3)&&!present[3],"repeat backing has no growth");
+ // 5: invalid inputs refuse before any mapper or privileged endpoint.
+ reset();check(!ensure(0,1)&&!ensure(0x800000000000ULL,1)&&!ensure(0xffff7fffffffffffULL,1)&&
+               !ensure(UINTPTR_MAX-15,32)&&!ensure(app(0),SIZE_MAX)&&!ensure(app(0),0),"invalid backing ranges refuse");
+ early_null=true;check(!ensure(app(0),8),"uninitialized root refuses");
+ check(calls==0&&saves==0&&restores==0&&irq,"invalid range leaves mapping and IF untouched");
+ // 6: partial OOM stops exactly at failure and preserves prior enabled IF.
+ reset();fail_call=3;check(!ensure(app(0),PAGE*32),"partial backing failure propagates");
+ check(calls==3&&materializations==2&&covers(2)&&!present[2]&&!present[3],"partial failure retains only completed permanent backing");
+ check(irq&&saves==3&&restores==3,"failed backing restores enabled IF");
+ // 7: the same failure never enables a caller's disabled IF.
+ reset();irq=false;fail_call=3;check(!ensure(app(0),PAGE*32),"IF-off partial failure propagates");
+ check(!irq&&calls==3&&saves==3&&restores==0,"failed backing preserves disabled IF");
+ // 8: an exact exclusive boundary does not visit the following page.
+ reset();check(ensure(app(0),PAGE*8),"one whole shadow page succeeds");
+ check(calls==1&&materializations==1&&present[0]&&!present[1],"exclusive range endpoint is exact");
+ // 9: execute the WHOLE actual integration, with real512KiB stack geometry.
+ reset();expect_unpublished=true;
+ check(mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(0x100000000ULL),4),"actual guarded integration succeeds");
+ expect_unpublished=false;
+ check(mm::virt::guarded_kernel_stack_initialized&&mm::virt::guarded_kernel_stack_capacity==4&&covers(65)&&!present[65],
+       "pool shadow backed before publication");
+ check(calls==65&&materializations==65&&data_pages==512&&register_calls==1,"actual integration covers finite four-slot geometry");
+ for(size_t guard:{size_t{0},size_t{129},size_t{130},size_t{259},size_t{260},size_t{389},size_t{390},size_t{519}})
+  check(!data_present[guard],"original guard data PTE remains absent");
+ check(data_present[1]&&data_present[128]&&data_present[391]&&data_present[518],"usable stack data endpoints remain mapped");
+ // 10: the actual pool refuses publication after a partial mapping failure.
+ reset();expect_unpublished=true;fail_call=3;
+ check(!mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(0x100000000ULL),4),"pool backing failure propagates");
+ expect_unpublished=false;
+ check(!mm::virt::guarded_kernel_stack_initialized&&mm::virt::guarded_kernel_stack_capacity==0&&calls==3&&materializations==2,
+       "failed backing never publishes pool");
+ check(irq&&saves==3&&restores==3&&register_calls==0,"integration failure restores IF before refusing");
+ // 11: original integration admission still rejects every invalid input axis.
+ reset();check(!mm::virt::init_guarded_kernel_stack_pool(nullptr,4)&&
+               !mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(1),0)&&
+               !mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(1),257)&&
+               !mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(1),SIZE_MAX),"original integration admission retained");
+ mm::virt::kernel_pagemap=nullptr;
+ check(!mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(1),4),"original null pagemap admission retained");
+ check(calls==0&&data_pages==0&&!mm::virt::guarded_kernel_stack_initialized,"invalid pool remains unpublished and unmapped");
+ // 12: repeat the API after publication, retaining poison and page count.
+ reset();expect_unpublished=true;check(mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(0x100000000ULL),4),"repeat fixture integration succeeds");
+ expect_unpublished=false;shadow[10][5]=kasan::SHADOW_HEAP_FREED;shadow[10][6]=3;
+ check(ensure(app(0),4*mm::KERNEL_STACK_SLOT_STRIDE),"published range reensure succeeds");
+ check(materializations==65&&calls==130&&shadow[10][5]==kasan::SHADOW_HEAP_FREED&&shadow[10][6]==3,"published reensure preserves poison and count");
+ check(!mm::virt::init_guarded_kernel_stack_pool(reinterpret_cast<void*>(1),4),"original repeated publication refuses");
+ check(irq,"all backing cases return exact enabled IF");
+ std::printf("%s kasan_backing cases=%u assertions=%u failures=%u\n",failures?"FAIL":"PASS",cases,assertions,failures);
+}
+}
+int main(){fixture::run();return fixture::failures?1:0;}
+'''
+
+ORIGINAL_GUARDED_INTEGRATION_SHA256 = '1a76a531e389e1f6407c6b885c1760f3b01db251684eecdb7cc374cd00f3f7cf'
+
+
+def generate_backing(source: str, header: str, virt: str, mm_header: str, control: str) -> tuple[str, dict]:
+    backing = definition(source, 'auto ensure_shadow_backing(')
+    integration = definition(virt, 'auto init_guarded_kernel_stack_pool(')
+    actual = {name: hashlib.sha256(body.encode()).hexdigest() for name, body in
+              [('backing', backing), ('guarded_integration', integration)]}
+    call = '''#ifdef WOS_KASAN
+    // The pool is permanent: back its complete actual-capacity shadow before
+    // either pool publishes a slot. Explicit mapping is safe before the IDT;
+    // touching shadow here to trigger a fault would not be. Preserve poison.
+    if (!kasan::ensure_shadow_backing(reinterpret_cast<void*>(GUARDED_KERNEL_STACK_ARENA_BASE), ARENA_BYTES)) {
+        return false;
+    }
+#endif
+'''
+    if control == 'missing-preparation':
+        if integration.count(call) != 1:
+            raise ValueError('exact actual preparation block changed')
+        integration = integration.replace(call, '')
+        if hashlib.sha256(integration.encode()).hexdigest() != ORIGINAL_GUARDED_INTEGRATION_SHA256:
+            raise ValueError('missing-preparation control is not the genuine whole original integration')
+    elif control == 'destructive-clear':
+        mapper = 'bool const READY = handle_shadow_fault(shadow_page);'
+        if backing.count(mapper) != 1:
+            raise ValueError('exact current range mapper endpoint changed')
+        backing = backing.replace(mapper, mapper + '\n        if (READY) fixture::clear_existing(shadow_page);')
+    elif control != 'current':
+        raise ValueError('unknown backing control')
+    save = 'asm volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");'
+    restore = 'asm volatile("sti" : : : "memory");'
+    if backing.count(save) != 1 or backing.count(restore) != 1:
+        raise ValueError('exact backing IRQ primitive selection changed')
+    backing = backing.replace(save, 'irq_flags = fixture::irq_save_disable();')
+    backing = backing.replace(restore, 'fixture::irq_restore_enable();')
+    constants = []
+    for name in ('KERNEL_STACK_SIZE', 'KERNEL_STACK_POOL_CAPACITY', 'KERNEL_STACK_GUARD_SIZE', 'KERNEL_STACK_SLOT_STRIDE',
+                 'GUARDED_KERNEL_STACK_ARENA_BASE', 'GUARDED_KERNEL_STACK_ARENA_END'):
+        rows = re.findall(r'^inline constexpr (?:size_t|uintptr_t) ' + name + r'\s*=[^;]+;', mm_header, re.M)
+        if len(rows) != 1:
+            raise ValueError('one actual guarded geometry constant required: ' + name)
+        constants.append(rows[0])
+    formula = re.findall(r'^inline auto addr_to_shadow\([^\n]+', header, re.M)
+    shadows = re.findall(r'^constexpr uint64_t SHADOW_[^\n]+', header, re.M)
+    sentinels = re.findall(r'^constexpr int8_t SHADOW_[^\n]+', header, re.M)
+    if len(formula) != 1 or len(shadows) != 3 or len(sentinels) != 6:
+        raise ValueError('actual address formula/shadow constants changed')
+    text = BACKING_PRELUDE
+    for name, body in {'ACTUAL_MM_CONSTANTS': '\n'.join(constants), 'ACTUAL_SHADOW_CONSTANTS': '\n'.join(shadows + ['[[maybe_unused]] ' + row for row in sentinels]),
+                       'ACTUAL_BACKING_FORMULA': formula[0], 'ACTUAL_BACKING_HELPER': backing,
+                       'ACTUAL_GUARDED_INTEGRATION': integration}.items():
+        marker = '// ' + name
+        if text.count(marker) != 1:
+            raise ValueError('one finite backing seam required: ' + name)
+        text = text.replace(marker, body)
+    actual['ported_bodies'] = {name: hashlib.sha256(body.encode()).hexdigest() for name, body in
+                               [('backing', backing), ('guarded_integration', integration)]}
+    actual['finite_endpoints'] = ['privileged IRQ save/restore', 'existing shadow mapper allocation/presence/failure',
+                                  'kernel-root/physical-address and data-PTE batching', 'boot selftest registry/log sink']
+    actual['original_guarded_control_sha256'] = ORIGINAL_GUARDED_INTEGRATION_SHA256
+    return text + BACKING_CASES, actual
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kasan-source', type=Path, default=SOURCE)
+    parser.add_argument('--virt-source', type=Path, default=VIRT_SOURCE)
     parser.add_argument('--cxx', default=os.environ.get('CXX', os.environ.get('WOS_HOST_CXX', '/usr/bin/clang++')))
     args = parser.parse_args()
     deadline = time.monotonic() + 90
@@ -351,6 +584,7 @@ def main() -> int:
                   native_IRQ_NMI_TLB_qualified=False)
     try:
         source = args.kasan_source.resolve(strict=True)
+        virt_source = args.virt_source.resolve(strict=True)
         compiler = Path(args.cxx).resolve(strict=True)
         if not compiler.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError('--cxx must name one executable compiler ELF')
@@ -359,7 +593,7 @@ def main() -> int:
                 raise ValueError('--cxx must name one executable compiler ELF')
         subreaper()
         watched = [source, HEADER, Path(__file__).resolve(),
-                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler]
+                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler, virt_source, MM_HEADER]
         before = [pin(path) for path in watched]
         scratch = Path(tempfile.mkdtemp(prefix='wos-kasan-shadow-', dir='/tmp'))
         for control in ('current', 'original-zero-fill', 'whole-page-clear'):
@@ -387,6 +621,32 @@ def main() -> int:
                           'whole-page-clear': 'FAIL clipped shadow neighbors retain poison'}[control]
                 if row['exit'] == 0 or not re.search(r'^FAIL kasan_shadow cases=22 assertions=\d+ failures=[1-9]\d*$', log, re.M) or marker not in log.splitlines():
                     raise ValueError(control + ': compiled negative must finish all22cases and fail its intended exact oracle')
+        for control in ('current', 'missing-preparation', 'destructive-clear'):
+            text, actual = generate_backing(source=source.read_text(), header=HEADER.read_text(),
+                                           virt=virt_source.read_text(), mm_header=MM_HEADER.read_text(), control=control)
+            result.setdefault('backing_actual_definition_hashes', {})[control] = actual
+            translation, binary = scratch / ('backing-' + control + '.cpp'), scratch / ('backing-' + control)
+            translation.write_text(text)
+            row = command([str(compiler), '-std=c++23', '-O1', '-g0', '-pipe', '-Wall', '-Wextra', '-Werror',
+                           '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(translation), '-o', str(binary)],
+                          scratch / ('backing-' + control + '-compile.log'), scratch, deadline, groups)
+            result['commands'].append(row)
+            if row['exit'] != 0:
+                print((scratch / ('backing-' + control + '-compile.log')).read_text(errors='replace')[-32768:])
+                raise ValueError(control + ': backing compile/link failure is not a successful control')
+            log_path = scratch / ('backing-' + control + '-run.log')
+            row = command([str(binary)], log_path, scratch, deadline, groups)
+            result['commands'].append(row)
+            log = log_path.read_text(errors='replace')
+            print(log[-32768:], end='')
+            positive = row['exit'] == 0 and re.search(r'^PASS kasan_backing cases=12 assertions=\d+ failures=0$', log, re.M)
+            if (control == 'current') != bool(positive):
+                raise ValueError(control + ': actual backing/integration oracle did not distinguish expected behavior')
+            if control != 'current':
+                marker = {'missing-preparation': 'FAIL pool shadow backed before publication',
+                          'destructive-clear': 'FAIL range backing preserves present poison'}[control]
+                if row['exit'] == 0 or not re.search(r'^FAIL kasan_backing cases=12 assertions=\d+ failures=[1-9]\d*$', log, re.M) or marker not in log.splitlines():
+                    raise ValueError(control + ': compiled backing control must finish all12cases and fail its exact intended oracle')
         result['pass_'] = True
     except (OSError, ValueError, TimeoutError, KeyboardInterrupt) as error:
         result['error'] = f'{type(error).__name__}: {error}'

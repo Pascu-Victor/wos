@@ -46,13 +46,23 @@ inline auto addr_to_shadow(uintptr_t addr) -> int8_t* { return reinterpret_cast<
 // Returns true if the fault was handled (shadow page allocated), false otherwise.
 auto handle_shadow_fault(uint64_t cr2) -> bool;
 
+// Back every covering shadow page without changing existing poison. For bounded
+// permanent boot ranges before publication; also usable by native selftests.
+// Requires initialized PMM/kernel pagemap and no outer pool/PMM/PTE locks.
+// Only boot or nonconcurrent selftests may call it. Each mapper saves/disables and
+// restores IRQ state; no raw shadow access or runtime-enabled prerequisite.
+// Rejects empty/non-kernel/overflowing ranges and allocation failure. Partial
+// permanent mappings are retained on failure; boot callers must fail closed.
+auto ensure_shadow_backing(const void* ptr, size_t size) -> bool;
+
 // Poison/unpoison a byte range in the shadow map.
 // value == SHADOW_ACCESSIBLE (0x00) = unpoison.
 void poison_range(const void* ptr, size_t size, int8_t value);
 void unpoison_range(const void* ptr, size_t size);
 
-// Called from early kernel init to pre-map the shadow region for the
-// kernel static image (text/data/bss).  Everything else is demand-faulted.
+// Called during early kernel initialization; runtime checks remain disabled
+// until enable(). Permanent boot ranges may explicitly back shadow before
+// publication; other addresses remain demand-faulted.
 void init();
 
 // Enable runtime shadow checking.  Must be called after the IDT is live

@@ -217,6 +217,38 @@ auto handle_shadow_fault(uint64_t cr2) -> bool {
     return true;
 }
 
+// Explicit backing for a permanent kernel range. This must not touch shadow
+// virtually: boot callers can run before the IDT or runtime checks are enabled.
+auto ensure_shadow_backing(const void* ptr, size_t size) -> bool {
+    auto const START = reinterpret_cast<uintptr_t>(ptr);
+    if (size == 0 || START < 0xffff800000000000ULL || size > UINTPTR_MAX - START || mm::virt::get_kernel_pagemap() == nullptr) {
+        return false;
+    }
+    uintptr_t const FIRST = reinterpret_cast<uintptr_t>(addr_to_shadow(START));
+    uintptr_t const LAST = reinterpret_cast<uintptr_t>(addr_to_shadow(START + size - 1));
+    if (FIRST < SHADOW_REGION_BASE || LAST >= SHADOW_REGION_END || LAST < FIRST) {
+        return false;
+    }
+
+    uintptr_t shadow_page = FIRST & ~(mm::paging::PAGE_SIZE - 1);
+    uintptr_t const LAST_PAGE = LAST & ~(mm::paging::PAGE_SIZE - 1);
+    for (;;) {
+        uint64_t irq_flags = 0;
+        asm volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
+        bool const READY = handle_shadow_fault(shadow_page);
+        if ((irq_flags & 0x200U) != 0U) {
+            asm volatile("sti" : : : "memory");
+        }
+        if (!READY) {
+            return false;
+        }
+        if (shadow_page == LAST_PAGE) {
+            return true;
+        }
+        shadow_page += mm::paging::PAGE_SIZE;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shadow memory manipulation
 // ---------------------------------------------------------------------------
