@@ -163,7 +163,9 @@ Before changing utility-facing kernel diagnostics:
 - Treat `JournalRecord`, ptrace request numbers/structs, perf event text formats, and `/proc/memacc` key/value rows as compatibility surfaces for WOS tools.
 - Do not assume Linux `/proc`, systemd journal, upstream `strace`, or Linux `perf` behavior; the local WOS utility source defines expected behavior.
 - Preserve nonblocking/poll semantics for device/procfs readers when utilities follow or poll data.
-- Ask the user to run the relevant WOS utility when behavior requires runtime confirmation.
+- Run the relevant WOS utility when behavior requires runtime confirmation,
+  under the user's standing agent-debugging authorization. Ask the user only
+  when the agent cannot perform the required action.
 
 ## Patch contract template
 
@@ -179,6 +181,6 @@ Can allocate/block/spin/log:
 ABI/wire/syscall impact:
 Lifetime/ownership impact:
 Build/test plan:
-Runtime/debug data needed from user:
+Runtime/debug data to collect; user-only actions, if any:
 Rollback plan:
 ```

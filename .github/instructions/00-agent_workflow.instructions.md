@@ -53,7 +53,9 @@ Required behavior:
 - Read `configs/rootfs/aliases.tsv` for installed command names and symlinks.
 - Do not assume GNU coreutils, systemd, procps, Linux `perf`, or upstream `strace` option behavior from a familiar command name.
 - Inspect the kernel ABI/procfs/device/syscall surface the utility consumes before changing either side.
-- If runtime output is needed, ask the user to run the utility inside WOS and provide logs/output.
+- If runtime output is needed, run the utility inside WOS under the user's
+  standing agent-debugging authorization. Ask the user only when the agent
+  cannot perform the required action.
 
 ### Reconnaissance task
 
@@ -96,4 +98,4 @@ Required behavior:
 - List build/test commands run.
 - If not run, say exactly why.
 - Note stale cache/docs discovered.
-- Identify user-run runtime/debug steps if needed.
+- Identify remaining runtime/debug steps and any action only the user can perform.

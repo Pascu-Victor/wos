@@ -52,7 +52,10 @@ These utility names are WOS programs, not GNU coreutils or guaranteed Linux/syst
 
 ## Runtime debugging
 
-Runtime debugging must be performed by the user. Ask the user to run the kernel/cluster and provide output when runtime behavior is needed.
+The user authorized agent-run debugging on 2026-10-20. Run the kernel/cluster,
+utilities and debugger to collect runtime evidence directly. Ask the user only
+when the agent cannot perform the required action. Preserve rootless
+`--no-setup`, test isolation, storage budgets and exact-owned cleanup.
 
 Public README fallback:
 
@@ -88,25 +91,25 @@ continue
 
 - `Build WOS`
 - Inspect libc/userspace wrappers.
-- Ask user to run focused userspace program if behavior is runtime-only.
+- Run the focused userspace program when runtime behavior needs validation.
 
 ### VFS changes
 
 - `Build WOS`
-- Ask user to run the kernel and exercise open/read/write/readdir/path cases when needed.
+- Run the kernel and exercise open/read/write/readdir/path cases when needed.
 - For remote VFS, include cluster/peer scenario details.
 
 ### Scheduler/task changes
 
 - `Build WOS`
-- Ask user for runtime scheduler logs/backtrace if needed.
+- Collect runtime scheduler logs/backtraces when needed.
 - Check task lifecycle and dead-list/epoch implications manually.
 
 ### WKI protocol/RX/channel changes
 
 - `Build WOS`
-- Ask user to run WKI cluster/VM scenario.
-- Request packet/log traces around peer connect, heartbeat, ACK/retransmit, or target operation.
+- Run the WKI cluster/VM scenario.
+- Collect packet/log traces around peer connect, heartbeat, ACK/retransmit, or target operation.
 - Treat build failures in rootfs/disk sync as possible cluster/VM state.
 
 ### Logging-only changes
@@ -120,14 +123,14 @@ continue
 - `Build WOS`
 - Check `configs/rootfs/aliases.tsv` when installed command names or symlinks are affected.
 - For `strace`, `perf`, `top`, `memacc`, `journalctl`/`journald`, or `wkictl`, inspect the matching kernel ABI/procfs/device/syscall surface.
-- Ask the user to run the utility inside WOS when behavior is runtime-only.
+- Run the utility inside WOS when runtime behavior needs validation.
 
 ### libc/mlibc changes
 
 - `Build WOS`
 - Check syscall ABI wrappers.
 - Check errno conventions.
-- Ask user to run affected userspace program if needed.
+- Run the affected userspace program when needed.
 
 ## Final response format for checks
 
@@ -135,5 +138,5 @@ continue
 Checks:
 - Build WOS: pass/fail/not run
 - Other checks: ...
-- Runtime debug: user-run required/not required
+- Runtime debug: checks run and any action only the user can perform
 ```

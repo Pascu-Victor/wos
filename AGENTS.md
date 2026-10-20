@@ -166,9 +166,18 @@ the hard disk, verify the boot partition contains `/EFI/BOOT/BOOTX64.EFI`,
 `/limine/limine.conf`, `/wos`, and `/initramfs.cpio`; that is a packaging or
 bootloader issue, not yet kernel runtime evidence.
 
-If the build fails during mountfs disk sync, `sync_rootfs.sh`, `mountfs_disk`, or a libguestfs/qemu appliance step, treat it as cluster/debug-VM state rather than a code failure. Ask the user to stop the cluster/VMs and rerun the build.
+If the build fails during mountfs disk sync, `sync_rootfs.sh`, `mountfs_disk`,
+or a libguestfs/qemu appliance step, investigate cluster/debug-VM state. Stop an
+agent-owned test topology through its existing owner, verify cleanup, then rerun
+the build. Preserve user-owned and unrelated VMs; coordinate with the user when
+their state prevents the build.
 
-Debugging must be done by the user. When runtime/debug information is needed, ask the user to run the kernel or cluster and provide logs/backtraces.
+The user explicitly authorizes agents to run and debug WOS (2026-10-20):
+"you may debug as well unless it is impossiblee for anyone but me to do it".
+Run the kernel, cluster, userspace utilities and debugger directly when needed.
+Ask for user involvement only when the required action cannot be performed by
+the agent. Use `--no-setup` for rootless cluster/KTEST launches and preserve the
+test isolation, storage budget and exact-owned cleanup rules above.
 
 ## WOSDBG host debugger
 
@@ -248,6 +257,6 @@ For code changes, summarize:
 - What was fixed or implemented.
 - Invariants preserved.
 - Builds/tests run, or why they were not run.
-- Remaining risks, stale docs, or required user-run debugging.
+- Remaining risks, stale docs, or actions only the user can perform.
 
 Do not claim a build, test, runtime check, or debug session succeeded unless it was actually performed in the current task.

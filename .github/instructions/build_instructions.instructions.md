@@ -69,11 +69,18 @@ If a WOS build fails during mountfs disk sync, for example in:
 - qemu appliance setup
 - rootfs/disk sync while cluster/debug VMs are running
 
-then treat it as a cluster/debug-VM state problem, not automatically as a code failure. Ask the user to stop the cluster/VMs and rerun the build.
+then investigate cluster/debug-VM state. Stop an agent-owned test topology
+through its existing owner, verify cleanup, then rerun the build. Preserve
+user-owned and unrelated VMs; coordinate with the user when their state prevents
+the build.
 
 ## Debugging rule
 
-Runtime debugging must be done by the user. When runtime information is required, ask the user to run the kernel, cluster, or debugger and provide logs/backtraces.
+The user authorized agent-run debugging on 2026-10-20. Run the kernel, cluster,
+utilities and debugger directly to collect logs/backtraces. Ask the user only
+when the agent cannot perform the required action. Use `--no-setup` for rootless
+cluster/KTEST launches and preserve the repository's isolation, storage and
+cleanup rules.
 
 Known public README debug flow:
 

@@ -78,7 +78,8 @@ Use these checklists for code review and self-review.
 - Are rootfs aliases in `configs/rootfs/aliases.tsv` still accurate?
 - If kernel-facing, are procfs/device/syscall/ptrace/perf/journal formats still compatible with the matching utility?
 - Do option usage/help text and implementation still agree?
-- Is runtime validation explicitly user-run when it requires WOS or a cluster?
+- Has runtime validation been performed under the user's agent-debugging
+  authorization, or is any action only the user can perform clearly identified?
 
 ## libc/mlibc review
 

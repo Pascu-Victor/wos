@@ -109,6 +109,7 @@ Before editing:
 
 After editing:
 - Run Build WOS when available, or explain why not.
-- If runtime behavior is involved, ask the user to run the utility in WOS and provide output.
+- If runtime behavior is involved, run the utility in WOS and collect output;
+  ask the user only for an action the agent cannot perform.
 - Report whether utility help/usage, aliases, and implementation remain consistent.
 ```
