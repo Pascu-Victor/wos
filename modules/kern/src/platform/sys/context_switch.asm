@@ -5,7 +5,7 @@ bits 64
 %assign GPREGS_SIZE 120
 %assign INTERRUPT_FRAME_SIZE 56
 %assign USER_IRET_FRAME_SIZE 40
-%assign IRETQ_KERNEL_FRAME_SIZE 24
+%assign IRETQ_KERNEL_FRAME_SIZE 40
 %assign IRETQ_KERNEL_FRAME_OFFSET GPREGS_SIZE + INTERRUPT_FRAME_SIZE
 %assign USER_RETURN_BLOCK_SIZE GPREGS_SIZE + USER_IRET_FRAME_SIZE
 %assign KERNEL_RETURN_BLOCK_SIZE GPREGS_SIZE + INTERRUPT_FRAME_SIZE + IRETQ_KERNEL_FRAME_SIZE
@@ -20,90 +20,81 @@ extern deferred_task_switch
 extern wos_kasan_prepare_kernel_resume
 %endif
 
-; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
-; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
-; Keep that normalized shadow intact, then skip it immediately before iretq.
-%macro build_kernel_return_from_stack 0
-    mov r10, [rsp + GPREGS_SIZE + 40]  ; saved kernel RSP
-    mov r12, [rsp + GPREGS_SIZE + 16]  ; RIP
-    mov r13, [rsp + GPREGS_SIZE + 24]  ; CS
-    mov r14, [rsp + GPREGS_SIZE + 32]  ; RFLAGS
-    sub r10, KERNEL_RETURN_BLOCK_SIZE
-
-    %assign i 14
-    %rep 15
-        mov r11, [rsp + i * 8]
-        mov [r10 + i * 8], r11
-        %assign i i - 1
-    %endrep
-
-    %assign j 6
-    %rep 7
-        mov r11, [rsp + GPREGS_SIZE + j * 8]
-        mov [r10 + GPREGS_SIZE + j * 8], r11
-        %assign j j - 1
-    %endrep
-
-    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET], r12
-    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 8], r13
-    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 16], r14
-
-    mov rsp, r10
-    sub rsp, 8
-%ifdef WOS_KASAN
-    lea rdi, [rsp + 8 + KERNEL_RETURN_BLOCK_SIZE]
-    call wos_kasan_prepare_kernel_resume
-%endif
-    call wos_commit_handoff_task
-    add rsp, 8
-    popq
-    add rsp, INTERRUPT_FRAME_SIZE
-    iretq
-%endmacro
-
+; IRETQ consumes RIP/CS/RFLAGS/RSP/SS for both CPLs. Keep the normalized
+; GPRegs + InterruptFrame shadow before that physical five-word tail.
 %macro build_kernel_return_from_ptrs 0
-    mov r10, [rsi + 40]  ; saved kernel RSP
-    mov r12, [rsi + 16]  ; RIP
-    mov r13, [rsi + 24]  ; CS
-    mov r14, [rsi + 32]  ; RFLAGS
+    ; Snapshot the independent frame before destination writes can overlap it.
+    ; Task::Context has a gap between regs and frame; they are not one span.
+    mov r8, [rsi]       ; int_num
+    mov r9, [rsi + 8]   ; err_code
+    mov r12, [rsi + 16] ; RIP
+    mov r13, [rsi + 24] ; CS
+    mov r14, [rsi + 32] ; RFLAGS
+    mov r10, [rsi + 40] ; exact saved RSP, including its original alignment
+    mov r15, [rsi + 48] ; SS
     sub r10, KERNEL_RETURN_BLOCK_SIZE
 
+    ; The native IRQ snapshot can overlap the lower return destination.
+    ; Move the GPRegs span in the direction required by its actual addresses.
+    cmp r10, rdi
+    jbe %%copy_forward
     %assign i 14
     %rep 15
         mov r11, [rdi + i * 8]
         mov [r10 + i * 8], r11
         %assign i i - 1
     %endrep
-
-    %assign j 6
-    %rep 7
-        mov r11, [rsi + j * 8]
-        mov [r10 + GPREGS_SIZE + j * 8], r11
-        %assign j j - 1
+    jmp %%copy_done
+%%copy_forward:
+    %assign i 0
+    %rep 15
+        mov r11, [rdi + i * 8]
+        mov [r10 + i * 8], r11
+        %assign i i + 1
     %endrep
+%%copy_done:
+
+    mov [r10 + GPREGS_SIZE], r8
+    mov [r10 + GPREGS_SIZE + 8], r9
+    mov [r10 + GPREGS_SIZE + 16], r12
+    mov [r10 + GPREGS_SIZE + 24], r13
+    mov [r10 + GPREGS_SIZE + 32], r14
+    lea r11, [r10 + KERNEL_RETURN_BLOCK_SIZE]
+    mov [r10 + GPREGS_SIZE + 40], r11
+    mov [r10 + GPREGS_SIZE + 48], r15
 
     mov [r10 + IRETQ_KERNEL_FRAME_OFFSET], r12
     mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 8], r13
     mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 16], r14
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 24], r11
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 32], r15
 
+    ; Helper calls use aligned scratch below the live return block. Preserve
+    ; the block pointer across calls without rounding the resumed task's RSP.
+    mov r15, r10
     mov rsp, r10
-    sub rsp, 8
+    and rsp, -16
 %ifdef WOS_KASAN
-    lea rdi, [rsp + 8 + KERNEL_RETURN_BLOCK_SIZE]
+    lea rdi, [r15 + KERNEL_RETURN_BLOCK_SIZE]
     call wos_kasan_prepare_kernel_resume
 %endif
     call wos_commit_handoff_task
-    add rsp, 8
+    mov rsp, r15
     popq
     add rsp, INTERRUPT_FRAME_SIZE
     iretq
 %endmacro
 
+%macro build_kernel_return_from_stack 0
+    lea rsi, [rsp + GPREGS_SIZE]
+    mov rdi, rsp
+    build_kernel_return_from_ptrs
+%endmacro
+
 %macro build_user_return_from_ptrs 0
     ; rdi = GPRegs*, rsi = InterruptFrame*
     ;
-    ; The timer path may enter from either an outer-privilege hardware frame or
-    ; a same-CPL kernel frame that we normalized in isr32. Always build the
+    ; The timer path has the same native frame shape for both origins. Build the
     ; outgoing userspace iret frame from the normalized InterruptFrame instead
     ; of depending on which physical stack shape reached task_switch_handler.
     mov r12, rdi
@@ -574,8 +565,8 @@ jump_to_next_task_no_save:
     call wos_jump_to_next_task_no_save
     cli
 
-    ; Same-CPL iretq does not restore RSP; kernel targets need a frame on
-    ; their own stack.
+    ; Kernel targets keep their normalized shadow and complete IRETQ tail on
+    ; their own stack before committing the handoff.
     lea rsi, [rsp + GPREGS_SIZE]
     mov rdi, rsp
     cmp qword [rsi + 24], qword 0x23

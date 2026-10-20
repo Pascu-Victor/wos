@@ -6,6 +6,9 @@ The exact complete process_tasks idle branch executes inside a finite wrapper.
 IRQ instructions, runqueue locking/eligibility/stealing, platform timer/GS/CR3,
 address bounds and assembly handoff are finite endpoints. This does not qualify
 hardware IRQ delivery, SMP scheduling/stealing, ASAN stack entry or reset cause.
+Native null-SS compatibility executes the actual classifier, kernel validator,
+resume guard and unchanged synthetic first-daemon discriminator. A finite live
+SS scalar is preserved across direct handoff endpoints; no ring-0 SS load runs.
 """
 from __future__ import annotations
 import argparse
@@ -187,6 +190,128 @@ ORIGINAL_START = r'''void start_scheduler() {
 }'''
 ORIGINAL_START_SHA256 = 'c282332e9ec7ec1019a8adb62b2afc14fd805c4b8e2eaff9c5bc7d80aff8e8bd'
 
+# Complete genuine pre-686b functions. Only this control restores their old
+# selector policy; the new positive oracle is unchanged.
+ORIGINAL_KERNEL_SS_FUNCTIONS = {
+    'inline void validate_kernel_frame(': (r'''inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::task::Task* task, const char* path) {
+    if (frame.cs == desc::gdt::GDT_USER_CS) {
+        dbg::logger<"ctxswitch">::error(
+            "user return frame passed to kernel validator: path=%s pid=%lu name=%s type=%u ss=0x%llx rip=0x%llx rsp=0x%llx "
+            "flags=0x%llx task=%p",
+            path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+            task != nullptr ? static_cast<unsigned>(task->type) : 0U, static_cast<unsigned long long>(frame.ss),
+            static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
+            static_cast<unsigned long long>(frame.flags), static_cast<void*>(task));
+        hcf();
+    }
+
+    if (frame.cs != desc::gdt::GDT_KERN_CS) {
+        dbg::logger<"ctxswitch">::error(
+            "bad return frame selector: path=%s pid=%lu name=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p",
+            path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+            static_cast<unsigned long long>(frame.cs), static_cast<unsigned long long>(frame.ss),
+            static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
+            static_cast<unsigned long long>(frame.flags), static_cast<void*>(task));
+        hcf();
+    }
+
+    const bool RIP_BAD = !is_kernel_text_pointer(frame.rip);
+    const bool RSP_BAD = !valid_kernel_stack(frame.rsp);
+    const bool STACK_OWNER_BAD = task != nullptr && task->type != sched::task::TaskType::IDLE && !stack_belongs_to_task(task, frame.rsp);
+    const bool FLAGS_BAD = (frame.flags & 0x2ULL) == 0;
+    const bool SS_BAD = frame.ss != desc::gdt::GDT_KERN_DS;
+    if (!RIP_BAD && !RSP_BAD && !STACK_OWNER_BAD && !FLAGS_BAD && !SS_BAD) {
+        return;
+    }
+
+    auto* owner = K_ENABLE_SCHED_VALIDATE_CONTEXT ? sched::debug_find_task_by_kernel_stack(frame.rsp) : nullptr;
+    dbg::logger<"ctxswitch">::error(
+        "bad kernel return frame: path=%s pid=%lu name=%s rip=0x%llx rsp=0x%llx stack=0x%llx owner=%lu(%s) cs=0x%llx ss=0x%llx "
+        "flags=0x%llx task=%p",
+        path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+        static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
+        task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL, owner != nullptr ? owner->pid : 0UL,
+        (owner != nullptr && owner->name != nullptr) ? owner->name : "?", static_cast<unsigned long long>(frame.cs),
+        static_cast<unsigned long long>(frame.ss), static_cast<unsigned long long>(frame.flags), static_cast<void*>(task));
+    hcf();
+}''', '8c32e83be4c6fb04e5859f94a67c3a4284e37d55dc2aafece74276c3ff52e446'),
+    'auto classify_saved_frame(': (r'''auto classify_saved_frame(const sched::task::Task* task, const gates::InterruptFrame& frame, sched::task::SavedFrameOrigin origin,
+                          bool voluntary_process) -> sched::task::SavedFrameClass {
+    using sched::task::SavedFrameClassificationInput;
+    using sched::task::SavedFrameOwner;
+    using sched::task::SavedFrameSelectors;
+
+    if (task == nullptr) {
+        return sched::task::SavedFrameClass::INVALID;
+    }
+
+    SavedFrameClassificationInput input{};
+    input.origin = origin;
+    input.voluntary_process = voluntary_process;
+    input.timer_interrupt = frame.int_num == gates::IRQ0 && frame.err_code == 0;
+
+    switch (task->type) {
+        case sched::task::TaskType::PROCESS:
+            input.owner = SavedFrameOwner::PROCESS;
+            break;
+        case sched::task::TaskType::DAEMON:
+            input.owner = SavedFrameOwner::DAEMON;
+            break;
+        case sched::task::TaskType::IDLE:
+            input.owner = SavedFrameOwner::IDLE;
+            break;
+    }
+
+    if (frame.cs == desc::gdt::GDT_USER_CS && frame.ss == desc::gdt::GDT_USER_DS) {
+        input.selectors = SavedFrameSelectors::USER;
+        input.instruction_pointer_valid = valid_user_resume_scalar(frame.rip);
+        input.stack_pointer_valid = valid_user_resume_scalar(frame.rsp);
+        input.flags_valid = valid_user_rflags(frame.flags);
+    } else if (frame.cs == desc::gdt::GDT_KERN_CS && frame.ss == desc::gdt::GDT_KERN_DS) {
+        input.selectors = SavedFrameSelectors::KERNEL;
+        input.instruction_pointer_valid = is_kernel_text_pointer(frame.rip);
+        input.stack_pointer_valid = stack_belongs_to_task(task, frame.rsp);
+        input.flags_valid = (frame.flags & USER_RFLAGS_FIXED_ONE) != 0;
+    }
+
+    return sched::task::classify_saved_frame(input);
+}''', '4f9772de6a021f772da27f0ac1c839a87625bc406beaf6513470b704ec565e0f'),
+    'inline void validate_kernel_resume_target(': (r'''inline void validate_kernel_resume_target(task::Task* task, const char* path) {
+    if (task == nullptr) {
+        return;
+    }
+    if (!sys::context_switch::saved_frame_class_is_valid(task, task->context.frame)) {
+        resume_log::error("invalid saved frame class: path=%s pid=%lu name=%s class=%s", path != nullptr ? path : "?", task->pid,
+                          task->name != nullptr ? task->name : "?", task::saved_frame_class_name(task->context.saved_frame_class));
+        hcf();
+    }
+    if (task->context.saved_frame_class == task::SavedFrameClass::USER_RETURN && task->type == task::TaskType::PROCESS) {
+        return;
+    }
+
+    const uint64_t RIP = task->context.frame.rip;
+    const uint64_t RSP = task->context.frame.rsp;
+    const bool CS_BAD = task->context.frame.cs != desc::gdt::GDT_KERN_CS;
+    const bool SS_BAD = task->context.frame.ss != desc::gdt::GDT_KERN_DS;
+    const bool RIP_BAD = !is_kernel_text_pointer(RIP);
+    const bool RSP_BAD = !is_valid_kernel_stack(RSP);
+    const bool FLAGS_BAD = (task->context.frame.flags & 0x2ULL) == 0;
+    if (!CS_BAD && !SS_BAD && !RIP_BAD && !RSP_BAD && !FLAGS_BAD) {
+        return;
+    }
+
+    resume_log::error(
+        "kernel resume anomaly: path=%s pid=%lu name=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx entry=0x%llx kentry=%p "
+        "scratch=%p",
+        path != nullptr ? path : "?", task->pid, task->name != nullptr ? task->name : "?",
+        static_cast<unsigned long long>(task->context.frame.cs), static_cast<unsigned long long>(task->context.frame.ss),
+        static_cast<unsigned long long>(RIP), static_cast<unsigned long long>(RSP),
+        static_cast<unsigned long long>(task->context.frame.flags), static_cast<unsigned long long>(task->entry),
+        reinterpret_cast<void*>(task->kthread_entry), reinterpret_cast<void*>(task->context.syscall_scratch_area));
+    hcf();
+}''', 'fc7a8b2dca1912cecb9aa71b615630dbd2bc9fa6eee19f5f9c97f8bd8ed1bc3f'),
+}
+
 PRELUDE = r'''
 #include <algorithm>
 #include <array>
@@ -199,8 +324,8 @@ PRELUDE = r'''
 #include <platform/sched/preemption_policy.hpp>
 namespace fixture {
 unsigned cases{},assertions{},failures{},lock_depth{},arm_calls{},steal_calls{},pick_calls{},switch_calls{},commits{},first_runs{};
-bool irq{},on_idle_stack{},kernel_root{},kernel_gs{},clock_ready{},switch_ok{true};
-uint64_t live_rsp{},tss_rsp{},fsbase{},gsbase{},kernel_gsbase{};
+bool irq{},on_idle_stack{},kernel_root{},kernel_gs{},clock_ready{},switch_ok{true},check_daemon_irq{};
+uint64_t live_rsp{},live_ss{16},tss_rsp{},fsbase{},gsbase{},kernel_gsbase{};
 constexpr uint64_t IDLE_TOP=0x140000,REAL_TOP=0x150000,BOOT_RSP=0x160000;
 struct Halt{};
 enum class End {IDLE,USER,DAEMON,RESUME};
@@ -211,6 +336,7 @@ void sti(){check(lock_depth==0,"enable IRQ only outside runqueue lock");irq=true
 uint64_t save_irq(){uint64_t f=irq?0x200:0;irq=false;return f;}
 void hlt();
 void timer(uint64_t rip);
+void daemon_handoff_irq();
 }
 [[noreturn]] void hcf(){throw fixture::Halt{};}
 template<size_t N>struct Literal{char bytes[N];constexpr Literal(char const(&v)[N]){std::copy_n(v,N,bytes);}};
@@ -272,7 +398,7 @@ struct Context{uint64_t syscall_kernel_stack{},syscall_scratch_area{};cpu::GPReg
  gates::InterruptFrame frame{};SavedFrameClass saved_frame_class{SavedFrameClass::INVALID};};
 struct Task {
  enum class Queue{NONE,WAITING};
- TaskType type{TaskType::IDLE};uint64_t pid{},cpu_no{};char const*name{"finite"};Thread*thread{};void*pagemap{};
+ TaskType type{TaskType::IDLE};uint64_t pid{},cpu_no{},entry{};char const*name{"finite"};Thread*thread{};void*pagemap{};
  Context context{};std::atomic<TaskState>state{TaskState::ACTIVE};Queue sched_queue{Queue::NONE};
  bool has_run{},wants_block{},blocked{},ptrace{};void(*kthread_entry)(){};
  void store_cpu(uint64_t v){cpu_no=v;}uint64_t load_cpu()const{return cpu_no;}
@@ -339,6 +465,7 @@ void validate_handoff_stack_ownership(sched::task::Task const*,sched::task::Task
 auto classify_saved_frame(sched::task::Task const*,gates::InterruptFrame const&,sched::task::SavedFrameOrigin,bool)->sched::task::SavedFrameClass;
 void record_saved_frame_class(sched::task::Task*,gates::InterruptFrame const&,sched::task::SavedFrameOrigin);
 void validate_classified_frame_for_restore(sched::task::Task*,gates::InterruptFrame const&,sched::task::SavedFrameClass,char const*);
+bool saved_frame_class_is_valid(sched::task::Task const*,gates::InterruptFrame const&);
 void validate_user_frame(gates::InterruptFrame const&,sched::task::Task*,char const*){
  // User PTE/lazy backing admission is deliberately outside these kernel-idle vectors.
  hcf();
@@ -364,9 +491,6 @@ void cpu_set_msr(uint64_t which,uint64_t value){
 
 ENDPOINTS = r'''
 namespace ker::mod::sched {
-void validate_kernel_resume_target(task::Task*t,char const*path){
- sys::context_switch::validate_classified_frame_for_restore(t,t->context.frame,t->context.saved_frame_class,path);
-}
 void arm_idle_timer_for_this_cpu(){
  ++fixture::arm_calls;
  fixture::check(fixture::clock_ready&&fixture::lock_depth==0,"idle timer after initialized clock and unlocked RQ");
@@ -391,6 +515,7 @@ void arm_idle_timer_for_this_cpu(){
 }
 [[noreturn]]void wos_start_kernel_thread(uint64_t stack,void(*entry)()){
  fixture::check(!fixture::irq&&stack==fixture::REAL_TOP&&entry==fixture_daemon_entry,"unchanged fresh daemon entry operands");
+ if(fixture::check_daemon_irq)fixture::daemon_handoff_irq();
  throw fixture::Stopped{fixture::End::DAEMON};
 }
 [[noreturn]]void wos_deferred_task_switch_return(cpu::GPRegs*,gates::InterruptFrame*){
@@ -407,7 +532,7 @@ namespace fixture {
 void timer(uint64_t rip){
  namespace s=ker::mod::sched;namespace c=ker::mod::sys::context_switch;using namespace ker::mod;
  bool previous=irq;irq=false;
- gates::InterruptFrame frame{gates::IRQ0,0,rip,desc::gdt::GDT_KERN_CS,0x202,live_rsp,desc::gdt::GDT_KERN_DS};
+ gates::InterruptFrame frame{gates::IRQ0,0,rip,desc::gdt::GDT_KERN_CS,0x202,live_rsp,live_ss};
  cpu::GPRegs gpr{};auto*live=s::get_current_task();
  auto interrupted=c::classify_saved_frame(live,frame,s::task::SavedFrameOrigin::INTERRUPT,false);
  s::process_idle_timer(gpr,frame);
@@ -434,9 +559,9 @@ s::task::Task idle,real,outgoing;s::task::Thread user_thread;cpu::PerCpu idle_sc
 void reset(){
  ++cases;std::destroy_at(&s::queues.rq);std::construct_at(&s::queues.rq);
  for(auto*t:{&idle,&real,&outgoing}){std::destroy_at(t);std::construct_at(t);}
- irq=false;on_idle_stack=kernel_root=kernel_gs=clock_ready=false;switch_ok=true;
+ irq=false;on_idle_stack=kernel_root=kernel_gs=clock_ready=check_daemon_irq=false;switch_ok=true;
  arm_calls=steal_calls=pick_calls=switch_calls=commits=first_runs=lock_depth=0;
- live_rsp=BOOT_RSP;tss_rsp=fsbase=gsbase=kernel_gsbase=0;s::scheduler_task_context_ready_mask=0;
+ live_rsp=BOOT_RSP;live_ss=16;tss_rsp=fsbase=gsbase=kernel_gsbase=0;s::scheduler_task_context_ready_mask=0;
  idle.context.syscall_kernel_stack=IDLE_TOP;idle.context.syscall_scratch_area=reinterpret_cast<uint64_t>(&idle_scratch);
  idle.pagemap=mm::virt::get_kernel_pagemap();s::queues.rq.idle_task=&idle;
  real.type=s::task::TaskType::DAEMON;real.pid=1;real.kthread_entry=fixture_daemon_entry;real.pagemap=mm::virt::get_kernel_pagemap();
@@ -449,6 +574,113 @@ bool rejected(gates::InterruptFrame f,s::task::Task*t=&idle){
   c::validate_classified_frame_for_restore(t,f,k,"negative-frame");return false;}catch(Halt const&){return true;}
 }
 gates::InterruptFrame idle_frame(){return {gates::IRQ0,0,reinterpret_cast<uint64_t>(wos_kernel_idle_loop)+2,8,0x202,IDLE_TOP,16};}
+gates::InterruptFrame kernel_frame(s::task::Task*t,uint64_t ss){
+ return {gates::IRQ0,0,reinterpret_cast<uint64_t>(fixture_daemon_entry)+1,8,0x202,t->context.syscall_kernel_stack-32,ss};
+}
+bool kernel_accepted(s::task::Task*t,gates::InterruptFrame f,s::task::SavedFrameOrigin origin,bool voluntary,
+                     s::task::SavedFrameClass expected,bool resume=true){
+ try{
+  if(c::classify_saved_frame(t,f,origin,voluntary)!=expected)return false;
+  c::validate_classified_frame_for_restore(t,f,expected,"native-SS-restore");
+  if(resume){
+   t->blocked=voluntary;t->context.frame=f;c::record_saved_frame_class(t,f,origin);
+   if(t->context.saved_frame_class!=expected)return false;
+   s::validate_kernel_resume_target(t,"native-SS-resume");
+  }
+  return true;
+ }catch(Halt const&){return false;}
+}
+void daemon_handoff_irq(){
+ auto*t=s::get_current_task();
+ if(!t){check(false,"direct daemon handoff has published owner");return;}
+ // Finite native snapshot after the existing direct stack handoff: ASM does
+ // not load SS, so retain the inherited live scalar rather than synthesize16.
+ live_rsp=t->context.syscall_kernel_stack;
+ check(kernel_accepted(t,kernel_frame(t,live_ss),s::task::SavedFrameOrigin::INTERRUPT,false,s::task::SavedFrameClass::DAEMON_KERNEL),
+       "direct daemon handoff preserves native null-or-kernel SS");
+}
+void native_kernel_ss_cases(){
+ using C=s::task::SavedFrameClass;using O=s::task::SavedFrameOrigin;
+ //20–23: both direct handoffs preserve the live SS inherited from their
+ // predecessor. Hardware entry is finite; all C++ consumers below are actual.
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}}){reset();live_ss=ss;
+  check(boot(End::IDLE),"direct idle handoff preserves native null-or-kernel SS");
+ }
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}}){reset();live_ss=ss;check_daemon_irq=true;s::queues.rq.runnable_heap={1,&real};
+  check(boot(End::DAEMON),"native daemon handoff reaches valid saved IRQ continuation");
+ }
+ //24: literal expected classes exercise the actual selector adapter, shared
+ // classification table, kernel restore validator and complete resume guard.
+ reset();
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}}){
+  auto f=kernel_frame(&real,ss);
+  check(kernel_accepted(&real,f,O::INTERRUPT,false,C::DAEMON_KERNEL),"native daemon IRQ accepts exact null-or-kernel SS");
+  f.int_num=0;
+  check(kernel_accepted(&real,f,O::DAEMON_START,false,C::DAEMON_KERNEL),"daemon-start class accepts exact null-or-kernel SS");
+  real.type=s::task::TaskType::PROCESS;f=kernel_frame(&real,ss);
+  check(kernel_accepted(&real,f,O::INTERRUPT,false,C::TIMER_PREEMPTED_PROCESS_KERNEL),"native process timer accepts exact null-or-kernel SS");
+  check(kernel_accepted(&real,f,O::INTERRUPT,true,C::VOLUNTARY_PARKED_KERNEL),"native voluntary process accepts exact null-or-kernel SS");
+  auto idle_irq=idle_frame();idle_irq.ss=ss;
+  check(kernel_accepted(&idle,idle_irq,O::INTERRUPT,false,C::INVALID,false),"idle native SS retains only existing exact-loop exception");
+  real.type=s::task::TaskType::DAEMON;
+ }
+ //25: no RPL, foreign selector, reserved or high bits are masked away.
+ reset();
+ for(uint64_t bad_ss:{uint64_t{1},uint64_t{2},uint64_t{3},uint64_t{0x11},uint64_t{0x1b},uint64_t{0x23},
+                     uint64_t{0x10010},uint64_t{1}<<63,UINT64_MAX}){
+  for(auto type:{s::task::TaskType::DAEMON,s::task::TaskType::PROCESS}){
+   real.type=type;auto f=kernel_frame(&real,bad_ss);
+   auto expected=type==s::task::TaskType::DAEMON?C::DAEMON_KERNEL:C::TIMER_PREEMPTED_PROCESS_KERNEL;
+   check(!kernel_accepted(&real,f,O::INTERRUPT,false,expected),"foreign native kernel SS remains refused");
+  }
+  auto f=idle_frame();f.ss=bad_ss;check(rejected(f),"idle exception still refuses foreign SS");
+ }
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}})for(uint64_t bad_cs:{uint64_t{0},uint64_t{9},uint64_t{0x23},uint64_t{0x10008}}){
+  for(auto type:{s::task::TaskType::DAEMON,s::task::TaskType::PROCESS}){
+   real.type=type;auto f=kernel_frame(&real,ss);f.cs=bad_cs;
+   auto expected=type==s::task::TaskType::DAEMON?C::DAEMON_KERNEL:C::TIMER_PREEMPTED_PROCESS_KERNEL;
+   check(!kernel_accepted(&real,f,O::INTERRUPT,false,expected),"native SS never permits a nonkernel CS");
+  }
+  auto f=idle_frame();f.ss=ss;f.cs=bad_cs;check(rejected(f),"idle native SS never permits a nonkernel CS");
+ }
+ //26: valid SS does not waive flags, finite text/stack bounds or exact owner.
+ reset();
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}})for(unsigned axis=0;axis<5;++axis){
+  for(auto type:{s::task::TaskType::DAEMON,s::task::TaskType::PROCESS}){
+   real.type=type;auto f=kernel_frame(&real,ss);
+   if(axis==0)f.flags=0;if(axis==1)f.rip=0;if(axis==2)f.rsp=0;
+   if(axis==3)f.rsp=IDLE_TOP;if(axis==4)f.rsp=REAL_TOP-mm::KERNEL_STACK_SIZE;
+   auto expected=type==s::task::TaskType::DAEMON?C::DAEMON_KERNEL:C::TIMER_PREEMPTED_PROCESS_KERNEL;
+   check(!kernel_accepted(&real,f,O::INTERRUPT,false,expected),"native SS preserves flags bounds and Task owner checks");
+  }
+  auto f=idle_frame();f.ss=ss;
+  if(axis==0)f.flags=0;if(axis==1)f.rip=0;if(axis>=2)f.rsp=0;
+  check(rejected(f),"idle native SS preserves frame scalar checks");
+ }
+ //27: IRQ/vector/error/origin provenance remains part of the actual class.
+ reset();
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}})for(unsigned axis=0;axis<5;++axis){
+  real.type=axis==4?s::task::TaskType::PROCESS:s::task::TaskType::DAEMON;
+  auto f=kernel_frame(&real,ss);auto origin=O::INTERRUPT;
+  if(axis==0)f.int_num=33;if(axis==1)f.err_code=1;if(axis==2)origin=O::INVALID;
+  if(axis==3)origin=O::SYNTHETIC_USER_RETURN;if(axis==4)origin=O::DAEMON_START;
+  auto expected=axis==4?C::TIMER_PREEMPTED_PROCESS_KERNEL:C::DAEMON_KERNEL;
+  check(!kernel_accepted(&real,f,origin,false,expected),"native SS preserves producer-origin and timer provenance");
+ }
+ //28: the synthetic brand-new daemon discriminator still requires SS16.
+ reset();s::prepare_first_run_daemon(&real,"native-SS-first-run");
+ check(c::is_first_run_kernel_thread_frame(real.context.frame,real.context.regs,&real),"fresh synthetic daemon retains kernel SS16");
+ auto first=real.context.frame;first.ss=0;
+ check(!c::is_first_run_kernel_thread_frame(first,real.context.regs,&real),"native null SS does not relax fresh synthetic daemon discriminator");
+ //29: correct selectors cannot authorize an invalid or wrong durable class.
+ reset();
+ for(uint64_t ss:{uint64_t{0},uint64_t{16}})for(auto bad_class:{C::INVALID,C::USER_RETURN,C::TIMER_PREEMPTED_PROCESS_KERNEL}){
+  real.context.frame=kernel_frame(&real,ss);real.context.saved_frame_class=bad_class;
+  bool refused=false;try{s::validate_kernel_resume_target(&real,"native-SS-wrong-class");}catch(Halt const&){refused=true;}
+  check(refused,"native SS never bypasses actual durable-class resume guard");
+ }
+ check(!kernel_accepted(nullptr,idle_frame(),O::INTERRUPT,false,C::INVALID),"native SS never grants restore to a missing owner");
+}
 void run(){
  //1–3: empty/null first pick; an actual queued IDLE first pick; and a nonempty
  // queue with no eligible pick. The last case takes the actual pick-null path
@@ -472,7 +704,7 @@ void run(){
  check(rejected(f),"strict restore rejects half-open idle range end");
  //6: malformed idle frames and non-idle owner never borrow the idle exception.
  reset();f=idle_frame();f.rsp=0;check(rejected(f),"invalid idle frame stack refused");
- f=idle_frame();f.ss=0;check(rejected(f),"invalid idle SS refused");
+ f=idle_frame();f.ss=1;check(rejected(f),"invalid idle SS refused");
  f=idle_frame();f.flags=0;check(rejected(f),"invalid idle flags refused");
  f=idle_frame();f.cs=3;check(rejected(f),"invalid idle CS refused");
  real.type=s::task::TaskType::PROCESS;check(rejected(idle_frame(),&real),"nonidle task does not borrow idle restore exception");
@@ -516,6 +748,7 @@ void run(){
  outgoing.context.syscall_kernel_stack=IDLE_TOP;s::queues.rq.current_task=&outgoing;
  bool collision_refused=false;try{s::enter_idle_loop(&s::queues.rq);}catch(Halt const&){collision_refused=true;}
  check(collision_refused&&commits==0,"distinct outgoing owner cannot share incoming idle stack");
+ native_kernel_ss_cases();
  std::printf("%s bootstrap_idle cases=%u assertions=%u failures=%u\n",failures?"FAIL":"PASS",cases,assertions,failures);
 }
 }
@@ -526,9 +759,14 @@ int main(){try{fixture::run();}catch(...){std::fprintf(stderr,"FAIL unexpected f
 def generate(scheduler: str, context: str, assembly: str, control: str) -> tuple[str, dict]:
     selected = {}
 
-    def body(text: str, anchor: str) -> str:
+    def body(text: str, anchor: str, key: str | None = None) -> str:
         value, row = capture(text, anchor)
-        selected[anchor] = row
+        selected[key or anchor] = row
+        if control == 'original-kernel-ss' and anchor in ORIGINAL_KERNEL_SS_FUNCTIONS:
+            value, expected_sha256 = ORIGINAL_KERNEL_SS_FUNCTIONS[anchor]
+            if hashlib.sha256(value.encode()).hexdigest() != expected_sha256:
+                raise ValueError('complete retained original kernel-SS function changed: ' + anchor)
+            selected['original-kernel-ss:' + anchor] = dict(bytes=len(value.encode()), sha256=expected_sha256)
         return value
 
     idle_asm = assembly[assembly.index('wos_enterIdleStack:\n'):assembly.index('; Exec owner entry', assembly.index('wos_enterIdleStack:\n'))]
@@ -542,18 +780,20 @@ def generate(scheduler: str, context: str, assembly: str, control: str) -> tuple
     start = body(scheduler, 'void start_scheduler() {')
     if control == 'original-bootstrap':
         start = ORIGINAL_START
-    elif control != 'current':
+    elif control not in ('current', 'original-kernel-ss'):
         raise ValueError('unknown complete-body control')
     replacements = {'asm volatile("cli" ::: "memory");': 'fixture::cli();',
                     'asm volatile("cli");': 'fixture::cli();',
                     'asm volatile("sti");': 'fixture::sti();',
                     'asm volatile("hlt");': 'fixture::hlt();'}
-    expected = {'current': [2, 0, 0, 0], 'original-bootstrap': [1, 1, 1, 1]}[control]
+    expected = {'current': [2, 0, 0, 0], 'original-bootstrap': [1, 1, 1, 1],
+                'original-kernel-ss': [2, 0, 0, 0]}[control]
     for (old, new), count in zip(replacements.items(), expected):
         if start.count(old) != count:
             raise ValueError('exact startup IRQ/HLT endpoint count changed: ' + old)
         start = start.replace(old, new)
     scheduler_anchors = [
+        'inline auto is_kernel_text_pointer(',
         'inline auto task_type_for_log(', 'inline auto task_state_for_log(', 'inline auto task_queue_for_log(',
         'inline auto task_name_for_log(', 'inline auto has_kernel_scheduler_context(', 'inline auto is_publishable_idle_task(',
         'inline int64_t compute_avg_vruntime(', 'inline uint32_t task_load_for_incoming(',
@@ -561,8 +801,11 @@ def generate(scheduler: str, context: str, assembly: str, control: str) -> tuple
         'inline void transition_publish_current_locked(', 'inline void publish_current_task_boot_exception(',
         'inline void transition_reserve_handoff_locked(', 'inline void reserve_handoff_task_locked(',
         'inline auto transition_commit_handoff_locked(', 'inline void restore_kernel_gs_for_idle(',
-        'inline void prepare_first_run_daemon(', 'auto get_return_task(', 'auto can_query_current_task()']
-    actual_scheduler = [body(scheduler, anchor) for anchor in scheduler_anchors]
+        'inline void validate_kernel_resume_target(', 'inline void prepare_first_run_daemon(',
+        'auto get_return_task(', 'auto can_query_current_task()']
+    actual_scheduler = [body(scheduler, anchor,
+                             key='scheduler.cpp:' + anchor if anchor == 'inline auto is_kernel_text_pointer(' else None)
+                        for anchor in scheduler_anchors]
     getter = body(scheduler, 'auto get_current_task()')
     save = 'asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");'
     restore = 'asm volatile("sti" ::: "memory");'
@@ -579,9 +822,11 @@ def generate(scheduler: str, context: str, assembly: str, control: str) -> tuple
     context_anchors = ['inline auto valid_kernel_stack(', 'inline auto is_kernel_text_pointer(',
                        'inline auto stack_belongs_to_task(', 'inline auto valid_user_resume_scalar(',
                        'inline auto valid_user_rflags(', 'inline void validate_kernel_frame(',
-                       'inline auto is_idle_return_frame(', 'void validate_handoff_stack_ownership(',
+                       'inline auto is_idle_return_frame(', 'inline auto is_first_run_kernel_thread_frame(',
+                       'void validate_handoff_stack_ownership(',
                        'auto classify_saved_frame(', 'void record_saved_frame_class(',
-                       'auto classified_frame_is_valid(', 'void validate_classified_frame_for_restore(']
+                       'auto classified_frame_is_valid(', 'void validate_classified_frame_for_restore(',
+                       'auto saved_frame_class_is_valid(']
     actual_context = [body(context, anchor) for anchor in context_anchors]
     text = PRELUDE.replace('// ACTUAL_CONTEXT', '\nnamespace ker::mod::sys::context_switch {\n' + '\n'.join(actual_context) + '\n}')
     text = text.replace('// ACTUAL_SCHEDULER', '\nnamespace ker::mod::sched {\n' + '\n'.join(actual_scheduler) + '\n}')
@@ -622,7 +867,7 @@ def main() -> int:
             target = scratch / 'include/platform/sched' / header.name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(header.read_bytes())
-        for control in ('current', 'original-bootstrap'):
+        for control in ('current', 'original-bootstrap', 'original-kernel-ss'):
             text, actual = generate(scheduler=source.read_text(), context=CONTEXT.read_text(), assembly=ASM.read_text(), control=control)
             result.setdefault('actual_definition_hashes', {})[control] = actual
             translation, binary, depfile = (scratch / (control + suffix) for suffix in ('.cpp', '', '.d'))
@@ -647,13 +892,14 @@ def main() -> int:
             result['commands'].append(row)
             log = log_path.read_text(errors='replace')
             print(log[-32768:], end='')
-            positive = row['exit'] == 0 and re.search(r'^PASS bootstrap_idle cases=19 assertions=\d+ failures=0$', log, re.M)
+            positive = row['exit'] == 0 and re.search(r'^PASS bootstrap_idle cases=29 assertions=\d+ failures=0$', log, re.M)
             if (control == 'current') != bool(positive):
                 raise ValueError(control + ': complete actual-body oracle did not distinguish expected behavior')
             if control != 'current':
-                marker = 'FAIL bootstrap no-successor timer returns through actual idle frame'
-                if row['exit'] != 1 or not re.search(r'^FAIL bootstrap_idle cases=19 assertions=\d+ failures=[1-9]\d*$', log, re.M) or marker not in log.splitlines():
-                    raise ValueError('strict-compiled complete original must finish all19cases and fail the same positive restore oracle')
+                marker = {'original-bootstrap': 'FAIL bootstrap no-successor timer returns through actual idle frame',
+                          'original-kernel-ss': 'FAIL direct idle handoff preserves native null-or-kernel SS'}[control]
+                if row['exit'] != 1 or not re.search(r'^FAIL bootstrap_idle cases=29 assertions=\d+ failures=[1-9]\d*$', log, re.M) or marker not in log.splitlines():
+                    raise ValueError('strict-compiled complete original must finish all29cases and fail its same positive restore oracle')
         result['pass_'] = True
     except (OSError, ValueError, TimeoutError, KeyboardInterrupt) as error:
         result['error'] = f'{type(error).__name__}: {error}'

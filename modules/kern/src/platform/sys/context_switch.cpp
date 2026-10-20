@@ -167,7 +167,8 @@ inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::tas
     const bool RSP_BAD = !valid_kernel_stack(frame.rsp);
     const bool STACK_OWNER_BAD = task != nullptr && task->type != sched::task::TaskType::IDLE && !stack_belongs_to_task(task, frame.rsp);
     const bool FLAGS_BAD = (frame.flags & 0x2ULL) == 0;
-    const bool SS_BAD = frame.ss != desc::gdt::GDT_KERN_DS;
+    // An IRQ from userspace can leave null SS live across a direct kernel handoff.
+    const bool SS_BAD = frame.ss != 0 && frame.ss != desc::gdt::GDT_KERN_DS;
     if (!RIP_BAD && !RSP_BAD && !STACK_OWNER_BAD && !FLAGS_BAD && !SS_BAD) {
         return;
     }
@@ -461,7 +462,7 @@ auto classify_saved_frame(const sched::task::Task* task, const gates::InterruptF
         input.instruction_pointer_valid = valid_user_resume_scalar(frame.rip);
         input.stack_pointer_valid = valid_user_resume_scalar(frame.rsp);
         input.flags_valid = valid_user_rflags(frame.flags);
-    } else if (frame.cs == desc::gdt::GDT_KERN_CS && frame.ss == desc::gdt::GDT_KERN_DS) {
+    } else if (frame.cs == desc::gdt::GDT_KERN_CS && (frame.ss == 0 || frame.ss == desc::gdt::GDT_KERN_DS)) {
         input.selectors = SavedFrameSelectors::KERNEL;
         input.instruction_pointer_valid = is_kernel_text_pointer(frame.rip);
         input.stack_pointer_valid = stack_belongs_to_task(task, frame.rsp);

@@ -229,7 +229,7 @@ inline void validate_kernel_resume_target(task::Task* task, const char* path) {
     const uint64_t RIP = task->context.frame.rip;
     const uint64_t RSP = task->context.frame.rsp;
     const bool CS_BAD = task->context.frame.cs != desc::gdt::GDT_KERN_CS;
-    const bool SS_BAD = task->context.frame.ss != desc::gdt::GDT_KERN_DS;
+    const bool SS_BAD = task->context.frame.ss != 0 && task->context.frame.ss != desc::gdt::GDT_KERN_DS;
     const bool RIP_BAD = !is_kernel_text_pointer(RIP);
     const bool RSP_BAD = !is_valid_kernel_stack(RSP);
     const bool FLAGS_BAD = (task->context.frame.flags & 0x2ULL) == 0;

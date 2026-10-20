@@ -248,7 +248,13 @@ def test_classified_restore_policy_owns_validation_and_return_boundaries() -> No
         "abandoned FPU return state must be discarded before successor selection",
     )
 
-    for macro_name in ("build_kernel_return_from_stack", "build_kernel_return_from_ptrs"):
+    stack_wrapper = asm_macro(asm_source, "build_kernel_return_from_stack")
+    wrapper_instructions = [line.split(";", 1)[0].strip() for line in stack_wrapper.splitlines()[1:]]
+    if [line for line in wrapper_instructions if line] != [
+        "lea rsi, [rsp + GPREGS_SIZE]", "mov rdi, rsp", "build_kernel_return_from_ptrs"
+    ]:
+        fail("kernel stack wrapper must pass the actual contiguous GP/frame references to the shared return")
+    for macro_name in ("build_kernel_return_from_ptrs",):
         macro_body = asm_macro(asm_source, macro_name)
         require_tokens(
             macro_body,
