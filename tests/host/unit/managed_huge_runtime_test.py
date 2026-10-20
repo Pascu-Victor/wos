@@ -258,6 +258,82 @@ def select_control_source(full: str, test: str, baseline_names: set[str]) -> tup
     return projection, verify_control_source(full, projection, test, baseline_names)
 
 
+def mixed_pch_prefix(source: str) -> str:
+    """Only the current idempotent declarations/includes, in physical order."""
+    boundary = "// Compile the real numa_alloc.cpp and its real phys.hpp declarations."
+    if source.count(boundary) != 1:
+        raise ValueError("mixed PCH boundary changed")
+    prefix = source[:source.index(boundary)]
+    expected = """
+#include <optional>
+#include <climits>
+#include <sys/types.h>
+namespace ker::vfs {struct File;}
+namespace ker::mod::mm::paging {struct PageTable;}
+namespace host_mixed {extern bool active;bool allocation_allowed();void put_file(ker::vfs::File*);void before_decrement(void*);void unmap_ack(ker::mod::mm::paging::PageTable*,unsigned long);}
+#include <cstdint>
+namespace ker::mod::mm::paging {struct PageTable;}
+namespace host_managed_remove {extern bool enabled,invoking;void before_decrement(void*);void unmap_ack(ker::mod::mm::paging::PageTable*,uint64_t);}
+#include <cstddef>
+namespace host_fork_alloc {bool refuse(std::size_t,bool);void* null_result();void note_delete(void*);bool free_stack(void*);void guard();}
+namespace host_fork_vm {extern bool enabled;void publication_acquire();void pin_acquire();}
+#include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <platform/acpi/numa_boot.hpp>
+#include <platform/asm/cpu.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/managed_huge.hpp>
+#include <platform/mm/numa_alloc.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <string>
+#include <utility>
+#include <vector>
+"""
+    def tokens(value: str) -> list:
+        if not value.isascii():
+            raise ValueError("mixed PCH prefix must be ASCII C++")
+        result = []
+        for line in value.split("\n"):
+            line = line.removesuffix("\r")  # Permit physical CRLF, not Unicode line splitting.
+            if line.lstrip(" \t").startswith("#"):
+                directive = re.fullmatch(r"[ \t]*#[ \t]*include[ \t]*<([A-Za-z_0-9./]+)>[ \t]*", line)
+                if directive is None:
+                    raise ValueError("mixed PCH include must occupy one exact header line")
+                result.append(("include", directive[1]))
+            else:
+                # Preserve identifier boundaries and include/declaration order.
+                # Only ASCII horizontal whitespace is ignorable here; comments,
+                # continuations and any new punctuation remain visible tokens.
+                result.extend(re.findall(r"[A-Za-z_][A-Za-z_0-9]*|::|[^ \t]", line))
+        return result
+
+    if tokens(prefix) != tokens(expected):
+        raise ValueError("mixed PCH prerequisite declarations/includes changed")
+    return prefix
+
+
+def verify_mixed_pch_consumer(source: str, prefix: str) -> dict:
+    if mixed_pch_prefix(source) != prefix:
+        raise ValueError("mixed PCH consumer prefix differs from the baseline")
+    raw, initial = source.encode(), prefix.encode()
+    restored = initial + raw[len(initial):]
+    if restored != raw:
+        raise ValueError("mixed PCH whole-program prefix inverse failed")
+    return dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
+                prefix_bytes=len(initial), prefix_sha256=hashlib.sha256(initial).hexdigest(),
+                exact_prefix_and_whole_program_inverse=True)
+
+
 def baseline_gtest_names(report: dict) -> set[str]:
     names = [suite["name"] + "." + case["name"] for suite in report["testsuites"] for case in suite["testsuite"]]
     if len(names) != len(set(names)) or len(names) != report["tests"]:
@@ -456,6 +532,8 @@ def main() -> int:
     errors: list[str] = []
     selected: list[dict] = []
     emitted: list[dict] = []
+    mixed_pch = None
+    mixed_pch_proof = {"used": False, "reason": "configured compiler uses the original flat path"}
     pending_signal = None
 
     def check_interrupted() -> None:
@@ -786,16 +864,66 @@ def main() -> int:
         (output / "baseline-case-inventory.json").write_text(json.dumps(baseline_cases, indent=2) + "\n")
         sources = [module, factory, composite] + ([public_source] if coordinator is not None else [])
         dependencies: set[Path] = set()
+        unit_dependencies: dict[int, set[Path]] = {}
         for index, path in enumerate(sources):
             depfile = scratch / f"deps-{index}.d"
             run(f"deps-{index}", flags + ["-M", "-MF", depfile, "-MT", "unit", path])
             words = shlex.split(depfile.read_text().replace("\\\n", " ").split(":", 1)[1])
             dependencies.update(Path(word).resolve() for word in words)
+            unit_dependencies[index] = {Path(word).resolve() for word in words}
         emitted = [pin(path) for path in sorted((dependencies - {composite}) | set(libraries), key=str)]
+        if options.mixed_geometry_only and re.fullmatch(r"clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?", Path(flags[0]).name):
+            actual_source = composite.read_text()
+            prefix = mixed_pch_prefix(actual_source)
+            original_program = verify_mixed_pch_consumer(actual_source, prefix)
+            # Audit the actual flat unit2 dependency closure, including fresh
+            # context headers. Never substitute a PCH dependency-only closure.
+            expected_inputs = {entry["path"]: entry for entry in emitted}
+            expected_inputs[str(composite.resolve())] = pin(composite)
+            audited = []
+            for dependency in sorted(unit_dependencies[2], key=str):
+                expected_input = expected_inputs[str(dependency)]
+                data = dependency.read_bytes()
+                if (len(data) != expected_input["bytes"] or hashlib.sha256(data).hexdigest() != expected_input["sha256"]
+                        or pin(dependency) != expected_input):
+                    raise RuntimeError("mixed PCH dependency changed before compilation")
+                if re.search(rb"\b__(?:BASE_FILE|INCLUDE_LEVEL|COUNTER|DATE|TIME|TIMESTAMP)__\b", data):
+                    raise RuntimeError(f"context-sensitive builtin in mixed PCH dependency: {dependency}")
+                audited.append(expected_input)
+            prefix_path = scratch / "mixed-prefix.hpp"
+            with prefix_path.open("x") as stream:
+                stream.write(prefix)
+            prefix_before = pin(prefix_path)
+            if (prefix_before["bytes"] != original_program["prefix_bytes"]
+                    or prefix_before["sha256"] != original_program["prefix_sha256"]):
+                raise RuntimeError("mixed PCH producer prefix differs from the expected buffer")
+            mixed_pch = scratch / "mixed-prefix.pch"
+            prefix_deps = scratch / "mixed-prefix.d"
+            run("compile-mixed-prefix", flags + ["-x", "c++-header", prefix_path, "-o", mixed_pch,
+                                                "-MD", "-MF", prefix_deps, "-MT", "mixed-prefix"])
+            if pin(prefix_path) != prefix_before:
+                raise RuntimeError("mixed PCH prefix changed during production")
+            words = shlex.split(prefix_deps.read_text().replace("\\\n", " ").split(":", 1)[1])
+            pch_dependencies = {Path(word).resolve() for word in words}
+            allowed = (unit_dependencies[2] - {composite.resolve()}) | {prefix_path.resolve()}
+            if prefix_path.resolve() not in pch_dependencies or not pch_dependencies <= allowed:
+                raise RuntimeError("mixed PCH introduced an undeclared flat dependency")
+            if allocated_bytes() > SCRATCH_BYTES:
+                raise RuntimeError("mixed PCH exhausted the original scratch budget")
+            generated = [prefix_before] + [pin(path) for path in (mixed_pch, prefix_deps)]
+            emitted.extend(generated)
+            mixed_pch_proof = dict(used=True, compiler=flags[0], prefix_text=prefix, original_program=original_program,
+                                   generated_before=generated, audited_flat_inputs=audited,
+                                   pch_dependencies=sorted(map(str, pch_dependencies)),
+                                   consumer_flags=["-include-pch", str(mixed_pch)],
+                                   scope="Fresh unit2 prefix only; complete original source and every control remain intact.")
         objects = []
         for index, path in enumerate(sources):
             obj = scratch / f"unit-{index}.o"
-            run(f"compile-{index}", flags + ["-c", path, "-o", obj])
+            extra = ["-include-pch", mixed_pch] if index == 2 and mixed_pch is not None else []
+            if extra:
+                verify_mixed_pch_consumer(path.read_text(), prefix)
+            run(f"compile-{index}", flags + extra + ["-c", path, "-o", obj])
             objects.append(obj)
 
         def link(label: str, inputs: list[Path]) -> Path:
@@ -820,6 +948,9 @@ def main() -> int:
             if replace_index == 2:
                 original = str(text)
                 text, selection = select_control_source(original, test, baseline_names)
+                if mixed_pch is not None:
+                    selection["precompiled_prefix"] = {"full": verify_mixed_pch_consumer(original, prefix),
+                                                       "projected": verify_mixed_pch_consumer(text, prefix)}
                 proof_bytes = len(original.encode()) + len(json.dumps(selection).encode())
                 if control_evidence_bytes + proof_bytes > SCRATCH_BYTES:
                     raise RuntimeError("bounded control source evidence exhausted")
@@ -831,7 +962,8 @@ def main() -> int:
             path = scratch / f"{label}.cpp"
             path.write_text(text)
             obj = scratch / f"{label}.o"
-            run(f"compile-{label}", flags + ["-c", path, "-o", obj])
+            extra = ["-include-pch", mixed_pch] if replace_index == 2 and mixed_pch is not None else []
+            run(f"compile-{label}", flags + extra + ["-c", path, "-o", obj])
             binary = link(label, [*objects[:replace_index], obj, *objects[replace_index + 1:]])
             controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary),
                              "selected_cases": sorted(selected_cases), "selection": selection, "original_source": original_source})
@@ -1173,6 +1305,7 @@ def main() -> int:
             "emitted_inputs_before": emitted,
             "emitted_inputs_after": emitted_after,
             "emitted_input_count": len(emitted),
+            **({"precompiled_prefix": mixed_pch_proof} if options.mixed_geometry_only else {}),
             "scratch_removed": not scratch.exists(),
             "scratch_allocated_bytes_removed": removed,
             "limits": [

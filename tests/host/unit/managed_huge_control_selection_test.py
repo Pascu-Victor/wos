@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure source checks for bounded GTest control compilation; no child processes."""
 
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +10,8 @@ from managed_huge_runtime_test import (
     CppText,
     baseline_gtest_names,
     control_case_names,
+    mixed_pch_prefix,
+    verify_mixed_pch_consumer,
     select_control_source,
     verify_control_source,
 )
@@ -133,10 +136,55 @@ def test_current_maintained_case_inventories():
     assert [len(CppText(text).gtest_cases()) for text in (base, coordinator, anonymous)] == [76, 116, 134]
 
 
+def test_actual_mixed_prefix_and_control_drift():
+    unit = Path(__file__).resolve().parent
+    declarations = []
+    for name, namespace in (("managed_mixed_geometry_fixture.py", "namespace host_mixed"),
+                            ("managed_anonymous_remove_fixture.py", "namespace host_managed_remove"),
+                            ("fork_vm_coordinator_fixture.py", "namespace host_fork_alloc")):
+        methods = [node for node in ast.walk(ast.parse((unit / name).read_text()))
+                   if isinstance(node, ast.FunctionDef) and node.name == "compose"]
+        values = [node.value for method in methods for node in ast.walk(method)
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                  and node.value.lstrip().startswith("#include") and namespace in node.value]
+        assert len(values) == 1
+        declarations.append(values[0])
+    marker = "// Compile the real numa_alloc.cpp and its real phys.hpp declarations."
+    fixture = (unit / "managed_huge_test.cpp").read_text()
+    assert fixture.count(marker) == 1
+    # Actual immutable generator declarations and fixture includes, rather
+    # than a duplicate test-only prefix. Bodies here test projection only.
+    prefix = "".join(declarations) + fixture[:fixture.index(marker)]
+    source = prefix + marker + "\nint support = 4;\nTEST(A, One) { EXPECT_TRUE(true); }\nTEST(B, Two) { EXPECT_TRUE(true); }\n"
+    assert mixed_pch_prefix(source) == prefix
+    projected, _ = select_control_source(source, "A.One", {"A.One", "B.Two"})
+    proof = verify_mixed_pch_consumer(projected, prefix)
+    assert proof["exact_prefix_and_whole_program_inverse"] and proof["prefix_bytes"] == len(prefix.encode())
+    for inserted in ("int state = 1;\n", "struct Defined {};\n", "void added(int = 1);\n", "#define NDEBUG\n"):
+        refuses(mixed_pch_prefix, source.replace(marker, inserted + marker))
+    refuses(mixed_pch_prefix, source.replace("#include <optional>", "#include <vector>", 1))
+    refuses(mixed_pch_prefix, source + marker)
+    # These changes collapsed to the same bytes under whitespace deletion.
+    for before, after in (
+        ("unsigned long", "unsignedlong"),
+        ("extern bool active", "externbool active"),
+        ("#include <optional>\n#include <climits>", "#include <optional> #include <climits>"),
+        ("sys/types.h", "sys /types.h"),
+        ("#include <optional>", "#include <optional> int state;"),
+        ("namespace ker::vfs", "namespace\u00a0ker::vfs"),
+    ):
+        assert source.count(before) == 1
+        refuses(mixed_pch_prefix, source.replace(before, after, 1))
+    # Token-equivalent whitespace can pass declaration validation, but a
+    # consumer must still match the exact baseline prefix, byte for byte.
+    refuses(verify_mixed_pch_consumer, projected.replace("#include <optional>", "#include  <optional>", 1), prefix)
+
+
 def main():
     checks = [test_exact_projection_and_utf8_offsets, test_literals_comments_and_balanced_bodies,
               test_unsupported_lexing_and_registrations_refuse, test_filter_and_baseline_identity_refusals,
-              test_changed_selected_body_gap_and_omission_refuse, test_current_maintained_case_inventories]
+              test_changed_selected_body_gap_and_omission_refuse, test_current_maintained_case_inventories,
+              test_actual_mixed_prefix_and_control_drift]
     for check in checks:
         check()
     print(json.dumps(dict(result="PASS_PURE_GTEST_CONTROL_SELECTION", checks=[check.__name__ for check in checks], child_processes=False)))

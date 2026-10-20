@@ -394,7 +394,8 @@ def require_companion_program(filename: str, cpp: str, driver: str) -> None:
                        and ast.unparse(loop.target) == "(index, path)"
                        and any(isinstance(call, ast.Call) and ast.unparse(call.func) == "run"
                                and len(call.args) == 2
-                               and ast.unparse(call.args[1]) == "flags + ['-c', path, '-o', obj]"
+                               and ast.unparse(call.args[1]) in ("flags + ['-c', path, '-o', obj]",
+                                                                 "flags + extra + ['-c', path, '-o', obj]")
                                for call in ast.walk(loop)) for loop in ast.walk(tree))
         linked = fixture and composed and selected and compiled
     else:
@@ -412,7 +413,7 @@ def require_managed_fixture_link_checks() -> None:
     coordinator = "coordinator.compose(fixture_source,"
     ordinary = "                    fixture_source,\n"
     sources = "sources = [module, factory, composite]"
-    compile_call = 'run(f"compile-{index}", flags + ["-c", path, "-o", obj])'
+    compile_call = 'run(f"compile-{index}", flags + extra + ["-c", path, "-o", obj])'
     fixture_path = 'fixture = support / "managed_huge_test.cpp"'
     replacement = 'fixture_source = fixture_source.replace(anchor, anchor + "\\n    host_range::check_preparation_allocation();")'
     for anchor in (read, coordinator, ordinary, sources, compile_call, fixture_path, replacement):
@@ -423,6 +424,9 @@ def require_managed_fixture_link_checks() -> None:
     direct = driver.replace(coordinator, "coordinator.compose(fixture.read_text(),").replace(ordinary,
                             "                    fixture.read_text(),\n")
     require_companion_program("managed_huge_test.cpp", cpp, direct)
+    # The original flat per-source compiler remains a supported positive form.
+    flat = driver.replace(compile_call, 'run(f"compile-{index}", flags + ["-c", path, "-o", obj])')
+    require_companion_program("managed_huge_test.cpp", cpp, flat)
     mutations = {
         "missing read": driver.replace(read, "        fixture_source = ''\n"),
         "read hidden in dead branch": driver.replace(read, "        if False:\n    " + read),
@@ -434,6 +438,12 @@ def require_managed_fixture_link_checks() -> None:
         "replacement discards anchor": driver.replace(replacement, 'fixture_source = fixture_source.replace(anchor, "")'),
         "composite omitted": driver.replace(sources, "sources = [module, factory]"),
         "compiler command missing": driver.replace(compile_call, "pass"),
+        "compiler uses different source": driver.replace(compile_call,
+            'run(f"compile-{index}", flags + extra + ["-c", fixture, "-o", obj])'),
+        "dependency command instead of compilation": driver.replace(compile_call,
+            'run(f"compile-{index}", flags + extra + ["-M", path, "-o", obj])'),
+        "PCH producer without per-source compiler": driver.replace(compile_call,
+            'run("compile-mixed-prefix", flags + ["-x", "c++-header", prefix_path, "-o", mixed_pch])'),
         "wrong fixture path": driver.replace(fixture_path, 'fixture = support / "unrelated.cpp"'),
     }
     for label, severed in mutations.items():
