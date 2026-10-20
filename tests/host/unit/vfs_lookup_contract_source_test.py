@@ -55,7 +55,7 @@ FAMILIES = {
         "vfs_wki_effective_route_for_path",
     },
     "path.cache-observer": {"vfs_cache_notify_invalidate_path", "vfs_cache_notify_path_changed"},
-    "path.selftest": {"vfs_selftest_remote_readonly_resolved"},
+    "path.selftest": {"vfs_selftest_remote_readonly_resolved", "vfs_selftest_utimensat_nonempty_as"},
 }
 
 PATH_SYSCALLS = {

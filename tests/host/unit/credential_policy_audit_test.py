@@ -423,7 +423,9 @@ def test_shm_write_limit_survives_mapping_lifetime():
     attach = body_after(shm, "auto shmat_impl(")
     assert "page_flags |= ker::mod::mm::paging::PAGE_WRITE_RESTRICTED" in attach
     vmem = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
-    protect = body_after(vmem, "case ker::abi::vmem::ops::PROTECT:")
+    protect_dispatch = body_after(vmem, "case ker::abi::vmem::ops::PROTECT:")
+    assert "return protect_range(a1, a2, a3, nullptr, MutationRoute::Public);" in protect_dispatch
+    protect = body_after(vmem, "auto protect_range(")
     assert protect.index("SharedVmemPublicationGuard publication_guard") < protect.index("is_page_write_restricted(")
     assert protect.index("is_page_write_restricted(") < protect.index("protect_shared_vmem_range_locked(") < protect.index("unify_page_flags(")
     assert "-EACCES" in protect
@@ -2323,7 +2325,9 @@ def test_file_mapping_uses_one_description_and_preflights_policy():
     assert "read_file_mapping_exact(file," in mapping
     assert mapping.count("register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK)") == 3
     assert "register_file_mmap_range_from_fd" not in vmem
-    protect = vmem[vmem.index("case ker::abi::vmem::ops::PROTECT:"):vmem.index("case ker::abi::vmem::ops::MREMAP:")]
+    protect_dispatch = body_after(vmem, "case ker::abi::vmem::ops::PROTECT:")
+    assert "return protect_range(a1, a2, a3, nullptr, MutationRoute::Public);" in protect_dispatch
+    protect = body_after(vmem, "auto protect_range(")
     assert protect.index("SharedVmemPublicationGuard") < protect.index("authorize_shared_file_protection_locked(") < protect.index("protect_shared_vmem_range_locked(") < protect.index("unify_page_flags(")
     preflight = body_after(vmem, "auto authorize_shared_file_protection_locked(")
     assert "authorize_file_mapping(" in preflight and "file_mount_read_only(*file)" in preflight
@@ -2375,7 +2379,7 @@ def test_retained_file_policy_denies_before_data_and_metadata_effects():
     assert direct.index("vfs_file_can_write(") < direct.index("file_mount_read_only(*f)") < direct.index("tmpfs_write_append(")
     assert direct.index("file_mount_read_only(*f)") < direct.index("f->fops->vfs_write(") < direct.index("cache_notify_file_data_changed_impl(")
     bounced = body_after(core, "auto vfs_write_user_bounced(")
-    assert bounced.index("file_mount_read_only(*file)") < bounced.index("copy_from_task_partial(")
+    assert bounced.index("file_mount_read_only(*file)") < bounced.index("copy_from_current_task_partial(")
     positional = body_after(core, "auto vfs_pwrite_file(")
     assert positional.index("validate_positional_offset(") < positional.index("file_mount_read_only(*f)") < positional.index("vfs_pwrite_user_bounced(")
     assert positional.index("file_mount_read_only(*f)") < positional.index("f->fops->vfs_write(")
@@ -2699,11 +2703,19 @@ def test_owned_directory_views_narrow_policy_and_publish_outside_locks():
 
 def test_serialized_lookup_releases_captured_references_after_publication():
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
-    fallback = body_after(core[core.index("// Only native TMPFS/XFS steps run"):], "auto open_local_serialized(")
+    fallback = body_after(core[core.index("// Only native TMPFS/XFS steps run"):], "auto native_lookup_serialized(")
     assert fallback.index("LocalWalkReferences references;") < fallback.index("MutexGuard publication_guard")
     assert fallback.index("LookupHandle lookup{};") < fallback.index("MutexGuard publication_guard")
     assert "nullptr, nullptr, &references" in fallback
     assert fallback.index("MutexGuard publication_guard") < fallback.index("acquire_local_component_lookup(") < fallback.index("consume_lookup_locked(")
+    assert "pathname, intent, follow_policy" in fallback
+    wrapper = " ".join(body_after(core[core.index("// Only native TMPFS/XFS steps run"):], "auto open_local_serialized(").split())
+    assert "native_lookup_serialized(task, dirfd, pathname, LookupIntent::OPEN" in wrapper
+    assert "consumer, context, admitted_credentials, directory_view)" in wrapper
+    stat = body_after(core, "auto vfs_statat(")
+    assert "scope == nullptr || !scope->is_host()" in stat
+    assert "native_lookup_serialized(task, dirfd, pathname, LookupIntent::STAT" in stat
+    assert "&REQUEST_CREDENTIALS, nullptr)" in stat
     walk = body_after(core, "auto acquire_local_component_lookup(")
     assert "serialized != (serialized_references != nullptr)" in walk
     assert "references.cwd || references.directory || references.view || references.procfs_view_origin" in walk
@@ -2911,7 +2923,7 @@ def test_shared_open_stages_direct_file_and_serialized_view_before_publication()
     assert hybrid.index("prepared_path.reset(new") < hybrid.index("switch (mount->fs_type)")
     assert hybrid.index("f->directory_view = *directory_view") < hybrid.index("vfs_cache_notify_register_open_file(f)") < hybrid.rindex("descriptor->install")
     assert "stable_lookup == nullptr || !stable_lookup->directory_view()" in hybrid
-    serial = body_after(core, "auto open_local_serialized(")
+    serial = body_after(core, "auto native_lookup_serialized(")
     assert serial.index("std::unique_ptr<File, LocalWalkFileRelease> pin") < serial.index("publication_guard")
     assert serial.index("prepare_open_directory_view_locked(") < serial.index("return consume_lookup_locked(")
     staged = body_after(core, "auto prepare_open_directory_view_locked(")

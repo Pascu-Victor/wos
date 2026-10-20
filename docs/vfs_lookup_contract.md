@@ -16,6 +16,17 @@ performs the operation before releasing the publication lock. A successful
 namespace mutation advances `g_vfs_namespace_generation` while still
 serialized. Callers release a stale handle before a bounded `-EAGAIN` retry.
 
+Task-aware open and stat keep their four optimistic attempts. After contention
+exhausts them, an eligible host-native TMPFS/XFS walk can retain the publication
+mutex through acquisition and consumption. The shared serialized helper carries
+the original OPEN or STAT intent, admitted credentials and final-follow policy;
+STAT does not prepare an open directory view or allocate a descriptor. Private
+namespaces and unsupported backends keep their transient refusal. Mount,
+authorization and backend validation still apply, so serialization does not
+promise that every independent transient failure succeeds. Captured references
+retire after the publication guard unlocks; no remote RPC or usercopy runs under
+that guard.
+
 The handle is local-only: it is never an ABI or WKI wire object and is never
 stored in a cache. A remote-mount target handle may remain retained across the
 bounded attach handshake, but no VFS, mount-table, or backend namespace lock is
@@ -58,7 +69,7 @@ exactly one family row when declarations change.
 | `path.resolve-helper` — no direct syscall | `vfs_resolve_dirfd`, `vfs_directory_path_beneath` | Text-only helpers. The directory-beneath query recovers a current name from an already-retained native directory and checks export confinement; it grants no child access. | No mutation commit. Directory-name recovery holds publication through native parent recovery and output. Never carry returned text across an unlocked lookup/act gap as authority. |
 | `path.route-policy` — `ops::WKI_RULE_ADD` | `vfs_wki_rule_add`, `vfs_wki_rule_add_for_task`, `vfs_wki_rule_get`, `vfs_wki_rule_get_for_task`, `vfs_wki_default_rule_get`, `vfs_wki_default_rule_get_for_task`, `vfs_wki_effective_route_for_path` | Policy-prefix management/query exception; these strings select routing and are not filesystem object lookups. Subject controls require open canonical Host PID/mount/IPC views before copies, rule mutation or default visibility. Private path routing stays local and ignores inherited/default rules and submitter aliases. The trusted default getter and null-subject effective query remain pure boot-default queries. | Preserve executor-owned WKI rule storage. The selected route is input to later handle acquisition, never proof of an owner object. Private new remote names and physical/export expansion refuse before discovery or owner requests; direct inherited File operations retain their grants. |
 | `path.cache-observer` — no direct syscall | `vfs_cache_notify_invalidate_path`, `vfs_cache_notify_path_changed` | Post-commit observer exception. These APIs invalidate hints and must never perform or authorize a filesystem operation. | Call after/within the operation's publication protocol as required; cache epochs and mount generation make stale hints miss. There is no remote owner fallback—the owner operation sends invalidation only after commit. |
-| `path.selftest` — no syscall; WOS_SELFTEST only | `vfs_selftest_remote_readonly_resolved` | Diagnostic fixture driver for direct remote pathname adapters using an explicit Snapshot and disposable disconnected mount. | Counts unexpected statuses; never used by production callers. Readonly mutations must stop before owner submission; both-OMIT preserves the existing owner validation path. |
+| `path.selftest` — no syscall; WOS_SELFTEST only | `vfs_selftest_remote_readonly_resolved`, `vfs_selftest_utimensat_nonempty_as` | Diagnostic fixtures for direct remote adapters with an explicit Snapshot and disconnected mount, and retained nonempty-path timestamp updates with an explicit Task. | Never used by production callers. Remote readonly mutations must stop before owner submission; both-OMIT preserves owner validation. The timestamp fixture uses the ordinary retained consumer and requester credentials, without an ambient Task override. |
 <!-- VFS_PATH_INVENTORY_END -->
 
 ## Narrow boot and pseudo-filesystem exceptions

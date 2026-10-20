@@ -409,6 +409,10 @@ KTEST(VFS, AbsoluteLocalStatFastPathGate) { KEXPECT_TRUE(ker::vfs::vfs_selftest_
 
 KTEST(VFS, CommonLocalRelativeResolverFastPath) { KEXPECT_TRUE(ker::vfs::vfs_selftest_common_local_relative_resolver_fast_path()); }
 
+KTEST(VFS, TmpfsStatatNamespaceRecovery) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_namespace_recovery(false)); }
+
+KTEST(VFS, XfsStatatNamespaceRecovery) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_namespace_recovery(true)); }
+
 KTEST(VFS, StatatDirfdMetadataCache) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_dirfd_metadata_cache()); }
 
 KTEST(VFS, StatatAtFdcwdUsesSuppliedTask) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_at_fdcwd_uses_supplied_task()); }

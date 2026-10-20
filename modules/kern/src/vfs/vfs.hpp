@@ -695,6 +695,7 @@ auto vfs_selftest_wki_host_root_mount_gate_matches_task_root() -> bool;
 auto vfs_selftest_resolved_wki_entry_uses_task_root_view() -> bool;
 auto vfs_selftest_absolute_local_stat_fast_path_gate() -> bool;
 auto vfs_selftest_common_local_relative_resolver_fast_path() -> bool;
+auto vfs_selftest_statat_namespace_recovery(bool disk) -> bool;
 auto vfs_selftest_statat_dirfd_metadata_cache() -> bool;
 auto vfs_selftest_statat_at_fdcwd_uses_supplied_task() -> bool;
 auto vfs_selftest_statat_root_cwd_relative_paths() -> bool;
