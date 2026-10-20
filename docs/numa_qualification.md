@@ -18,15 +18,16 @@ ACPI initialization still requires a usable RSDP.
 The parser supports 256 CPU identities and 64 proximity domains. The current
 scheduler/affinity ABI supports 1–64 online CPUs and requires the BSP at logical
 index zero; boot explicitly rejects unsupported enumeration before publishing
-partial masks. Public preferred/bind/interleave policy and general 2 MiB user mappings remain
-gated. Topology discovery alone does not qualify either feature.
+partial masks. The public policy setter accepts LOCAL, PREFERRED, BIND and
+INTERLEAVE after validating the mode and node mask against the boot topology.
+Topology discovery alone does not qualify placement or large-page behavior.
 
 Task defaults are stored per executor under a short IRQ-safe snapshot lock.
 Creation copies the initiating executor's value independently of its credential
 owner. Owned exec preparation carries the value to successful canonical image
 commit; failed or canceled preparation preserves the existing default. These
-internal paths support saved policy values. The public setter currently admits
-only LOCAL with an empty node mask; other well-formed modes return ENOTSUP.
+internal paths support saved policy values. The public setter updates the actual
+executor independently of its credential/quota owner.
 
 The internal placed allocator supports preferred, strict-bind and deterministic
 virtual-page interleave selection. A checked interval claim returns either one
@@ -36,7 +37,7 @@ consume the supplied executor's copied policy and a captured CPU-node value.
 Hardware origin uses the saved exception CPL; software ensures remain separately
 classified. Installed private-copy frames, zero-COW and new anonymous pages have
 separate counters; remote fallback remains a miss in an eligible locality count.
-Public non-LOCAL selection and large user mappings remain gated.
+Opt-in large anonymous mappings use the captured policy as described below.
 
 Domain-constrained claims bypass unfiltered CPU caches, so cached capacity can
 cause conservative allocation failure. Allocation-pressure bookkeeping can wake
@@ -49,6 +50,39 @@ placement stays local and explicit remote placement returns ENOTSUP. Queued
 worker exec uses the initiating request's saved policy. Direct submission also
 refuses non-LOCAL policy and releases transferred preparation ownership. These
 rules do not put local node IDs into the wire protocol.
+
+## Large-page admission and reclaim policy
+
+Private anonymous allocations explicitly requesting `MAP_HUGETLB` use 2 MiB
+leaves. Their length must be a multiple of 2 MiB, and the chosen virtual address
+and physical backing are aligned to 2 MiB. The public allocation path requires
+`MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB`; `MAP_POPULATE` is its only additional
+supported mapping flag. Ordinary anonymous mappings retain their existing path.
+
+An unsplit large leaf is nonreclaimable by the ordinary 4 KiB anonymous swap
+selector, which rejects an intermediate page-table entry with the PS bit set.
+Allocation uses `ReclaimMode::NEVER`; it can fail under memory pressure without
+waiting for reclaim or automatically demoting other large leaves. Supported
+mapping mutations can split a leaf into independently owned 4 KiB frames.
+
+The registry bounds this nonreclaimable backing. Each node admits at most one
+sixteenth of its usable pages, rounded down to complete 512-page leaves. The
+global limit is the smaller of the same rounded fraction across all nodes and
+128 leaves (256 MiB). Each address-space root admits at most 64 leaves (128 MiB),
+subject to the node and global limits. Preparing, mapped, splitting and retired
+rows all retain their capacity charge. Failed preparation returns its owned
+frames before releasing that charge. Split and teardown completion release
+registry capacity only after the required TLB completion and frame-ownership
+handoff.
+
+Large allocations also pass the initiating task's address-space resource
+admission before preparation and again before publication, then commit normal
+mapping accounting. Large-page admission does not bypass `RLIMIT_AS`. The public
+`testprog numa-huge --phase correctness` workload includes refusal below the
+required address-space limit, alongside mapping mutations and fork/COW checks.
+These are implementation and test descriptions; current pressure, external
+mapping/ownership observations and paired performance qualification require
+their actual run results. The dated results below retain their original scope.
 
 The explicit per-node balance diagnostic scans bounded physical metadata and
 collects global and node owner totals during one allocator-lock interval. Its
@@ -325,10 +359,10 @@ The installed WOS `sys/numa.h` records and `sys/vmem.h` wrappers provide immutab
 topology/CPU masks, the actor's policy and at most 64 resident-page node rows per
 request. Target-page observation does not fault absent payload into memory;
 request/output transport follows ordinary checked usercopy rules and may fault.
-It exports no physical address or kernel root identity. The LOCAL-only setter
+It exports no physical address or kernel root identity. The policy setter
 updates the actual executor, independently of its credential/quota owner.
-Version, size, geometry and reserved fields are checked. Public non-LOCAL modes
-remain unavailable while connected placement/pressure qualification continues.
+Version, size, geometry, node masks and reserved fields are checked. Connected
+placement/pressure qualification remains separate from API availability.
 The existing strace decoder names both appended operations.
 
 `testprog numa-first-touch` uses real pinned pthread workers, verifies all pages
