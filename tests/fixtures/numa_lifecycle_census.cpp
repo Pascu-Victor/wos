@@ -4,6 +4,7 @@
 #include <grp.h>
 #include <link.h>
 #include <signal.h>
+#include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -42,6 +43,7 @@ Transports transport{};
 int files[5]{-1, -1, -1, -1, -1};
 uint64_t deadline_ns{}, nonce{}, cookie{};
 uint64_t diagnostic_parent{};
+uint64_t supervisor_cpu{UINT64_MAX};
 enum DiagnosticValid : uint32_t { FORK_RESULT = 1, WAIT_RESULT = 2, WAIT_STATUS = 4, CENSUS_RESULT = 8, LIBC_ERRNO = 16, HEADER = 32 };
 struct FailureDiagnostic {
     const char* phase{"main"};
@@ -117,6 +119,30 @@ auto time_left() -> bool {
     auto const now = now_ns();
     return now != UINT64_MAX && now < deadline_ns;
 }
+auto supervisor_still_here() -> bool {
+    if (supervisor_cpu >= 64 || diagnostic_parent <= 1) return false;
+    uint64_t const MASK = uint64_t{1} << supervisor_cpu;
+    return ker::multiproc::currentThreadId() == diagnostic_parent &&
+           static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(diagnostic_parent)) == MASK &&
+           ker::multiproc::getcurrent_cpu() == supervisor_cpu && time_left();
+}
+auto pin_supervisor() -> bool {
+    auto const tid = ker::multiproc::currentThreadId();
+    if (tid <= 1 || tid != diagnostic_parent) return false;
+    while (time_left()) {
+        auto const cpu = ker::multiproc::getcurrent_cpu();
+        if (cpu >= 64) return false;
+        auto const result = ker::multiproc::setThreadAffinityMask(tid, uint64_t{1} << cpu);
+        if (result == -EBUSY) {
+            if (static_cast<int64_t>(ker::multiproc::yield()) < 0) return false;
+            continue;  // Recapture the current CPU; never request a remote self move.
+        }
+        if (result != 0) return false;
+        supervisor_cpu = cpu;
+        return supervisor_still_here();
+    }
+    return false;
+}
 auto write_all(int fd, const void* data, size_t bytes) -> bool {
     auto* current = static_cast<const unsigned char*>(data);
     while (bytes != 0) {
@@ -170,12 +196,14 @@ auto prefault_loaded_object(dl_phdr_info* info, size_t bytes, void* opaque) -> i
     return time_left() ? 0 : 1;
 }
 auto prepare_endpoint() -> bool {
+    if (!supervisor_still_here()) return false;
     for (int fd : files) {
         if (fd < 0 || !time_left() || ::fsync(fd) != 0 || !time_left()) return false;
     }
     prefault_transport();
     EndpointPrefault scan{};
-    return time_left() && ::dl_iterate_phdr(prefault_loaded_object, &scan) == 0 && scan.objects != 0 && scan.pages != 0 && time_left();
+    return time_left() && ::dl_iterate_phdr(prefault_loaded_object, &scan) == 0 && scan.objects != 0 && scan.pages != 0 &&
+           supervisor_still_here();
 }
 
 auto prepare_files() -> bool {
@@ -228,6 +256,10 @@ struct Child {
     ::_exit(72);
 }
 auto child(unsigned index, uint64_t parent, const char* seed, int64_t& pid_out) -> bool {
+    if (!supervisor_still_here()) {
+        failure = {.phase = index == 0 ? "warm" : "measured", .stage = "supervisor-placement"};
+        return false;
+    }
     auto const pid = ker::process::fork();
     auto failed = [&](const char* stage, int64_t result = 0, int32_t status = 0, uint32_t valid = 0, int error = 0) {
         failure = {.phase = index == 0 ? "warm" : "measured",
@@ -259,6 +291,7 @@ auto child(unsigned index, uint64_t parent, const char* seed, int64_t& pid_out) 
 }
 auto poll_census(nl::Phase phase) -> bool {
     while (time_left()) {
+        if (!supervisor_still_here()) return census_failure(phase, "supervisor-placement", 0, 0);
         transport.request = {.version = nl::VERSION,
                              .bytes = sizeof(nl::Request),
                              .phase = static_cast<uint32_t>(phase),
@@ -317,6 +350,9 @@ auto main(int argc, char** argv) -> int {
         return finish_failure(70, "parent-start-clock");
     deadline_ns = start + WHOLE_NS;
     (void)::umask(0077);
+    // Fork may COW our own persistent stack while the child still shares it.
+    // Keep its LOCAL replacement domain stable across warm and measured runs.
+    if (!pin_supervisor()) return finish_failure(73, "supervisor-placement");
     prefault_transport();
     if (!prepare_files() || !poll_census(nl::Phase::PREPARE)) return finish_failure(73, "prepare-files");
     int64_t warm_pid{}, measured_pid{};

@@ -276,6 +276,8 @@ def main():
         return body, row
     watched = [Path(__file__), source, shell, helper_path,
                root / "toolchain/src/mlibc/sysdeps/wos/include/sys/callnums.h"]
+    if not any((args.workload_wait, args.public_policy, args.workload_placement, args.pressure_only, args.public_huge)):
+        watched.append(root / "toolchain/src/mlibc/sysdeps/wos/include/sys/multiproc.h")
     libc_wait = root / "toolchain/src/mlibc/options/posix/generic/sys-wait.cpp"
     if args.workload_wait:
         watched.append(libc_wait)
@@ -479,6 +481,11 @@ def main():
             branch = main_body[begin:end]
             both_end = main_body.index("    transport.end = transport.output;", end) + len("    transport.end = transport.output;")
             both_branch = main_body[begin:both_end]
+            startup = main_body[main_body.index("    (void)::umask(0077);"):begin]
+            if startup.count("    prefault_transport();") != 1:
+                raise ValueError("one actual startup prefault observation")
+            startup = startup.replace("    prefault_transport();", "    fixture::main_prefault();\n    prefault_transport();")
+            startup = startup.replace("::umask(", "::fixture::umask(").replace("prepare_files()", "fixture::prepare_files()")
             endpoint = actual[actual.index("constexpr size_t ENDPOINT_MAX_OBJECTS"):actual.index("auto prepare_files(")]
             endpoint = endpoint.replace("::fsync(", "::fixture::endpoint_fsync(").replace("::dl_iterate_phdr(", "::fixture::iterate_phdr(")
             result["extractions"] = extracted
@@ -486,7 +493,8 @@ def main():
             result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
             ports = [("::lseek(", "::fixture::lseek("), ("::write(", "::fixture::write("),
                      ("::fsync(", "::fixture::fsync("), ("::clock_gettime(", "::fixture::clock_gettime("),
-                     ("::nanosleep(", "::fixture::nanosleep("), ("::syscall(", "::fixture::census_syscall(")]
+                     ("::nanosleep(", "::fixture::nanosleep("), ("::syscall(", "::fixture::census_syscall("),
+                     ("ker::multiproc::", "fixture::")]
 
             def ported(body):
                 for old, new in ports:
@@ -498,6 +506,9 @@ def main():
                 "ACTUAL_STORAGE_AND_DIAGNOSTIC": ported(storage),
                 "ACTUAL_CLOCK_AND_PREFAULT": ported("\n".join(take(anchor) for anchor in
                                                 ["auto now_ns(", "auto pause_poll(", "auto time_left(", "void prefault_transport("])),
+                "ACTUAL_SUPERVISOR_PLACEMENT": ported("\n".join(take(anchor) for anchor in
+                                                               ["auto supervisor_still_here(", "auto pin_supervisor("])),
+                "ACTUAL_STARTUP_BRANCH": startup,
                 "ACTUAL_ENDPOINT_PREPARATION": ported(endpoint),
                 "ACTUAL_CHILD": take("struct Child {", True),
                 "ACTUAL_CHILD_CALL": child,
@@ -518,6 +529,12 @@ def main():
                 ("stale-transport-header", '"census-transport", result, CENSUS_RESULT)',
                  '"census-transport", result, CENSUS_RESULT | HEADER)'),
                 ("write-after-failed-seek", "::fixture::lseek(files[4], 0, SEEK_SET) == 0", "true"),
+                ("lost-supervisor-main-pin", 'if (!pin_supervisor()) return finish_failure(73, "supervisor-placement");',
+                 'if (false) return finish_failure(73, "supervisor-placement");'),
+                ("lost-supervisor-mask-readback",
+                 "static_cast<uint64_t>(fixture::getThreadAffinityMask(diagnostic_parent)) == MASK", "true"),
+                ("lost-supervisor-busy-recapture", "continue;  // Recapture the current CPU; never request a remote self move.",
+                 "return true;  // Finite control: abandon the required EBUSY recapture."),
             ]:
                 if generated.count(old) != 1:
                     raise ValueError("unique genuine control: " + name)

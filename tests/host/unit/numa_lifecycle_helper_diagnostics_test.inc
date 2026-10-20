@@ -2,6 +2,7 @@
 // No WOS process, credential transition, native context or VM is constructed.
 #include <link.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +43,52 @@ uint64_t endpoint_late_at{};
 size_t observed_pages{};
 alignas(4096) unsigned char loaded_pages[3 * 4096]{};
 auto iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void*) -> int;
+
+// These ports represent raw ABI results, including signed mask bit63. They
+// never invoke a host scheduler or a WOS task.
+uint64_t current_tid{50}, current_cpu{}, observed_mask{1};
+uint64_t mask_xor{};
+unsigned tid_reads{}, cpu_reads{}, affinity_reads{}, affinity_sets{}, yields{};
+std::vector<int64_t> set_results;
+std::vector<uint64_t> requested_masks;
+int64_t yield_result{}, mask_error{};
+uint64_t cpu_after_yield{UINT64_MAX}, cpu_after_set{UINT64_MAX}, tid_after_set{};
+uint64_t late_after_yield{}, late_after_set{}, fork_late_at{};
+bool endpoint_cpu_drift{}, poll_cpu_drift{};
+unsigned startup_prefaults{}, startup_files{};
+auto currentThreadId() -> uint64_t {
+    ++tid_reads;
+    return current_tid;
+}
+auto getcurrent_cpu() -> uint64_t {
+    ++cpu_reads;
+    return current_cpu;
+}
+auto getThreadAffinityMask(uint64_t tid) -> int64_t {
+    ++affinity_reads;
+    if (tid != 50) return -ESRCH;
+    return mask_error != 0 ? mask_error : static_cast<int64_t>(observed_mask ^ mask_xor);
+}
+auto setThreadAffinityMask(uint64_t tid, uint64_t mask) -> int64_t {
+    auto const index = affinity_sets++;
+    requested_masks.push_back(mask);
+    auto const result = index < set_results.size() ? set_results[index] : int64_t{0};
+    if (tid != 50 || current_cpu >= 64 || mask != (uint64_t{1} << current_cpu)) return -EINVAL;
+    if (result == 0) observed_mask = mask;
+    if (cpu_after_set != UINT64_MAX) current_cpu = cpu_after_set;
+    if (tid_after_set != 0) current_tid = tid_after_set;
+    if (late_after_set != 0) now = late_after_set;
+    return result;
+}
+auto yield() -> uint64_t {
+    ++yields;
+    if (cpu_after_yield != UINT64_MAX) current_cpu = cpu_after_yield;
+    if (late_after_yield != 0) now = late_after_yield;
+    return static_cast<uint64_t>(yield_result);
+}
+auto umask(mode_t) -> mode_t;
+void main_prefault();
+auto prepare_files() -> bool;
 
 void check(bool value, const char* why) {
     ++assertions;
@@ -188,6 +235,7 @@ auto census_syscall(long selector, uint64_t operation, uint64_t request_address,
         h.outcome = static_cast<uint64_t>(nl::Outcome::WAIT);
         h.coverage = 0;
     }
+    if (poll_cpu_drift) current_cpu = 1;
     return 0;
 }
 }  // namespace fixture
@@ -195,6 +243,7 @@ auto census_syscall(long selector, uint64_t operation, uint64_t request_address,
 namespace ker::process {
 auto fork() -> int64_t {
     ++fixture::forks;
+    if (fixture::fork_late_at != 0) fixture::now = fixture::fork_late_at;
     return fixture::fork_result;
 }
 auto waitpid(int64_t pid, int32_t* status, int options, void*) -> int64_t {
@@ -217,11 +266,16 @@ namespace {
 namespace nl = ker::test::numa_lifecycle;
 /* @ACTUAL_STORAGE_AND_DIAGNOSTIC@ */
 /* @ACTUAL_CLOCK_AND_PREFAULT@ */
+/* @ACTUAL_SUPERVISOR_PLACEMENT@ */
 /* @ACTUAL_ENDPOINT_PREPARATION@ */
 [[noreturn]] void run_child(int, uint64_t, const char*) { std::abort(); }  // Declared unexecuted CPL3/exec endpoint.
 /* @ACTUAL_CHILD@ */
 /* @ACTUAL_CHILD_CALL@ */
 /* @ACTUAL_CENSUS_CALL@ */
+auto startup_after_deadline() -> int {
+    /* @ACTUAL_STARTUP_BRANCH@ */
+    return 0;
+}
 auto after_prepare() -> int {
     constexpr uint64_t parent = 50;
     char seed[] = "11";
@@ -239,6 +293,20 @@ auto after_both_endpoints() -> int {
 }  // namespace
 
 namespace fixture {
+auto umask(mode_t mask) -> mode_t {
+    check(mask == 0077, "actual startup umask operand");
+    return 0;
+}
+void main_prefault() {
+    ++startup_prefaults;
+    check(affinity_sets != 0 && supervisor_still_here(), "actual supervisor pin before startup CPL3 prefault");
+}
+auto prepare_files() -> bool {
+    ++startup_files;
+    check(startup_prefaults == 1 && affinity_sets != 0 && supervisor_still_here(),
+          "actual supervisor pin and prefault precede owned files and PREPARE");
+    return true;
+}
 auto iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void* opaque) -> int {
     ++image_walks;
     if (iterate_error != 0) return iterate_error;
@@ -258,6 +326,7 @@ auto iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void* opaque) -
     info.dlpi_phnum = 2;
     int const result = callback(&info, sizeof(info), opaque);
     observed_pages = static_cast<EndpointPrefault*>(opaque)->pages;
+    if (endpoint_cpu_drift) current_cpu = 1;
     return result;
 }
 void reset() {
@@ -284,6 +353,18 @@ void reset() {
     nonce = 11;
     cookie = 0;
     diagnostic_parent = 50;
+    supervisor_cpu = 0;
+    current_tid = 50;
+    current_cpu = 0;
+    observed_mask = 1;
+    mask_xor = 0;
+    tid_reads = cpu_reads = affinity_reads = affinity_sets = yields = startup_prefaults = startup_files = 0;
+    set_results.clear();
+    requested_masks.clear();
+    yield_result = mask_error = 0;
+    cpu_after_yield = cpu_after_set = UINT64_MAX;
+    tid_after_set = late_after_yield = late_after_set = fork_late_at = 0;
+    endpoint_cpu_drift = poll_cpu_drift = false;
     deadline_ns = 850'000'000'000;
     for (unsigned i = 0; i < 5; ++i) files[i] = 5 + static_cast<int>(i);
     transport = {};
@@ -292,6 +373,111 @@ void reset() {
 void expect_stage(const char* phase, const char* stage) {
     check(failure.phase != nullptr && std::strcmp(failure.phase, phase) == 0, "exact failure phase");
     check(failure.stage != nullptr && std::strcmp(failure.stage, stage) == 0, "exact failure stage");
+}
+void supervisor_cases() {
+    for (uint64_t cpu : {uint64_t{0}, uint64_t{7}, uint64_t{63}}) {
+        reset();
+        supervisor_cpu = UINT64_MAX;
+        current_cpu = cpu;
+        check(pin_supervisor() && supervisor_cpu == cpu && affinity_sets == 1 && affinity_reads == 1 && yields == 0 &&
+                  requested_masks == std::vector<uint64_t>{uint64_t{1} << cpu},
+              "actual pin validates exact current-CPU mask including signed CPU63 getter");
+        check(supervisor_still_here(), "actual pinned supervisor remains on exact TID/mask/CPU");
+    }
+    reset();
+    supervisor_cpu = UINT64_MAX;
+    set_results = {-EBUSY, 0};
+    cpu_after_yield = 1;
+    check(pin_supervisor() && supervisor_cpu == 1 && affinity_sets == 2 && yields == 1 && requested_masks == std::vector<uint64_t>{1, 2},
+          "actual EBUSY retry recaptures CPU before the second local-only SET");
+    for (int64_t error : {int64_t{-EINVAL}, int64_t{-EPERM}, int64_t{-ENOSYS}, int64_t{1}}) {
+        reset();
+        set_results = {error};
+        check(!pin_supervisor() && affinity_sets == 1 && yields == 0, "non-EBUSY SET result fails without retry");
+    }
+    reset();
+    set_results = {-EBUSY};
+    yield_result = -EIO;
+    check(!pin_supervisor() && affinity_sets == 1 && yields == 1, "raw yield error refuses EBUSY retry");
+    reset();
+    set_results = {-EBUSY};
+    late_after_yield = deadline_ns;
+    check(!pin_supervisor() && affinity_sets == 1 && yields == 1, "recapture never extends absolute deadline");
+    reset();
+    deadline_ns = now;
+    check(!pin_supervisor() && affinity_sets == 0, "expired original deadline forbids first SET");
+    for (uint64_t cpu : {uint64_t{64}, UINT64_MAX, static_cast<uint64_t>(-EIO)}) {
+        reset();
+        current_cpu = cpu;
+        check(!pin_supervisor() && affinity_sets == 0 && yields == 0, "CPU64 and raw CPU error refuse before shift or SET");
+    }
+    for (uint64_t tid : {uint64_t{0}, uint64_t{1}, uint64_t{51}, static_cast<uint64_t>(-EIO)}) {
+        reset();
+        current_tid = tid;
+        check(!pin_supervisor() && affinity_sets == 0 && cpu_reads == 0, "invalid or foreign raw TID refuses before CPU/SET");
+    }
+    reset();
+    mask_error = -EIO;
+    check(!pin_supervisor() && affinity_sets == 1 && affinity_reads == 1, "raw GET_AFFINITY failure is not exact mask");
+    reset();
+    mask_xor = 3;
+    check(!pin_supervisor() && affinity_sets == 1 && affinity_reads == 1, "wrong mask readback refuses successful SET");
+    reset();
+    cpu_after_set = 1;
+    check(!pin_supervisor(), "actual CPU drift after successful SET refuses");
+    reset();
+    tid_after_set = 51;
+    check(!pin_supervisor(), "actual TID drift after successful SET refuses");
+    reset();
+    late_after_set = deadline_ns;
+    check(!pin_supervisor(), "successful SET cannot renew expired deadline");
+    for (uint64_t cpu : {uint64_t{64}, UINT64_MAX}) {
+        reset();
+        supervisor_cpu = cpu;
+        check(!supervisor_still_here() && affinity_reads == 0, "invalid saved CPU refuses before mask shift/readback");
+    }
+    for (uint64_t parent : {uint64_t{0}, uint64_t{1}}) {
+        reset();
+        diagnostic_parent = parent;
+        check(!supervisor_still_here() && tid_reads == 0, "invalid saved parent refuses without task query");
+    }
+    reset();
+    observed_mask = 2;
+    check(!supervisor_still_here(), "actual later mask drift refuses");
+    reset();
+    current_cpu = 1;
+    check(!prepare_endpoint() && endpoint_syncs == 0 && image_walks == 0, "endpoint guard precedes every owned FD and page read");
+    reset();
+    endpoint_cpu_drift = true;
+    check(!prepare_endpoint() && endpoint_syncs == 5 && image_walks == 1, "endpoint final guard detects drift after image walk");
+    for (unsigned index : {0U, 1U}) {
+        reset();
+        current_cpu = 1;
+        int64_t pid = 123;
+        check(!child(index, 50, "11", pid) && forks == 0 && polls == 0 && kills == 0 && pid == 123,
+              "both actual child guards refuse before fork/adoption");
+        expect_stage(index == 0 ? "warm" : "measured", "supervisor-placement");
+    }
+    reset();
+    current_cpu = 1;
+    check(!poll_census(nl::Phase::BEGIN) && census_calls == 0 && failure.valid == 0,
+          "census placement guard precedes request/syscall and invents no returned header");
+    expect_stage("BEGIN", "supervisor-placement");
+    reset();
+    wait_once = poll_cpu_drift = true;
+    check(!poll_census(nl::Phase::END) && census_calls == 1 && pauses == 1 && failure.valid == 0,
+          "actual WAIT loop rechecks placement before each next census syscall");
+    expect_stage("END", "supervisor-placement");
+    reset();
+    supervisor_cpu = UINT64_MAX;
+    check(startup_after_deadline() == 0 && startup_prefaults == 1 && startup_files == 1 && census_calls == 1 && affinity_sets == 1,
+          "actual main orders pin before CPL3 prefault, owned files and PREPARE");
+    reset();
+    supervisor_cpu = UINT64_MAX;
+    set_results = {-EPERM};
+    check(startup_after_deadline() == 73 && startup_prefaults == 0 && startup_files == 0 && census_calls == 0 && forks == 0,
+          "actual failed main pin prevents all future prefault/prepare/fork work");
+    expect_stage("main", "supervisor-placement");
 }
 void endpoint_cases() {
     reset();
@@ -464,7 +650,7 @@ void child_cases() {
           "diagnostic precedes original destructor cleanup");
     reset();
     waits = {{0, 123}, {-ECHILD, 0}};
-    deadline_ns = now;
+    fork_late_at = deadline_ns;  // Reach the original wait-budget after the new valid pre-fork guard.
     check(after_prepare() == 74, "wait budget returns74");
     expect_stage("warm", "wait-budget");
     check(failure.wait_result == 0 && (failure.valid & WAIT_STATUS) == 0 && kills == 1, "pending wait never validates status");
@@ -539,6 +725,7 @@ void census_cases() {
 }  // namespace fixture
 
 auto main() -> int {
+    fixture::supervisor_cases();
     fixture::endpoint_cases();
     fixture::writer_cases();
     fixture::child_cases();
