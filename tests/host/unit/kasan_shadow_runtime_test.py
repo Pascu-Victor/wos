@@ -24,6 +24,7 @@ SOURCE = ROOT / 'modules/kern/src/sanitizer/kasan.cpp'
 HEADER = ROOT / 'modules/kern/src/sanitizer/kasan.hpp'
 VIRT_SOURCE = ROOT / 'modules/kern/src/platform/mm/virt.opt.cpp'
 MM_HEADER = ROOT / 'modules/kern/src/platform/mm/mm.hpp'
+PAGING_HEADER = ROOT / 'modules/kern/src/platform/mm/paging.hpp'
 ORIGINAL_UNPOISON = r'''void unpoison_range(const void* ptr, size_t size) {
     if (size == 0) {
         return;
@@ -613,6 +614,9 @@ struct log {
 auto handle_shadow_fault(uint64_t)->bool;
 // ACTUAL_IMAGE_BACKING
 // ACTUAL_IMAGE_ACTIVE
+// This image-only group retains its original oracle; the actual allocator
+// helper executes separately in the whole-init allocator group below.
+inline auto prepare_allocator_ram_shadow()->bool{return true;}
 // ACTUAL_IMAGE_INIT
 }
 namespace fixture {
@@ -730,6 +734,241 @@ def generate_image_init(source: str, header: str, control: str) -> tuple[str, di
     actual['original_image_init_sha256'] = ORIGINAL_IMAGE_INIT_SHA256
     return text + IMAGE_INIT_CASES, actual
 
+# Separate actual whole-init/allocator group. PageZone is the actual complete
+# public definition. Only descriptor virtual addresses, getters, linker values,
+# IRQ operations and mapper/log/fatal endpoints are finite Host data ports.
+ORIGINAL_ALLOCATOR_INIT = 'void init() {\n    // Use the relocated linker symbols directly: this runs before the IDT,\n    // constructors and SMP, so neither a shadow fault nor an instrumented\n    // out-of-line layout helper is safe. Backing preserves existing poison.\n    auto const START = reinterpret_cast<uintptr_t>(__kernel_image_start);\n    auto const END = reinterpret_cast<uintptr_t>(__kernel_end);\n    if (START < 0xffff800000000000ULL || END <= START || !ensure_shadow_backing(reinterpret_cast<const void*>(START), END - START)) {\n        log::error("cannot back permanent kernel image shadow (start=0x%lx end=0x%lx)", START, END);\n        hcf();\n    }\n    log::info("initialized (shadow base=0x%lx)", SHADOW_OFFSET);\n}'
+ORIGINAL_ALLOCATOR_INIT_SHA256 = '94897d62e40cd39f7c61a86bb316f2eb1363944f56150e71e1a72915e2aab77c'
+
+ALLOCATOR_INIT_PRELUDE = r'''
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <set>
+#include <vector>
+namespace ker::mod::mm {struct PageAllocator;}
+namespace ker::mod::mm::paging {
+constexpr uint64_t PAGE_SIZE=4096;
+// ACTUAL_ALLOCATOR_PAGE_ZONE
+}
+namespace fixture {
+constexpr size_t PAGE=4096,ZONE_CAPACITY=129,MAP_CAP=2048,CALL_CAP=8192;
+constexpr uintptr_t IMAGE=0xffffffff80000000ULL,DESC=0xffff800100000000ULL,RAM=0xffff800200000000ULL,HUGE=0xffff800300000000ULL;
+// These literal expected shadow pages are fixture geometry, independently
+// fixed for the application addresses above. No production range walker is
+// used to manufacture expected coverage.
+constexpr uintptr_t IMAGE_SHADOW=0xfffffbfff0000000ULL,DESC_SHADOW=0xffffec0020000000ULL,RAM_SHADOW=0xffffec0040000000ULL,HUGE_SHADOW=0xffffec0060000000ULL;
+unsigned failures{},assertions{},cases{},calls{},ram_calls{},materializations{},saves{},restores{},fatals{},errors{},infos{},regular_gets{},huge_gets{},fail_ram_call{};
+bool irq=true,root_missing{},lose_root_on_get{},ram_phase{};
+uintptr_t image_start=IMAGE,image_end=IMAGE+PAGE*8;
+std::array<ker::mod::mm::paging::PageZone,ZONE_CAPACITY>zones{};
+std::array<uintptr_t,ZONE_CAPACITY>descriptor_addresses{};
+ker::mod::mm::paging::PageZone*head{};ker::mod::mm::paging::PageZone*huge{};
+std::map<uintptr_t,std::array<int8_t,PAGE>>pages;
+std::vector<uintptr_t>requests;
+struct Fatal{};
+void check(bool value,const char*why){++assertions;if(!value&&failures++<64)std::fprintf(stderr,"FAIL %s\n",why);}
+uint64_t irq_save_disable(){++saves;auto flags=irq?0x200U:0U;irq=false;return flags;}
+void irq_restore_enable(){check(!irq,"allocator mapper keeps IF masked until restore");++restores;irq=true;}
+auto descriptor_address(ker::mod::mm::paging::PageZone*zone)->const void*{
+ for(size_t i=0;i<zones.size();++i)if(zone==&zones[i])return reinterpret_cast<const void*>(descriptor_addresses[i]);
+ check(false,"known finite descriptor address endpoint");return nullptr;
+}
+}
+[[noreturn]] void hcf(){++fixture::fatals;throw fixture::Fatal{};}
+namespace ker::mod::mm::virt {
+struct PageTable{};PageTable root;
+auto get_kernel_pagemap()->PageTable*{return fixture::root_missing?nullptr:&root;}
+}
+namespace ker::mod::mm::phys {
+auto get_zones()->paging::PageZone*{++fixture::regular_gets;fixture::ram_phase=true;if(fixture::lose_root_on_get)fixture::root_missing=true;return fixture::head;}
+auto get_huge_page_zone()->paging::PageZone*{++fixture::huge_gets;return fixture::huge;}
+}
+namespace ker::mod::kasan {
+namespace mm=ker::mod::mm;
+struct log {
+ template<class...T>static void info(const char*,T...){++fixture::infos;}
+ template<class...T>static void error(const char*,T...){++fixture::errors;}
+};
+// ACTUAL_ALLOCATOR_SHADOW_CONSTANTS
+// ACTUAL_ALLOCATOR_SHADOW_FORMULA
+auto handle_shadow_fault(uint64_t)->bool;
+// ACTUAL_ALLOCATOR_BACKING
+// ACTUAL_ALLOCATOR_ACTIVE
+// ACTUAL_ALLOCATOR_RAM_HELPER
+// ACTUAL_ALLOCATOR_INIT
+}
+namespace fixture {
+namespace kasan=ker::mod::kasan;
+void chain(size_t count){
+ head=count?&zones[0]:nullptr;
+ for(size_t i=0;i<count;++i){zones[i].start=RAM+i*PAGE*32;zones[i].len=PAGE*8;zones[i].next=i+1<count?&zones[i+1]:nullptr;}
+}
+void reset(){
+ ++cases;irq=true;root_missing=lose_root_on_get=ram_phase=false;image_start=IMAGE;image_end=IMAGE+PAGE*8;
+ calls=ram_calls=materializations=saves=restores=fatals=errors=infos=regular_gets=huge_gets=fail_ram_call=0;
+ zones={};for(size_t i=0;i<zones.size();++i)descriptor_addresses[i]=DESC+i*PAGE*16;
+ pages.clear();requests.clear();huge=nullptr;chain(1);kasan::s_active=false;
+}
+bool invoke(){ram_phase=false;try{kasan::init();return true;}catch(const Fatal&){return false;}}
+auto expected()->std::set<uintptr_t>{return {IMAGE_SHADOW};}
+void expect_zone(std::set<uintptr_t>&want,size_t index,size_t count=1){
+ want.insert(DESC_SHADOW+index*PAGE*2);
+ for(size_t p=0;p<count;++p)want.insert(RAM_SHADOW+index*PAGE*4+p*PAGE);
+}
+void expect_huge(std::set<uintptr_t>&want){want.insert(DESC_SHADOW+128*PAGE*2);want.insert(HUGE_SHADOW);want.insert(HUGE_SHADOW+PAGE);}
+bool exact(const std::set<uintptr_t>&want){std::set<uintptr_t>got;for(auto const&row:pages)got.insert(row.first);return got==want;}
+bool fatal(){return fatals==1&&errors==1&&infos==0;}
+}
+namespace ker::mod::kasan {
+auto handle_shadow_fault(uint64_t address)->bool{
+ fixture::check(!fixture::irq,"allocator mapper called with IF disabled");++fixture::calls;
+ if(fixture::ram_phase)++fixture::ram_calls;
+ if((address&(fixture::PAGE-1))!=0||fixture::calls>fixture::CALL_CAP||fixture::pages.size()>=fixture::MAP_CAP){fixture::check(false,"finite allocator mapper bounds");return false;}
+ fixture::requests.push_back(address);
+ if(fixture::ram_phase&&fixture::ram_calls==fixture::fail_ram_call)return false;
+ auto [at,created]=fixture::pages.try_emplace(address);
+ if(created){at->second.fill(0);++fixture::materializations;}
+ return true;
+}
+}
+'''
+
+ALLOCATOR_INIT_CASES = r'''
+namespace fixture {
+void run(){
+ // 1: Every descriptor and every page of two disjoint RAM spans, with gaps.
+ reset();chain(2);zones[0].len=PAGE*24;zones[1].len=PAGE*16;
+ auto want=expected();expect_zone(want,0,3);expect_zone(want,1,2);
+ check(invoke(),"allocator init accepts multiple published zones");
+ check(exact(want),"allocator init backs every descriptor and complete RAM span");
+ check(infos==1&&errors==0&&fatals==0&&regular_gets==1&&huge_gets==1&&irq&&!kasan::s_active&&saves==restores,"allocator success preserves runtime and IF before publication");
+ // 2: Optional huge descriptor and full huge span are separately covered.
+ reset();huge=&zones[128];huge->start=HUGE;huge->len=PAGE*16;
+ want=expected();expect_zone(want,0);expect_huge(want);
+ check(invoke()&&exact(want),"allocator init covers optional huge descriptor and span");
+ // 3: The ordinary descriptor lies outside its data span, both are necessary.
+ reset();want=expected();expect_zone(want,0);
+ check(invoke()&&exact(want)&&huge_gets==1,"allocator init covers separate descriptor without optional huge");
+ // 4: An unaligned descriptor crossing a shadow-page edge needs both pages.
+ reset();descriptor_addresses[0]=DESC+PAGE*8-sizeof(zones[0])/2;
+ want=expected();expect_zone(want,0);want.insert(DESC_SHADOW+PAGE);
+ check(invoke()&&exact(want),"allocator init covers complete unaligned descriptor");
+ // 5: The explicit local regular traversal limit accepts all128 descriptors.
+ reset();chain(128);want=expected();for(size_t i=0;i<128;++i)expect_zone(want,i);
+ check(invoke()&&exact(want)&&infos==1,"allocator init accepts exactly128 regular zones");
+ // 6: A129th regular node is refused before unknown extra traversal/backing.
+ reset();chain(129);
+ check(!invoke()&&fatal()&&huge_gets==0&&!pages.contains(DESC_SHADOW+128*PAGE*2),"allocator init refuses regular capacity overflow");
+ // 7: A malformed cycle terminates under the same finite traversal guard.
+ reset();chain(2);zones[1].next=&zones[0];
+ check(!invoke()&&fatal()&&calls<=1+128*2&&huge_gets==0,"allocator init refuses cyclic regular list without publication");
+ // 8: An optional zone cannot substitute for missing regular allocator RAM.
+ reset();head=nullptr;huge=&zones[128];huge->start=HUGE;huge->len=PAGE*16;
+ check(!invoke()&&fatal()&&huge_gets==0&&calls==1,"allocator init missing regular zone is fatal");
+ // 9: Empty published data is invalid, even if its descriptor is backed.
+ reset();zones[0].len=0;
+ check(!invoke()&&fatal()&&pages.contains(DESC_SHADOW)&&ram_calls==1,"allocator init empty RAM span is fatal");
+ // 10: A low non-kernel range is refused by the unchanged actual backing API.
+ reset();zones[0].start=0x1000;
+ check(!invoke()&&fatal()&&ram_calls==1,"allocator init invalid low RAM span is fatal");
+ // 11: Full start+length overflow is refused without wrapping to low memory.
+ reset();zones[0].start=UINTPTR_MAX-7;zones[0].len=16;
+ check(!invoke()&&fatal()&&ram_calls==1,"allocator init overflowing RAM span is fatal");
+ // 12/13: Descriptor bounds are validated before the data fields are consumed.
+ reset();descriptor_addresses[0]=0x1000;
+ check(!invoke()&&fatal()&&ram_calls==0,"allocator init invalid descriptor is fatal");
+ reset();descriptor_addresses[0]=UINTPTR_MAX-sizeof(zones[0])+2;
+ check(!invoke()&&fatal()&&ram_calls==0,"allocator init overflowing descriptor is fatal");
+ // 14: Lose the root only after image preparation, at the real zone getter.
+ reset();lose_root_on_get=true;
+ check(!invoke()&&fatal()&&calls==1&&ram_calls==0&&irq,"allocator init missing allocator root is fatal");
+ // 15: First RAM mapping OOM retains image backing and restores enabled IF.
+ reset();fail_ram_call=1;
+ check(!invoke()&&fatal()&&exact(expected())&&irq&&saves==restores,"allocator init first RAM OOM is fatal with IF restored");
+ // 16/17: Partial failure never publishes success, with either original IF.
+ reset();zones[0].len=PAGE*24;fail_ram_call=3;
+ check(!invoke()&&fatal()&&pages.contains(DESC_SHADOW)&&pages.contains(RAM_SHADOW)&&!pages.contains(RAM_SHADOW+PAGE)&&irq&&saves==restores,"allocator init partial RAM OOM is fatal with IF restored");
+ reset();irq=false;zones[0].len=PAGE*24;fail_ram_call=3;
+ check(!invoke()&&fatal()&&!irq&&restores==0&&pages.contains(RAM_SHADOW)&&!pages.contains(RAM_SHADOW+PAGE),"allocator init partial RAM OOM preserves disabled IF");
+ // 18: Repeat preserves all existing poison, partial bytes and active state.
+ reset();chain(2);want=expected();expect_zone(want,0);expect_zone(want,1);
+ check(invoke()&&exact(want),"allocator init initial complete backing before repeat");
+ for(auto&row:pages){row.second.fill(kasan::SHADOW_HEAP_FREED);row.second[7]=3;}
+ {auto saved=pages;auto allocated=materializations;kasan::s_active=true;irq=false;
+ check(invoke()&&pages==saved&&materializations==allocated&&kasan::s_active&&!irq,"allocator init repeat preserves poison active state and backing count");}
+ // 19: A wholly successful IF-off call must never enable interrupts.
+ reset();irq=false;want=expected();expect_zone(want,0);
+ check(invoke()&&exact(want)&&!irq&&restores==0,"allocator init successful backing preserves disabled IF");
+ // 20/21: Optional huge spans obey the same empty/overflow refusal policy.
+ reset();huge=&zones[128];huge->start=HUGE;huge->len=0;
+ check(!invoke()&&fatal()&&pages.contains(DESC_SHADOW+128*PAGE*2)&&!pages.contains(HUGE_SHADOW),"allocator init empty huge span is fatal");
+ reset();huge=&zones[128];huge->start=UINTPTR_MAX-7;huge->len=16;
+ check(!invoke()&&fatal()&&!pages.contains(HUGE_SHADOW),"allocator init overflowing huge span is fatal");
+ // 22: Original image validation remains before any allocator publication.
+ reset();image_end=image_start;
+ check(!invoke()&&fatal()&&regular_gets==0&&huge_gets==0&&calls==0,"allocator init retains image-first fatal ordering");
+}
+}
+int main(){fixture::run();std::printf("%s kasan_allocator_init cases=%u assertions=%u failures=%u\n",fixture::failures?"FAIL":"PASS",fixture::cases,fixture::assertions,fixture::failures);return fixture::failures?1:0;}
+'''
+
+def generate_allocator_init(source: str, header: str, paging_header: str, control: str) -> tuple[str, dict]:
+    init = definition(source, 'void init() {')
+    helper = definition(source, 'static auto prepare_allocator_ram_shadow(')
+    backing = definition(source, 'auto ensure_shadow_backing(')
+    zone = definition(paging_header, 'struct PageZone {') + ';'
+    active = re.findall(r'^static volatile bool s_active = false;[^\n]*', source, re.M)
+    if len(active) != 1:
+        raise ValueError('one actual allocator-group active flag required')
+    actual = {name: hashlib.sha256(body.encode()).hexdigest() for name, body in
+              [('allocator_init', init), ('allocator_helper', helper), ('backing', backing), ('PageZone', zone), ('active', active[0])]}
+    if hashlib.sha256(ORIGINAL_ALLOCATOR_INIT.encode()).hexdigest() != ORIGINAL_ALLOCATOR_INIT_SHA256:
+        raise ValueError('genuine whole pre573 image-only init control changed')
+    if control == 'original-init':
+        init = ORIGINAL_ALLOCATOR_INIT
+    elif control != 'current':
+        raise ValueError('unknown allocator-init control')
+    for old, new in [('reinterpret_cast<uintptr_t>(__kernel_image_start)', 'fixture::image_start'),
+                     ('reinterpret_cast<uintptr_t>(__kernel_end)', 'fixture::image_end')]:
+        if init.count(old) != 1:
+            raise ValueError('exact whole allocator-init linker endpoint changed')
+        init = init.replace(old, new)
+    descriptor = 'ensure_shadow_backing(zone, sizeof(*zone))'
+    if helper.count(descriptor) != 1:
+        raise ValueError('exact finite descriptor-address endpoint changed')
+    helper = helper.replace(descriptor, 'ensure_shadow_backing(fixture::descriptor_address(zone), sizeof(*zone))')
+    for old, new in [('asm volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");', 'irq_flags = fixture::irq_save_disable();'),
+                     ('asm volatile("sti" : : : "memory");', 'fixture::irq_restore_enable();')]:
+        if backing.count(old) != 1:
+            raise ValueError('exact allocator backing IRQ endpoint changed')
+        backing = backing.replace(old, new)
+    formula = re.findall(r'^inline auto addr_to_shadow\([^\n]+', header, re.M)
+    shadows = re.findall(r'^constexpr uint64_t SHADOW_[^\n]+', header, re.M)
+    sentinels = re.findall(r'^constexpr int8_t SHADOW_[^\n]+', header, re.M)
+    if len(formula) != 1 or len(shadows) != 3 or len(sentinels) != 6:
+        raise ValueError('actual allocator shadow formula/constants changed')
+    text = ALLOCATOR_INIT_PRELUDE
+    for name, body in {'ACTUAL_ALLOCATOR_PAGE_ZONE': zone,
+                       'ACTUAL_ALLOCATOR_SHADOW_CONSTANTS': '\n'.join(shadows + ['[[maybe_unused]] ' + row for row in sentinels]),
+                       'ACTUAL_ALLOCATOR_SHADOW_FORMULA': formula[0], 'ACTUAL_ALLOCATOR_BACKING': backing,
+                       'ACTUAL_ALLOCATOR_ACTIVE': active[0], 'ACTUAL_ALLOCATOR_RAM_HELPER': '[[maybe_unused]] ' + helper,
+                       'ACTUAL_ALLOCATOR_INIT': init}.items():
+        marker = '// ' + name
+        if text.count(marker) != 1:
+            raise ValueError('one finite allocator-init seam required: ' + name)
+        text = text.replace(marker, body)
+    actual['ported_bodies'] = {name: hashlib.sha256(body.encode()).hexdigest() for name, body in
+                               [('allocator_init', init), ('allocator_helper', helper), ('backing', backing)]}
+    actual['finite_endpoints'] = ['direct linker-symbol integer addresses', 'actual complete public PageZone with finite descriptors/getters',
+                                  'one descriptor logical-address bridge', 'privileged IRQ save/restore',
+                                  'bounded existing shadow mapper/root/allocation/failure', 'early log sink and noreturn fatal halt']
+    actual['original_allocator_init_sha256'] = ORIGINAL_ALLOCATOR_INIT_SHA256
+    return text + ALLOCATOR_INIT_CASES, actual
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kasan-source', type=Path, default=SOURCE)
@@ -753,7 +992,7 @@ def main() -> int:
                 raise ValueError('--cxx must name one executable compiler ELF')
         subreaper()
         watched = [source, HEADER, Path(__file__).resolve(),
-                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler, virt_source, MM_HEADER]
+                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler, virt_source, MM_HEADER, PAGING_HEADER]
         before = [pin(path) for path in watched]
         scratch = Path(tempfile.mkdtemp(prefix='wos-kasan-shadow-', dir='/tmp'))
         for control in ('current', 'original-zero-fill', 'whole-page-clear'):
@@ -832,6 +1071,32 @@ def main() -> int:
                            'FAIL image init invalid low span is fatal before publication')
                 if row['exit'] == 0 or not re.search(r'^FAIL kasan_image_init cases=12 assertions=\d+ failures=[1-9]\d*$', log, re.M) or not all(marker in log.splitlines() for marker in markers):
                     raise ValueError(control + ': compiled old-init control must finish all12cases and fail the same coverage/fatal oracles')
+        for control in ('current', 'original-init'):
+            text, actual = generate_allocator_init(source=source.read_text(), header=HEADER.read_text(),
+                                                   paging_header=PAGING_HEADER.read_text(), control=control)
+            result.setdefault('allocator_init_actual_definition_hashes', {})[control] = actual
+            translation, binary = scratch / ('allocator-init-' + control + '.cpp'), scratch / ('allocator-init-' + control)
+            translation.write_text(text)
+            row = command([str(compiler), '-std=c++23', '-O1', '-g0', '-pipe', '-Wall', '-Wextra', '-Werror',
+                           '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(translation), '-o', str(binary)],
+                          scratch / ('allocator-init-' + control + '-compile.log'), scratch, deadline, groups)
+            result['commands'].append(row)
+            if row['exit'] != 0:
+                print((scratch / ('allocator-init-' + control + '-compile.log')).read_text(errors='replace')[-32768:])
+                raise ValueError(control + ': allocator-init compile/link failure is not a successful control')
+            log_path = scratch / ('allocator-init-' + control + '-run.log')
+            row = command([str(binary)], log_path, scratch, deadline, groups)
+            result['commands'].append(row)
+            log = log_path.read_text(errors='replace')
+            print(log[-32768:], end='')
+            positive = row['exit'] == 0 and re.search(r'^PASS kasan_allocator_init cases=22 assertions=\d+ failures=0$', log, re.M)
+            if (control == 'current') != bool(positive):
+                raise ValueError(control + ': whole actual allocator-init oracle did not distinguish expected behavior')
+            if control != 'current':
+                markers = ('FAIL allocator init backs every descriptor and complete RAM span',
+                           'FAIL allocator init missing regular zone is fatal')
+                if row['exit'] == 0 or not re.search(r'^FAIL kasan_allocator_init cases=22 assertions=\d+ failures=[1-9]\d*$', log, re.M) or not all(marker in log.splitlines() for marker in markers):
+                    raise ValueError(control + ': compiled pre573 init must finish all22cases and fail the same coverage/fatal oracles')
         result['pass_'] = True
     except (OSError, ValueError, TimeoutError, KeyboardInterrupt) as error:
         result['error'] = f'{type(error).__name__}: {error}'

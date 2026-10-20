@@ -346,6 +346,34 @@ void unpoison_range(const void* ptr, size_t size) {
 // is live (so shadow page demand-faults work).
 static volatile bool s_active = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+// Back only the RAM actually published by the physical allocator. This is
+// pre-IDT preparation, never a virtual shadow touch or an all-HHDM reservation.
+static auto prepare_allocator_ram_shadow() -> bool {
+    // This local traversal guard matches the regular physical-census capacity.
+    // It is not a claim that firmware sanitization globally limits zone count.
+    constexpr size_t MAX_REGULAR_ZONES = 128;
+    auto const BACK_ZONE = [](mm::paging::PageZone* zone) -> bool {
+        if (!ensure_shadow_backing(zone, sizeof(*zone))) {
+            return false;
+        }
+        return ensure_shadow_backing(reinterpret_cast<const void*>(zone->start), zone->len);
+    };
+
+    auto* const REGULAR = mm::phys::get_zones();
+    if (REGULAR == nullptr) {
+        return false;
+    }
+    size_t regular_zones = 0;
+    for (auto* zone = REGULAR; zone != nullptr; zone = zone->next) {
+        if (regular_zones == MAX_REGULAR_ZONES || !BACK_ZONE(zone)) {
+            return false;
+        }
+        ++regular_zones;
+    }
+    auto* const HUGE = mm::phys::get_huge_page_zone();
+    return HUGE == nullptr || BACK_ZONE(HUGE);
+}
+
 void init() {
     // Use the relocated linker symbols directly: this runs before the IDT,
     // constructors and SMP, so neither a shadow fault nor an instrumented
@@ -354,6 +382,10 @@ void init() {
     auto const END = reinterpret_cast<uintptr_t>(__kernel_end);
     if (START < 0xffff800000000000ULL || END <= START || !ensure_shadow_backing(reinterpret_cast<const void*>(START), END - START)) {
         log::error("cannot back permanent kernel image shadow (start=0x%lx end=0x%lx)", START, END);
+        hcf();
+    }
+    if (!prepare_allocator_ram_shadow()) {
+        log::error("cannot back published physical allocator RAM shadow");
         hcf();
     }
     log::info("initialized (shadow base=0x%lx)", SHADOW_OFFSET);

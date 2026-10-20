@@ -405,6 +405,68 @@ KTEST(Kasan, PermanentKernelImageIsFullyBackedAndReensureKeepsOwners) {
     expect_same(cheap, baseline);
     expect_kasan_reuse_owners_same();
 }
+KTEST(Kasan, PhysicalAllocatorZonesAreFullyBackedAndReensureKeepsOwners) {
+    KREQUIRE_TRUE(ker::mod::kasan::is_enabled());
+    KREQUIRE_TRUE(mm::phys::node_counters_ready());
+    auto* const ROOT = mm::virt::get_kernel_pagemap();
+    KREQUIRE_NE(ROOT, nullptr);
+    auto const* const REGULAR = mm::phys::get_zones();
+    auto const* const HUGE = mm::phys::get_huge_page_zone();
+    KREQUIRE_NE(REGULAR, nullptr);
+    auto const backed = [ROOT](const void* address, size_t bytes) -> bool {
+        auto const BEGIN = reinterpret_cast<uintptr_t>(address);
+        if (BEGIN < 0xffff800000000000ULL || bytes == 0 || bytes > UINTPTR_MAX - BEGIN) return false;
+        uintptr_t const FIRST = reinterpret_cast<uintptr_t>(ker::mod::kasan::addr_to_shadow(BEGIN)) & ~(mm::paging::PAGE_SIZE - 1);
+        uintptr_t const LAST =
+            reinterpret_cast<uintptr_t>(ker::mod::kasan::addr_to_shadow(BEGIN + bytes - 1)) & ~(mm::paging::PAGE_SIZE - 1);
+        if (FIRST > LAST) return false;
+        for (uintptr_t page = FIRST;; page += mm::paging::PAGE_SIZE) {
+            if (mm::virt::translate(ROOT, page) == mm::virt::PADDR_INVALID) return false;
+            if (page == LAST) return true;
+        }
+    };
+    // Inspect every actual allocator shadow PTE before any ensure or baseline
+    // preparation. Missing boot coverage must fail rather than warm the test.
+    size_t count = 0;
+    for (auto const* zone = REGULAR; zone != nullptr; zone = zone->next) {
+        KREQUIRE_TRUE(count++ < balance::MAX_ZONES - 1);
+        KREQUIRE_TRUE(backed(zone, sizeof(*zone)));
+        KREQUIRE_TRUE(backed(reinterpret_cast<const void*>(zone->start), zone->len));
+    }
+    if (HUGE != nullptr) {
+        KREQUIRE_TRUE(backed(HUGE, sizeof(*HUGE)));
+        KREQUIRE_TRUE(backed(reinterpret_cast<const void*>(HUGE->start), HUGE->len));
+    }
+    prepare_kasan_reuse_storage();
+    auto const POOL = mm::phys::get_kernel_stack_pool_stats();
+    KREQUIRE_TRUE(collect_comparable());
+    baseline = cheap;
+    kasan_reuse_baseline = scanned;
+    for (size_t repeat = 0; repeat < 2; ++repeat) {
+        count = 0;
+        for (auto const* zone = REGULAR; zone != nullptr; zone = zone->next) {
+            KREQUIRE_TRUE(count++ < balance::MAX_ZONES - 1);
+            KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(zone, sizeof(*zone)));
+            KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(reinterpret_cast<const void*>(zone->start), zone->len));
+        }
+        if (HUGE != nullptr) {
+            KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(HUGE, sizeof(*HUGE)));
+            KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(reinterpret_cast<const void*>(HUGE->start), HUGE->len));
+        }
+    }
+    auto const AFTER = mm::phys::get_kernel_stack_pool_stats();
+    KEXPECT_EQ(AFTER.capacity, POOL.capacity);
+    KEXPECT_EQ(AFTER.free_slots, POOL.free_slots);
+    KEXPECT_EQ(AFTER.high_watermark, POOL.high_watermark);
+    KREQUIRE_TRUE(collect_comparable());
+    expect_same(cheap, baseline);      // Global/node free, cached and buddy counts.
+    expect_kasan_reuse_owners_same();  // All41 scanned and per-node owners.
+    KEXPECT_EQ(scanned.global.free_pages, kasan_reuse_baseline.global.free_pages);
+    for (size_t owner = 0; owner < mm::PHYSICAL_PAGE_OWNER_COUNT; ++owner) {
+        KEXPECT_EQ(scanned.global.owners[owner].pages, kasan_reuse_baseline.global.owners[owner].pages);
+        KEXPECT_EQ(scanned.global.owners[owner].objects, kasan_reuse_baseline.global.owners[owner].objects);
+    }
+}
 KTEST(Kasan, PermanentStackPoolIsFullyBackedAndReensureKeepsOwners) {
     prepare_kasan_reuse_storage();
     KREQUIRE_TRUE(ker::mod::kasan::is_enabled());
