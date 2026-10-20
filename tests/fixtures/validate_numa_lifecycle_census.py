@@ -262,7 +262,13 @@ def decode(directory, nonce, nodes):
         "exact same session/root with ordered boundaries",
     )
     require(
-        begin["mm"][4:] == end["mm"][4:] and begin["totals"] == end["totals"] and begin["physical"] == end["physical"],
+        begin["mm"][4:] == end["mm"][4:]
+        and begin["totals"] == end["totals"]
+        # Cached pages are included in free and have no live owner. Each
+        # report already validates their bounds and exact node reconciliation;
+        # BEGIN/END must conserve every ownership/capacity field, while the
+        # free cache/buddy partition may change across the workload.
+        and all(a[:5] == b[:5] and a[6:] == b[6:] for a, b in zip(begin["physical"], end["physical"])),
         "exact MM/owner/physical baseline closure",
     )
     witness = fixed_text(directory / "witness.txt", 4096)

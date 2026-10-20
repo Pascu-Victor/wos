@@ -298,8 +298,13 @@ def main():
         assert public_scope != scope_class
         policy_presence = "    present(14, driver.pending_mremap_ps_policies != nullptr);"
         assert generated.count(policy_presence) == 1
+        baseline_physical = "same_physical_ownership(plain.physical_baseline, plain.physical_b)"
+        assert generated.count(baseline_physical) == 1
         variants = {
             "actual": generated,
+            "old-baseline-cache-partition": generated.replace(
+                baseline_physical, "same_physical(plain.physical_baseline, plain.physical_b)", 1
+            ),
             "omit-endpoint-maintenance": generated.replace(
                 endpoint_function, endpoint_function[:endpoint_function.index("{")] + "{ return Outcome::ACCEPT; }", 1),
             "omit-mremap-policy-presence": generated.replace(
@@ -356,6 +361,9 @@ def main():
                 )
                 if row["exit"] != expected:
                     raise ValueError(f'actual handler {name}/{phase}: expected {expected}, got {row["exit"]}')
+                if phase == "run" and name == "old-baseline-cache-partition":
+                    if "physical ownership partition acceptance oracle failed" not in log.read_text():
+                        raise ValueError("old baseline control missed the physical partition acceptance oracle")
         result["pass"] = True
     except BaseException as error:
         result["errors"].append(f"{type(error).__name__}: {error}")

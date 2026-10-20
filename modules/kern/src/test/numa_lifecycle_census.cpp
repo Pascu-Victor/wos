@@ -293,19 +293,26 @@ auto coherent_registry_mm(const RegistrySnapshot& registry, const MmDebtSnapshot
     return registry_complete(registry) && mm_complete(mm) && mm.version_begin != 0 && mm.version_begin != UINT64_MAX &&
            registry.stamp.version == mm.version_begin;
 }
-auto same_physical_counts(const balance::Counts& a, const balance::Counts& b) noexcept -> bool {
-    if (a.managed_pages != b.managed_pages || a.free_pages != b.free_pages || a.cached_free_pages != b.cached_free_pages ||
-        a.allocator_metadata_pages != b.allocator_metadata_pages || a.zone_descriptor_pages != b.zone_descriptor_pages ||
-        a.owner_pages != b.owner_pages || a.kind_pages != b.kind_pages)
+// Cached order-0 pages are already included in free_pages and have no live
+// owner. A workload may return them to a different free-list/cache partition
+// without retaining memory. Compare all ownership and inclusive capacity at
+// BEGIN/END; require the exact partition as well for adjacent quiet samples.
+auto same_physical_ownership_counts(const balance::Counts& a, const balance::Counts& b) noexcept -> bool {
+    if (a.cached_free_pages > a.free_pages || b.cached_free_pages > b.free_pages || a.managed_pages != b.managed_pages ||
+        a.free_pages != b.free_pages || a.allocator_metadata_pages != b.allocator_metadata_pages ||
+        a.zone_descriptor_pages != b.zone_descriptor_pages || a.owner_pages != b.owner_pages || a.kind_pages != b.kind_pages)
         return false;
     for (size_t i = 0; i < OWNER_COUNT; ++i)
         if (a.owners[i].pages != b.owners[i].pages || a.owners[i].objects != b.owners[i].objects) return false;
     return true;
 }
-auto same_physical(const balance::Snapshot& a, const balance::Snapshot& b) noexcept -> bool {
+auto same_physical_counts(const balance::Counts& a, const balance::Counts& b) noexcept -> bool {
+    return same_physical_ownership_counts(a, b) && a.cached_free_pages == b.cached_free_pages;
+}
+auto same_physical_ownership(const balance::Snapshot& a, const balance::Snapshot& b) noexcept -> bool {
     if (!a.complete || !b.complete || !a.result.valid() || !b.result.valid() || a.provenance != b.provenance || a.node_count == 0 ||
         a.node_count > MAX_NODES || a.node_count != b.node_count || a.zone_count != b.zone_count || a.scanned_frames != b.scanned_frames ||
-        !same_physical_counts(a.scanned, b.scanned))
+        !same_physical_ownership_counts(a.scanned, b.scanned))
         return false;
     auto const& x = a.global;
     auto const& y = b.global;
@@ -321,6 +328,12 @@ auto same_physical(const balance::Snapshot& a, const balance::Snapshot& b) noexc
         if (x.firmware_reserves[i].pages != y.firmware_reserves[i].pages ||
             x.firmware_reserves[i].objects != y.firmware_reserves[i].objects)
             return false;
+    for (size_t i = 0; i < a.node_count; ++i)
+        if (!same_physical_ownership_counts(a.nodes[i], b.nodes[i])) return false;
+    return true;
+}
+auto same_physical(const balance::Snapshot& a, const balance::Snapshot& b) noexcept -> bool {
+    if (!same_physical_ownership(a, b) || !same_physical_counts(a.scanned, b.scanned)) return false;
     for (size_t i = 0; i < a.node_count; ++i)
         if (!same_physical_counts(a.nodes[i], b.nodes[i])) return false;
     return true;
@@ -534,7 +547,8 @@ class CensusHandler final {
         if (result == Outcome::ACCEPT && request.phase == static_cast<uint32_t>(Phase::END) &&
             (!lifecycle60::same_baseline_debt(plain.owner_baseline, plain.owner_b) ||
              !same_scalar_baseline(plain.scalar_baseline, plain.scalar_b) || !same_mm_debt(plain.mm_baseline, plain.mm_b) ||
-             !same_registry_rows(plain.registry_baseline, plain.registry_b) || !same_physical(plain.physical_baseline, plain.physical_b))) {
+             !same_registry_rows(plain.registry_baseline, plain.registry_b) ||
+             !same_physical_ownership(plain.physical_baseline, plain.physical_b))) {
             result = Outcome::WAIT;
             reason = Reason::BASELINE_DEBT;
         }

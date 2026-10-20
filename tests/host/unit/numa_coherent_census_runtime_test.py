@@ -61,7 +61,9 @@ def generate(selected):
             "auto mm_settled(",
             "void prepare_mm_capture(",
             "auto coherent_registry_mm(",
+            "auto same_physical_ownership_counts(",
             "auto same_physical_counts(",
+            "auto same_physical_ownership(",
             "auto same_physical(",
         ]
     )

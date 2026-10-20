@@ -82,6 +82,119 @@ def log():
     return ("\n".join(lines) + "\n").encode()
 
 
+def physical_reports(codec, directory, original, good):
+    """Exercise ownership closure independently of the free-page cache partition."""
+    checks = 0
+
+    def word(data, row, field):
+        return struct.unpack_from("<Q", data, 600 + row * 704 + field * 8)[0]
+
+    def changed(data, updates):
+        result = bytearray(data)
+        for row, field, value in updates:
+            struct.pack_into("<Q", result, 600 + row * 704 + field * 8, value)
+        return bytes(result)
+
+    def pair(begin_updates, end_updates, label, reason=None, reports_valid=True):
+        nonlocal checks
+        begin = changed(original["begin.bin"], begin_updates)
+        end = changed(original["end.bin"], end_updates)
+        assert (begin, end) != (original["begin.bin"], original["end.bin"]), "control must change actual bytes"
+        (directory / "begin.bin").write_bytes(begin)
+        (directory / "end.bin").write_bytes(end)
+        try:
+            if reports_valid:
+                codec.report(directory / "begin.bin", 1, NONCE, 2)
+                codec.report(directory / "end.bin", 2, NONCE, 2)
+            try:
+                decoded = codec.decode(directory, NONCE, 2)
+            except (ValueError, UnicodeError) as error:
+                if reason is None:
+                    raise AssertionError(f"cache-only saved report acceptance: {label}") from error
+                assert str(error) == reason, f"wrong rejection for {label}: {error}"
+            else:
+                assert reason is None, f"accepted physical ownership drift: {label}"
+                assert decoded == good, f"cache-only saved report changed decoded qualification: {label}"
+            checks += 1
+        finally:
+            for name in ["begin.bin", "end.bin"]:
+                (directory / name).write_bytes(original[name])
+
+    # Each report reconciles global cached pages to its two active nodes.
+    # These are historical BEGIN/END changes; adjacent kernel quiet samples
+    # retain their separate cache-exact predicate.
+    for label, begin, end in [
+        ("decrease", (56, 28, 28), (50, 25, 25)),
+        ("increase", (40, 20, 20), (58, 29, 29)),
+        ("per-node repartition", (56, 28, 28), (56, 25, 31)),
+    ]:
+        pair(
+            [(row, 5, value) for row, value in enumerate(begin)],
+            [(row, 5, value) for row, value in enumerate(end)],
+            label,
+        )
+
+    invalid = "invalid tracked owner/free identity"
+    closure = "exact MM/owner/physical baseline closure"
+    for name in ["begin.bin", "end.bin"]:
+        for row in range(3):
+            updates = [(row, 5, word(original[name], row, 4) + 1)]
+            if row != 0:
+                # Keep global/node reconciliation coherent while the selected
+                # node alone violates cached<=inclusive-free.
+                updates.append((0, 5, updates[0][2]))
+            pair(
+                updates if name == "begin.bin" else [],
+                updates if name == "end.bin" else [],
+                f"{name} cached above inclusive free, row={row}",
+                reason=invalid,
+                reports_valid=False,
+            )
+
+    for node_row in [1, 2]:
+        for owner in range(41):
+            for kind, field in [("pages", 6 + owner * 2), ("objects", 7 + owner * 2)]:
+                updates = []
+                for row in [0, node_row]:
+                    updates.append((row, field, word(original["end.bin"], row, field) + 1))
+                    if kind == "pages":
+                        updates.append((row, 4, word(original["end.bin"], row, 4) - 1))
+                pair(
+                    [],
+                    updates,
+                    f"owner={owner} {kind} global/node={node_row - 1}",
+                    reason=invalid if owner == 0 else closure,
+                    reports_valid=owner != 0,
+                )
+
+        # Complete per-report physical equations still hold for these changes;
+        # only comparing BEGIN with END exposes their retained ownership/capacity.
+        for label, deltas in [
+            ("retained page", [(8, 1), (9, 1), (4, -1)]),
+            ("inclusive free loss", [(1, -1), (4, -1)]),
+            ("managed/free growth", [(1, 1), (4, 1)]),
+            ("metadata growth", [(2, 1), (4, -1)]),
+            ("descriptor growth", [(3, 1), (4, -1)]),
+        ]:
+            updates = [
+                (row, field, word(original["end.bin"], row, field) + delta)
+                for row in [0, node_row]
+                for field, delta in deltas
+            ]
+            pair([], updates, f"{label} global/node={node_row - 1}", reason=closure)
+
+    for name in ["begin.bin", "end.bin"]:
+        updates = [(3, 5, 1)]
+        pair(
+            updates if name == "begin.bin" else [],
+            updates if name == "end.bin" else [],
+            f"{name} unused node cache",
+            reason="nonzero unused physical rows",
+            reports_valid=False,
+        )
+    return checks
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
@@ -167,6 +280,7 @@ def main():
         reject("witness.txt", original["witness.txt"].replace(b"warm_wait0=1", b"warm_wait0=0"))
         reject("witness.txt", original["witness.txt"].replace(b"measured_pid=4", b"measured_pid=3"))
         reject("witness.txt", b"NUMA_CENSUS_FAILURE version=1 nonce=11 exit=74 phase=warm stage=fork\n".ljust(4096, b"\0"))
+        checks += physical_reports(codec, directory, original, good)
         assert codec.decode(directory, NONCE, 2) == good
         checks += 1
     print(f"PASS strict saved census codec checks={checks}; synthetic controls only; no runtime qualification")

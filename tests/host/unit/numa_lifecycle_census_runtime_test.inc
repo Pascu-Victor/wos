@@ -112,6 +112,8 @@ uint32_t ids[6]{};
 uint64_t preempt{}, root_serial{7}, now{100}, ready_mask{255}, cores{8}, vmap_debt{}, active_tasks{8};
 unsigned physical_calls{};
 bool physical_churn{}, owner_churn{};
+const ker::mod::mm::numa::balance::Snapshot* physical_override{};
+bool physical_cache_pair_churn{};
 ker::test::numa_lifecycle::MmDebtSnapshot mm{};
 }  // namespace fixture
 namespace ker::mod::security {
@@ -606,6 +608,13 @@ auto snapshot(Snapshot& out, Workspace&, uint64_t max) noexcept -> Result {
     out.scanned.allocator_metadata_pages = 1;
     out.scanned.zone_descriptor_pages = 1;
     out.nodes[0] = out.scanned;
+    if (fixture::physical_override != nullptr) {
+        out = *fixture::physical_override;
+        if (fixture::physical_cache_pair_churn && fixture::physical_calls % 2 == 0) {
+            --out.scanned.cached_free_pages;
+            --out.nodes[0].cached_free_pages;
+        }
+    }
     if (fixture::physical_churn && fixture::physical_calls % 2 == 0) {
         --out.scanned.free_pages;
         --out.nodes[0].free_pages;
@@ -669,6 +678,8 @@ void reset() {
     active_tasks = 8;
     physical_calls = provider_calls = copies = progress = 0;
     physical_churn = owner_churn = false;
+    physical_override = nullptr;
+    physical_cache_pair_churn = false;
     actor.fd_table = {};
     actor.cloexec = {};
     actor.pending_fd_reservations = nullptr;
@@ -759,6 +770,143 @@ void begin() {
     ++now;
     accept(Phase::BEGIN);
     ++now;
+}
+// Finite provider data exercises the COMPLETE actual handler below. Real
+// PageAllocator/scanner transfers are covered separately by coherent-census.
+void physical_partition_begin(ker::mod::mm::numa::balance::Snapshot& value, uint64_t cached) {
+    reset();
+    value = {};
+    value.complete = true;
+    value.result.error = ker::mod::mm::numa::balance::Error::NONE;
+    value.node_count = value.zone_count = 2;
+    value.scanned_frames = 2000;
+    value.global.managed_pages = value.global.identity_pages = 2000;
+    value.global.free_pages = 1996;
+    value.global.allocator_metadata_pages = value.global.zone_descriptor_pages = value.global.zone_count = 2;
+    value.scanned.managed_pages = 2000;
+    value.scanned.free_pages = 1996;
+    value.scanned.cached_free_pages = 2 * cached;
+    value.scanned.allocator_metadata_pages = value.scanned.zone_descriptor_pages = 2;
+    for (size_t node = 0; node < 2; ++node) {
+        value.nodes[node].managed_pages = 1000;
+        value.nodes[node].free_pages = 998;
+        value.nodes[node].cached_free_pages = cached;
+        value.nodes[node].allocator_metadata_pages = value.nodes[node].zone_descriptor_pages = 1;
+    }
+    physical_override = &value;
+    begin();
+    check(plain.physical_baseline.node_count == 2 && plain.physical_baseline.scanned.cached_free_pages == 2 * cached);
+}
+void physical_partition_wait(Reason reason) {
+    check(call(Phase::END) == 0);
+    check(output.header.outcome == static_cast<uint64_t>(Outcome::WAIT) && output.header.coverage == 0 &&
+          output.header.reason == static_cast<uint64_t>(reason));
+    check((session.flags & SESSION_ENDED) == 0);
+}
+void physical_cache_partition_cases() {
+    namespace balance = ker::mod::mm::numa::balance;
+    balance::Snapshot value{};
+    for (bool reverse : {false, true}) {
+        physical_partition_begin(value, reverse ? 25 : 28);
+        uint64_t const cached = reverse ? 28 : 25;
+        value.scanned.cached_free_pages = 2 * cached;
+        value.nodes[0].cached_free_pages = value.nodes[1].cached_free_pages = cached;
+        auto const result = call(Phase::END);
+        bool const accepted = result == 0 && output.header.outcome == static_cast<uint64_t>(Outcome::ACCEPT) &&
+                              output.header.reason == static_cast<uint64_t>(Reason::NONE) && output.header.coverage == 255 &&
+                              (session.flags & SESSION_ENDED) != 0;
+        if (!accepted) std::fprintf(stderr, "physical ownership partition acceptance oracle failed\n");
+        check(accepted);
+        check(same_physical(plain.physical_a, plain.physical_b));
+        check(!same_physical(plain.physical_baseline, plain.physical_b));
+        check(output.physical[0].cached_free == 2 * cached && output.physical[1].cached_free == cached &&
+              output.physical[2].cached_free == cached);
+    }
+    physical_partition_begin(value, 28);
+    physical_cache_pair_churn = true;
+    physical_partition_wait(Reason::PHYSICAL);
+    check(!same_physical(plain.physical_a, plain.physical_b));
+    // Every page/object owner, including INVALID, remains exact at every level.
+    for (size_t scope = 0; scope < 4; ++scope) {
+        for (size_t owner = 0; owner < 41; ++owner) {
+            for (bool objects : {false, true}) {
+                physical_partition_begin(value, 28);
+                auto& row = scope == 0   ? value.global.owners[owner]
+                            : scope == 1 ? value.scanned.owners[owner]
+                                         : value.nodes[scope - 2].owners[owner];
+                if (objects)
+                    ++row.objects;
+                else
+                    ++row.pages;
+                physical_partition_wait(Reason::BASELINE_DEBT);
+            }
+        }
+    }
+    physical_partition_begin(value, 28);
+    --value.global.free_pages;
+    --value.scanned.free_pages;
+    --value.nodes[0].free_pages;
+    ++value.global.owner_pages;
+    ++value.scanned.owner_pages;
+    ++value.nodes[0].owner_pages;
+    ++value.global.owners[1].pages;
+    ++value.scanned.owners[1].pages;
+    ++value.nodes[0].owners[1].pages;
+    physical_partition_wait(Reason::BASELINE_DEBT);  // A retained-page observation is never a free partition change.
+    for (size_t scope = 0; scope < 3; ++scope) {
+        for (size_t field = 0; field < 5; ++field) {
+            physical_partition_begin(value, 28);
+            auto& counts = scope == 0 ? value.scanned : value.nodes[scope - 1];
+            uint64_t* fields[]{&counts.managed_pages, &counts.free_pages, &counts.allocator_metadata_pages, &counts.zone_descriptor_pages,
+                               &counts.owner_pages};
+            ++*fields[field];
+            physical_partition_wait(Reason::BASELINE_DEBT);
+        }
+        for (size_t kind = 0; kind < 8; ++kind) {
+            physical_partition_begin(value, 28);
+            auto& counts = scope == 0 ? value.scanned : value.nodes[scope - 1];
+            ++counts.kind_pages[kind];
+            physical_partition_wait(Reason::BASELINE_DEBT);
+        }
+        physical_partition_begin(value, 28);
+        auto& counts = scope == 0 ? value.scanned : value.nodes[scope - 1];
+        counts.cached_free_pages = counts.free_pages + 1;
+        physical_partition_wait(Reason::PHYSICAL);
+        auto bad = plain.physical_baseline;
+        auto& bad_counts = scope == 0 ? bad.scanned : bad.nodes[scope - 1];
+        bad_counts.cached_free_pages = bad_counts.free_pages + 1;
+        check(!same_physical_ownership(bad, plain.physical_baseline));
+        check(!same_physical_ownership(plain.physical_baseline, bad));
+    }
+    for (size_t field = 0; field < 11; ++field) {
+        physical_partition_begin(value, 28);
+        auto& global = value.global;
+        uint64_t* fields[]{&global.managed_pages,
+                           &global.free_pages,
+                           &global.allocator_metadata_pages,
+                           &global.zone_descriptor_pages,
+                           &global.per_cpu_page_cache_reserve_pages,
+                           &global.per_cpu_page_cache_reserve_objects,
+                           &global.owner_pages,
+                           &global.identity_pages,
+                           &global.identity_mismatch_pages,
+                           &global.untracked_unreclaimable_pages,
+                           &global.zone_count};
+        ++*fields[field];
+        physical_partition_wait(field == 8 || field == 9 ? Reason::PHYSICAL : Reason::BASELINE_DEBT);
+    }
+    for (size_t kind = 0; kind < 8; ++kind) {
+        for (bool objects : {false, true}) {
+            physical_partition_begin(value, 28);
+            auto& reserve = value.global.firmware_reserves[kind];
+            if (objects)
+                ++reserve.objects;
+            else
+                ++reserve.pages;
+            physical_partition_wait(Reason::BASELINE_DEBT);
+        }
+    }
+    reset();
 }
 void endpoint_attempt_cases() {
     reset();
@@ -861,6 +1009,7 @@ int main() {
     check(lock_depth == 0 && copy_pins == 0);
     endpoint_attempt_cases();
     mremap_policy_presence_census_case();
+    physical_cache_partition_cases();
     reset();
     check(!std::is_constructible_v<CurrentCensusScope, ker::mod::sched::task::Task&, uint64_t, uint64_t>);
     for (unsigned condition = 0; condition < 10; ++condition) {
