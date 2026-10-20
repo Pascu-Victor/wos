@@ -21,6 +21,10 @@ SHARED_CONDITION = 'if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)\n'
 MARKER = 'WOS_SANITIZER_PROPERTIES_COMPLETE_BEFORE_GENERATION'
 ORDINARY = 'src/test/numa_lifecycle_census.cpp'
 BALANCE = 'src/platform/mm/numa_balance.cpp'
+REQUIRED_CLOCK_SOURCES = {
+    'tsc': 'src/platform/tsc/tsc.cpp',
+    'kvmclock': 'src/platform/ktime/kvmclock.cpp',
+}
 SECONDS = 120
 COMMAND_SECONDS = 10
 OUTPUT_CAP = 1 << 20
@@ -105,6 +109,15 @@ class KernelSanitizerCMakeTest(unittest.TestCase):
         # the current source body. No historical file or copied policy is used.
         old_condition = block.replace(SHARED_CONDITION, 'if(WOS_KASAN)\n', 1)
         cls.sources = excluded_sources(block)
+        # Probe these required fault-runtime dependencies even if the actual
+        # exclusion declaration accidentally loses one of them.
+        cls.probes = list(dict.fromkeys(cls.sources + list(REQUIRED_CLOCK_SOURCES.values()) + [ORDINARY, BALANCE]))
+        variants = [('current', block), ('old-condition', old_condition)]
+        for name, source in REQUIRED_CLOCK_SOURCES.items():
+            declaration = '        ' + source + '\n'
+            if block.count(declaration) != 1:
+                raise ValueError('unique required clock runtime declaration: ' + source)
+            variants.append(('missing-' + name, block.replace(declaration, '', 1)))
         cls.rows = {}
         environment = dict(os.environ)
         for key in ('CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS',
@@ -114,7 +127,7 @@ class KernelSanitizerCMakeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='wos-sanitizer-properties-') as temporary:
             root = Path(temporary)
             for flags in itertools.product((False, True), repeat=4):
-                for label, actual in (('current', block), ('old-condition', old_condition)):
+                for label, actual in variants:
                     cls.check_deadline()
                     directory = root / (label + '-' + ''.join('1' if flag else '0' for flag in flags))
                     directory.mkdir()
@@ -123,7 +136,7 @@ class KernelSanitizerCMakeTest(unittest.TestCase):
                                      WOS_KCOV_SOURCE_FRIENDLY=False, WOS_KCOV_PANIC_TRACE=flags[2])
                     data = PREFIX + ''.join('set(' + key + ' ' + ('ON' if value else 'OFF') + ')\n'
                                            for key, value in variables.items())
-                    data += 'set(PORT_SOURCES\n' + '\n'.join(cls.sources + [ORDINARY, BALANCE]) + '\n)\n'
+                    data += 'set(PORT_SOURCES\n' + '\n'.join(cls.probes) + '\n)\n'
                     (directory / 'CMakeLists.txt').write_text(data + actual + SUFFIX)
                     log = directory / 'cmake.log'
                     with log.open('wb') as output:
@@ -144,7 +157,7 @@ class KernelSanitizerCMakeTest(unittest.TestCase):
                         properties[key] = bytes.fromhex(encoded).decode().replace(str(directory), '<PORT_SOURCE>')
                     required = {'target:COMPILE_OPTIONS', 'target:COMPILE_DEFINITIONS', 'target:LINK_OPTIONS',
                                 'excluded_sources', 'excluded_options', 'complete'}
-                    required.update('source:' + source for source in cls.sources + [ORDINARY, BALANCE])
+                    required.update('source:' + source for source in cls.probes)
                     if set(properties) != required or properties['complete'] != 'yes':
                         raise AssertionError('complete target and every declared source property required')
                     cls.rows[label, flags] = properties
@@ -158,6 +171,11 @@ class KernelSanitizerCMakeTest(unittest.TestCase):
         self.assertEqual(row['excluded_options'], expected)
         self.assertEqual(row['excluded_sources'], ';'.join(self.sources))
         for source in self.sources:
+            self.assertEqual(row['source:' + source], expected, source)
+
+    def clock_protection(self, row, kcfi):
+        expected = '-fno-sanitize=all;-fno-sanitize-coverage=trace-pc' + (';-fsanitize=kcfi' if kcfi else '')
+        for source in REQUIRED_CLOCK_SOURCES.values():
             self.assertEqual(row['source:' + source], expected, source)
 
     def test_target_instrumentation_is_independent_of_exclusion_condition(self):
@@ -177,8 +195,24 @@ class KernelSanitizerCMakeTest(unittest.TestCase):
         for kcfi in (False, True):
             flags = (False, False, False, kcfi)
             self.assertEqual(self.rows['current', flags], self.rows['old-condition', flags])
-            for source in self.sources + [ORDINARY, BALANCE]:
+            for source in self.probes:
                 self.assertEqual(self.rows['current', flags]['source:' + source], '')
+
+    def test_required_clock_runtime_properties(self):
+        for flags in itertools.product((False, True), repeat=4):
+            if any(flags[:3]):
+                with self.subTest(flags=flags):
+                    self.clock_protection(self.rows['current', flags], flags[3])
+
+    def test_missing_clock_runtime_mutants_fail_the_same_protection(self):
+        for flags in itertools.product((False, True), repeat=4):
+            if any(flags[:3]):
+                for name, source in REQUIRED_CLOCK_SOURCES.items():
+                    row = self.rows['missing-' + name, flags]
+                    with self.subTest(flags=flags, source=source):
+                        self.assertEqual(row['source:' + source], '')
+                        with self.assertRaises(AssertionError):
+                            self.clock_protection(row, flags[3])
 
     def test_report_or_coverage_without_asan_retains_runtime_protection(self):
         for ubsan, kcov, kcfi in itertools.product((False, True), repeat=3):

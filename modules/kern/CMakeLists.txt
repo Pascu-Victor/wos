@@ -343,6 +343,10 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         src/platform/acpi/ioapic/ioapic.cpp
         src/platform/acpi/madt/madt.cpp
         src/platform/acpi/tables/rsdp.cpp
+        # Clock reads are fault-runtime dependencies: preemption accounting
+        # uses them while allocating shadow/page tables under IRQ-save locks.
+        src/platform/tsc/tsc.cpp
+        src/platform/ktime/kvmclock.cpp
         # KASan/UBSan/KCOV runtimes (must not instrument themselves)
         src/sanitizer/kasan.cpp
         src/sanitizer/ubsan.cpp
