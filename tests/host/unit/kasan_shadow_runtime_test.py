@@ -570,6 +570,166 @@ def generate_backing(source: str, header: str, virt: str, mm_header: str, contro
     actual['original_guarded_control_sha256'] = ORIGINAL_GUARDED_INTEGRATION_SHA256
     return text + BACKING_CASES, actual
 
+
+# Separate whole-init group. Linker addresses, logging, fatal halt, IRQ and
+# existing mapper are finite endpoints; the actual init and backing decisions
+# execute. This does not claim native PTE, boot ordering or physical accounting.
+ORIGINAL_IMAGE_INIT = 'void init() {\n    // The compiler\'s shadow accesses for global variables and kernel static\n    // code will fault into handle_shadow_fault() and get demand-zeroed pages.\n    // For global redzones (emitted by -asan-globals=1), Clang calls\n    // __asan_register_globals() which we stub out below — we rely on the\n    // demand-fault mechanism instead of pre-populating global shadows.\n    log::info("initialized (shadow base=0x%lx)", SHADOW_OFFSET);\n}'
+ORIGINAL_IMAGE_INIT_SHA256 = 'eb75a4df29170f98d3699275d03fbad2292d33c0a51cedd404aed380debf29f2'
+
+IMAGE_INIT_PRELUDE = r'''
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+namespace fixture {
+constexpr size_t PAGE=4096,PAGES=8;
+constexpr uintptr_t IMAGE_BASE=0xffffffff80000000ULL;
+unsigned failures{},assertions{},cases{},calls{},materializations{},saves{},restores{},fatals{},errors{},infos{},fail_call{};
+bool irq=true,early_null{};
+uintptr_t image_start=IMAGE_BASE,image_end=IMAGE_BASE+PAGE*8;
+std::array<bool,PAGES>present{};
+std::array<std::array<int8_t,PAGE>,PAGES>shadow{};
+std::array<uint64_t,32>addresses{};
+struct Fatal{};
+void check(bool value,const char*why){++assertions;if(!value&&failures++<64)std::fprintf(stderr,"FAIL %s\n",why);}
+uint64_t irq_save_disable(){++saves;uint64_t flags=irq?0x200:0;irq=false;return flags;}
+void irq_restore_enable(){check(!irq,"image mapper keeps IF masked until restore");++restores;irq=true;}
+}
+[[noreturn]] void hcf(){++fixture::fatals;throw fixture::Fatal{};}
+namespace ker::mod::mm::paging {constexpr uint64_t PAGE_SIZE=4096;}
+namespace ker::mod::mm::virt {
+struct PageTable{};PageTable root;
+auto get_kernel_pagemap()->PageTable*{return fixture::early_null?nullptr:&root;}
+}
+namespace ker::mod::kasan {
+namespace mm=ker::mod::mm;
+struct log {
+ template<class...T>static void info(const char*,T...){++fixture::infos;}
+ template<class...T>static void error(const char*,T...){++fixture::errors;}
+};
+// ACTUAL_IMAGE_SHADOW_CONSTANTS
+// ACTUAL_IMAGE_SHADOW_FORMULA
+auto handle_shadow_fault(uint64_t)->bool;
+// ACTUAL_IMAGE_BACKING
+// ACTUAL_IMAGE_ACTIVE
+// ACTUAL_IMAGE_INIT
+}
+namespace fixture {
+namespace kasan=ker::mod::kasan;
+uintptr_t base(){return reinterpret_cast<uintptr_t>(kasan::addr_to_shadow(IMAGE_BASE));}
+void reset(){
+ ++cases;irq=true;early_null=false;image_start=IMAGE_BASE;image_end=IMAGE_BASE+PAGE*8;
+ calls=materializations=saves=restores=fatals=errors=infos=fail_call=0;
+ present.fill(false);for(auto&page:shadow)page.fill(0);addresses.fill(0);kasan::s_active=false;
+}
+bool invoke(){try{kasan::init();return true;}catch(const Fatal&){return false;}}
+bool covers(size_t count){for(size_t i=0;i<count;++i)if(!present[i])return false;return true;}
+void fill(size_t index,int8_t value){present[index]=true;shadow[index].fill(value);}
+}
+namespace ker::mod::kasan {
+auto handle_shadow_fault(uint64_t address)->bool{
+ fixture::check(!fixture::irq,"image mapper called with IF disabled");++fixture::calls;
+ if(fixture::calls<=fixture::addresses.size())fixture::addresses[fixture::calls-1]=address;
+ fixture::check(address>=fixture::base()&&(address-fixture::base())%fixture::PAGE==0,"image mapper exact page alignment");
+ if(address<fixture::base())return false;
+ size_t index=(address-fixture::base())/fixture::PAGE;
+ fixture::check(index<fixture::PAGES,"image mapper finite page bound");
+ if(index>=fixture::PAGES||fixture::calls==fixture::fail_call)return false;
+ if(!fixture::present[index]){fixture::present[index]=true;fixture::shadow[index].fill(0);++fixture::materializations;}
+ return true;
+}
+}
+'''
+
+IMAGE_INIT_CASES = r'''
+namespace fixture {
+void run(){
+ // Exact exclusive span: two full shadow pages, no third-page allocation.
+ reset();image_end=IMAGE_BASE+PAGE*16;check(invoke(),"image init accepts permanent span");
+ check(calls==2&&materializations==2&&covers(2)&&!present[2],"image init backs exact complete linker span");
+ check(addresses[0]==base()&&addresses[1]==base()+PAGE,"image init uses actual shadow formula");
+ check(irq&&saves==2&&restores==2&&infos==1&&errors==0&&fatals==0&&!kasan::s_active,"image init preserves disabled runtime and enabled IF");
+ // One unaligned byte on each side of a shadow-page boundary needs both pages.
+ reset();image_start=IMAGE_BASE+PAGE*8-1;image_end=image_start+2;
+ check(invoke()&&calls==2&&covers(2)&&!present[2],"image init covers unaligned exclusive edges");
+ // Already mapped pages retain every byte, including partial-granule poison.
+ reset();fill(0,kasan::SHADOW_HEAP_FREED);shadow[0][7]=3;auto saved=shadow;
+ check(invoke()&&materializations==0&&shadow==saved,"image init preserves all existing poison");
+ // Repeated init must not grow backing or reset runtime state.
+ reset();image_end=IMAGE_BASE+PAGE*24;kasan::s_active=true;
+ check(invoke(),"image init first backing succeeds");irq=false;
+ check(invoke()&&calls==6&&materializations==3&&covers(3)&&!present[3],"image init repeat has no shadow growth");
+ check(kasan::s_active&&!irq&&saves==6&&restores==3,"image init repeat preserves active state and both IF states");
+ // Entire ordinary kernel aperture is rejected before touching shadow.
+ reset();image_start=0x1000;image_end=0x2000;
+ check(!invoke()&&fatals==1&&errors==1&&infos==0&&calls==0&&saves==0&&irq,"image init invalid low span is fatal before publication");
+ reset();image_end=image_start;
+ check(!invoke()&&fatals==1&&calls==0&&infos==0&&irq,"image init empty span is fatal");
+ reset();image_end=image_start-1;
+ check(!invoke()&&fatals==1&&calls==0&&infos==0&&irq,"image init reversed span is fatal");
+ reset();image_start=UINTPTR_MAX-7;image_end=4;
+ check(!invoke()&&fatals==1&&calls==0&&infos==0&&irq,"image init wrapped span is fatal");
+ // A valid span without its early kernel root is a failed boot, not success.
+ reset();early_null=true;
+ check(!invoke()&&fatals==1&&errors==1&&infos==0&&calls==0&&saves==0&&irq,"image init missing root is fatal");
+ // The helper restores original IF before the finite fatal endpoint.
+ reset();fail_call=1;
+ check(!invoke()&&fatals==1&&errors==1&&infos==0&&calls==1&&materializations==0&&irq&&saves==1&&restores==1,"image init first OOM is fatal with IF restored");
+ reset();image_end=IMAGE_BASE+PAGE*24;fail_call=2;
+ check(!invoke()&&fatals==1&&infos==0&&calls==2&&materializations==1&&present[0]&&!present[1]&&!present[2]&&irq&&saves==2&&restores==2,"image init partial OOM stops with IF restored");
+ reset();irq=false;image_end=IMAGE_BASE+PAGE*16;fail_call=2;
+ check(!invoke()&&fatals==1&&infos==0&&calls==2&&materializations==1&&!irq&&saves==2&&restores==0,"image init OOM preserves disabled IF");
+}
+}
+int main(){fixture::run();std::printf("%s kasan_image_init cases=%u assertions=%u failures=%u\n",fixture::failures?"FAIL":"PASS",fixture::cases,fixture::assertions,fixture::failures);return fixture::failures?1:0;}
+'''
+
+def generate_image_init(source: str, header: str, control: str) -> tuple[str, dict]:
+    init = definition(source, 'void init() {')
+    backing = definition(source, 'auto ensure_shadow_backing(')
+    active = re.findall(r'^static volatile bool s_active = false;[^\n]*', source, re.M)
+    if len(active) != 1:
+        raise ValueError('one actual runtime enable flag required')
+    actual = {name: hashlib.sha256(body.encode()).hexdigest() for name, body in
+              [('image_init', init), ('backing', backing), ('active', active[0])]}
+    if hashlib.sha256(ORIGINAL_IMAGE_INIT.encode()).hexdigest() != ORIGINAL_IMAGE_INIT_SHA256:
+        raise ValueError('genuine whole old-init control changed')
+    if control == 'original-init':
+        init = ORIGINAL_IMAGE_INIT
+    elif control != 'current':
+        raise ValueError('unknown image-init control')
+    for old, new in [('reinterpret_cast<uintptr_t>(__kernel_image_start)', 'fixture::image_start'),
+                     ('reinterpret_cast<uintptr_t>(__kernel_end)', 'fixture::image_end')]:
+        expected = 0 if control == 'original-init' else 1
+        if init.count(old) != expected:
+            raise ValueError('exact direct linker-address endpoint changed')
+        init = init.replace(old, new)
+    for old, new in [('asm volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");', 'irq_flags = fixture::irq_save_disable();'),
+                     ('asm volatile("sti" : : : "memory");', 'fixture::irq_restore_enable();')]:
+        if backing.count(old) != 1:
+            raise ValueError('exact image backing IRQ endpoint changed')
+        backing = backing.replace(old, new)
+    formula = re.findall(r'^inline auto addr_to_shadow\([^\n]+', header, re.M)
+    shadows = re.findall(r'^constexpr uint64_t SHADOW_[^\n]+', header, re.M)
+    sentinels = re.findall(r'^constexpr int8_t SHADOW_[^\n]+', header, re.M)
+    if len(formula) != 1 or len(shadows) != 3 or len(sentinels) != 6:
+        raise ValueError('actual image shadow formula/constants changed')
+    text = IMAGE_INIT_PRELUDE
+    for name, body in {'ACTUAL_IMAGE_SHADOW_CONSTANTS': '\n'.join(shadows + ['[[maybe_unused]] ' + row for row in sentinels]),
+                       'ACTUAL_IMAGE_SHADOW_FORMULA': formula[0], 'ACTUAL_IMAGE_BACKING': backing,
+                       'ACTUAL_IMAGE_ACTIVE': active[0], 'ACTUAL_IMAGE_INIT': init}.items():
+        marker = '// ' + name
+        if text.count(marker) != 1:
+            raise ValueError('one finite image-init seam required: ' + name)
+        text = text.replace(marker, body)
+    actual['ported_bodies'] = {name: hashlib.sha256(body.encode()).hexdigest() for name, body in
+                               [('image_init', init), ('backing', backing)]}
+    actual['finite_endpoints'] = ['direct linker-symbol integer addresses', 'privileged IRQ save/restore',
+                                  'existing shadow mapper/root/allocation/failure', 'early log sink and noreturn fatal halt']
+    actual['original_image_init_sha256'] = ORIGINAL_IMAGE_INIT_SHA256
+    return text + IMAGE_INIT_CASES, actual
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kasan-source', type=Path, default=SOURCE)
@@ -647,6 +807,31 @@ def main() -> int:
                           'destructive-clear': 'FAIL range backing preserves present poison'}[control]
                 if row['exit'] == 0 or not re.search(r'^FAIL kasan_backing cases=12 assertions=\d+ failures=[1-9]\d*$', log, re.M) or marker not in log.splitlines():
                     raise ValueError(control + ': compiled backing control must finish all12cases and fail its exact intended oracle')
+        for control in ('current', 'original-init'):
+            text, actual = generate_image_init(source=source.read_text(), header=HEADER.read_text(), control=control)
+            result.setdefault('image_init_actual_definition_hashes', {})[control] = actual
+            translation, binary = scratch / ('image-init-' + control + '.cpp'), scratch / ('image-init-' + control)
+            translation.write_text(text)
+            row = command([str(compiler), '-std=c++23', '-O1', '-g0', '-pipe', '-Wall', '-Wextra', '-Werror',
+                           '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(translation), '-o', str(binary)],
+                          scratch / ('image-init-' + control + '-compile.log'), scratch, deadline, groups)
+            result['commands'].append(row)
+            if row['exit'] != 0:
+                print((scratch / ('image-init-' + control + '-compile.log')).read_text(errors='replace')[-32768:])
+                raise ValueError(control + ': image-init compile/link failure is not a successful control')
+            log_path = scratch / ('image-init-' + control + '-run.log')
+            row = command([str(binary)], log_path, scratch, deadline, groups)
+            result['commands'].append(row)
+            log = log_path.read_text(errors='replace')
+            print(log[-32768:], end='')
+            positive = row['exit'] == 0 and re.search(r'^PASS kasan_image_init cases=12 assertions=\d+ failures=0$', log, re.M)
+            if (control == 'current') != bool(positive):
+                raise ValueError(control + ': whole actual-init oracle did not distinguish expected behavior')
+            if control != 'current':
+                markers = ('FAIL image init backs exact complete linker span',
+                           'FAIL image init invalid low span is fatal before publication')
+                if row['exit'] == 0 or not re.search(r'^FAIL kasan_image_init cases=12 assertions=\d+ failures=[1-9]\d*$', log, re.M) or not all(marker in log.splitlines() for marker in markers):
+                    raise ValueError(control + ': compiled old-init control must finish all12cases and fail the same coverage/fatal oracles')
         result['pass_'] = True
     except (OSError, ValueError, TimeoutError, KeyboardInterrupt) as error:
         result['error'] = f'{type(error).__name__}: {error}'

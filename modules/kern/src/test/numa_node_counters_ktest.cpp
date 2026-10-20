@@ -12,6 +12,7 @@
 
 #ifdef WOS_KASAN
 #include <array>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 #include <sanitizer/kasan.hpp>
@@ -372,6 +373,38 @@ KTEST(NumaNodeCounters, ActualPerNodeSpansCloseCountersAndOwners) {
 }
 
 #ifdef WOS_KASAN
+KTEST(Kasan, PermanentKernelImageIsFullyBackedAndReensureKeepsOwners) {
+    KREQUIRE_TRUE(ker::mod::kasan::is_enabled());
+    KREQUIRE_TRUE(mm::phys::node_counters_ready());
+    auto* const ROOT = mm::virt::get_kernel_pagemap();
+    KREQUIRE_NE(ROOT, nullptr);
+    uintptr_t const BEGIN = reinterpret_cast<uintptr_t>(__kernel_image_start);
+    uintptr_t const END = reinterpret_cast<uintptr_t>(__kernel_end);
+    KREQUIRE_TRUE(END > BEGIN);
+    uintptr_t const FIRST = reinterpret_cast<uintptr_t>(ker::mod::kasan::addr_to_shadow(BEGIN)) & ~(mm::paging::PAGE_SIZE - 1);
+    uintptr_t const LAST = reinterpret_cast<uintptr_t>(ker::mod::kasan::addr_to_shadow(END - 1)) & ~(mm::paging::PAGE_SIZE - 1);
+    KREQUIRE_TRUE(FIRST <= LAST);
+    // Inspect the whole actual linker span before any ensure or buffer setup.
+    // A missing boot preparation must fail rather than warm this baseline.
+    for (uintptr_t page = FIRST;; page += mm::paging::PAGE_SIZE) {
+        KREQUIRE_TRUE(mm::virt::translate(ROOT, page) != mm::virt::PADDR_INVALID);
+        if (page == LAST) break;
+    }
+    prepare_kasan_reuse_storage();
+    auto const POOL = mm::phys::get_kernel_stack_pool_stats();
+    KREQUIRE_TRUE(collect_comparable());
+    baseline = cheap;
+    kasan_reuse_baseline = scanned;
+    for (size_t repeat = 0; repeat < 2; ++repeat)
+        KEXPECT_TRUE(ker::mod::kasan::ensure_shadow_backing(reinterpret_cast<const void*>(BEGIN), END - BEGIN));
+    auto const AFTER = mm::phys::get_kernel_stack_pool_stats();
+    KEXPECT_EQ(AFTER.capacity, POOL.capacity);
+    KEXPECT_EQ(AFTER.free_slots, POOL.free_slots);
+    KEXPECT_EQ(AFTER.high_watermark, POOL.high_watermark);
+    KREQUIRE_TRUE(collect_comparable());
+    expect_same(cheap, baseline);
+    expect_kasan_reuse_owners_same();
+}
 KTEST(Kasan, PermanentStackPoolIsFullyBackedAndReensureKeepsOwners) {
     prepare_kasan_reuse_storage();
     KREQUIRE_TRUE(ker::mod::kasan::is_enabled());

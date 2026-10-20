@@ -20,6 +20,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -338,7 +339,7 @@ void unpoison_range(const void* ptr, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
-// KASan early init — unpoison the kernel static image
+// KASan early init — back the permanent kernel static-image shadow
 // ---------------------------------------------------------------------------
 
 // Runtime enable flag — false until enable() is called after the IDT
@@ -346,11 +347,15 @@ void unpoison_range(const void* ptr, size_t size) {
 static volatile bool s_active = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 void init() {
-    // The compiler's shadow accesses for global variables and kernel static
-    // code will fault into handle_shadow_fault() and get demand-zeroed pages.
-    // For global redzones (emitted by -asan-globals=1), Clang calls
-    // __asan_register_globals() which we stub out below — we rely on the
-    // demand-fault mechanism instead of pre-populating global shadows.
+    // Use the relocated linker symbols directly: this runs before the IDT,
+    // constructors and SMP, so neither a shadow fault nor an instrumented
+    // out-of-line layout helper is safe. Backing preserves existing poison.
+    auto const START = reinterpret_cast<uintptr_t>(__kernel_image_start);
+    auto const END = reinterpret_cast<uintptr_t>(__kernel_end);
+    if (START < 0xffff800000000000ULL || END <= START || !ensure_shadow_backing(reinterpret_cast<const void*>(START), END - START)) {
+        log::error("cannot back permanent kernel image shadow (start=0x%lx end=0x%lx)", START, END);
+        hcf();
+    }
     log::info("initialized (shadow base=0x%lx)", SHADOW_OFFSET);
 }
 
