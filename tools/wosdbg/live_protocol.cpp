@@ -992,9 +992,6 @@ class GdbRspAdapter::Impl final {
                 capabilities.qxfer_wos_images_read = true;
             }
         }
-        if (!capabilities.qxfer_features_read) {
-            fail(ProtocolErrorCode::Unsupported, "GDB RSP target does not support qXfer:features:read");
-        }
         if (names.contains("QStartNoAckMode")) {
             const auto FEATURE = std::ranges::find_if(FEATURES, [](const QByteArray& value) { return value == "QStartNoAckMode+"; });
             if (FEATURE != FEATURES.end()) {
@@ -1048,6 +1045,9 @@ class GdbRspAdapter::Impl final {
     }
 
     auto load_layout(const OperationContext& context) -> QVector<RegisterDescriptor> {
+        if (!capabilities.qxfer_features_read) {
+            fail(ProtocolErrorCode::Unsupported, "GDB RSP target does not support qXfer:features:read");
+        }
         if (layout_loaded) {
             return layout;
         }
@@ -1148,6 +1148,11 @@ auto GdbRspAdapter::operator=(GdbRspAdapter&&) noexcept -> GdbRspAdapter& = defa
 
 void GdbRspAdapter::connect(const OperationContext& context) {
     close();
+    impl->capabilities = RspCapabilities{};
+    impl->capabilities.packet_size = impl->limits.max_packet_bytes;
+    impl->root_description.clear();
+    impl->layout.clear();
+    impl->layout_loaded = false;
     const QHostAddress HOST(impl->address);
     impl->socket.connectToHost(HOST, impl->port, QIODevice::ReadWrite);
     while (impl->socket.state() != QAbstractSocket::ConnectedState) {

@@ -267,11 +267,20 @@ class FakeRsp:
     )
     REGISTER_BYTES = bytes.fromhex("44332211" "0020000000000000" "3412000000000000" "0200")
 
-    def __init__(self, build_id: str, *, fault: str | None = None, raw_kernel_base: int | None = None, entry_offset: int = 0x1234) -> None:
+    def __init__(
+        self,
+        build_id: str,
+        *,
+        fault: str | None = None,
+        raw_kernel_base: int | None = None,
+        entry_offset: int = 0x1234,
+        advertise_target_description: bool = True,
+    ) -> None:
         self.build_id = build_id
         self.fault = fault
         self.raw_kernel_base = raw_kernel_base
         self.entry_offset = entry_offset
+        self.advertise_target_description = advertise_target_description
         self.commands: list[str] = []
         self.error: BaseException | None = None
         self._stop = threading.Event()
@@ -349,9 +358,12 @@ class FakeRsp:
     def response(self, command: str) -> bytes:
         if command.startswith("qSupported:"):
             images = b"" if self.raw_kernel_base is not None else b";qXfer:wos-images:read+"
-            return b"PacketSize=2000;qXfer:features:read+;QStartNoAckMode+" + images
+            features = b";qXfer:features:read+" if self.advertise_target_description else b""
+            return b"PacketSize=2000" + features + b";QStartNoAckMode+" + images
         if command == "QStartNoAckMode":
             return b"OK"
+        if command.startswith("qXfer:features:read:"):
+            require(self.advertise_target_description, "target XML requested without an advertised description")
         if command.startswith("qXfer:features:read:target.xml:"):
             return self.xfer(command, self.TARGET_XML)
         if command.startswith("qXfer:features:read:dynamic-core.xml:"):
@@ -840,6 +852,95 @@ def run_raw_qemu_relocation(binary: Path, build_id: str, timeout: float) -> None
             assert_qmp_lease(qmp, owned=True)
 
 
+def run_memory_only(binary: Path, build_id: str, timeout: float) -> None:
+    for raw_metadata in (False, True):
+        source = "raw-metadata" if raw_metadata else "image-catalog"
+        with tempfile.TemporaryDirectory(prefix=f"wosdbg-live-memory-only-{source}-") as raw_root:
+            root = Path(raw_root)
+            load_base = 0xFFFFFFFF92000000 if raw_metadata else 0
+            text_offset = 0x1000
+            target_id = "memory-only"
+            qmp = FakeQmp(root / "qmp.sock", running=True)
+            rsp = FakeRsp(
+                build_id,
+                raw_kernel_base=load_base if raw_metadata else None,
+                entry_offset=text_offset,
+                advertise_target_description=False,
+            )
+            try:
+                write_config(root, [runtime_target(target_id, "6", qmp, rsp, binary, build_id)], binary)
+                session = {"sessionId": "$open.sessionId", "leaseToken": "$open.leaseToken"}
+                target = {**session, "targetId": target_id}
+                memory = {**target, "length": 8, "confirmation": "READ_SENSITIVE_LIVE_MEMORY"}
+                status, results = invoke_batch(
+                    binary,
+                    cwd=root,
+                    timeout=timeout,
+                    calls=[
+                        call("discover", "discover_live_targets"),
+                        call("open", "open_live_session", open_arguments(targetId=target_id)),
+                        call("resolve", "resolve_live_address", {**target, "address": hex(load_base + text_offset)}),
+                        call("memory_before", "read_live_memory", {**memory, "address": "0x1000"}),
+                        call("registers", "read_live_registers", target),
+                        call("backtrace", "backtrace_live", target),
+                        call("memory_after", "read_live_memory", {**memory, "address": "0x1020"}),
+                        call("close", "close_live_session", session),
+                        call("after", "list_live_sessions"),
+                    ],
+                )
+                require(status == 1, f"{source}: register-specific failures did not fail the batch")
+                for label in ("discover", "open", "resolve", "memory_before", "memory_after", "close", "after"):
+                    success(results[label], f"{source} memory-only {label}")
+                opened = results["open"].get("targets", [{}])[0]
+                require(opened.get("remoteBuildId") == build_id, f"{source}: build ID mismatch: {opened}")
+                require(opened.get("symbolsQuarantined") is False, f"{source}: matching symbols quarantined: {opened}")
+                resolved = results["resolve"]
+                require(resolved.get("verified") is True, f"{source}: address identity was not verified: {resolved}")
+                require(
+                    int(str(resolved.get("objectAddress")), 16) == text_offset,
+                    f"{source}: wrong resolved object address: {resolved}",
+                )
+                for label, start in (("memory_before", 0), ("memory_after", 0x20)):
+                    payload = bytes(range(start, start + 8))
+                    require(
+                        results[label].get("data") == base64.b64encode(payload).decode("ascii"),
+                        f"{source}: {label} payload mismatch",
+                    )
+                    require(results[label].get("sha256") == hashlib.sha256(payload).hexdigest(), f"{source}: {label} digest mismatch")
+                for label in ("registers", "backtrace"):
+                    require(results[label].get("ok") is False, f"{source}: {label} unexpectedly succeeded")
+                    require(
+                        results[label].get("errorCode") == "protocol_failure",
+                        f"{source}: {label} did not report protocol failure: {results[label]}",
+                    )
+                require(
+                    not any(
+                        command.startswith("qXfer:features:read:") or command == "g" or command.startswith("p")
+                        for command in rsp.commands
+                    ),
+                    f"{source}: featureless peer received XML/register traffic: {rsp.commands}",
+                )
+                if raw_metadata:
+                    require(
+                        any(command.startswith(f"m{KERNEL_DEBUG_METADATA_ADDRESS:x},") for command in rsp.commands),
+                        f"{source}: fixed136-byte kernel metadata was not read",
+                    )
+                    require(
+                        not any(command.startswith("qXfer:wos-images:read::") for command in rsp.commands),
+                        f"{source}: unexpected image-catalog request",
+                    )
+                else:
+                    require(
+                        any(command.startswith("qXfer:wos-images:read::") for command in rsp.commands),
+                        f"{source}: image catalog was not read",
+                    )
+                require(results["after"].get("sessionCount") == 0, f"{source}: closed session remained listed")
+            finally:
+                rsp.close()
+                qmp.close()
+            assert_qmp_lease(qmp, owned=True)
+
+
 def run_initially_paused(binary: Path, build_id: str, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="wosdbg-live-paused-") as raw_root:
         root = Path(raw_root)
@@ -951,7 +1052,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--wosdbg", type=Path, default=DEFAULT_WOSDBG, help="WOSDBG executable to exercise")
     parser.add_argument(
         "--mode",
-        choices=("all", "happy", "raw-qemu", "paused", "rollback", "faults"),
+        choices=("all", "happy", "raw-qemu", "memory-only", "paused", "rollback", "faults"),
         default="all",
         help="bounded scenario group to run",
     )
@@ -980,6 +1081,8 @@ def main(argv: list[str]) -> int:
         run_happy(binary, build_id, args.timeout)
     if args.mode in {"all", "raw-qemu"}:
         run_raw_qemu_relocation(binary, build_id, args.timeout)
+    if args.mode in {"all", "memory-only"}:
+        run_memory_only(binary, build_id, args.timeout)
     if args.mode in {"all", "paused"}:
         run_initially_paused(binary, build_id, args.timeout)
     if args.mode in {"all", "rollback"}:

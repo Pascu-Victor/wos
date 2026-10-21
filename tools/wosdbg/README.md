@@ -304,6 +304,10 @@ Every operation, memory response, transcript, target count, and lease has a
 configured bound. Transcript payloads are hashed/redacted unless explicitly
 requested with the documented sensitive-data confirmation.
 
+Targets without a register description can still provide memory reads and
+verified image identities. Register reads and backtraces require an advertised
+`qXfer:features:read` description; WOSDBG never guesses a register layout.
+
 `get_live_source` and `inspect_live_pte` use only build-ID-verified kernel
 symbols; the PTE walk reads at most one x86-64 paging chain through WOS's HHDM.
 `capture_live_incident` takes `confirmation=CAPTURE_LIVE_INCIDENT`, records
