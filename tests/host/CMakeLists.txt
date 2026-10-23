@@ -120,6 +120,12 @@ wos_add_fuzz_target(block_request_model_fuzz
 # ---------------------------------------------------------------------------
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME owned_command_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/owned_command_runtime_test.py
+)
+set_tests_properties(owned_command_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 60
+)
 add_test(NAME block_wait_poll_predicate_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_wait_poll_predicate_test.py
 )

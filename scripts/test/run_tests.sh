@@ -98,6 +98,7 @@ timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 
 FUZZ_TARGETS=(wki_wire_fuzz wki_rdma_protocol_fuzz data_struct_fuzz tcp_fuzz tcp_sender_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz block_request_model_fuzz dmar_fuzz pci_ecam_fuzz)
 UNIT_TESTS=(
+    owned_command_runtime_test
     credential_model_test
     credential_policy_audit_test
     wki_resource_contract_test
