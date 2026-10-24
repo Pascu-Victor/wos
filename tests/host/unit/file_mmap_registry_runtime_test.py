@@ -403,7 +403,22 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
 
 
 def allocated(path: Path) -> int:
-    return sum(p.stat().st_blocks * 512 for p in path.rglob("*") if p.is_file())
+    """Count scratch blocks while children create and remove temporary entries."""
+    def walk_error(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    try:
+        total = path.lstat().st_blocks * 512
+    except FileNotFoundError:
+        return 0
+    for parent, dirs, files in os.walk(path, followlinks=False, onerror=walk_error):
+        for name in [*dirs, *files]:
+            try:
+                total += (Path(parent) / name).lstat().st_blocks * 512
+            except FileNotFoundError:
+                continue
+    return total
 
 
 def subreaper() -> None:
