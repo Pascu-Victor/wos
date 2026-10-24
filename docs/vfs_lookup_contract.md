@@ -16,11 +16,14 @@ performs the operation before releasing the publication lock. A successful
 namespace mutation advances `g_vfs_namespace_generation` while still
 serialized. Callers release a stale handle before a bounded `-EAGAIN` retry.
 
-Task-aware open and stat keep their four optimistic attempts. After contention
-exhausts them, an eligible host-native TMPFS/XFS walk can retain the publication
-mutex through acquisition and consumption. The shared serialized helper carries
-the original OPEN or STAT intent, admitted credentials and final-follow policy;
-STAT does not prepare an open directory view or allocate a descriptor. Private
+Task-aware open, stat and unlink/rmdir keep their four optimistic attempts.
+After contention exhausts them, an eligible host-native TMPFS/XFS walk can retain
+the publication mutex through acquisition and consumption. The shared serialized
+helper carries the original OPEN, STAT or REMOVE intent, admitted credentials and final-follow
+policy. REMOVE preserves NOFOLLOW_FINAL and the directory requirement, and
+publishes its successful namespace mutation. STAT and REMOVE do not prepare an
+open directory view or allocate a descriptor. Remote REMOVE returns its first
+RPC result without retrying it through this fallback. Private
 namespaces and unsupported backends keep their transient refusal. Mount,
 authorization and backend validation still apply, so serialization does not
 promise that every independent transient failure succeeds. Captured references

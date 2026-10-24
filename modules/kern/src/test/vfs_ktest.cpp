@@ -413,6 +413,10 @@ KTEST(VFS, TmpfsStatatNamespaceRecovery) { KEXPECT_TRUE(ker::vfs::vfs_selftest_s
 
 KTEST(VFS, XfsStatatNamespaceRecovery) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_namespace_recovery(true)); }
 
+KTEST(VFS, TmpfsUnlinkatNamespaceRecovery) { KEXPECT_TRUE(ker::vfs::vfs_selftest_unlinkat_namespace_recovery(false)); }
+
+KTEST(VFS, XfsUnlinkatNamespaceRecovery) { KEXPECT_TRUE(ker::vfs::vfs_selftest_unlinkat_namespace_recovery(true)); }
+
 KTEST(VFS, StatatDirfdMetadataCache) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_dirfd_metadata_cache()); }
 
 KTEST(VFS, StatatAtFdcwdUsesSuppliedTask) { KEXPECT_TRUE(ker::vfs::vfs_selftest_statat_at_fdcwd_uses_supplied_task()); }

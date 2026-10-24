@@ -305,6 +305,13 @@ if(WOS_HOST_TEST_DISABLE_LSAN)
     set_property(TEST vfs_metadata_batch_runtime_test APPEND PROPERTY ENVIRONMENT
         "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
 endif()
+add_test(NAME vfs_unlink_progress_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_unlink_progress_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(vfs_unlink_progress_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 60
+)
 
 wos_add_unit_test(dmar_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/dmar_test.cpp

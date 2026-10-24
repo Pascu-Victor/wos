@@ -13630,8 +13630,8 @@ auto acquire_confined_owner_lookup(ker::mod::sched::task::Task& task, const ker:
 // held. The walker declines other backends before opening or reading them.
 auto native_lookup_serialized(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, LookupIntent intent,
                               LookupFollowPolicy follow_policy, bool require_directory, bool apply_task_route, LookupConsumer consumer,
-                              void* context, const ker::mod::security::Snapshot* admitted_credentials, DirectoryViewRef* directory_view)
-    -> int {
+                              void* context, const ker::mod::security::Snapshot* admitted_credentials, DirectoryViewRef* directory_view,
+                              bool namespace_mutation = false) -> int {
     if (task == nullptr) return -ESRCH;
     auto const REQUEST_CREDENTIALS = admitted_credentials != nullptr ? *admitted_credentials : task->credentials();
     if (directory_view != nullptr && *directory_view) return -EINVAL;
@@ -13647,7 +13647,7 @@ auto native_lookup_serialized(ker::mod::sched::task::Task* task, int dirfd, cons
         int const PREPARE = prepare_open_directory_view_locked(*task, REQUEST_CREDENTIALS, lookup, pin, *directory_view);
         if (PREPARE != 0) return PREPARE;
     }
-    return consume_lookup_locked(lookup, false, consumer, context, task, &REQUEST_CREDENTIALS);
+    return consume_lookup_locked(lookup, namespace_mutation, consumer, context, task, &REQUEST_CREDENTIALS);
 }
 
 auto open_local_serialized(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, LookupFollowPolicy follow_policy,
@@ -19251,6 +19251,12 @@ auto vfs_rmdir(const char* path) -> int {
     return vfs_rmdir_resolved_path(current_metadata_credentials(), path_buf.data(), path_buf_len, path_buf_hash);
 }
 
+namespace {
+#ifdef WOS_SELFTEST
+void (*unlinkat_lookup_test_hook)(ker::mod::sched::task::Task&, const LookupHandle&) = nullptr;
+#endif
+}  // namespace
+
 auto vfs_unlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags) -> int {
     if (task == nullptr) {
         return -ESRCH;
@@ -19321,19 +19327,28 @@ auto vfs_unlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* path
         int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::REMOVE, LookupFollowPolicy::NOFOLLOW_FINAL,
                                                (flags & AT_REMOVEDIR) != 0, true, &lookup, 0, false, &REQUEST_CREDENTIALS);
         if (acquire != 0) {
-            if (acquire == -EAGAIN && attempt != 3) {
+            if (acquire == -EAGAIN) {
                 continue;
             }
             return acquire;
         }
         if (lookup.mount()->fs_type == FSType::REMOTE) return consume_unlink(lookup, &context);
+#ifdef WOS_SELFTEST
+        if (unlinkat_lookup_test_hook != nullptr) unlinkat_lookup_test_hook(*task, lookup);
+#endif
         ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
         int const result = consume_lookup_locked(lookup, true, consume_unlink, &context, task, &REQUEST_CREDENTIALS);
-        if (result != -EAGAIN || attempt == 3) {
+        if (result != -EAGAIN) {
             return result;
         }
     }
-    return -EAGAIN;
+    // Unrelated namespace publication must not exhaust native REMOVE progress.
+    // Release every optimistic handle/guard before the serialized fresh walk;
+    // preserve private scopes and never replay a remote operation here.
+    auto const* scope = task->mount_namespace();
+    if (scope == nullptr || !scope->is_host()) return -EAGAIN;
+    return native_lookup_serialized(task, dirfd, pathname, LookupIntent::REMOVE, LookupFollowPolicy::NOFOLLOW_FINAL,
+                                    (flags & AT_REMOVEDIR) != 0, true, consume_unlink, &context, &REQUEST_CREDENTIALS, nullptr, true);
 }
 
 namespace {
@@ -26055,6 +26070,177 @@ auto vfs_selftest_statat_namespace_recovery(bool disk) -> bool {
         query(-1, TARGET, 0, 0, 4, &expected) && query(AT_FDCWD, "/dev/null", 0, -EAGAIN, 4, nullptr);
     bool const CLEAN = cleanup.finish();
     return OK && CLEAN;
+}
+
+auto vfs_selftest_unlinkat_namespace_recovery(bool disk) -> bool {
+    using Task = ker::mod::sched::task::Task;
+    constexpr const char* BASE = "/tmp/ktest_remove_recovery";
+    constexpr const char* FILE_PATH = "/tmp/ktest_remove_recovery/file";
+    constexpr const char* DIRECTORY = "/tmp/ktest_remove_recovery/directory";
+    constexpr const char* CHILD = "/tmp/ktest_remove_recovery/directory/child";
+    constexpr const char* LINK = "/tmp/ktest_remove_recovery/link";
+    constexpr const char* CHURN = "/tmp/ktest_remove_recovery/churn";
+    auto check = [](bool okay, int line) {
+        if (!okay) log::warn("remove namespace recovery check failed at {}", line);
+        return okay;
+    };
+    if (!check(unlinkat_lookup_test_hook == nullptr, __LINE__)) return false;
+    Task task{};
+    struct Cleanup {
+        Task& task;
+        File* directory = nullptr;
+        int fd = -1;
+        bool base_created = false, mounted = false, finished = false;
+        bool file_owned = false, directory_owned = false, child_owned = false, link_owned = false, churn_owned = false;
+        auto finish() -> bool {
+            unlinkat_lookup_test_hook = nullptr;
+            bool okay = true;
+            if (fd >= 0) {
+                okay = vfs_release_fd(&task, fd) == 0;
+                fd = -1;
+            }
+            if (directory != nullptr) {
+                vfs_put_file(directory);
+                directory = nullptr;
+            }
+            if (mounted) {
+                auto remove = [&](const char* path, bool owned, bool is_directory = false) {
+                    if (!owned) return;
+                    int const RESULT = is_directory ? vfs_rmdir(path) : vfs_unlink(path);
+                    okay = (RESULT == 0 || RESULT == -ENOENT) && okay;
+                };
+                remove(CHURN, churn_owned);
+                remove(LINK, link_owned);
+                remove(CHILD, child_owned);
+                remove(FILE_PATH, file_owned);
+                remove(DIRECTORY, directory_owned, true);
+                int const UNMOUNT = unmount_filesystem(BASE);
+                mounted = UNMOUNT != 0;
+                okay = UNMOUNT == 0 && okay;
+            }
+            if (base_created && !mounted) okay = vfs_rmdir(BASE) == 0 && okay;
+            finished = true;
+            return okay && !mounted && task.fd_table.empty();
+        }
+        ~Cleanup() {
+            if (!finished) static_cast<void>(finish());
+        }
+    } cleanup{.task = task};
+    if (!check(vfs_mkdir(BASE, 0755) == 0, __LINE__)) return false;
+    cleanup.base_created = true;
+    auto* device = disk ? ker::dev::block_device_find_by_name("sdb2") : nullptr;
+    if (!check((!disk || device != nullptr) && mount_filesystem(BASE, disk ? "xfs" : "tmpfs", device) == 0, __LINE__)) return false;
+    cleanup.mounted = true;
+    if (!check(vfs_selftest_initialize_task_paths(task), __LINE__)) return false;
+    cleanup.directory = vfs_open_file(BASE, O_DIRECTORY, 0);
+    if (!check(cleanup.directory != nullptr, __LINE__)) return false;
+    cleanup.fd = vfs_alloc_fd(&task, cleanup.directory);
+    if (!check(cleanup.fd >= 0, __LINE__)) return false;
+    auto const FD_COUNT = task.fd_table.size();
+    auto seed_file = [&](const char* path, bool& owned) {
+        File* file = vfs_open_file(path, O_CREAT | O_EXCL | 2, 0600);
+        if (file == nullptr) return false;
+        owned = true;
+        vfs_put_file(file);
+        return true;
+    };
+    auto seed_directory = [&]() {
+        if (vfs_mkdir(DIRECTORY, 0700) != 0) return false;
+        cleanup.directory_owned = true;
+        return true;
+    };
+    struct State {
+        Task* task;
+        Cleanup* cleanup;
+        const char* selected = nullptr;
+        ker::mod::security::Snapshot credentials{};
+        Stat expected{};
+        uint64_t last_generation = 0;
+        unsigned calls = 0;
+        bool require_directory = false, okay = true;
+    } state{.task = &task, .cleanup = &cleanup};
+    static State* active = nullptr;
+    active = &state;
+    struct Reset {
+        ~Reset() {
+            unlinkat_lookup_test_hook = nullptr;
+            active = nullptr;
+        }
+    } reset;
+    auto invalidate = +[](Task& actor, const LookupHandle& lookup) {
+        auto& state = *active;
+        ++state.calls;
+        if (&actor != state.task || lookup.intent() != LookupIntent::REMOVE || state.calls > 4 ||
+            lookup.follow_policy() != LookupFollowPolicy::NOFOLLOW_FINAL || lookup.requires_directory() != state.require_directory ||
+            lookup.authorization().credentials != state.credentials) {
+            state.okay = false;
+            return;
+        }
+        // Real unrelated native mutation invalidates each optimistic handle.
+        // The hook is absent from the serialized path and disabled for churn.
+        auto const SAVED = unlinkat_lookup_test_hook;
+        unlinkat_lookup_test_hook = nullptr;
+        auto const BEFORE = g_vfs_namespace_generation.load(std::memory_order_acquire);
+        File* created = vfs_open_file(CHURN, O_CREAT | O_EXCL | 2, 0600);
+        if (created != nullptr) {
+            state.cleanup->churn_owned = true;
+            vfs_put_file(created);
+        }
+        int const REMOVE = created != nullptr ? vfs_unlink(CHURN) : -EIO;
+        if (REMOVE == 0) state.cleanup->churn_owned = false;
+        state.last_generation = g_vfs_namespace_generation.load(std::memory_order_acquire);
+        Stat present{};
+        int const PRESENT = vfs_lstat(state.selected, &present);
+        state.okay &= lookup.namespace_generation() == BEFORE && created != nullptr && REMOVE == 0 && state.last_generation > BEFORE &&
+                      PRESENT == 0 && present.st_ino == state.expected.st_ino &&
+                      (present.st_mode & S_IFMT) == (state.expected.st_mode & S_IFMT);
+        unlinkat_lookup_test_hook = SAVED;
+    };
+    auto query = [&](int dirfd, const char* path, const char* selected, int flags, int wanted, unsigned mutations) {
+        std::array<char, MAX_PATH_LEN> input{}, original{};
+        if (copy_path_string(path, input.data(), input.size()) != 0) return false;
+        original = input;
+        state.selected = selected;
+        state.credentials = task.credentials();
+        state.expected = {};
+        int const PRESENT_BEFORE = vfs_lstat(selected, &state.expected);
+        state.last_generation = g_vfs_namespace_generation.load(std::memory_order_acquire);
+        state.calls = 0;
+        state.require_directory = (flags & AT_REMOVEDIR) != 0 || path_requires_directory(path);
+        state.okay = true;
+        unlinkat_lookup_test_hook = invalidate;
+        int const RESULT = vfs_unlinkat(&task, dirfd, input.data(), flags);
+        unlinkat_lookup_test_hook = nullptr;
+        auto const AFTER = g_vfs_namespace_generation.load(std::memory_order_acquire);
+        Stat remaining{};
+        int const PRESENT_AFTER = vfs_lstat(selected, &remaining);
+        bool const TARGET = wanted == 0 ? PRESENT_BEFORE == 0 && PRESENT_AFTER == -ENOENT
+                                        : PRESENT_AFTER == PRESENT_BEFORE &&
+                                              (PRESENT_BEFORE != 0 || (remaining.st_ino == state.expected.st_ino &&
+                                                                       (remaining.st_mode & S_IFMT) == (state.expected.st_mode & S_IFMT)));
+        return check(RESULT == wanted && state.calls == mutations && state.okay && TARGET && input == original &&
+                         AFTER == state.last_generation + (wanted == 0 ? 1 : 0) && task.credentials() == state.credentials &&
+                         task.fd_table.size() == FD_COUNT && vfs_get_file(&task, cleanup.fd) == cleanup.directory,
+                     __LINE__);
+    };
+    bool okay = seed_file(FILE_PATH, cleanup.file_owned) && query(AT_FDCWD, FILE_PATH, FILE_PATH, 0, 0, 4) &&
+                seed_file(FILE_PATH, cleanup.file_owned) && query(cleanup.fd, "file", FILE_PATH, 0, 0, 4) && seed_directory() &&
+                query(AT_FDCWD, DIRECTORY, DIRECTORY, AT_REMOVEDIR, 0, 4) && seed_directory() &&
+                query(cleanup.fd, "directory", DIRECTORY, AT_REMOVEDIR, 0, 4) && seed_file(FILE_PATH, cleanup.file_owned);
+    if (okay) {
+        int const LINK_RESULT = vfs_symlink("file", LINK);
+        cleanup.link_owned = LINK_RESULT == 0;
+        Stat target_before{}, target_after{};
+        okay = LINK_RESULT == 0 && vfs_lstat(FILE_PATH, &target_before) == 0 &&
+               query(cleanup.fd, "link", LINK, AT_REMOVEDIR, -ENOTDIR, 0) && query(cleanup.fd, "link", LINK, 0, 0, 4) &&
+               vfs_lstat(FILE_PATH, &target_after) == 0 && target_before.st_ino == target_after.st_ino &&
+               query(cleanup.fd, "file/", FILE_PATH, 0, -ENOTDIR, 0) && query(-1, "file", FILE_PATH, 0, -EBADF, 0) &&
+               query(cleanup.fd, "missing", "/tmp/ktest_remove_recovery/missing", 0, -ENOENT, 0) &&
+               query(-1, FILE_PATH, FILE_PATH, 0, 0, 4) && seed_directory() && seed_file(CHILD, cleanup.child_owned) &&
+               query(cleanup.fd, "directory", DIRECTORY, AT_REMOVEDIR, -ENOTEMPTY, 4);
+    }
+    bool const CLEAN = cleanup.finish();
+    return okay && CLEAN;
 }
 
 auto vfs_selftest_statat_dirfd_metadata_cache() -> bool {
