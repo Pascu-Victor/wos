@@ -64,7 +64,7 @@ def main():
     audit=source_root/'scripts/test/runtime_test_audit.py'
     init_root=args.root.resolve()/'modules/init/src'
     init_sources=[init_root/'services.cpp',init_root/'supervisor_model.h',init_root/'service_manifest.h',
-                  args.root.resolve()/'configs/wos-services-uma-reference.conf']
+                  source_root/'configs/wos-services-uma-reference.conf',init_root/'supervisor_model.cpp',init_root/'service_manifest.cpp']
     sources = [owner, header, catalog, cases, suite, Path(__file__), helper_path, baseline,abi,decoder,audit]+support+init_sources
     spec=importlib.util.spec_from_file_location('uma_whole_arm_decoder',decoder)
     codec=importlib.util.module_from_spec(spec);spec.loader.exec_module(codec)
@@ -183,7 +183,7 @@ def main():
         objects=[]
         units=[('owner',owner,None),('arm',support[0],None),('stamp',support[2],None),('host',support[3],None),
                ('controller',support[4],'uma_controller_main'),('observer',support[5],'uma_witness_main'),('cases',cases,None),
-               ('aggregate',aggregate,None)]
+               ('aggregate',aggregate,None),('supervisor',init_root/'supervisor_model.cpp',None),('manifest',init_root/'service_manifest.cpp',None)]
         for label,source,rename in units:
             obj=scratch/(label+'.o');objects.append(obj)
             extra=['-Dmain='+rename]if rename else[]
@@ -199,23 +199,25 @@ def main():
         def tree(mode):
             root=scratch/mode
             root.with_suffix('.clock').write_text(clock)
+            root.with_suffix('.services').write_bytes((source_root/'configs/wos-services-uma-reference.conf').read_bytes())
             return root
-        for mode in ('validators','consumed','positive','pending-exec','eintr','cancel','child-refuse','bad-warm','bad-init','storm'):
+        for mode in ('validators','consumed','positive','pending-exec','eintr','cancel','child-refuse','bad-warm','bad-init','storm','pending-final','bad-final'):
             case_root=tree(mode)
             text=command('arm-'+mode,[binary,mode,case_root])
             check(mode+' actual compiled controller/audit/observer assertions',
                   re.search(r'ARM_CASE mode='+mode+r' checks=[1-9][0-9]* failures=0\n',text)is not None)
-            if mode=='pending-exec':
-                check('actual pending observer reaches final0', 'PENDING_EXEC_OBSERVER_EXIT=0\n'in text)
+            if mode in ('pending-exec','pending-final'):
+                if mode=='pending-exec':check('actual pending observer reaches final0', 'PENDING_EXEC_OBSERVER_EXIT=0\n'in text)
                 shutil.copyfile(case_root/'host-poweroff.txt',out/'pending-host-poweroff.txt')
                 (case_root/'host-poweroff.txt').unlink()
                 codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
                 check('pending path publishes only final strict saved wire',True)
+                if mode=='pending-final':check('actual pending finalizer reaches0','PENDING_FINALIZER_EXIT=0\n'in text)
             if mode=='positive':
                 shutil.copyfile(case_root/'host-poweroff.txt',out/'actual-host-poweroff.txt')
                 (case_root/'host-poweroff.txt').unlink()
                 result=codec.decode_complete_arm(case_root,'0123456789abcdef0123456789abcdef',audit_source=audit,suite_source=suite,uid=os.getuid(),gid=os.getgid())
-                check('actual Host raw234/initial/consumed/controller/observer joins',result['init_exit']['sequence']>result['init_start']['sequence'])
+                check('actual Host raw234/initial/consumed/controller/observer joins',result['init_exit']['sequence']>result['init_start']['sequence'] and result['init_final']['sequence']>result['init_exit']['sequence'])
                 controls=[('consumed-readiness',case_root/'init-exit.bin',lambda raw:raw[:64+6*256+68]+(1).to_bytes(4,'little')+raw[64+6*256+72:]),
                           ('raw-completion-CR',case_root/'completion.txt',lambda raw:raw[:-1]+b'\r'),
                           ('source-work-fallback',case_root/'warmup/logs/make_large_file.log',lambda raw:raw.replace(b'using /dev/zero',b'using /dev/none')),
@@ -241,6 +243,15 @@ def main():
                     ('testd-active',case_root/'init-exit.bin',lambda raw:wire_field(raw,5,64,'<I',3)),
                     ('controller-nonzero',case_root/'init-exit.bin',lambda raw:wire_field(raw,6,112,'<i',1)),
                     ('observer-text-join',case_root/'init-exit.txt',lambda raw:raw.replace((' observer='+str(observer)+' ').encode(),(' observer='+str(observer+1)+' ').encode())),
+                ])
+                controls.extend([
+                    ('unstarted-finalizer-STARTING',case_root/'init-exit.bin',lambda raw:wire_field(raw,8,64,'<I',2)),
+                    ('witness-still-running',case_root/'init-final.bin',lambda raw:wire_field(raw,7,64,'<I',3)),
+                    ('witness-final-nonzero',case_root/'init-final.bin',lambda raw:wire_field(raw,7,112,'<i',1)),
+                    ('witness-final-restart',case_root/'init-final.bin',lambda raw:wire_field(raw,7,104,'<Q',1)),
+                    ('finalizer-already-exited',case_root/'init-final.bin',lambda raw:wire_field(raw,8,64,'<I',6)),
+                    ('window-renewed-service-deadline',case_root/'witness-window.txt',lambda raw:re.sub(rb'deadline=[0-9]+',b'deadline='+str(struct.unpack_from('<Q',final_raw,64+7*256+128)[0]).encode(),raw)),
+                    ('final-deadline-text-join',case_root/'init-final.txt',lambda raw:re.sub(rb'deadline=([0-9]+)',lambda m:b'deadline='+str(int(m[1])+1).encode(),raw)),
                 ])
                 for label,path,mutate in controls:
                     old=path.read_bytes();path.write_bytes(mutate(old))

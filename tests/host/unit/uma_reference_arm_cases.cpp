@@ -12,6 +12,8 @@
 #include <cstring>
 #include <string>
 
+#include "service_manifest.h"
+#include "supervisor_model.h"
 #include "uma_reference_arm.hpp"
 #include "uma_reference_catalog.hpp"
 #include "uma_reference_owner.hpp"
@@ -22,6 +24,8 @@ extern auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot&) -> in
 extern void uma_arm_host_complete(ker::abi::init_control::StatusSnapshot&, pid_t);
 extern void uma_arm_host_state(ker::abi::init_control::StatusSnapshot&);
 extern void uma_arm_host_pending(ker::abi::init_control::StatusSnapshot&);
+extern void uma_arm_host_witness_complete(ker::abi::init_control::StatusSnapshot&, pid_t);
+extern void uma_arm_host_final_pending(ker::abi::init_control::StatusSnapshot&);
 namespace {
 namespace arm = uma_reference::arm;
 unsigned checks{}, failures{}, consuming{}, interrupted{};
@@ -152,12 +156,12 @@ void validators() {
     }
     arm::init::StatusSnapshot s{};
     arm::init::ServiceStatus selected{};
-    check(uma_arm_host_snapshot(s) == 0 && arm::snapshot_valid(s, selected), "actual whole8 wire positive");
+    check(uma_arm_host_snapshot(s) == 0 && arm::snapshot_valid(s, selected), "actual whole9 wire positive");
     for (unsigned i = 0; i < 10; ++i) {
         auto x = s;
         switch (i) {
             case 0:
-                x.service_count = 7;
+                x.service_count = 8;
                 break;
             case 1:
                 x.reserved[0] = 1;
@@ -349,6 +353,92 @@ void consumed_rows() {
     check(!arm::consumed(s, ::getpid() + 1), "actual caller PID must own observer row");
 }
 
+
+void finalized_rows() {
+    arm::init::StatusSnapshot earlier{};
+    check(uma_arm_host_snapshot(earlier) == 0, "actual nine-row initial snapshot");
+    uma_arm_host_complete(earlier, ::getpid());
+    auto final = earlier;
+    ++final.published_mono_ns;
+    pid_t const FINALIZER = ::getpid() + 1;
+    uma_arm_host_witness_complete(final, FINALIZER);
+    uint64_t const BOUND = earlier.services[7].deadline_mono_ns - 1;
+    check(arm::witness_consumed(final, earlier, FINALIZER, BOUND), "two consumed raw0 rows with live finalizer positive");
+    check(final.services[8].state == arm::init::ServiceState::RUNNING &&
+              arm::witness_consumed(final, earlier, FINALIZER, BOUND), "finalizer own consumption is not recursive proof");
+    auto pending = final;
+    uma_arm_host_final_pending(pending);
+    check(arm::witness_awaiting_exec(pending, earlier, FINALIZER, BOUND) &&
+              !arm::witness_consumed(pending, earlier, FINALIZER, BOUND), "pending finalizer EXEC is polling only");
+    for (unsigned i = 0; i < 17; ++i) {
+        auto bad = final;
+        switch (i) {
+            case 0: bad.services[7].state = arm::init::ServiceState::RUNNING; break;
+            case 1: bad.services[7].readiness = arm::init::ReadinessState::NOT_READY; break;
+            case 2: bad.services[7].last_wait_status = 1; break;
+            case 3: bad.services[7].generation = 2; break;
+            case 4: bad.services[7].restart_count = 1; break;
+            case 5: bad.services[7].pid = ::getpid(); break;
+            case 6: bad.services[7].deadline_mono_ns = BOUND; break;
+            case 7: bad.services[7].history[0].reason = arm::init::TransitionReason::SPAWN; break;
+            case 8: bad.services[8].pid = FINALIZER + 1; break;
+            case 9: bad.services[8].generation = 2; break;
+            case 10: bad.services[8].deadline_mono_ns++; break;
+            case 11: bad.services[6].last_wait_status = 1; break;
+            case 12: bad.services[0].pid++; break;
+            case 13: bad.published_mono_ns = BOUND; break;
+            case 14: bad.sequence = earlier.sequence; break;
+            case 15: bad.services[8].history[0].from_state = arm::init::ServiceState::WAITING; break;
+            case 16: bad.services[8].history[0].timestamp_mono_ns++; break;
+        }
+        check(!arm::witness_consumed(bad, earlier, FINALIZER, BOUND), "actual dual-consumed validator rejects mutation");
+    }
+    check(!arm::witness_consumed(final, earlier, FINALIZER, earlier.services[7].deadline_mono_ns + 1),
+          "original bound cannot exceed witness service deadline");
+    check(!arm::witness_consumed(final, earlier, FINALIZER + 1, BOUND), "finalizer caller identity must match");
+}
+void dependency_gate() {
+    namespace model = wos::init;
+    std::array<char, model::MAX_MANIFEST_BYTES + 1> bytes{};
+    std::string path = root + ".services";
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    ssize_t n = fd < 0 ? -1 : ::read(fd, bytes.data(), bytes.size());
+    if (fd >= 0) ::close(fd);
+    model::ServiceManifest manifest{};
+    model::ServiceTopology topology{};
+    bool const PARSED = n > 0 && size_t(n) < bytes.size() &&
+                        bool(model::parse_service_manifest(std::span(bytes.data(), size_t(n)), manifest)) &&
+                        bool(model::validate_service_manifest(manifest, topology));
+    check(PARSED && manifest.service_count == 9, "actual corrected nine-service manifest parses");
+    if (!PARSED || manifest.service_count != 9) return;
+    model::SupervisorModel state{};
+    std::array<model::EnablementResult, model::MAX_SERVICES> enabled{};
+    enabled.fill(model::EnablementResult::CONDITION_MET);
+    check(model::initialize_supervisor(state, manifest, topology, std::span(enabled.data(), manifest.service_count), 1) ==
+              model::SupervisorResult::OK, "actual supervisor initializes corrected manifest");
+    unsigned witness = 99, finalizer = 99;
+    for (unsigned i = 0; i < manifest.service_count; ++i) {
+        if (manifest.services[i].name.view() == arm::OBSERVER) witness = i;
+        if (manifest.services[i].name.view() == arm::FINALIZER) finalizer = i;
+        state.services[i].state = model::ServiceState::READY;
+    }
+    check(witness < 9 && finalizer < 9 &&
+              (manifest.services[finalizer].dependency_mask & (1U << witness)), "actual finalizer depends on original witness");
+    if (witness >= 9 || finalizer >= 9) return;
+    auto& original = state.services[witness];
+    original.state = model::ServiceState::RUNNING;
+    check(!model::supervisor_dependencies_satisfied(state, uint8_t(finalizer)), "live witness does not release finalizer");
+    original.state = model::ServiceState::EXITED;
+    original.completion_success = false;
+    original.quiesced = true;
+    check(!model::supervisor_dependencies_satisfied(state, uint8_t(finalizer)), "nonzero witness does not release finalizer");
+    original.completion_success = true;
+    original.quiesced = false;
+    check(!model::supervisor_dependencies_satisfied(state, uint8_t(finalizer)), "reaped but unquiesced witness does not release finalizer");
+    original.quiesced = true;
+    check(model::supervisor_dependencies_satisfied(state, uint8_t(finalizer)), "consumed successful quiescent witness releases finalizer");
+}
+
 }  // namespace
 auto uma_owner_host_waitpid(pid_t pid, int* raw, int options) -> pid_t {
     if (after_consume) {
@@ -404,9 +494,17 @@ auto main(int argc, char** argv) -> int {
     if (argc >= 2 && !std::strcmp(argv[1], "--suite")) return suite(argc, argv);
     if (argc == 3 && !std::strcmp(argv[1], "--observe-only")) {
         ::setenv("WOS_UMA_TEST_ROOT", argv[2], 1);
+        ::setenv("UMA_HOST_LATE_EXEC", "1", 1);
         char* observe[]{argv[0], const_cast<char*>("--observe"), const_cast<char*>("--nonce"),
                         const_cast<char*>("0123456789abcdef0123456789abcdef"), nullptr};
         return uma_witness_main(4, observe);
+    }
+    if (argc == 3 && !std::strcmp(argv[1], "--finalize-only")) {
+        ::setenv("WOS_UMA_TEST_ROOT", argv[2], 1);
+        ::setenv("UMA_HOST_FINALIZE", "1", 1);
+        char* finalize[]{argv[0], const_cast<char*>("--finalize"), const_cast<char*>("--nonce"),
+                         const_cast<char*>("0123456789abcdef0123456789abcdef"), nullptr};
+        return uma_witness_main(4, finalize);
     }
     if (argc != 3) return 2;
     executable = argv[0];
@@ -415,8 +513,10 @@ auto main(int argc, char** argv) -> int {
     const char* mode = argv[1];
     if (!std::strcmp(mode, "validators")) {
         validators();
+        dependency_gate();
     } else if (!std::strcmp(mode, "consumed")) {
         consumed_rows();
+        finalized_rows();
     } else {
         ::setenv("WOS_UMA_TEST_ROOT", root.c_str(), 1);
         ::setenv("USER", "root", 1);
@@ -467,8 +567,46 @@ auto main(int argc, char** argv) -> int {
             int observed = got == observer && WIFEXITED(raw) ? WEXITSTATUS(raw) : -1;
             if (!std::strcmp(mode, "pending-exec")) std::fprintf(stderr, "PENDING_EXEC_OBSERVER_EXIT=%d\n", observed);
             check(observed == (!std::strcmp(mode, "bad-init") ? 82 : 0), "actual independent observer enforces consumed READY");
-            check(present(root + "/host-poweroff.txt") == (std::strcmp(mode, "bad-init") != 0),
-                  "only validated observer requests Host-only poweroff seam");
+            check(!present(root + "/host-poweroff.txt") && !present(root + "/host-observe-poweroff-attempt.txt"),
+                  "actual observer returns0 without any poweroff request");
+            if (observed == 0) {
+                arm::init::StatusSnapshot earlier{};
+                size_t size{};
+                std::array<char, 512> window{};
+                unsigned long long observer_pid{}, entered{}, bound{};
+                std::array<char, 33> window_nonce{};
+                bool const WINDOW = arm::read("init-exit.bin", &earlier, sizeof(earlier), size) && size == sizeof(earlier) &&
+                                    arm::read("witness-window.txt", window.data(), window.size(), size) &&
+                                    std::sscanf(window.data(), "UMA_WITNESS_WINDOW v=2 nonce=%32[0-9a-f] observer=%llu entered=%llu deadline=%llu",
+                                                window_nonce.data(), &observer_pid, &entered, &bound) == 4;
+                check(WINDOW && observer_pid == uint64_t(observer) && bound == entered + arm::MARGIN &&
+                          bound < earlier.services[7].deadline_mono_ns, "original observer entry precedes EXEC and bounds finalizer");
+                if (!std::strcmp(mode, "pending-final")) ::setenv("UMA_HOST_PENDING_FINAL", "1", 1);
+                if (!std::strcmp(mode, "bad-final")) ::setenv("UMA_HOST_BAD_FINAL", "1", 1);
+                pid_t finalizer = ::fork();
+                if (finalizer == 0) {
+                    ::execl(argv[0], argv[0], "--finalize-only", root.c_str(), static_cast<char*>(nullptr));
+                    ::_exit(96);
+                }
+                uint64_t until{};
+                if (!arm::now(until)) return 95;
+                until += 2 * arm::SECOND;
+                int final_raw = -1;
+                pid_t final_got = 0;
+                while (finalizer > 1 && final_got == 0) {
+                    final_got = ::waitpid(finalizer, &final_raw, WNOHANG);
+                    if (final_got < 0 && errno == EINTR) { final_got = 0; continue; }
+                    uint64_t tick{};
+                    if (!arm::now(tick) || tick >= until) break;
+                    if (!final_got) ::usleep(1000);
+                }
+                int const FINAL_EXIT = final_got == finalizer && WIFEXITED(final_raw) ? WEXITSTATUS(final_raw) : -1;
+                if (!std::strcmp(mode, "pending-final")) std::fprintf(stderr, "PENDING_FINALIZER_EXIT=%d\n", FINAL_EXIT);
+                bool const EXPECTED = std::strcmp(mode, "bad-final") != 0;
+                check(FINAL_EXIT == (EXPECTED ? 0 : 92), "actual independent finalizer validates original witness consumption");
+                check(present(root + "/host-poweroff.txt") == EXPECTED && present(root + "/init-final.bin") == EXPECTED &&
+                          present(root + "/init-final.txt") == EXPECTED, "only finalizer with saved dual-consumed proof requests poweroff");
+            }
         }
     }
     std::printf("ARM_CASE mode=%s checks=%u failures=%u\n", mode, checks, failures);

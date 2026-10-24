@@ -239,12 +239,13 @@ def decode_arm(root, nonce, deadline, warmup_suite, measure_suite, uid=0, gid=0)
 # here qualifies saved guest evidence only: kernel/bundle identity, natural OS
 # stop, Linux readback, image pruning and physical-zero remain outer gates.
 SERVICES = ('journald','dropbear-keygen','netd','httpd','dropbear','testd',
-            'uma-reference','uma-reference-exit-witness')
+            'uma-reference','uma-reference-exit-witness','uma-reference-finalizer')
 COMPLETE_NUMBERS = ('controller','warm','measure','init_deadline','work_stop',
                     'warm_first','warm_last','measure_first','measure_last','res',
                     'warm_transport','measure_transport','warm_output','measure_output')
 META = {'init-start.bin':4160,'init-exit.bin':4160,'clock-before.txt':4095,
-        'clock-after.txt':4095,'completion.txt':1535,'init-exit.txt':511}
+        'clock-after.txt':4095,'completion.txt':1535,'init-exit.txt':511,'witness-window.txt':511,
+        'init-final.bin':4160,'init-final.txt':511}
 
 def strict_meta(path,limit,uid,gid):
     # Reading may legitimately update atime. Every ownership/identity/content
@@ -263,15 +264,15 @@ def strict_meta(path,limit,uid,gid):
     if len(raw)!=before.st_size or identity(path.lstat())!=identity(before):raise ValueError('metadata changed')
     return raw
 
-def init_wire(data,final=False):
+def init_wire(data,final=False,finalizer=False,prior=None,original_deadline=None):
     import struct
     if len(data)!=4160:raise ValueError('complete4160 wire')
     h=struct.unpack_from('<4I2Q2I3Q',data)
-    if h[0:2]!=(4160,1)or h[2]not in(1,2)or h[3]or not h[4]or not h[5]or h[6]!=8 or any(h[7:]):raise ValueError('eight-service init header')
+    if h[0:2]!=(4160,1)or h[2]not in(1,2)or h[3]or not h[4]or not h[5]or h[6]!=9 or any(h[7:]):raise ValueError('nine-service corrected init header')
     seen=set();selected=None;services={}
     for i in range(16):
         raw=data[64+i*256:64+(i+1)*256]
-        if i>=8:
+        if i>=9:
             if any(raw):raise ValueError('unused init row')
             continue
         f=struct.unpack_from('<64s4IqqQQiiQQII2Q',raw)
@@ -294,15 +295,15 @@ def init_wire(data,final=False):
                 previous=stamp;history.append(t)
         services[name]=dict(state=state,ready=ready,flags=flags,pid=pid,pgid=pgid,generation=generation,restarts=restarts,wait=wait,error=error,since=since,deadline=deadline,history=history)
         if name=='uma-reference':
-            if final:
+            if final or finalizer:
                 if h[2]!=1 or(state,ready,flags,pid,pgid,generation,restarts,wait,error,deadline)!=(6,2,3,-1,-1,1,0,0,0,0)or not any(t[3]==5 and t[2]==6 and t[0]>=since for t in history):raise ValueError('actual consumed EXITED/READY/raw0')
             else:
                 if(state,ready,flags,generation,restarts,wait,error)!=(3,1,3,1,0,0,0)or pid<=1 or pgid!=pid or deadline-since!=600_000_000_000 or not any(t[3]==3 and t[2]==3 and t[0]==since for t in history):raise ValueError('actual EXEC600s authority')
             selected=dict(pid=pid,deadline=deadline,since=since)
     if seen!=set(SERVICES)or selected is None:raise ValueError('complete init services')
     if final:
-        # The live exit-witness is the sole unfinished oneshot behind STARTING.
-        # All other rows must match the actual manifest's settled dispositions.
+        # Exact live witness plus its unstarted dependent finalizer; neither
+        # initialized wait0 is credited as consumption.
         def history(row,reason,state):
             return any(t[3]==reason and t[2]==state and t[0]==row['since']for t in row['history'])
         observer=services['uma-reference-exit-witness']
@@ -313,13 +314,33 @@ def init_wire(data,final=False):
             if name=='uma-reference':continue
             if name=='uma-reference-exit-witness':
                 if(row['state'],row['ready'],row['flags'],row['generation'],row['pgid'])!=(3,1,3,1,observer_pid)or row['since']<selected['since']or row['deadline']<=row['since']or row['deadline']-row['since']!=30_000_000_000 or h[5]>=row['deadline']or not any(t[3]==3 and t[1:3]==(2,3)and t[0]==row['since']for t in row['history']):raise ValueError('actual observer EXEC30s authority')
+            elif name=='uma-reference-finalizer':
+                if(row['state'],row['ready'],row['flags'],row['generation'],row['pid'],row['pgid'],row['deadline'])!=(1,1,3,0,-1,-1,0)or not history(row,2,1):raise ValueError('unstarted dependent finalizer')
             elif name=='dropbear-keygen':
                 if(row['state'],row['ready'],row['pid'],row['pgid'],row['deadline'])!=(6,2,-1,-1,0)or not((row['generation'],row['flags'])==(0,0)and history(row,2,6)or(row['generation'],row['flags'])==(1,1)and history(row,5,6)):raise ValueError('actual successful or skipped keygen')
             elif name=='testd':
                 if(row['state'],row['ready'],row['flags'],row['generation'],row['pid'],row['pgid'],row['deadline'])!=(8,1,0,0,-1,-1,0)or not history(row,2,8):raise ValueError('actual disabled testd')
             elif(row['state'],row['ready'],row['flags'],row['generation'],row['deadline'])!=(3,2,3,1,0)or row['pid']<=1 or row['pgid']!=row['pid']or row['pid']==observer_pid or not(history(row,3,3)or history(row,4,3)):raise ValueError('actual ready daemon')
         selected['observer']=observer_pid
-    return dict(sequence=h[4],published=h[5],**selected)
+        selected['observer_deadline']=observer['deadline']
+    if finalizer:
+        if prior is None or h[2]!=1 or h[4]<=prior['sequence'] or h[5]<prior['published']:
+            raise ValueError('fresh finalizer publication after original observer snapshot')
+        if type(original_deadline)is not int or not 0<original_deadline<=prior['observer_deadline']:raise ValueError('original witness absolute bound')
+        if h[5]>=original_deadline:raise ValueError('original witness deadline, never a renewed window')
+        observer=services['uma-reference-exit-witness'];actuator=services['uma-reference-finalizer']
+        for name,row in services.items():
+            if row['restarts']or row['wait']or row['error']or any(t[3]in(6,7,8,9)for t in row['history']):raise ValueError('clean final consumed status')
+            if name=='uma-reference-exit-witness':
+                if(row['state'],row['ready'],row['flags'],row['pid'],row['pgid'],row['generation'],row['deadline'])!=(6,2,3,-1,-1,1,0)or row['since']<prior['published']or not any(t[3]==5 and t[2]==6 and t[0]>=row['since']for t in row['history']):raise ValueError('actual original witness consumed EXITED/READY/raw0')
+            elif name=='uma-reference-finalizer':
+                if(row['state'],row['ready'],row['flags'],row['generation'])!=(3,1,3,1)or row['pid']<=1 or row['pid']==prior['observer']or row['pgid']!=row['pid']or row['since']<observer['since']or row['deadline']-row['since']!=30_000_000_000 or h[5]>=row['deadline']or not any(t[3]==3 and t[1:3]==(2,3)and t[0]==row['since']for t in row['history']):raise ValueError('live bounded finalizer actuator, not a claimed consumed0')
+            elif row!=prior['services'][name]:raise ValueError('unchanged controller and other original service rows')
+        selected['observer']=prior['observer']
+        selected['observer_deadline']=prior['observer_deadline']
+        selected['original_deadline']=original_deadline
+        selected['finalizer']=actuator['pid']
+    return dict(sequence=h[4],published=h[5],services=services,**selected)
 
 CLOCK_KEYS=('version','source','invariant_tsc','frequency_hz','resolution_ns','conversion_multiplier','conversion_divisor','calibration_spread_ppm','watchdog_deviation_ns','kvm_registered_cpus','kvm_expected_cpus','kvm_watchdog_checks','rtc_valid','wall_steps','wall_slews','wall_rejected','wall_pending_ns','slew_limit_ppm','process_timer_real_depth','process_timer_wake_depth','process_timer_expirations','process_timer_late_us_max','process_timer_work_budget','clockevent')
 def clock_wire(raw,resolution):
@@ -389,5 +410,13 @@ def decode_complete_arm(root,nonce,*,audit_source,suite_source,uid=0,gid=0):
     if any(clocks[0][key]!=clocks[1][key]for key in stable):raise ValueError('clock source/scale transition')
     status=re.fullmatch(re.escape(f'UMA_INIT_EXIT v=1 nonce={nonce} controller={c["controller"]}')+r' observer=([1-9][0-9]{0,18}) sequence='+str(final['sequence'])+r' state=6 readiness=2 wait=0 error=0 generation=1 restarts=0 history_exit=1 snapshot_bytes=4160\n',blobs['init-exit.txt'].decode('ascii'),re.ASCII)
     if not status or not 1<int(status.group(1))<1<<63 or int(status.group(1))!=final['observer']or int(status.group(1))in(c['controller'],c['warm'],c['measure']):raise ValueError('independent observer raw join')
-    return dict(**result,controller=c,init_start=initial,init_exit=final,clock_before=clocks[0],clock_after=clocks[1],
+    window=re.fullmatch(re.escape(f'UMA_WITNESS_WINDOW v=2 nonce={nonce} observer={final["observer"]} entered=')+r'([1-9][0-9]{0,19}) deadline=([1-9][0-9]{0,19})\n',blobs['witness-window.txt'].decode('ascii'),re.ASCII)
+    if not window:raise ValueError('persisted original witness entry and deadline')
+    entered,original_deadline=map(int,window.groups())
+    if entered>(1<<64)-1-30_000_000_000 or entered<=c['measure_last'] or original_deadline!=min(entered+30_000_000_000,final['observer_deadline']):raise ValueError('exact original local/service minimum, no renewed window')
+    finalized=init_wire(blobs['init-final.bin'],finalizer=True,prior=final,original_deadline=original_deadline)
+    if entered>finalized['published']:raise ValueError('observer entry precedes final proof')
+    closing=re.fullmatch(re.escape(f'UMA_INIT_FINAL v=2 nonce={nonce} controller={c["controller"]} witness={final["observer"]} finalizer={finalized["finalizer"]} sequence={finalized["sequence"]} deadline={original_deadline} controller_wait=0 witness_wait=0 snapshot_bytes=4160\n'),blobs['init-final.txt'].decode('ascii'),re.ASCII)
+    if not closing or finalized['finalizer']in(c['controller'],c['warm'],c['measure'],final['observer']):raise ValueError('both original consumed0 identities before finalizer signal')
+    return dict(**result,controller=c,init_start=initial,init_exit=final,init_final=finalized,clock_before=clocks[0],clock_after=clocks[1],
                 saved_guest_evidence='COMPLETE_REQUIRES_SEPARATE_BUNDLE_NATURAL_STOP_LINUX_READBACK_AND_PHYSICAL_ZERO')

@@ -17,7 +17,8 @@ extern auto uma_arm_host_aggregate(const wos::init::SupervisorModel&) -> ker::ab
 namespace {
 pid_t const original = ::getpid();
 uint64_t since{}, completed_since{};
-unsigned pending_snapshots{};
+unsigned pending_snapshots{}, observer_snapshots{};
+uint64_t late_exec_since{};
 }  // namespace
 auto uma_arm_host_profile(uma_reference::arm::Profile& p, pid_t expected, bool witness) -> bool {
     p = {};
@@ -44,7 +45,7 @@ void uma_arm_host_state(ker::abi::init_control::StatusSnapshot& s) {
     for (size_t i = 0; i < s.service_count; ++i) {
         auto const& row = s.services[i];
         auto& service = value.services[i];
-        service.desired_running = i != 1 && i != 5 && !(i == 6 && row.state == init::ServiceState::EXITED);
+        service.desired_running = i != 1 && i != 5 && !((i == 6 || i == 7) && row.state == init::ServiceState::EXITED);
         switch (row.state) {
             case init::ServiceState::WAITING:
                 service.state = model::ServiceState::WAITING;
@@ -112,6 +113,40 @@ void uma_arm_host_pending(ker::abi::init_control::StatusSnapshot& s) {
                           init::TransitionReason::DEPENDENCY, 0};
     uma_arm_host_state(s);
 }
+void uma_arm_host_witness_complete(ker::abi::init_control::StatusSnapshot& s, pid_t finalizer) {
+    namespace arm = uma_reference::arm;
+    namespace init = arm::init;
+    uint64_t const now = s.published_mono_ns;
+    ++s.sequence;
+    auto& witness = s.services[7];
+    witness.state = init::ServiceState::EXITED;
+    witness.readiness = init::ReadinessState::READY;
+    witness.pid = witness.pgid = -1;
+    witness.deadline_mono_ns = 0;
+    witness.state_since_mono_ns = now;
+    std::memset(witness.history, 0, sizeof(witness.history));
+    witness.history_count = 1;
+    witness.history[0] = {now, init::ServiceState::STOPPING, init::ServiceState::EXITED, init::TransitionReason::EXIT, 0};
+    auto& last = s.services[8];
+    last.state = init::ServiceState::RUNNING;
+    last.readiness = init::ReadinessState::NOT_READY;
+    last.pid = last.pgid = finalizer;
+    last.generation = 1;
+    last.state_since_mono_ns = now;
+    last.deadline_mono_ns = now + arm::MARGIN;
+    std::memset(last.history, 0, sizeof(last.history));
+    last.history_count = 1;
+    last.history[0] = {now, init::ServiceState::STARTING, init::ServiceState::RUNNING, init::TransitionReason::SPAWN, 0};
+    uma_arm_host_state(s);
+}
+void uma_arm_host_final_pending(ker::abi::init_control::StatusSnapshot& s) {
+    namespace init = ker::abi::init_control;
+    auto& last = s.services[8];
+    last.state = init::ServiceState::STARTING;
+    last.history[0] = {last.state_since_mono_ns, init::ServiceState::WAITING, init::ServiceState::STARTING,
+                       init::TransitionReason::DEPENDENCY, 0};
+    uma_arm_host_state(s);
+}
 auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot& s) -> int64_t {
     namespace arm = uma_reference::arm;
     namespace init = arm::init;
@@ -123,7 +158,7 @@ auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot& s) -> int64_t
     s.version = 1;
     s.sequence = 2;
     s.published_mono_ns = now;
-    s.service_count = 8;
+    s.service_count = 9;
     for (size_t i = 0; i < arm::SERVICES.size(); ++i) {
         auto& r = s.services[i];
         std::strcpy(r.service, arm::SERVICES[i]);
@@ -161,14 +196,39 @@ auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot& s) -> int64_t
     witness.pid = witness.pgid = -1;
     witness.generation = 0;
     witness.history[0] = {since, init::ServiceState::UNKNOWN, init::ServiceState::WAITING, init::TransitionReason::START_REQUEST, 0};
-    if (std::getenv("UMA_HOST_CONSUMED")) {
+    auto& finalizer = s.services[8];
+    finalizer.state = init::ServiceState::WAITING;
+    finalizer.readiness = init::ReadinessState::NOT_READY;
+    finalizer.pid = finalizer.pgid = -1;
+    finalizer.generation = 0;
+    finalizer.history[0] = {since, init::ServiceState::UNKNOWN, init::ServiceState::WAITING, init::TransitionReason::START_REQUEST, 0};
+    if (std::getenv("UMA_HOST_FINALIZE")) {
+        size_t size{};
+        if (!arm::read("init-exit.bin", &s, sizeof(s), size) || size != sizeof(s)) return -1;
+        s.published_mono_ns = now;
+        uma_arm_host_witness_complete(s, ::getpid());
+        if (std::getenv("UMA_HOST_PENDING_FINAL") && ++pending_snapshots <= 3) uma_arm_host_final_pending(s);
+        if (std::getenv("UMA_HOST_BAD_FINAL")) s.services[7].last_wait_status = 1;
+    } else if (std::getenv("UMA_HOST_CONSUMED")) {
         size_t size{};
         init::StatusSnapshot initial{};
         if (!arm::read("init-start.bin", &initial, sizeof(initial), size) || size != sizeof(initial)) return -1;
         s = initial;
         s.published_mono_ns = now;
+        bool const LATE_EXEC = std::getenv("UMA_HOST_LATE_EXEC") != nullptr;
+        bool pending = LATE_EXEC && ++observer_snapshots == 1;
+        if (std::getenv("UMA_HOST_PENDING_EXEC") && ++pending_snapshots <= 3) pending = true;
         uma_arm_host_complete(s, ::getpid());
-        if (std::getenv("UMA_HOST_PENDING_EXEC") && ++pending_snapshots <= 3) uma_arm_host_pending(s);
+        // The admission/profile read precedes observe's entry clock. Keep it
+        // pending; publish EXEC only from a later actual Host snapshot time.
+        if (LATE_EXEC && !pending) {
+            if (!late_exec_since) late_exec_since = now;
+            auto& running = s.services[7];
+            running.state_since_mono_ns = late_exec_since;
+            running.deadline_mono_ns = late_exec_since + arm::MARGIN;
+            running.history[0].timestamp_mono_ns = late_exec_since;
+        }
+        if (pending) uma_arm_host_pending(s);
         if (std::getenv("UMA_HOST_BAD_INIT")) s.services[6].readiness = init::ReadinessState::NOT_READY;
     } else {
         uma_arm_host_state(s);
@@ -176,7 +236,18 @@ auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot& s) -> int64_t
     return 0;
 }
 auto uma_arm_host_poweroff() -> bool {
-    if (std::getenv("UMA_HOST_PENDING_EXEC") && pending_snapshots < 4) return false;
+    if (!std::getenv("UMA_HOST_FINALIZE")) {
+        static constexpr char wrong[] = "OBSERVE_POWEROFF_ATTEMPT\n";
+        static_cast<void>(uma_reference::arm::save("host-observe-poweroff-attempt.txt", wrong, sizeof(wrong) - 1));
+        return false;
+    }
+    if (std::getenv("UMA_HOST_PENDING_FINAL") && pending_snapshots < 4) return false;
+    std::array<char, 512> final_text{};
+    ker::abi::init_control::StatusSnapshot final{};
+    size_t bytes{};
+    if (!uma_reference::arm::read("init-final.bin", &final, sizeof(final), bytes) || bytes != sizeof(final) ||
+        !uma_reference::arm::read("init-final.txt", final_text.data(), final_text.size(), bytes) || !bytes)
+        return false;
     static constexpr char text[] = "HOST_ONLY_POWEROFF_REQUEST\n";
     return uma_reference::arm::save("host-poweroff.txt", text, sizeof(text) - 1);
 }

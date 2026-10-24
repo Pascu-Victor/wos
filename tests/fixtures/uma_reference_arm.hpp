@@ -14,8 +14,9 @@ inline constexpr uint64_t SECOND = 1'000'000'000, MARGIN = 30 * SECOND;
 inline constexpr char ROOT[] = "/var/lib/uma-reference";
 inline constexpr char SERVICE[] = "uma-reference";
 inline constexpr char OBSERVER[] = "uma-reference-exit-witness";
-inline constexpr std::array<const char*, 8> SERVICES{"journald", "dropbear-keygen", "netd",  "httpd",
-                                                     "dropbear", "testd",           SERVICE, OBSERVER};
+inline constexpr char FINALIZER[] = "uma-reference-finalizer";
+inline constexpr std::array<const char*, 9> SERVICES{"journald", "dropbear-keygen", "netd",   "httpd",  "dropbear",
+                                                     "testd",    SERVICE,           OBSERVER, FINALIZER};
 
 // Ordinary one-arm lexical owner. The handler only sets caller-owned storage;
 // install never clears it. This object outlives both suite phases and audits.
@@ -48,6 +49,11 @@ struct Profile {
 [[nodiscard]] auto consumed(const init::StatusSnapshot&, pid_t observer) -> bool;
 // Pending exec publication permits only another bounded poll, never final credit.
 [[nodiscard]] auto awaiting_exec(const init::StatusSnapshot&, pid_t observer) -> bool;
+// These require original controller AND witness consumption, never their initialized wait0.
+[[nodiscard]] auto witness_consumed(const init::StatusSnapshot&, const init::StatusSnapshot& earlier, pid_t finalizer,
+                                    uint64_t original_deadline) -> bool;
+[[nodiscard]] auto witness_awaiting_exec(const init::StatusSnapshot&, const init::StatusSnapshot& earlier, pid_t finalizer,
+                                         uint64_t original_deadline) -> bool;
 [[nodiscard]] auto now(uint64_t&) -> bool;
 [[nodiscard]] auto save(const char* name, const void*, size_t) -> bool;
 [[nodiscard]] auto read(const char* name, void*, size_t capacity, size_t& bytes) -> bool;

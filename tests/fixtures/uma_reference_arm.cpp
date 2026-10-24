@@ -326,9 +326,9 @@ auto running(const init::StatusSnapshot& s, pid_t controller, uint64_t& deadline
 namespace {
 auto completed_context(const init::StatusSnapshot& s, pid_t observer, bool pending_exec) -> bool {
     init::ServiceStatus row{};
-    // The enabled exit-witness is itself an unfinished oneshot. Init therefore
-    // correctly publishes STARTING until this observer returns; only its exact
-    // live row may account for that aggregate state.
+    // Witness and its dependent finalizer are unfinished oneshots. This stage
+    // requires the exact live witness and an unstarted finalizer, not success
+    // inferred from either row's initialized wait0.
     if (!snapshot_valid(s, row) || s.state != init::SupervisorState::STARTING || observer <= 1 || row.state != init::ServiceState::EXITED ||
         row.readiness != init::ReadinessState::READY || row.flags != 3 || row.generation != 1 || row.restart_count || row.pid != -1 ||
         row.pgid != -1 || row.last_wait_status || row.last_error || row.deadline_mono_ns)
@@ -356,7 +356,12 @@ auto completed_context(const init::StatusSnapshot& s, pid_t observer, bool pendi
                 return false;
         }
         if (!std::strcmp(service.service, SERVICE)) continue;
-        if (!std::strcmp(service.service, OBSERVER)) {
+        if (!std::strcmp(service.service, FINALIZER)) {
+            if (service.state != init::ServiceState::WAITING || service.readiness != init::ReadinessState::NOT_READY ||
+                service.flags != 3 || service.generation || service.restart_count || service.pid != -1 || service.pgid != -1 ||
+                service.deadline_mono_ns || !history(service, init::TransitionReason::START_REQUEST, init::ServiceState::WAITING))
+                return false;
+        } else if (!std::strcmp(service.service, OBSERVER)) {
             if (service.state != (pending_exec ? init::ServiceState::STARTING : init::ServiceState::RUNNING) ||
                 service.readiness != init::ReadinessState::NOT_READY || service.flags != 3 || service.generation != 1 ||
                 service.pid != observer || service.pgid != observer || service.state_since_mono_ns < row.state_since_mono_ns ||
@@ -397,6 +402,80 @@ auto completed_context(const init::StatusSnapshot& s, pid_t observer, bool pendi
 }  // namespace
 auto consumed(const init::StatusSnapshot& s, pid_t observer) -> bool { return completed_context(s, observer, false); }
 auto awaiting_exec(const init::StatusSnapshot& s, pid_t observer) -> bool { return completed_context(s, observer, true); }
+namespace {
+auto witnessed_context(const init::StatusSnapshot& s, const init::StatusSnapshot& earlier, pid_t finalizer, uint64_t original_deadline,
+                       bool pending_exec) -> bool {
+    init::ServiceStatus selected{}, prior{};
+    if (!snapshot_valid(s, selected) || !snapshot_valid(earlier, prior) || s.state != init::SupervisorState::STARTING ||
+        s.sequence <= earlier.sequence || s.published_mono_ns < earlier.published_mono_ns || finalizer <= 1 || !original_deadline ||
+        s.published_mono_ns >= original_deadline)
+        return false;
+    auto find = [](const init::StatusSnapshot& snapshot, const char* name) -> const init::ServiceStatus* {
+        for (size_t i = 0; i < snapshot.service_count; ++i)
+            if (!std::strcmp(snapshot.services[i].service, name)) return &snapshot.services[i];
+        return nullptr;
+    };
+    auto* old_witness = find(earlier, OBSERVER);
+    if (old_witness == nullptr || old_witness->pid <= 1 || old_witness->pid == finalizer ||
+        original_deadline > old_witness->deadline_mono_ns || !consumed(earlier, pid_t(old_witness->pid)))
+        return false;
+    for (size_t i = 0; i < s.service_count; ++i) {
+        auto const& service = s.services[i];
+        if (service.restart_count || service.last_wait_status || service.last_error) return false;
+        for (size_t j = 0; j < service.history_count; ++j) {
+            auto reason = service.history[j].reason;
+            if (reason == init::TransitionReason::RESTART || reason == init::TransitionReason::STOP_REQUEST ||
+                reason == init::TransitionReason::SHUTDOWN || reason == init::TransitionReason::TIMEOUT)
+                return false;
+        }
+        auto history = [&](init::TransitionReason reason, init::ServiceState state) {
+            for (size_t j = 0; j < service.history_count; ++j)
+                if (service.history[j].reason == reason && service.history[j].to_state == state &&
+                    service.history[j].timestamp_mono_ns >= service.state_since_mono_ns)
+                    return true;
+            return false;
+        };
+        if (!std::strcmp(service.service, OBSERVER)) {
+            if (service.state != init::ServiceState::EXITED || service.readiness != init::ReadinessState::READY || service.flags != 3 ||
+                service.generation != 1 || service.pid != -1 || service.pgid != -1 || service.deadline_mono_ns ||
+                service.state_since_mono_ns < earlier.published_mono_ns ||
+                !history(init::TransitionReason::EXIT, init::ServiceState::EXITED))
+                return false;
+        } else if (!std::strcmp(service.service, FINALIZER)) {
+            bool exec = false;
+            for (size_t j = 0; j < service.history_count; ++j) {
+                auto const& event = service.history[j];
+                if (event.reason == (pending_exec ? init::TransitionReason::DEPENDENCY : init::TransitionReason::SPAWN) &&
+                    event.from_state == (pending_exec ? init::ServiceState::WAITING : init::ServiceState::STARTING) &&
+                    event.to_state == (pending_exec ? init::ServiceState::STARTING : init::ServiceState::RUNNING) &&
+                    event.timestamp_mono_ns == service.state_since_mono_ns)
+                    exec = true;
+            }
+            if (service.state != (pending_exec ? init::ServiceState::STARTING : init::ServiceState::RUNNING) ||
+                service.readiness != init::ReadinessState::NOT_READY || service.flags != 3 || service.generation != 1 ||
+                service.pid != finalizer || service.pgid != finalizer || service.state_since_mono_ns < old_witness->state_since_mono_ns ||
+                service.deadline_mono_ns <= service.state_since_mono_ns ||
+                service.deadline_mono_ns - service.state_since_mono_ns != MARGIN || s.published_mono_ns >= service.deadline_mono_ns ||
+                !exec)
+                return false;
+            auto* exited = find(s, OBSERVER);
+            if (exited == nullptr || service.state_since_mono_ns < exited->state_since_mono_ns) return false;
+        } else {
+            auto* old = find(earlier, service.service);
+            if (old == nullptr || std::memcmp(old, &service, sizeof(service))) return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+auto witness_consumed(const init::StatusSnapshot& s, const init::StatusSnapshot& earlier, pid_t finalizer, uint64_t original_deadline)
+    -> bool {
+    return witnessed_context(s, earlier, finalizer, original_deadline, false);
+}
+auto witness_awaiting_exec(const init::StatusSnapshot& s, const init::StatusSnapshot& earlier, pid_t finalizer, uint64_t original_deadline)
+    -> bool {
+    return witnessed_context(s, earlier, finalizer, original_deadline, true);
+}
 auto now(uint64_t& out) -> bool {
     timespec t{};
     if (::clock_gettime(CLOCK_MONOTONIC, &t) || t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= long(SECOND) ||
