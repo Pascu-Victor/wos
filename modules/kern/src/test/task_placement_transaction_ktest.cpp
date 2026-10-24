@@ -51,3 +51,19 @@ KTEST(TaskPlacementInheritance, ActualQueueTupleAndRefusal) {
 KTEST(TaskPlacementInheritance, FreshChildAndAllowedInitialCpu) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_inherited_placement_initial_eligibility());
 }
+
+namespace ker::mod::sched {
+auto scheduler_selftest_vruntime_origin_metamorphic() -> bool;
+auto scheduler_selftest_vruntime_waiting_clock_transfer() -> bool;
+auto scheduler_selftest_vruntime_worker_batch_clock_transfer() -> bool;
+}  // namespace ker::mod::sched
+
+KTEST(TaskPlacementTransaction, IndependentVirtualClockOrigins) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_vruntime_origin_metamorphic());
+}
+KTEST(TaskPlacementTransaction, WaitingVirtualClockTransfer) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_vruntime_waiting_clock_transfer());
+}
+KTEST(TaskPlacementTransaction, WorkerBatchVirtualClockTransfer) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_vruntime_worker_batch_clock_transfer());
+}

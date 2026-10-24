@@ -1747,6 +1747,15 @@ inline void publish_current_task_boot_exception(RunQueue* rq, task::Task* task) 
     update_current_load_cache(rq, task);
 }
 
+// Run queues have independent virtual-clock origins. This preserves the
+// source-min-relative coordinate, not an exact post-enqueue weighted-average lag.
+inline auto translate_vruntime_origin(int64_t value, int64_t source_min, int64_t target_min) -> int64_t {
+    __int128 const TRANSLATED = static_cast<__int128>(value) - source_min + target_min;
+    if (TRANSLATED > INT64_MAX) return INT64_MAX;
+    if (TRANSLATED < INT64_MIN) return INT64_MIN;
+    return static_cast<int64_t>(TRANSLATED);
+}
+
 // Add a task's EEVDF contribution to the run queue aggregate sums.
 // Call AFTER setting task->vruntime and inserting into the heap.
 inline void add_to_sums(RunQueue* rq, task::Task* t) {
@@ -3017,17 +3026,20 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
         // would then be silently refused (double-insert guard), leaving the
         // task stuck on the victim CPU with a stale cpu field.
         task::Task* stolen = nullptr;
-        run_queues->try_with_lock(VICTIM_CPU, [stealing_cpu, &stolen, N, VICTIM_CPU](RunQueue* victim_rq) {
+        int64_t source_min = 0;
+        run_queues->try_with_lock(VICTIM_CPU, [stealing_cpu, &stolen, &source_min, N, VICTIM_CPU](RunQueue* victim_rq) {
+            source_min = victim_rq->min_vruntime;
             stolen = detach_steal_candidate_in_current_domain_locked(victim_rq, VICTIM_CPU, stealing_cpu, N);
         });
 
         if (stolen != nullptr) {
             // Phase 2: insert into our heap. Victim lock is now released.
             // Our lock is already held by the outer thisCpuLocked - safe to write.
+            stolen->vruntime = translate_vruntime_origin(stolen->vruntime, source_min, our_rq->min_vruntime);
+            stolen->vdeadline = translate_vruntime_origin(stolen->vdeadline, source_min, our_rq->min_vruntime);
             if (stolen->vruntime < our_rq->min_vruntime) {
-                int64_t const DIFF = our_rq->min_vruntime - stolen->vruntime;
+                stolen->vdeadline = translate_vruntime_origin(stolen->vdeadline, stolen->vruntime, our_rq->min_vruntime);
                 stolen->vruntime = our_rq->min_vruntime;
-                stolen->vdeadline += DIFF;
             }
             if (!publish_runnable_task_locked(our_rq, stolen, "work-steal")) {
                 // Insert refused (double-insert guard fired) - task is already
@@ -4252,6 +4264,7 @@ auto commit_task_placement_locked(RunQueue* owner, RunQueue* target, task::Task*
     // Explicit administration overrides old pin/hard/mask, not safety guards.
     if (!task_cross_cpu_migration_decision(subject, owner_cpu, destination, core_count, true).can_migrate) return result;
 
+    int64_t const SOURCE_MIN = owner->min_vruntime;
     bool const DETACHED =
         ownership.runnable ? transition_detach_runnable_locked(owner, subject) : transition_detach_wait_locked(owner, subject);
     if (!DETACHED) {
@@ -4259,7 +4272,9 @@ auto commit_task_placement_locked(RunQueue* owner, RunQueue* target, task::Task*
         return result;
     }
     install_task_placement_policy(subject, destination, core_count, request);
+    subject->vruntime = translate_vruntime_origin(subject->vruntime, SOURCE_MIN, target->min_vruntime);
     if (ownership.waiting) {
+        subject->vdeadline = translate_vruntime_origin(subject->vdeadline, SOURCE_MIN, target->min_vruntime);
         transition_make_waiting_locked(target, subject);
     } else {
         int64_t const FAIR_VRUNTIME = std::max(target->min_vruntime, compute_avg_vruntime(target));
@@ -4519,6 +4534,7 @@ struct KernelWorkerPinPlan {
     RunQueue* owner{};
     RunQueue* target{};
     bool runnable{};
+    int64_t source_min{};
 };
 
 // All affected queues are locked. Admission is read-only, including failures
@@ -4539,6 +4555,7 @@ auto commit_kernel_worker_pins_locked(std::span<KernelWorkerPinPlan> plans, uint
         if (RESERVED && plan.owner != plan.target) return false;
         if (!task_cross_cpu_migration_decision(worker, plan.owner_cpu, plan.request.cpu, core_count, true).can_migrate) return false;
         plan.runnable = plan.owner->runnable_heap.contains(worker);
+        plan.source_min = plan.owner->min_vruntime;
         bool const WAITING = wait_list_contains_locked(plan.owner, worker);
         if (plan.runnable && WAITING) return false;
         if (!RESERVED && !plan.runnable && !WAITING) return false;
@@ -4567,7 +4584,9 @@ auto commit_kernel_worker_pins_locked(std::span<KernelWorkerPinPlan> plans, uint
         worker->store_cpu(plan.request.cpu);
         worker->store_cpu_pinned(true);
         if (plan.owner == plan.target) continue;
+        worker->vruntime = translate_vruntime_origin(worker->vruntime, plan.source_min, plan.target->min_vruntime);
         if (!plan.runnable) {
+            worker->vdeadline = translate_vruntime_origin(worker->vdeadline, plan.source_min, plan.target->min_vruntime);
             transition_make_waiting_locked(plan.target, worker);
             continue;
         }
@@ -7032,6 +7051,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
     bool is_current_on_some_cpu = false;
     uint64_t current_cpu_of_task = UINT64_MAX;
     uint64_t found_owner_cpu = UINT64_MAX;
+    int64_t source_min = 0;
     bool found_and_removed = false;
     ReservedTaskWake reserved_wake{};
 
@@ -7040,7 +7060,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
     if (LAST_CPU < NCPUS_RESCHED) {
         with_event_wake_runqueue_lock(LAST_CPU, diagnostics,
                                       [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu, &found_and_removed,
-                                       &reserved_wake, &cpu_no, LAST_CPU, NCPUS_RESCHED](RunQueue* rq) {
+                                       &reserved_wake, &cpu_no, &source_min, LAST_CPU, NCPUS_RESCHED](RunQueue* rq) {
                                           if (runqueue_task_is_reserved_locked(rq, task)) {
                                               reserved_wake = publish_reserved_task_wakeup_locked(rq, task);
                                               is_current_on_some_cpu = true;
@@ -7056,6 +7076,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
                                               return;
                                           }
                                           cpu_no = cross_cpu_migration_target_or_source(task, LAST_CPU, cpu_no, NCPUS_RESCHED);
+                                          source_min = rq->min_vruntime;
                                           if (IN_WAIT && transition_detach_wait_locked(rq, task)) {
                                               found_owner_cpu = LAST_CPU;
                                               found_and_removed = true;
@@ -7085,7 +7106,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
                 with_event_wake_runqueue_lock(
                     search_cpu, diagnostics,
                     [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu, &found_and_removed, &reserved_wake, &cpu_no,
-                     search_cpu, NCPUS_RESCHED](RunQueue* rq) {
+                     &source_min, search_cpu, NCPUS_RESCHED](RunQueue* rq) {
                         if (found_and_removed || is_current_on_some_cpu) {
                             return;
                         }
@@ -7106,6 +7127,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
                             return;
                         }
                         cpu_no = cross_cpu_migration_target_or_source(task, search_cpu, cpu_no, NCPUS_RESCHED);
+                        source_min = rq->min_vruntime;
                         if (IN_WAIT && transition_detach_wait_locked(rq, task)) {
                             found_owner_cpu = search_cpu;
                             found_and_removed = true;
@@ -7200,8 +7222,9 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
     } else {
         task->store_cpu(cpu_no);
     }
+    bool const REBASE_CLOCK = found_and_removed && found_owner_cpu < NCPUS_RESCHED && found_owner_cpu != cpu_no;
     bool published_runnable = false;
-    with_event_wake_runqueue_lock(cpu_no, diagnostics, [task, cpu_no, &published_runnable](RunQueue* rq) {
+    with_event_wake_runqueue_lock(cpu_no, diagnostics, [task, cpu_no, &published_runnable, REBASE_CLOCK, source_min](RunQueue* rq) {
         // insert_into_dead_list() detaches under every runqueue lock after
         // publishing DEAD. Revalidate while holding the final target lock so
         // a stale waker cannot resurrect a DEAD/GC task after that scan, or a
@@ -7219,6 +7242,9 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
             return;
         }
 
+        if (REBASE_CLOCK) {
+            task->vruntime = translate_vruntime_origin(task->vruntime, source_min, rq->min_vruntime);
+        }
         uint64_t const NOW_US = time::get_us();
         bool const WAS_WAITING = (task->sched_queue == task::Task::sched_queue::WAITING);
         uint64_t const WAKE_AT_US = task->wake_at_us;
@@ -11995,6 +12021,8 @@ auto scheduler_selftest_placement_wait_timer_transfer() -> bool {
     auto expected = fixture.before->tasks[0];
     expected.core.cpu = 1;
     expected.core.cpu_pinned = true;
+    expected.core.vruntime = 110;
+    expected.core.deadline = 1'090;
     expected.core.previous = nullptr;
     expected.core.next = &fixture.tasks[4];
     expected.core.list_owner = &fixture.queue(1)->wait_list;
@@ -12516,6 +12544,208 @@ auto scheduler_selftest_completed_current_wait_refusals() -> bool {
          OWNER->total_weight == static_cast<int64_t>(PER_CPU_HEAP_CAP) * 1024 && OWNER->total_weighted_vruntime == independent_sum &&
          wait_list_contains_locked(OWNER, SUBJECT) && !OWNER->runnable_heap.contains(SUBJECT) && ok;
     compact.lock.unlock_irqrestore(FLAGS);
+    return ok;
+}
+
+namespace {
+auto rebase_native_sums_match(RunQueue* rq) -> bool {
+    int64_t weight = 0;
+    int64_t weighted = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i < rq->runnable_heap.size; ++i) {
+        auto* t = run_heap_entry(rq->runnable_heap, i);
+        ok = t != nullptr && t->heap_index == static_cast<int32_t>(i) && rq->runnable_heap.contains(t) && ok;
+        if (t == nullptr) return false;
+        weight += t->sched_weight;
+        weighted += (t->vruntime - rq->min_vruntime) * static_cast<int64_t>(t->sched_weight);
+    }
+    return ok && rq->total_weight == weight && rq->total_weighted_vruntime == weighted;
+}
+
+// Rebuild real private heaps before shifting their independent clock origins.
+// Literal expected sums below do not use the production translation helper.
+auto prepare_rebase_native_fixture(PlacementNativeFixture& fixture, int64_t source_shift, int64_t target_shift, bool below_floor) -> bool {
+    bool ok = fixture.prepare();
+    uint64_t const FLAGS = fixture.lock.lock_irqsave();
+    for (size_t i = 0; i < 3; ++i) {
+        ok = transition_detach_runnable_locked(fixture.queue(i == 2 ? 1 : 0), &fixture.tasks[i]) && ok;
+    }
+    fixture.queue(0)->min_vruntime = 100 + source_shift;
+    fixture.queue(1)->min_vruntime = 10 + target_shift;
+    fixture.tasks[0].vruntime = (below_floor ? 95 : 117) + source_shift;
+    fixture.tasks[1].vruntime = (below_floor ? 110 : 66) + source_shift;
+    fixture.tasks[2].vruntime = 10 + target_shift;
+    for (size_t i = 0; i < 3; ++i) {
+        auto& t = fixture.tasks[i];
+        t.vdeadline = t.vruntime + (i == 1 ? 2'048'000 : 1'024'000);
+        ok = transition_make_runnable_locked(fixture.queue(i == 2 ? 1 : 0), &t) == RunnableTransitionResult::PUBLISHED && ok;
+    }
+    ok = fixture.queue(0)->total_weight == 1536 && fixture.queue(0)->total_weighted_vruntime == 0 &&
+         fixture.queue(1)->total_weight == 1024 && fixture.queue(1)->total_weighted_vruntime == 0 &&
+         rebase_native_sums_match(fixture.queue(0)) && rebase_native_sums_match(fixture.queue(1)) && ok;
+    fixture.lock.unlock_irqrestore(FLAGS);
+    return ok;
+}
+}  // namespace
+
+auto scheduler_selftest_vruntime_origin_metamorphic() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = translate_vruntime_origin(INT64_MAX, INT64_MIN, 0) == INT64_MAX &&
+              translate_vruntime_origin(INT64_MIN, INT64_MAX, 0) == INT64_MIN &&
+              translate_vruntime_origin(INT64_MAX, INT64_MIN, INT64_MIN) == INT64_MAX &&
+              translate_vruntime_origin(INT64_MIN, INT64_MAX, INT64_MAX) == INT64_MIN;
+    constexpr std::array<int64_t, 3> SHIFTS{0, 10'000'000'000, -10'000'000'000};
+    for (int64_t source_shift : SHIFTS) {
+        for (int64_t target_shift : SHIFTS) {
+            for (bool below_floor : {false, true}) {
+                bool const PREPARED = prepare_rebase_native_fixture(fixture, source_shift, target_shift, below_floor);
+                auto* subject = &fixture.tasks[0];
+                bool const CLAIMED = try_claim_task_placement(subject);
+                uint64_t const FLAGS = fixture.lock.lock_irqsave();
+                fixture.capture_locked();
+                TaskPlacementRequest const MOVE{.kind = TaskPlacementKind::MIGRATE, .target_cpu = 1};
+                auto const RESULT = commit_task_placement_locked(fixture.queue(0), fixture.queue(1), subject, 0, 1, 2, MOVE);
+                auto expected = fixture.before->tasks[0];
+                expected.core.cpu = 1;
+                expected.core.vruntime = (below_floor ? 10 : 27) + target_shift;
+                expected.core.deadline = (below_floor ? 1'024'010 : 1'024'027) + target_shift;
+                expected.core.heap_index = 1;
+                expected.core.migration_diagnostic = encode_migration_diagnostic({.frame_class = task::SavedFrameClass::USER_RETURN,
+                                                                                  .reason = MigrationRejectionReason::NONE,
+                                                                                  .source_cpu = 0,
+                                                                                  .target_cpu = 1});
+                ok = PREPARED && CLAIMED && RESULT.status == 0 && RESULT.runnable && RESULT.target_cpu == 1 &&
+                     placement_native_task_snapshot(*subject) == expected && !fixture.queue(0)->runnable_heap.contains(subject) &&
+                     fixture.queue(1)->runnable_heap.contains(subject) && fixture.queue(0)->total_weight == 512 &&
+                     fixture.queue(0)->total_weighted_vruntime == (below_floor ? 5120 : -17408) && fixture.queue(1)->total_weight == 2048 &&
+                     fixture.queue(1)->total_weighted_vruntime == (below_floor ? 0 : 17408) && rebase_native_sums_match(fixture.queue(0)) &&
+                     rebase_native_sums_match(fixture.queue(1)) && ok;
+                fixture.lock.unlock_irqrestore(FLAGS);
+                ok = placement_finish_without_pending(subject) && ok;
+            }
+            bool const PREPARED = prepare_rebase_native_fixture(fixture, source_shift, target_shift, false);
+            auto* subject = &fixture.tasks[0];
+            bool const CLAIMED = try_claim_task_placement(subject);
+            uint64_t const FLAGS = fixture.lock.lock_irqsave();
+            fixture.capture_locked();
+            TaskPlacementRequest const SAME{.kind = TaskPlacementKind::MIGRATE, .target_cpu = 0};
+            auto const RESULT = commit_task_placement_locked(fixture.queue(0), fixture.queue(0), subject, 0, 0, 2, SAME);
+            ok = PREPARED && CLAIMED && RESULT.status == 0 && fixture.unchanged_locked() && ok;
+            fixture.lock.unlock_irqrestore(FLAGS);
+            ok = placement_finish_without_pending(subject) && ok;
+        }
+    }
+    return ok;
+}
+
+auto scheduler_selftest_vruntime_waiting_clock_transfer() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = true;
+    constexpr std::array<int64_t, 3> SHIFTS{0, 10'000'000'000, -10'000'000'000};
+    for (int64_t source_shift : SHIFTS) {
+        for (int64_t target_shift : SHIFTS) {
+            bool const PREPARED = prepare_rebase_native_fixture(fixture, source_shift, target_shift, false);
+            auto* subject = &fixture.tasks[0];
+            bool const CLAIMED = try_claim_task_placement(subject);
+            uint64_t const FLAGS = fixture.lock.lock_irqsave();
+            fixture.make_waiting_locked(0, 0, 300);
+            fixture.capture_locked();
+            TaskPlacementRequest const MOVE{.kind = TaskPlacementKind::MIGRATE, .target_cpu = 1};
+            auto const RESULT = commit_task_placement_locked(fixture.queue(0), fixture.queue(1), subject, 0, 1, 2, MOVE);
+            auto expected = fixture.before->tasks[0];
+            expected.core.cpu = 1;
+            expected.core.vruntime = 27 + target_shift;
+            expected.core.deadline = 1'024'027 + target_shift;
+            expected.core.list_owner = &fixture.queue(1)->wait_list;
+            ++expected.core.timer_generation;
+            expected.core.migration_diagnostic = encode_migration_diagnostic({.frame_class = task::SavedFrameClass::USER_RETURN,
+                                                                              .reason = MigrationRejectionReason::NONE,
+                                                                              .source_cpu = 0,
+                                                                              .target_cpu = 1});
+            ok = PREPARED && CLAIMED && RESULT.status == 0 && !RESULT.runnable && RESULT.target_cpu == 1 &&
+                 placement_native_task_snapshot(*subject) == expected && wait_list_contains_locked(fixture.queue(1), subject) &&
+                 !wait_list_contains_locked(fixture.queue(0), subject) && fixture.queue(0)->next_wait_deadline_us == 0 &&
+                 fixture.queue(1)->next_wait_deadline_us == 300 && fixture.queue(0)->total_weight == 512 &&
+                 fixture.queue(0)->total_weighted_vruntime == -17408 && fixture.queue(1)->total_weight == 1024 &&
+                 fixture.queue(1)->total_weighted_vruntime == 0 && rebase_native_sums_match(fixture.queue(0)) &&
+                 rebase_native_sums_match(fixture.queue(1)) && ok;
+            fixture.lock.unlock_irqrestore(FLAGS);
+            ok = placement_finish_without_pending(subject) && ok;
+        }
+    }
+    return ok;
+}
+
+auto scheduler_selftest_vruntime_worker_batch_clock_transfer() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = true;
+    constexpr std::array<int64_t, 3> SHIFTS{0, 10'000'000'000, -10'000'000'000};
+    for (int64_t source_shift : SHIFTS) {
+        for (int64_t target_shift : SHIFTS) {
+            bool const PREPARED = fixture.prepare();
+            uint64_t const FLAGS = fixture.lock.lock_irqsave();
+            for (size_t i = 0; i < 3; ++i) {
+                ok = transition_detach_runnable_locked(fixture.queue(i == 2 ? 1 : 0), &fixture.tasks[i]) && ok;
+            }
+            fixture.queue(0)->min_vruntime = 100 + source_shift;
+            fixture.queue(1)->min_vruntime = 10 + target_shift;
+            for (size_t i = 0; i < 5; ++i) {
+                auto& t = fixture.tasks[i];
+                init_pin_test_worker(t, i == 2 || i == 4 ? 1 : 0);
+                t.thread = nullptr;
+                t.sched_weight = i == 1 || i == 4 ? 512 : 1024;
+                t.slice_ns = 1'024'000;
+                t.slice_used_ns = static_cast<uint32_t>(17 + i);
+            }
+            fixture.tasks[0].vruntime = 117 + source_shift;
+            fixture.tasks[1].vruntime = 66 + source_shift;
+            fixture.tasks[2].vruntime = 27 + target_shift;
+            fixture.tasks[3].vruntime = 120 + source_shift;
+            fixture.tasks[4].vruntime = -24 + target_shift;
+            for (size_t i = 0; i < 5; ++i) {
+                auto& t = fixture.tasks[i];
+                t.vdeadline = t.vruntime + (i == 1 || i == 4 ? 2'048'000 : 1'024'000);
+                if (i != 3) {
+                    ok = transition_make_runnable_locked(fixture.queue(i == 2 || i == 4 ? 1 : 0), &t) ==
+                             RunnableTransitionResult::PUBLISHED &&
+                         ok;
+                }
+            }
+            fixture.make_waiting_locked(3, 0, 300);
+            auto expected_waiter = placement_native_task_snapshot(fixture.tasks[3]);
+            expected_waiter.core.cpu = 1;
+            expected_waiter.core.cpu_pinned = true;
+            expected_waiter.core.vruntime = 30 + target_shift;
+            expected_waiter.core.deadline = 1'024'030 + target_shift;
+            expected_waiter.core.list_owner = &fixture.queue(1)->wait_list;
+            ++expected_waiter.core.timer_generation;
+            std::array<KernelWorkerPinPlan, 3> plans{{
+                {.request = {&fixture.tasks[0], 1}, .owner_cpu = 0, .owner = fixture.queue(0), .target = fixture.queue(1)},
+                {.request = {&fixture.tasks[2], 0}, .owner_cpu = 1, .owner = fixture.queue(1), .target = fixture.queue(0)},
+                {.request = {&fixture.tasks[3], 1}, .owner_cpu = 0, .owner = fixture.queue(0), .target = fixture.queue(1)},
+            }};
+            bool const COMMITTED = commit_kernel_worker_pins_locked(plans, 2);
+            ok = PREPARED && COMMITTED && fixture.tasks[0].vruntime == 27 + target_shift &&
+                 fixture.tasks[0].vdeadline == 1'024'027 + target_shift && fixture.tasks[0].slice_used_ns == 17 &&
+                 fixture.tasks[2].vruntime == 117 + source_shift && fixture.tasks[2].vdeadline == 1'024'117 + source_shift &&
+                 fixture.tasks[2].slice_used_ns == 19 && placement_native_task_snapshot(fixture.tasks[3]) == expected_waiter &&
+                 fixture.queue(0)->total_weight == 1536 && fixture.queue(0)->total_weighted_vruntime == 0 &&
+                 fixture.queue(1)->total_weight == 1536 && fixture.queue(1)->total_weighted_vruntime == 0 &&
+                 fixture.queue(0)->next_wait_deadline_us == 0 && fixture.queue(1)->next_wait_deadline_us == 300 &&
+                 rebase_native_sums_match(fixture.queue(0)) && rebase_native_sums_match(fixture.queue(1)) && ok;
+            fixture.queue(1)->current_task = &fixture.tasks[0];
+            update_current_load_cache(fixture.queue(1), &fixture.tasks[0]);
+            fixture.capture_locked();
+            plans[0] = {.request = {&fixture.tasks[0], 1}, .owner_cpu = 1, .owner = fixture.queue(1), .target = fixture.queue(1)};
+            ok = commit_kernel_worker_pins_locked(std::span(plans).first(1), 2) && fixture.unchanged_locked() && ok;
+            fixture.queue(1)->current_task = nullptr;
+            update_current_load_cache(fixture.queue(1), nullptr);
+            fixture.lock.unlock_irqrestore(FLAGS);
+        }
+    }
     return ok;
 }
 
