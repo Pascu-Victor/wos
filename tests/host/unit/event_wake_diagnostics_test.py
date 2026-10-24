@@ -2,6 +2,8 @@
 
 The runqueue callback is a seam; this checks elapsed attribution and unchanged
 wake/coalescing behavior, not the heap implementation or hardware IRQ latency.
+The actual PreemptGuard uses counting endpoints here; the separate leadership
+regression executes the guard transitions and real timer preemption policy.
 """
 
 import os
@@ -13,6 +15,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
 source = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
+header = (ROOT / "modules/kern/src/platform/sched/scheduler.hpp").read_text()
 
 
 def function(name):
@@ -37,6 +40,13 @@ namespace ker::mod::sched {
 namespace time { uint64_t now=1000; unsigned reads=0; uint64_t get_us(){++reads;return now;} }
 namespace cpu { uint64_t current=0; uint64_t current_cpu(){return current;} }
 namespace smt { uint64_t get_core_count(){return 4;} }
+unsigned preempt_depth=0,preempt_entries=0,preempt_exits=0;
+void preempt_disable(){++preempt_depth;++preempt_entries;}
+void preempt_enable(){assert(preempt_depth);--preempt_depth;++preempt_exits;}
+'''
+guard_start = header.index("struct PreemptGuard {")
+code += header[guard_start:header.index("\n};", guard_start) + 3] + "\n"
+code += r'''
 // This adapter only checks CPU ownership at the poke boundary. The separate
 // scheduler_poke_migration_test executes real migration transitions and guards.
 struct MigrationGuard {
@@ -112,6 +122,7 @@ unsigned cases=0;
 void reset(){
  time::now=1000;time::reads=0;cpu::current=0;run_queues=&storage;
  assert(!storage.locked);storage.calls=0;guarded={};requested_passes=1;migrate=false;
+ assert(!preempt_depth);preempt_entries=preempt_exits=0;
  local_pokes=remote_pokes=rejections=passes=0;
  for(auto& rq:storage.rows){rq.cpu_irq_us.store(5);rq.scheduler_timer_interrupts.store(10);}
 }
@@ -122,6 +133,7 @@ void tests(){
   wake_task_from_event(&t,EventWakeDeferredSwitch::CANCEL,enabled?&d:nullptr);
   assert(t.wakeup_pending.load()&&t.deferred_task_switch==proxy);
   assert(!t.reschedule_pending.load()&&!t.reschedule_in_progress.load());
+  assert(!preempt_depth&&preempt_entries==1&&preempt_exits==1);
   assert(passes==n&&storage.calls==n&&local_pokes+remote_pokes==n);
   assert(local_pokes==(target==0?n:0)&&remote_pokes==(target==2?n:0));
   assert(time::now==1007+60*n);

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>  // NOLINT(misc-include-cleaner): placement new declares the RunQueue selftest storage lifetime.
+#include <optional>
 #include <platform/ktime/process_timer.hpp>
 #include <platform/ktime/timer_queue.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -4414,7 +4415,11 @@ auto apply_task_placement_request(task::Task* subject, const TaskPlacementReques
     if ((request.kind == TaskPlacementKind::MIGRATE || request.kind == TaskPlacementKind::PIN) && request.target_cpu >= CORE_COUNT)
         return result;
     bool claimed = false;
+    std::optional<PreemptGuard> leadership_guard;
     auto commit = [&] {
+        // The publication mutex may sleep. Protect the executor only after
+        // acquiring it, but before claiming leadership, through the final drain.
+        leadership_guard.emplace();
         if (!try_claim_task_placement(subject)) return;
         claimed = true;
         result = commit_task_placement_request(subject, CORE_COUNT, request);
@@ -7313,6 +7318,9 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task, EventWakeDiagnos
     if (task == nullptr || run_queues == nullptr) {
         return;
     }
+    // A ptrace stop can park this executor at the next timer interrupt. Keep
+    // its producer stack runnable until every owned request has been released.
+    PreemptGuard const LEADERSHIP_GUARD;
     uint64_t const START = event_wake_clock(diagnostics);
     bool const LEADER = queue_reschedule_request(task, cpu_no);
     if (diagnostics != nullptr) {

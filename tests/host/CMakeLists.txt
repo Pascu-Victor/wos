@@ -1508,6 +1508,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_wait_accounting_runtime_test.py
 )
 add_test(
+    NAME reschedule_leader_preemption_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/reschedule_leader_preemption_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(reschedule_leader_preemption_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 150
+)
+add_test(
     NAME thread_backing_zero_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/thread_backing_zero_test.py
 )
