@@ -1884,6 +1884,19 @@ inline auto pick_best_daemon_eligible_for_switch_locked(RunQueue* rq, int64_t av
 
 inline auto park_job_control_stopped_task_locked(RunQueue* rq, task::Task* task) -> bool;
 
+inline auto current_halted_wait_needs_alternate(task::Task const* current_task) -> bool {
+    if (current_task == nullptr || !current_task->is_voluntary_blocked() || current_task->wakeup_pending.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // Wake producers can clear block/deadline metadata before the saved wait
+    // continuation resumes and clears voluntary_block. Let that ready owner
+    // keep its natural EEVDF win, including across an early return-path IRQ.
+    // kern_yield has no block/deadline, but still needs to dispatch a peer.
+    return current_task->wants_block || current_task->wake_at_us != 0 ||
+           (current_task->wait_channel_is(task::WaitChannelKind::GENERIC) && current_task->wait_channel != nullptr &&
+            std::strcmp(current_task->wait_channel, "kern_yield") == 0);
+}
+
 inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vruntime, task::Task const* current_task) -> task::Task* {
     if (rq == nullptr || rq->runnable_heap.size == 0) {
         return nullptr;
@@ -1891,8 +1904,7 @@ inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vrunt
 
     while (rq->runnable_heap.size != 0) {
         task::Task* next = rq->runnable_heap.pick_best_eligible(avg_vruntime);
-        if (next == current_task && current_task != nullptr && current_task->is_voluntary_blocked() &&
-            !current_task->wakeup_pending.load(std::memory_order_acquire) && rq->runnable_heap.size > 1) {
+        if (next == current_task && current_halted_wait_needs_alternate(current_task) && rq->runnable_heap.size > 1) {
             task::Task* alternate = pick_best_eligible_excluding_locked(rq, avg_vruntime, current_task);
             if (alternate != nullptr) {
                 next = alternate;

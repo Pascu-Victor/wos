@@ -41,6 +41,7 @@ PRELUDE = r'''
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 namespace ker::mod::time {uint64_t now=100;uint64_t get_us(){return now;}}
 namespace ker::mod::dbg {
@@ -58,7 +59,7 @@ bool irq_enabled=true,query_ready=true;
 unsigned guard_depth=0;
 namespace task {
 enum class TaskType {PROCESS,DAEMON,IDLE};
-enum class WaitChannelKind {GENERIC,LOCAL_PIPE};
+enum class WaitChannelKind {NONE=0,GENERIC=1,LOCAL_PIPE=2,WAITPID=4};
 enum class TaskState {ACTIVE,DEAD,EXITING};
 struct Task {
  TaskType type=TaskType::PROCESS;int sched_nice=0;HEAP_INDEX_DECLARATION
@@ -71,6 +72,8 @@ struct Task {
  uint32_t sched_weight=1024,slice_ns=10000000,slice_used_ns=0;
  int64_t vruntime=0,vdeadline=10000000;
  bool blocked=false,wants_block=false;
+ const char* wait_channel=nullptr;
+ WaitChannelKind wait_channel_kind=WaitChannelKind::NONE;
  uint64_t wake_at_us=0,perf_wait_callsite=0;
  uint64_t syscall_account_start_us=0,precharged_syscall_time_us=0;
  uint64_t user_time_us=0,system_time_us=0;
@@ -78,8 +81,11 @@ struct Task {
  struct {uint64_t cpu_time_us=0,cpu_user_time_us=0,cpu_system_time_us=0;} resources;
  bool is_voluntary_blocked() const{return blocked;}
  void set_voluntary_blocked(bool b){blocked=b;}
- void set_wait_channel(const char*,WaitChannelKind=WaitChannelKind::GENERIC){}
- void clear_wait_channel(){}
+ void set_wait_channel(const char* channel,WaitChannelKind kind=WaitChannelKind::GENERIC){
+  wait_channel=channel;wait_channel_kind=channel!=nullptr?kind:WaitChannelKind::NONE;
+ }
+ void clear_wait_channel(){set_wait_channel(nullptr,WaitChannelKind::NONE);}
+ bool wait_channel_is(WaitChannelKind kind) const{return wait_channel!=nullptr&&wait_channel_kind==kind;}
 };
 }
 }
@@ -338,8 +344,10 @@ void woken_wait_continuation(){
  check(!worker.wakeup_pending.load(std::memory_order_acquire));
  finish_kernel_wait_accounting(&worker,accounting);
  check(!worker.blocked && !worker.wants_block && rq.runnable_heap.contains(&worker));
- // Preserve the old alternate rule for a genuinely unwoken voluntary owner.
+ // A genuine kern_yield remains active without wants_block/deadline/token.
  worker.blocked=true;worker.wakeup_pending.store(false,std::memory_order_release);
+ worker.set_wait_channel("kern_yield");
+ check(!scheduler_wait_should_cancel(&worker,SchedulerHaltWaitKind::YIELD));
  auto* unwoken=q.this_cpu_locked([&](RunQueue* locked){
   return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
  });
@@ -360,6 +368,90 @@ void woken_wait_continuation(){
  check(scheduler_wait_should_cancel(&worker,SchedulerHaltWaitKind::BLOCK));
  worker.blocked=false;
  check(rq.runnable_heap.remove(&parent));check(rq.runnable_heap.remove(&worker));
+}
+'''
+
+
+READY_WAIT_CASES = r'''
+void ready_wait_without_token(task::TaskType type,bool retain_daemon_channel=false){
+ Queues q;task::Task worker,peer;initialise(q,worker,128);auto& rq=q.rows[0];
+ worker.type=type;worker.pid=8;
+ worker.thread=type==task::TaskType::PROCESS?&worker:nullptr;
+ worker.pagemap=type==task::TaskType::PROCESS?&worker:ker::mod::mm::virt::get_kernel_pagemap();
+ worker.vdeadline=1;rq.runnable_heap.update(&worker);
+ peer.pid=106;peer.thread=&peer;peer.pagemap=&peer;peer.heap_index=-1;
+ peer.vruntime=0;peer.vdeadline=2;
+ check(rq.runnable_heap.insert(&peer));rq.total_weight+=peer.sched_weight;
+ irq_enabled=false;
+ worker.set_wait_channel(type==task::TaskType::PROCESS?"waitpid":"kern_sleep",
+  type==task::TaskType::PROCESS?task::WaitChannelKind::WAITPID:task::WaitChannelKind::GENERIC);
+ worker.wants_block=true;worker.wake_at_us=500;
+ auto const accounting=begin_kernel_wait_accounting(&worker);
+ check(!accounting.was_blocked && worker.blocked);
+ // Model the ready publication before the saved wait continuation resumes.
+ // DAEMON event republish clears its channel; timer wake may retain kern_sleep.
+ // PROCESS park retains its channel. Only actual kern_yield needs the alternate.
+ // This is a finite state projection, not execution of a wake or APIC handler.
+ worker.wants_block=false;worker.wake_at_us=0;
+ if(type==task::TaskType::DAEMON && !retain_daemon_channel)worker.clear_wait_channel();
+ auto const channel=worker.wait_channel;auto const channel_kind=worker.wait_channel_kind;
+ auto const vruntime=worker.vruntime,deadline=worker.vdeadline;
+ auto const used=worker.slice_used_ns;
+ for(unsigned early_tick=0;early_tick<64;++early_tick){
+  auto* selected=q.this_cpu_locked([&](RunQueue* locked){
+   return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
+  });
+  check(selected==&worker);
+  check(worker.blocked && !worker.wants_block && !worker.wake_at_us);
+  check(!worker.wakeup_pending.load(std::memory_order_acquire));
+  check(worker.wait_channel==channel && worker.wait_channel_kind==channel_kind);
+  check(worker.vruntime==vruntime && worker.vdeadline==deadline && worker.slice_used_ns==used);
+  check(rq.current_task==&worker && rq.runnable_heap.contains(&worker) && rq.runnable_heap.contains(&peer));
+ }
+ // Ready does not boost priority over a naturally earlier eligible peer.
+ peer.vdeadline=0;rq.runnable_heap.update(&peer);
+ auto* earlier=q.this_cpu_locked([&](RunQueue* locked){
+  return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&worker);
+ });
+ check(earlier==&peer && worker.blocked && !worker.wakeup_pending.load());
+ peer.vdeadline=2;rq.runnable_heap.update(&peer);
+ // Actual non-YIELD cancellation recognizes readiness even with TOKEN=false.
+ check(scheduler_wait_should_cancel(&worker,type==task::TaskType::PROCESS?
+  SchedulerHaltWaitKind::PROCESS_PARK:SchedulerHaltWaitKind::BLOCK));
+ check(!worker.wakeup_pending.load(std::memory_order_acquire));
+ worker.clear_wait_channel(); // Actual wait-wrapper order before accounting finish.
+ finish_kernel_wait_accounting(&worker,accounting);
+ check(!worker.blocked && !worker.wants_block && !worker.wake_at_us);
+ check(worker.wait_channel==nullptr && worker.wait_channel_kind==task::WaitChannelKind::NONE);
+ check(rq.runnable_heap.remove(&peer));check(rq.runnable_heap.remove(&worker));
+}
+
+void active_waits_keep_alternate(task::TaskType type){
+ Queues q;task::Task owner,peer;initialise(q,owner,128);auto& rq=q.rows[0];
+ owner.type=type;owner.thread=type==task::TaskType::PROCESS?&owner:nullptr;
+ owner.pagemap=type==task::TaskType::PROCESS?&owner:ker::mod::mm::virt::get_kernel_pagemap();
+ owner.vdeadline=1;rq.runnable_heap.update(&owner);
+ peer.heap_index=-1;peer.thread=&peer;peer.pagemap=&peer;peer.vdeadline=2;
+ check(rq.runnable_heap.insert(&peer));rq.total_weight+=peer.sched_weight;
+ irq_enabled=false;auto const accounting=begin_kernel_wait_accounting(&owner);
+ for(bool timed:{false,true}){
+  owner.wants_block=!timed;owner.wake_at_us=timed?500:0;
+  auto* alternate=q.this_cpu_locked([&](RunQueue* locked){
+   return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&owner);
+  });
+  check(alternate==&peer && owner.blocked && owner.wants_block==!timed && owner.wake_at_us==(timed?500U:0U));
+  check(!scheduler_wait_should_cancel(&owner,SchedulerHaltWaitKind::BLOCK));
+  owner.wakeup_pending.store(true,std::memory_order_release);
+  auto* pending=q.this_cpu_locked([&](RunQueue* locked){
+   return pick_best_eligible_for_switch_locked(locked,compute_avg_vruntime(locked),&owner);
+  });
+  check(pending==&owner && owner.wakeup_pending.load(std::memory_order_acquire));
+  check(scheduler_wait_should_cancel(&owner,SchedulerHaltWaitKind::BLOCK));
+  check(!owner.wakeup_pending.load(std::memory_order_acquire));
+ }
+ owner.wants_block=false;owner.wake_at_us=0;owner.clear_wait_channel();
+ finish_kernel_wait_accounting(&owner,accounting);check(!owner.blocked);
+ check(rq.runnable_heap.remove(&peer));check(rq.runnable_heap.remove(&owner));
 }
 '''
 
@@ -584,8 +676,12 @@ def main():
     if new:
         # Actual picker and eligibility bodies; no replacement selector is defined.
         names += [('inline auto', 'has_kernel_scheduler_context'), ('inline auto', 'is_publishable_runnable_task'),
-                  ('inline auto', 'run_heap_entry'), ('inline auto', 'pick_best_eligible_excluding_locked'),
-                  ('inline auto', 'pick_best_eligible_for_switch_locked')]
+                  ('inline auto', 'run_heap_entry'), ('inline auto', 'pick_best_eligible_excluding_locked')]
+        # Saved prepatch sources compile their actual old picker and fail the
+        # ready TOKEN=false behavior, rather than a missing-helper extraction.
+        if re.search(r'^inline auto current_halted_wait_needs_alternate\(', source, re.M):
+            names.append(('inline auto', 'current_halted_wait_needs_alternate'))
+        names.append(('inline auto', 'pick_best_eligible_for_switch_locked'))
     bodies = []
     for prefix, name in names:
         # Reject forward declarations; only current definitions are executable evidence.
@@ -628,7 +724,7 @@ def main():
     else:
         code += NEW_CASES
     if new:
-        code += WOKEN_WAIT_CASES
+        code += WOKEN_WAIT_CASES + READY_WAIT_CASES
     if new:
         # Compile the real getter in its own namespace, keeping the old mock.
         getter = block(source, r'^auto get_current_task\([^;{}]*?\)\s*->[^;{]+\{')
@@ -672,7 +768,10 @@ int main(){
   // The controlled migration endpoint models one transfer per pipeline.
   pipeline(kind,weight,tick,enabled,cancel,manual,migration,count);++pipelines;
  }
-''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + ('current_task_capture_fixture::cases();\n' if new else '') + ('percpu_lock_capture_fixture::cases();\n' if new else '') + r'''
+''' + ('boundaries_and_guards();\n' if new else '') + ('woken_wait_continuation();\n' if new else '') + (
+        'for(auto type:{task::TaskType::DAEMON,task::TaskType::PROCESS}){ready_wait_without_token(type);active_waits_keep_alternate(type);}\n'
+        'ready_wait_without_token(task::TaskType::DAEMON,true);\n'
+        if new else '') + ('current_task_capture_fixture::cases();\n' if new else '') + ('percpu_lock_capture_fixture::cases();\n' if new else '') + r'''
  std::printf("actual wait/accounting/RunHeap: %u pipelines, %u assertions PASS\n",pipelines,checks);
 }
 '''
