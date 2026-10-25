@@ -525,7 +525,9 @@ def main() -> int:
     selected_profiles = (options.mremap_policy_only, options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.current_huge_map_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.public_mutation_only, options.public_huge_map_only, options.shm_occupancy_only)
     if sum(selected_profiles) > 1:
         parser.error("select at most one explicit managed memory profile")
-    overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only else OVERALL_SECONDS
+    # Coordinator rollback and compiled mutation controls need the larger Host
+    # compile budget; VM/runtime qualification deadlines are separate.
+    overall_seconds = 180 if options.fork_vm_coordinator_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only else OVERALL_SECONDS
     root = options.source_root.resolve()
     host_build = options.host_build.resolve()
     overlay = options.kernel_overlay.resolve() if options.kernel_overlay else None

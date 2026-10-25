@@ -71,6 +71,12 @@ class ForkVmCoordinator : public ManagedFork {
         child_task.pagemap = child;
         actor.pid = 1;
         host_fork_vm::registry_tries = host_fork_vm::registry_fail_try = 0;
+        host_fork_vm::registry_depth = 0;
+        host_fork_vm::registry_busy_remaining = 0;
+        host_fork_vm::registry_busy_always = false;
+        host_fork_vm::once_calls = host_fork_vm::retry_yields = 0;
+        host_fork_vm::on_registry_try = nullptr;
+        host_fork_vm::on_retry = nullptr;
         host_fork_vm::pubs = 0;
         host_fork_vm::at_final_publication = false;
         host_fork_vm::on_pub = nullptr;
@@ -107,6 +113,10 @@ class ForkVmCoordinator : public ManagedFork {
         fm::host_drain();
     }
     void TearDown() override {
+        host_fork_vm::on_registry_try = nullptr;
+        host_fork_vm::on_retry = nullptr;
+        host_fork_vm::registry_busy_always = false;
+        host_fork_vm::registry_busy_remaining = 0;
         host_fork_vm::enabled = false;
         rollback();
         ker::mod::sched::task::release_lazy_vmem_ranges(actor);
@@ -127,6 +137,7 @@ class ForkVmCoordinator : public ManagedFork {
         ASSERT_EQ(actor.lifetime_refs, 1U);
         ASSERT_EQ(file.refcount.load(), 1);
         ASSERT_EQ(host_fork_vm::locks, 0U);
+        ASSERT_EQ(host_fork_vm::registry_depth, 0U);
         for (auto& entry : shm::g_attachments) entry = {};
         for (auto& entry : shm::g_segments) entry = {};
         // Existing physical fixture owns all PTE references. Reduce child
@@ -138,17 +149,30 @@ class ForkVmCoordinator : public ManagedFork {
         ManagedFork::TearDown();
     }
     auto run(numa::AllocationContext* placement = nullptr, numa::AllocationResult* output = nullptr,
-             huge::RangePrepareWitness* witness = nullptr, ker::syscall::process::detail::ForkVmFailurePoint* point = nullptr) -> int {
+             huge::RangePrepareWitness* witness = nullptr, ker::syscall::process::detail::ForkVmFailurePoint* point = nullptr,
+             vmem::LegacyFileForkPreparation::MatchConflict* conflict = nullptr) -> int {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
         host_fork_vm::enabled = true;
         auto status =
-            ker::syscall::process::detail::prepare_fork_vm_snapshot(actor, child_task, preparation, placement, output, point, witness);
+            ker::syscall::process::detail::prepare_fork_vm_snapshot_once(actor, child_task, preparation, placement, output, point,
+                                                                      witness, conflict);
         host_fork_vm::enabled = false;
         EXPECT_TRUE(host_fork_vm::ordinary());
         EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
         EXPECT_EQ(root_readers, 0U);
         EXPECT_FALSE(host_range::exclusive);
         return status;
+    }
+    auto run_retry(ker::syscall::process::detail::ForkVmFailurePoint* point = nullptr) -> int {
+        ker::mod::sys::SyscallPreparationScope preparation(actor);
+        host_fork_vm::enabled = true;
+        auto const STATUS = ker::syscall::process::detail::prepare_fork_vm_snapshot(actor, child_task, preparation, nullptr, nullptr, point);
+        host_fork_vm::enabled = false;
+        EXPECT_TRUE(host_fork_vm::ordinary());
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+        EXPECT_EQ(root_readers, 0U);
+        EXPECT_FALSE(host_range::exclusive);
+        return STATUS;
     }
     void lazy(uint64_t va, ker::mod::sched::task::LazyVmemKind kind) {
         ker::mod::sched::task::LazyVmemRange row;
@@ -569,3 +593,254 @@ TEST_F(ForkVmCoordinator, GeometryWitnessIsCopiedAfterOwnersAndClearedBeforeOthe
     EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
     EXPECT_EQ(root_readers + publication_depth + cow_depth + pin_depth, 0U);
 }
+
+namespace {
+using MatchConflict = vmem::LegacyFileForkPreparation::MatchConflict;
+using ForkPoint = ker::syscall::process::detail::ForkVmFailurePoint;
+using ForkTask = ker::mod::sched::task::Task;
+ForkTask* retry_child_identity{};
+mm::paging::PageTable* retry_root_identity{};
+std::array<uint64_t, 13> retry_child_image{};
+std::array<uint64_t, 512> retry_root_words{};
+auto image_fields(const ForkTask& task) -> std::array<uint64_t, 13> {
+    return {task.entry, task.program_header_addr, task.elf_header_addr, task.image_load_base, task.image_vaddr_start,
+            task.image_vaddr_end, task.program_header_count, task.program_header_ent_size, task.interp_base,
+            task.interp_vaddr_start, task.interp_vaddr_end, task.at_random_addr, task.mmap_next.load()};
+}
+void remember_retry_child(ForkTask& task) {
+    retry_child_identity = &task;
+    retry_root_identity = task.pagemap;
+    retry_child_image = image_fields(task);
+    for (unsigned i = 0; i < retry_root_words.size(); ++i) retry_root_words[i] = word(task.pagemap, i);
+}
+void expect_retry_child_unchanged(ForkTask&, ForkTask& task) {
+    EXPECT_TRUE(host_fork_vm::ordinary());
+    EXPECT_EQ(vmem::g_shared_vmem_publication_owner.load(), nullptr);
+    EXPECT_EQ(&task, retry_child_identity);
+    EXPECT_EQ(task.pagemap, retry_root_identity);
+    EXPECT_EQ(image_fields(task), retry_child_image);
+    EXPECT_FALSE(task.has_run);
+    EXPECT_TRUE(task.lazy_vmem_ranges.empty());
+    for (unsigned i = 0; i < retry_root_words.size(); ++i) EXPECT_EQ(word(task.pagemap, i), retry_root_words[i]);
+    for (auto const& row : vmem::g_file_mmap_ranges) EXPECT_NE(row.pagemap, task.pagemap);
+    for (auto const& row : shm::g_attachments) EXPECT_FALSE(row.active && row.pid == task.pid);
+    for (auto* row = virt::anonymous_swap_mappings; row; row = row->next) EXPECT_NE(row->pagemap, task.pagemap);
+    size_t bindings = 0;
+    ASSERT_TRUE(virt::file_mapping_index.count_root_locked(task.pagemap, virt::host_child_control.serial, bindings));
+    EXPECT_EQ(bindings, 0U);
+}
+auto pending_fork_bindings() -> unsigned {
+    unsigned count = 0;
+    for (auto const& ticket : fm::host_tickets)
+        count += ticket.pending && ticket.run == fm::FileMappingBinding::finish;
+    return count;
+}
+
+TEST_F(ForkVmCoordinator, RegistryBusyRetriesFreshPreparationBeforeOneSuccessfulAdoption) {
+    legacy();
+    tmpfs();
+    shared();
+    marker(TEST_VA + 20 * PAGE, virt::AnonymousSwapRuntimeState::SWAPPED, true);
+    child_task.entry = 77;
+    child_task.program_header_count = 9;
+    child_task.mmap_next = 0x1234000;
+    actor.entry = 41;
+    actor.program_header_count = 7;
+    remember_retry_child(child_task);
+    host_fork_vm::on_retry = expect_retry_child_unchanged;
+    host_fork_vm::registry_busy_remaining = 1;
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), 0);
+    EXPECT_EQ(point, ForkPoint::Complete);
+    EXPECT_EQ(host_fork_vm::once_calls, 2U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 1U);
+    EXPECT_EQ(host_fork_vm::registry_tries, 3U);
+    EXPECT_EQ(fork_exclusives, 1U);
+    EXPECT_EQ(fork_cow_entries, 1U);
+    EXPECT_EQ(child_task.entry, actor.entry);
+    EXPECT_EQ(child_task.program_header_count, actor.program_header_count);
+    EXPECT_EQ(child_task.lazy_vmem_ranges.size(), 3U);
+    EXPECT_EQ(shm::g_segments[0].attach_count, 2U);
+}
+
+TEST_F(ForkVmCoordinator, RegistryBusyExhaustionReturnsOriginalErrorAfterThreeAttempts) {
+    legacy();
+    tmpfs();
+    shared();
+    remember_retry_child(child_task);
+    host_fork_vm::on_retry = expect_retry_child_unchanged;
+    host_fork_vm::registry_busy_always = true;
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), -EAGAIN);
+    EXPECT_EQ(point, ForkPoint::LegacyMatch);
+    EXPECT_EQ(host_fork_vm::once_calls, 3U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 2U);
+    EXPECT_EQ(host_fork_vm::registry_tries, 3U);
+    EXPECT_EQ(fork_exclusives, 0U);
+    expect_retry_child_unchanged(actor, child_task);
+    EXPECT_EQ(pending_fork_bindings(), 6U);
+    EXPECT_EQ(family->owner_counts().count(fm::FamilyOwner::BINDING), 8U);
+    fm::host_drain();
+    EXPECT_EQ(pending_fork_bindings(), 0U);
+    EXPECT_EQ(family->owner_counts().count(fm::FamilyOwner::BINDING), 2U);
+}
+
+TEST_F(ForkVmCoordinator, RowsAndContextMismatchDoNotRetry) {
+    legacy();
+    remember_retry_child(child_task);
+    host_fork_vm::on_pub = +[] {
+        if (host_fork_vm::at_final_publication) ++vmem::g_file_mmap_ranges.at(0).file_offset;
+    };
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), -EAGAIN);
+    EXPECT_EQ(point, ForkPoint::LegacyMatch);
+    EXPECT_EQ(host_fork_vm::once_calls, 1U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 0U);
+    expect_retry_child_unchanged(actor, child_task);
+    --vmem::g_file_mmap_ranges.at(0).file_offset;
+    host_fork_vm::once_calls = host_fork_vm::registry_tries = 0;
+    host_fork_vm::on_pub = +[] {
+        if (host_fork_vm::at_final_publication) host_range::current->syscall_account_start_us = 0;
+    };
+    EXPECT_EQ(run_retry(&point), -EAGAIN);
+    host_fork_vm::on_pub = nullptr;
+    actor.syscall_account_start_us = 1;
+    EXPECT_EQ(point, ForkPoint::LegacyMatch);
+    EXPECT_EQ(host_fork_vm::once_calls, 1U);
+    EXPECT_EQ(host_fork_vm::registry_tries, 0U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 0U);
+    expect_retry_child_unchanged(actor, child_task);
+}
+
+TEST_F(ForkVmCoordinator, BusyContextLossSkipsYieldAndRetry) {
+    legacy();
+    remember_retry_child(child_task);
+    host_fork_vm::registry_busy_remaining = 1;
+    host_fork_vm::on_registry_try = +[] { host_range::current->syscall_account_start_us = 0; };
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), -EAGAIN);
+    host_fork_vm::on_registry_try = nullptr;
+    actor.syscall_account_start_us = 1;
+    EXPECT_EQ(point, ForkPoint::LegacyMatch);
+    EXPECT_EQ(host_fork_vm::once_calls, 1U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 0U);
+    expect_retry_child_unchanged(actor, child_task);
+}
+
+TEST_F(ForkVmCoordinator, ContextChangedDuringYieldIsRevalidatedByNextAttempt) {
+    legacy();
+    remember_retry_child(child_task);
+    host_fork_vm::registry_busy_remaining = 1;
+    host_fork_vm::on_retry = +[](ForkTask& parent, ForkTask& child_task) {
+        expect_retry_child_unchanged(parent, child_task);
+        parent.scheduler_transition_active = true;
+    };
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), -EWOULDBLOCK);
+    actor.scheduler_transition_active = false;
+    EXPECT_EQ(point, ForkPoint::Context);
+    EXPECT_EQ(host_fork_vm::once_calls, 2U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 1U);
+    EXPECT_EQ(host_fork_vm::registry_tries, 1U);
+    expect_retry_child_unchanged(actor, child_task);
+}
+
+TEST_F(ForkVmCoordinator, DeferredTmpfsBindingsRemainPendingUntilRealDrain) {
+    legacy();
+    tmpfs();
+    remember_retry_child(child_task);
+    host_fork_vm::registry_busy_remaining = 2;
+    host_fork_vm::on_retry = +[](ForkTask& parent, ForkTask& child_task) {
+        expect_retry_child_unchanged(parent, child_task);
+        auto* held_family = parent.lazy_vmem_ranges.at(1).lifetime;
+        EXPECT_EQ(pending_fork_bindings(), 2U * host_fork_vm::retry_yields);
+        EXPECT_EQ(held_family->owner_counts().count(fm::FamilyOwner::BINDING), 2U + 2U * host_fork_vm::retry_yields);
+    };
+    EXPECT_EQ(run_retry(), 0);
+    EXPECT_EQ(host_fork_vm::once_calls, 3U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 2U);
+    EXPECT_EQ(pending_fork_bindings(), 4U);
+    EXPECT_EQ(family->owner_counts().count(fm::FamilyOwner::BINDING), 8U);
+    auto const RETURNS = host_fork_vm::binding_returns;
+    fm::host_drain();
+    EXPECT_EQ(host_fork_vm::binding_returns - RETURNS, 4U);
+    EXPECT_EQ(pending_fork_bindings(), 0U);
+    EXPECT_EQ(family->owner_counts().count(fm::FamilyOwner::BINDING), 4U);
+}
+
+TEST_F(ForkVmCoordinator, DeferredBindingCapacityFailureStopsWithoutAdoption) {
+    legacy();
+    tmpfs();
+    remember_retry_child(child_task);
+    host_fork_vm::registry_busy_remaining = 1;
+    host_fork_vm::on_retry = +[](ForkTask& parent, ForkTask& child_task) {
+        expect_retry_child_unchanged(parent, child_task);
+        EXPECT_EQ(pending_fork_bindings(), 2U);
+        host_fork_vm::fail_binding_reserve = true;
+    };
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), -ENOMEM);
+    host_fork_vm::fail_binding_reserve = false;
+    EXPECT_EQ(point, ForkPoint::TmpfsPrepare);
+    EXPECT_EQ(host_fork_vm::once_calls, 2U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 1U);
+    EXPECT_EQ(fork_exclusives, 0U);
+    expect_retry_child_unchanged(actor, child_task);
+    EXPECT_EQ(pending_fork_bindings(), 2U);
+    fm::host_drain();
+    EXPECT_EQ(pending_fork_bindings(), 0U);
+    EXPECT_EQ(family->owner_counts().count(fm::FamilyOwner::BINDING), 2U);
+}
+
+TEST_F(ForkVmCoordinator, PrivateBusyWitnessClearsForContextRowsAndEveryAttempt) {
+    legacy();
+    MatchConflict conflict = MatchConflict::RegistryBusy;
+    ForkPoint point{};
+    actor.type = ker::mod::sched::task::TaskType::THREAD;
+    EXPECT_EQ(run(nullptr, nullptr, nullptr, &point, &conflict), -EWOULDBLOCK);
+    actor.type = ker::mod::sched::task::TaskType::PROCESS;
+    EXPECT_EQ(point, ForkPoint::Context);
+    EXPECT_EQ(conflict, MatchConflict::None);
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    vmem::LegacyFileForkPreparation plan;
+    ASSERT_EQ(plan.prepare(actor, child_task, preparation), 0);
+    host_fork_vm::enabled = true;
+    {
+        vmem::SharedVmemPublicationGuard publication;
+        conflict = MatchConflict::RegistryBusy;
+        actor.scheduler_transition_active = true;
+        EXPECT_EQ(plan.matches(actor, child_task, preparation, publication, &conflict), -EAGAIN);
+        EXPECT_EQ(conflict, MatchConflict::None);
+        actor.scheduler_transition_active = false;
+        ++vmem::g_file_mmap_ranges.at(0).file_offset;
+        conflict = MatchConflict::RegistryBusy;
+        EXPECT_EQ(plan.matches(actor, child_task, preparation, publication, &conflict), -EAGAIN);
+        EXPECT_EQ(conflict, MatchConflict::None);
+        --vmem::g_file_mmap_ranges.at(0).file_offset;
+        host_fork_vm::registry_busy_remaining = 1;
+        EXPECT_EQ(plan.matches(actor, child_task, preparation, publication, &conflict), -EAGAIN);
+        EXPECT_EQ(conflict, MatchConflict::RegistryBusy);
+        EXPECT_EQ(plan.matches(actor, child_task, preparation, publication, &conflict), 0);
+        EXPECT_EQ(conflict, MatchConflict::None);
+    }
+    host_fork_vm::enabled = false;
+}
+
+TEST_F(ForkVmCoordinator, LaterCommitBusyNeverRetriesAdoptedPrefix) {
+    ordinary(TEST_VA);
+    legacy();
+    tmpfs();
+    shared();
+    host_fork_vm::registry_fail_try = 2;
+    ForkPoint point{};
+    EXPECT_EQ(run_retry(&point), -EAGAIN);
+    EXPECT_EQ(point, ForkPoint::LegacyCommit);
+    EXPECT_EQ(host_fork_vm::once_calls, 1U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 0U);
+    EXPECT_EQ(fork_exclusives, 1U);
+    EXPECT_EQ(child_task.lazy_vmem_ranges.size(), 3U);
+    EXPECT_EQ(shm::g_segments[0].attach_count, 2U);
+    rollback();
+    EXPECT_EQ(shm::g_segments[0].attach_count, 1U);
+}
+}  // namespace

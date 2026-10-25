@@ -854,12 +854,14 @@ auto public_fork_vm_error(ForkVmFailurePoint point, int status) -> int {
 // The caller exclusively owns an initialized, never-active
 // child/root and every non-VM resource. Eager storage is caller-born before all
 // final owners. Any adopted child prefix belongs to ordinary caller rollback.
-auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
-                              const ker::mod::sys::SyscallPreparationScope& preparation,
-                              ker::mod::mm::numa::AllocationContext* eager_context, ker::mod::mm::numa::AllocationResult* empty_result,
-                              ForkVmFailurePoint* failure_point = nullptr,
-                              ker::mod::mm::huge::RangePrepareWitness* geometry_failure = nullptr) -> int {
+auto prepare_fork_vm_snapshot_once(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                   const ker::mod::sys::SyscallPreparationScope& preparation,
+                                   ker::mod::mm::numa::AllocationContext* eager_context, ker::mod::mm::numa::AllocationResult* empty_result,
+                                   ForkVmFailurePoint* failure_point = nullptr,
+                                   ker::mod::mm::huge::RangePrepareWitness* geometry_failure = nullptr,
+                                   ker::syscall::vmem::LegacyFileForkPreparation::MatchConflict* conflict = nullptr) -> int {
     using namespace ker::mod;
+    if (conflict != nullptr) *conflict = ker::syscall::vmem::LegacyFileForkPreparation::MatchConflict::None;
     auto fail_at = [failure_point](ForkVmFailurePoint point) {
         if (failure_point != nullptr) *failure_point = point;
     };
@@ -920,7 +922,7 @@ auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sche
         ker::syscall::vmem::SharedVmemPublicationGuard publication;
         if (!lazy.matches(actor) || !tmpfs.matches(actor)) return -EAGAIN;
         fail_at(ForkVmFailurePoint::LegacyMatch);
-        status = legacy_file.matches(actor, child, preparation, publication);
+        status = legacy_file.matches(actor, child, preparation, publication, conflict);
         if (status != 0) return status;
         fail_at(ForkVmFailurePoint::ShmMatch);
         status = shm.matches(actor, child, preparation, publication);
@@ -957,6 +959,38 @@ auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sche
     }
     if (status == 0) fail_at(ForkVmFailurePoint::Complete);
     return status;
+}
+
+auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                              const ker::mod::sys::SyscallPreparationScope& preparation,
+                              ker::mod::mm::numa::AllocationContext* eager_context, ker::mod::mm::numa::AllocationResult* empty_result,
+                              ForkVmFailurePoint* failure_point = nullptr,
+                              ker::mod::mm::huge::RangePrepareWitness* geometry_failure = nullptr) -> int {
+    using namespace ker::mod;
+    using Conflict = ker::syscall::vmem::LegacyFileForkPreparation::MatchConflict;
+    constexpr uint32_t REGISTRY_ATTEMPTS = 3;
+    for (uint32_t attempt = 0;; ++attempt) {
+        ForkVmFailurePoint point{};
+        Conflict conflict{};
+        int const STATUS =
+            prepare_fork_vm_snapshot_once(actor, child, preparation, eager_context, empty_result, &point, geometry_failure, &conflict);
+        if (failure_point != nullptr) *failure_point = point;
+        if (STATUS != -EAGAIN || point != ForkVmFailurePoint::LegacyMatch || conflict != Conflict::RegistryBusy ||
+            attempt + 1 == REGISTRY_ATTEMPTS)
+            return STATUS;
+
+        // This gate precedes every child adoption. The one-attempt frame has
+        // released PUB and all scoped owners before yielding; detached TMPFS
+        // bindings may still be awaiting asynchronous retirement. Start with
+        // fresh preparations after the yield, never reuse those snapshots.
+        if (!preparation.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor ||
+            actor.type != sched::task::TaskType::PROCESS || actor.syscall_account_start_us == 0 ||
+            actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+            actor.scheduler_transition_active.load(std::memory_order_acquire) || !sched::interrupts_enabled() ||
+            sched::preempt_count() != 0)
+            return STATUS;
+        ker::mod::sched::kern_yield();
+    }
 }
 }  // namespace detail
 

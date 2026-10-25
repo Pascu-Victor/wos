@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class Builder:
-    test_count = 21
+    test_count = 30
 
     def __init__(self, kernel_file, support, definition):
         self.path = kernel_file
@@ -174,7 +174,11 @@ auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*&,paging::
 }
 namespace host_fork_vm {
 unsigned locks{}, retained_tasks{}, returned_tasks{}, vfs_puts{}, binding_reserves{}, binding_returns{};
-unsigned registry_tries{}, registry_fail_try{};
+unsigned registry_tries{}, registry_fail_try{}, registry_busy_remaining{}, registry_depth{};
+unsigned once_calls{}, retry_yields{};
+bool registry_busy_always{};
+void(*on_registry_try)(){};
+void(*on_retry)(ker::mod::sched::task::Task&,ker::mod::sched::task::Task&){};
 bool enabled{}, fail_attach{}, fail_shm{}, fail_lazy{}, fail_binding_reserve{};
 unsigned child_attaches{}, queries{};
 unsigned pubs{};bool at_final_publication{};void(*on_pub)(){};
@@ -182,16 +186,21 @@ void(*on_pin)(){},(*on_shm)(){},(*on_legacy)(){};
 void publication_acquire(){++pubs;if(on_pub)on_pub();}
 void pin_acquire(){if(enabled&&on_pin)on_pin();}
 void enter_legacy(){if(enabled&&on_legacy)on_legacy();}
-auto ordinary()->bool {return host_range::interrupts && !publication_depth && !host_range::exclusive && !root_readers && !cow_depth && !pin_depth && !backend().preempt_depth && !locks;}
+auto ordinary()->bool {return host_range::interrupts && !publication_depth && !host_range::exclusive && !root_readers && !cow_depth && !pin_depth && !backend().preempt_depth && !locks && !registry_depth;}
+void once_enter(){++once_calls;}
+void retry_boundary(ker::mod::sched::task::Task&actor,ker::mod::sched::task::Task&child){
+ EXPECT_TRUE(ordinary());EXPECT_EQ(actor.usercopy_pagemap_accesses.load(),0U);
+ EXPECT_EQ(actor.lifetime_refs,1U);++retry_yields;if(on_retry)on_retry(actor,child);
+}
 uint64_t lock_irq(unsigned tag){host_fork_public::lazy_lock(tag);if(enabled&&tag==1&&on_shm)on_shm();auto f=host_range::interrupts;host_range::interrupts=false;++locks;return f;}
 void unlock_irq(uint64_t f){EXPECT_GT(locks,0U);--locks;host_range::interrupts=f;}
 void retain_task(){EXPECT_TRUE(ordinary());++retained_tasks;}
 void release_task(){EXPECT_TRUE(ordinary());++returned_tasks;}
 struct RegistryMutex {
  bool held{};
- void lock(){EXPECT_FALSE(held);held=true;}
- bool try_lock(){++registry_tries;if(enabled && registry_fail_try==registry_tries)return false;lock();return true;}
- void unlock(){EXPECT_TRUE(held);held=false;}
+ void lock(){EXPECT_FALSE(held);held=true;++registry_depth;}
+ bool try_lock(){++registry_tries;if(enabled&&on_registry_try)on_registry_try();if(enabled&&(registry_busy_always||registry_fail_try==registry_tries))return false;if(enabled&&registry_busy_remaining){--registry_busy_remaining;return false;}lock();return true;}
+ void unlock(){EXPECT_TRUE(held);EXPECT_GT(registry_depth,0U);--registry_depth;held=false;}
 };
 }
 namespace ker::vfs {struct File {std::atomic<int> refcount{1};};
@@ -451,17 +460,32 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
         )
         # The namespace is declared before the fixture's header includes.
         declaration = "#include <cstddef>\nnamespace host_fork_alloc {bool refuse(std::size_t,bool);void* null_result();void note_delete(void*);bool free_stack(void*);void guard();}\nnamespace host_fork_vm {extern bool enabled;void publication_acquire();void pin_acquire();}\n"
-        coordinator = self.body(
-            "syscalls_impl/process/process.cpp", "auto prepare_fork_vm_snapshot("
+        coordinator_once = self.body(
+            "syscalls_impl/process/process.cpp", "auto prepare_fork_vm_snapshot_once("
         )
         # External Host observation port: tag only the real final constructor,
         # then restore immediately. No guard/matches or ownership logic changes.
         final_guard = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        if (!lazy.matches(actor)"
-        if coordinator.count(final_guard) != 1:
+        if coordinator_once.count(final_guard) != 1:
             raise RuntimeError("actual final publication observation boundary changed")
-        coordinator = coordinator.replace(
+        coordinator_once = coordinator_once.replace(
             final_guard,
             "host_fork_vm::at_final_publication = true;\n        ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        if (!lazy.matches(actor)",
+        )
+        once_entry = "    using namespace ker::mod;"
+        assert coordinator_once.count(once_entry) == 1
+        coordinator_once = coordinator_once.replace(
+            once_entry, once_entry + "\n    host_fork_vm::once_enter();", 1
+        )
+        coordinator = self.body(
+            "syscalls_impl/process/process.cpp", "auto prepare_fork_vm_snapshot("
+        )
+        retry_yield = "ker::mod::sched::kern_yield();"
+        assert coordinator.count(retry_yield) == 1
+        coordinator = coordinator.replace(
+            retry_yield,
+            "host_fork_vm::retry_boundary(actor,child);\n        " + retry_yield,
+            1,
         )
         return "\n".join(
             [
@@ -489,6 +513,7 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
                 "namespace ker::syscall::process::detail {",
                 self.public.body("enum class ForkVmFailurePoint :"),
                 "auto public_fork_vm_error(ForkVmFailurePoint,int)->int;",
+                coordinator_once,
                 coordinator,
                 "}",
                 "namespace ker::mod::mm::virt {",
@@ -530,6 +555,30 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
                 "if (!lazy.matches(actor) || !tmpfs.matches(actor)) return -EAGAIN;",
                 "if (!lazy.matches(actor) || !tmpfs.matches(actor) || !tmpfs.matches(actor)) return -EAGAIN;",
                 "ForkVmCoordinator.MixedFileMetadataKeepDistinctOwners",
+            ),
+            (
+                "coordinator-retry-cap",
+                "constexpr uint32_t REGISTRY_ATTEMPTS = 3;",
+                "constexpr uint32_t REGISTRY_ATTEMPTS = 1;",
+                "ForkVmCoordinator.RegistryBusyRetriesFreshPreparationBeforeOneSuccessfulAdoption",
+            ),
+            (
+                "coordinator-retry-classification",
+                "conflict != Conflict::RegistryBusy ||",
+                "false ||",
+                "ForkVmCoordinator.RowsAndContextMismatchDoNotRetry",
+            ),
+            (
+                "coordinator-retry-yield-under-publication",
+                "status = legacy_file.matches(actor, child, preparation, publication, conflict);",
+                "ker::mod::sched::kern_yield();\n        status = legacy_file.matches(actor, child, preparation, publication, conflict);",
+                "ForkVmCoordinator.RegistryBusyRetriesFreshPreparationBeforeOneSuccessfulAdoption",
+            ),
+            (
+                "coordinator-busy-witness-not-reset",
+                "if (conflict != nullptr) *conflict = MatchConflict::None;",
+                "/* Compiled control retains the previous match conflict. */",
+                "ForkVmCoordinator.PrivateBusyWitnessClearsForContextRowsAndEveryAttempt",
             ),
         ]
         for label, old, new, test in vectors:

@@ -121,6 +121,8 @@ class PublicFileForkPreparation {
 // outside PUB/root/IF/preempt owners. Real checked File refs own every prefix.
 class LegacyFileForkPreparation {
    public:
+    enum class MatchConflict : uint8_t { None, RegistryBusy };
+
     LegacyFileForkPreparation() = default;
     ~LegacyFileForkPreparation();
     LegacyFileForkPreparation(const LegacyFileForkPreparation&) = delete;
@@ -128,7 +130,7 @@ class LegacyFileForkPreparation {
     [[nodiscard]] auto prepare(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&)
         -> int;
     [[nodiscard]] auto matches(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
-                               const SharedVmemPublicationGuard&) const -> int;
+                               const SharedVmemPublicationGuard&, MatchConflict* conflict = nullptr) const -> int;
     [[nodiscard]] auto commit(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
                               const SharedVmemPublicationGuard&) -> int;
 

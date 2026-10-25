@@ -423,7 +423,7 @@ add_test(NAME fork_vm_coordinator_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --fork-vm-coordinator-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
-set_tests_properties(fork_vm_coordinator_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+set_tests_properties(fork_vm_coordinator_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
 add_test(NAME task_placement_inheritance_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/task_placement_inheritance_runtime_test.py
         --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..

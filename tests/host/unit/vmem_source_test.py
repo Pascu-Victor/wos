@@ -1164,7 +1164,7 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
     require_cpp_tokens(fork, ["if (EAGER_COPY)",
         "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,",
         "EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure)"], "prepared route borrows caller-born eager storage only when requested")
-    coordinator = function_body(source, "prepare_fork_vm_snapshot")
+    coordinator = function_body(source, "prepare_fork_vm_snapshot_once")
     require_cpp_tokens(coordinator, [
         "deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap)"
     ], "prepared coordinator transfers the same borrowed eager context and result")
@@ -1202,7 +1202,7 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
 def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
     process = PROCESS_CPP.read_text()
     fork = function_body(process, "wos_proc_fork")
-    snapshot = function_body(process, "prepare_fork_vm_snapshot")
+    snapshot = function_body(process, "prepare_fork_vm_snapshot_once")
     require_ordered_tokens(snapshot, [
         "LazyVmemClone lazy;", "PublicFileForkPreparation tmpfs;",
         "LegacyFileForkPreparation legacy_file;", "PreparedAnonymousSwapFork swap;",
@@ -1213,7 +1213,7 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
         "prepare_current_fork_range_split(actor, preparation, 0, USER_END, survey, tables, geometry_failure)",
         "SharedVmemPublicationGuard publication;",
         "!lazy.matches(actor) || !tmpfs.matches(actor)",
-        "legacy_file.matches(actor, child, preparation, publication)",
+        "legacy_file.matches(actor, child, preparation, publication, conflict)",
         "shm.matches(actor, child, preparation, publication)",
         "LegacyInterval legacy_context(preparation);",
         "child.mmap_next.store(actor.mmap_next.load(std::memory_order_relaxed)",
@@ -1266,7 +1266,7 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
 
 def test_fork_failure_phase_is_scalar_and_precedes_each_refusal() -> None:
     source = PROCESS_CPP.read_text()
-    coordinator = function_body(source, "prepare_fork_vm_snapshot")
+    coordinator = function_body(source, "prepare_fork_vm_snapshot_once")
     require_cpp_tokens(source, ["ForkVmFailurePoint* failure_point = nullptr"],
                        "old five-argument coordinator calls remain source compatible")
     require_cpp_tokens(coordinator, ["if (failure_point != nullptr) *failure_point = point;"],

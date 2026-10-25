@@ -5043,9 +5043,13 @@ auto LegacyFileForkPreparation::rows_match_locked() const -> bool {
 
 auto LegacyFileForkPreparation::matches(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
                                         const ker::mod::sys::SyscallPreparationScope& preparation,
-                                        const SharedVmemPublicationGuard& publication) const -> int {
+                                        const SharedVmemPublicationGuard& publication, MatchConflict* conflict) const -> int {
+    if (conflict != nullptr) *conflict = MatchConflict::None;
     if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
-    if (!g_file_mmap_ranges_lock.try_lock()) return -EAGAIN;
+    if (!g_file_mmap_ranges_lock.try_lock()) {
+        if (conflict != nullptr) *conflict = MatchConflict::RegistryBusy;
+        return -EAGAIN;
+    }
     bool const matched = rows_match_locked();
     g_file_mmap_ranges_lock.unlock();
     return matched ? 0 : -EAGAIN;
