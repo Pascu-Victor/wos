@@ -46,6 +46,14 @@ PRELUDE = r'''
 #include <vector>
 #define WOS_PERF_CALLSITE() 123ULL
 namespace ker::syscall::process { class ExecRequestArguments; class PreparedNativeExecImage; struct WorkerExecHandoff; }
+namespace ker::syscall::vmem { struct PendingMremapPsPolicy; }
+// Value-only interfaces from numa_policy.hpp, numa_alloc.hpp and elf_loader.hpp.
+namespace ker::mod::mm::numa {
+enum class Mode:uint8_t { LOCAL,PREFERRED,BIND,INTERLEAVE };
+struct Policy { uint64_t nodes{}; Mode mode{Mode::LOCAL}; auto operator==(const Policy&)const->bool=default; };
+struct AllocationContext { Policy policy{}; uint16_t local_node{UINT16_MAX}; uint64_t virtual_page_index{}; };
+}
+namespace ker::loader::elf { enum class ElfAllocationOrigin:uint8_t { MISSING=0,EXECUTOR_CAPTURE=1,TRUSTED_LOCAL=2 }; }
 struct Lock {
  bool held=false;
  uint64_t lock_irqsave() { assert(!held); held=true; return 0; }
@@ -63,6 +71,9 @@ struct Task {
  std::atomic<ker::syscall::process::PreparedNativeExecImage*> owned_exec_preparation{nullptr};
  std::atomic<ker::syscall::process::ExecRequestArguments*> owned_exec_arguments{nullptr};
  std::atomic<ker::syscall::process::WorkerExecHandoff*> pending_exec_handoff{nullptr},active_exec_handoff{nullptr};
+ ker::syscall::vmem::PendingMremapPsPolicy* pending_mremap_ps_policies{};
+ ker::mod::mm::numa::Policy copied_policy{4,ker::mod::mm::numa::Mode::BIND};
+ auto memory_policy_snapshot()const noexcept->ker::mod::mm::numa::Policy { return copied_policy; }
  Lock resource_lock;
  ker::mod::security::Snapshot credentials() { return {}; }
 };
@@ -111,6 +122,10 @@ namespace ker::net::wki { enum class WkiRemoteSpawnResult:uint8_t { LOCAL,REMOTE
 namespace ker::syscall::multiproc { unsigned exits=0; void wos_thread_exit_current() { ++exits; } }
 namespace ker::syscall::process {
 constexpr int MAX_SHEBANG_DEPTH=4;
+// Controlled capture endpoint; the production wrapper still owns propagation.
+auto capture_exec_allocation_context(ker::mod::mm::numa::Policy policy,ker::mod::mm::numa::AllocationContext& output)->int {
+ output={policy,2,0};return 0;
+}
 '''
 
 FACES = r'''
@@ -131,6 +146,8 @@ class PreparedNativeExecImage {
 class ExecRequestArguments {
  public:
  ExecArgumentsSnapshot snapshot; ker::mod::security::Snapshot admitted_credentials; NativeExecCompletion completion;
+ ker::mod::mm::numa::Policy memory_policy{};ker::mod::mm::numa::AllocationContext allocation_context{};
+ ker::loader::elf::ElfAllocationOrigin allocation_origin{ker::loader::elf::ElfAllocationOrigin::MISSING};
  WorkerExecHandoff handoff; ExecTraceState trace; uint32_t remote_proxy_id{}; bool remote_worker_committed{};
  ~ExecRequestArguments() { ++argument_destroys; }
 };
@@ -193,6 +210,9 @@ void publish_remote_exec_proxy(Task&,uint32_t id) { assert(id==77); }
 void wos_asm_park_exec_owner(uint64_t) {}
 uint64_t wos_proc_execve_impl(const char*,const char* const*,const char* const*,ker::mod::cpu::GPRegs&,int) {
  auto* r=current->owned_exec_arguments.load();
+ assert(r->memory_policy==current->memory_policy_snapshot() && r->allocation_context.policy==r->memory_policy);
+ assert(r->allocation_context.local_node==2 && r->allocation_context.virtual_page_index==0);
+ assert(r->allocation_origin==ker::loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE);
  for(unsigned d=0;d<=recursion;++d)r->trace.begin(current,d,123);
  // The omitted loader is a controlled producer, not a model of VFS/MM.
  auto op=remote_case?ker::mod::perf::WkiPerfLocalProcOp::REMOTE_SPAWN:ker::mod::perf::WkiPerfLocalProcOp::STACK_SETUP;

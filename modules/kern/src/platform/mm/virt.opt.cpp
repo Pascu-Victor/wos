@@ -9148,21 +9148,34 @@ auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t en
     return VALID;
 }
 
-auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t end) -> bool {
+auto query_user_virtual_range(PageTable* page_table, uint64_t start, uint64_t end) -> UserVirtualRangeStatus {
     if (page_table == nullptr || start >= end || end > 0x0000800000000000ULL || ((start | end) & (paging::PAGE_SIZE - 1)) != 0) {
-        return false;
+        return UserVirtualRangeStatus::Invalid;
     }
     // As with counting, callers serialize publication or own a private root.
     // The pin only keeps fork/teardown from reclaiming tables during the walk.
     sched::PreemptGuard guard;
     size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(page_table, false, gate)) {
-        return false;
+    auto refused = UserVirtualRangeStatus::ReaderUnavailable;
+    if (!admit_user_pagemap_reader(page_table, gate, [page_table, &refused](bool) {
+            // The callback runs only on an initial or raced teardown refusal,
+            // after rolling back any reader. Capacity is never retryable.
+            auto const& access = user_pagemap_access_gates.at(user_pagemap_access_gate_index(page_table));
+            refused = access.readers.load(std::memory_order_acquire) == UINT32_MAX ? UserVirtualRangeStatus::ReaderUnavailable
+                                                                                   : UserVirtualRangeStatus::GateBusy;
+            return false;
+        })) {
+        return refused;
     }
     uint64_t bytes = 0;
     bool const VALID = count_virtual_bytes_in_table<true>(page_table, 4, 0, start, end, bytes);
     release_user_pagemap_access(gate);
-    return VALID && bytes == 0;
+    if (!VALID) return UserVirtualRangeStatus::Invalid;
+    return bytes == 0 ? UserVirtualRangeStatus::Free : UserVirtualRangeStatus::Occupied;
+}
+
+auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t end) -> bool {
+    return query_user_virtual_range(page_table, start, end) == UserVirtualRangeStatus::Free;
 }
 
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {

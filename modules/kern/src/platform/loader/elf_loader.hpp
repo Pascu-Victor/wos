@@ -61,6 +61,27 @@ using ElfLazyLoadRangeVec = ker::util::SmallVec<ElfLazyLoadRange, 16>;
 
 enum class ElfAllocationOrigin : uint8_t { MISSING = 0, EXECUTOR_CAPTURE = 1, TRUSTED_LOCAL = 2 };
 
+// Synchronous, caller-owned authority shared by main/interpreter preflight.
+// The callback grants one cooperation, never authority to skip a range query.
+class ElfLayoutCooperation {
+   public:
+    using Cooperate = auto (*)(void* context, ker::mod::mm::virt::PageTable* root) -> bool;
+    ElfLayoutCooperation(Cooperate cooperate, void* context) : cooperate_(cooperate), context_(context) {}
+    ElfLayoutCooperation(const ElfLayoutCooperation&) = delete;
+    auto operator=(const ElfLayoutCooperation&) -> ElfLayoutCooperation& = delete;
+
+    [[nodiscard]] auto try_cooperate(ker::mod::mm::virt::PageTable* root) -> bool {
+        if (cooperate_ == nullptr || remaining_ == 0) return false;
+        --remaining_;
+        return cooperate_(context_, root);
+    }
+
+   private:
+    Cooperate cooperate_;
+    void* context_;
+    uint8_t remaining_{2};
+};
+
 struct ElfLoadOptions {
     bool register_special_symbols = true;
     uint64_t base_address = 0;
@@ -72,6 +93,7 @@ struct ElfLoadOptions {
     ker::mod::sched::task::Task* policy_owner = nullptr;
     ker::mod::mm::numa::AllocationContext allocation_context{};
     ElfAllocationOrigin allocation_origin{ElfAllocationOrigin::MISSING};
+    ElfLayoutCooperation* layout_cooperation = nullptr;
 };
 // Value validation only; no allocation, CPU capture or Task policy lookup.
 [[nodiscard]] auto image_allocation_context_error(const ElfLoadOptions& options) noexcept -> int;

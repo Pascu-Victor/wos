@@ -1532,6 +1532,21 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/user_layout_walk_test.py
 )
 add_test(
+    NAME elf_layout_contention_test
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/elf_layout_contention_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(elf_layout_contention_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 180
+)
+add_test(
+    NAME exec_layout_context_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_layout_context_test.py
+)
+set_tests_properties(exec_layout_context_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 60
+)
+add_test(
     NAME page_table_zero_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_table_zero_test.py
 )

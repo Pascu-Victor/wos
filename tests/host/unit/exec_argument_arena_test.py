@@ -174,12 +174,12 @@ void vector_checks(){
  for(size_t offset:{size_t{1},size_t{4088},size_t{4090},size_t{4094},size_t{4095}})vector_case(3,offset);
  vector_case(1,0,16);vector_case(1,0,15,-EFAULT);vector_case(2,0,19,-EFAULT);vector_case(3,0,24,-EFAULT);
  for(size_t n:{size_t{40},size_t{100}})vector_case(n,0,SIZE_MAX,0,0,SIZE_MAX,true);
- // Every real growth failure must be the last prefetched word: SmallVec's
- // actual push_back grows at sizes16,17,32,64 even though capacity() differs.
- for(auto pair:{std::pair<size_t,size_t>{1,17}, {2,18},{3,33},{4,65}})
-  vector_case(100,0,SIZE_MAX,-ENOMEM,pair.first,pair.second*8);
+ // Every real growth failure must be the last prefetched word. SmallVec's
+ // total capacity doubles at sizes16,32,64,128; use200 pointers to cover all4.
+ for(auto pair:{std::pair<size_t,size_t>{1,17}, {2,33},{3,65},{4,129}})
+  vector_case(200,0,SIZE_MAX,-ENOMEM,pair.first,pair.second*8);
 
- for(size_t failure=1;failure<=6;++failure)vector_case(100,0,SIZE_MAX,-ENOMEM,failure);
+ for(size_t failure=1;failure<=6;++failure)vector_case(200,0,SIZE_MAX,-ENOMEM,failure);
  // An unterminated maximal vector consumes exactly the global pointer budget;
  // the next page/word must never be requested, and no string may be copied.
  memory::clear();memory::text_offset=0;

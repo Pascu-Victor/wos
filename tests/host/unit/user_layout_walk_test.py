@@ -17,11 +17,14 @@ prefix = re.search(r"template <bool StopAtFirst = false>\s*(?=auto count_virtual
 assert prefix
 chunks = [function(source, n) for n in ["index_of", "is_reserved_leaf", "leaf_entry", "is_page_mapped_or_reserved"]]
 chunks += [prefix.group() + walker, function(source, "count_user_virtual_bytes"),
-           function(source, "is_user_virtual_range_free")]
+           function(source, "query_user_virtual_range"), function(source, "is_user_virtual_range_free")]
+range_status = re.search(r"enum class UserVirtualRangeStatus[^;]*;", (MM / "virt.hpp").read_text())
+assert range_status
 placement = function(layout, "range_is_free")
 code = r'''
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -41,7 +44,11 @@ auto raw(uint64_t n)->PageTableEntry{PageTableEntry e;std::memcpy(&e,&n,8);retur
 namespace addr{auto get_virt_pointer(uint64_t p)->void*{++translations;if(p==POISON){++poison_translations;assert(false);}return reinterpret_cast<void*>(p);}}
 namespace sched{struct PreemptGuard{PreemptGuard(){++guard_depth;}~PreemptGuard(){assert(!pins);--guard_depth;}};}
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE=SIZE_MAX;
+RANGE_STATUS
+struct Gate{std::atomic<uint32_t>readers{0};};std::array<Gate,1>user_pagemap_access_gates;
+auto user_pagemap_access_gate_index(PageTable*)->size_t{return 0;}
 auto acquire_user_pagemap_access(PageTable*,bool wait,size_t&gate)->bool{assert(guard_depth&&!wait);++acquires;if(!pin_ok)return false;++pins;gate=0;return true;}
+template<class Wait>auto admit_user_pagemap_reader(PageTable*root,size_t&gate,Wait&&)->bool{return acquire_user_pagemap_access(root,false,gate);}
 void release_user_pagemap_access(size_t gate){assert(guard_depth&&gate==0&&pins);--pins;++releases;}
 struct Log{template<class...T>static void critical(T...){assert(false);}};using log=Log;
 FUNCTIONS
@@ -131,7 +138,7 @@ int run(){
 }
 }
 int main(){return test::run();}
-'''.replace("FUNCTIONS", "\n".join(chunks)).replace("PLACEMENT", placement)
+'''.replace("RANGE_STATUS", range_status.group()).replace("FUNCTIONS", "\n".join(chunks)).replace("PLACEMENT", placement)
 with tempfile.TemporaryDirectory(prefix="wos-user-layout-walk-") as directory:
     source_path = Path(directory) / "test.cpp"
     binary_path = Path(directory) / "test"

@@ -1344,8 +1344,37 @@ auto load_segments_overlap_runtime_range(const ElfFile& elf, uint64_t range_star
     return false;
 }
 
+struct ElfRangeProbe {
+    ElfLayoutCooperation* cooperation{};
+    mod::mm::virt::UserVirtualRangeStatus status{mod::mm::virt::UserVirtualRangeStatus::Invalid};
+
+    static auto query(mod::mm::paging::PageTable* root, uint64_t start, uint64_t size, void* context)
+        -> mod::mm::virt::UserVirtualRangeStatus {
+        auto& probe = *static_cast<ElfRangeProbe*>(context);
+        if (size == 0 || start > UINT64_MAX - size) {
+            probe.status = mod::mm::virt::UserVirtualRangeStatus::Invalid;
+            return probe.status;
+        }
+        for (;;) {
+            // query_user_virtual_range releases both its reader and preemption
+            // guard before a caller-owned cooperation can run.
+            probe.status = mod::mm::virt::query_user_virtual_range(root, start, start + size);
+            if (probe.status != mod::mm::virt::UserVirtualRangeStatus::GateBusy || probe.cooperation == nullptr ||
+                !probe.cooperation->try_cooperate(root)) {
+                return probe.status;
+            }
+        }
+    }
+
+    auto range_is_free(mod::mm::virt::PageTable* root, uint64_t start, uint64_t size) -> bool {
+        return query(root, start, size, this) == mod::mm::virt::UserVirtualRangeStatus::Free;
+    }
+
+    [[nodiscard]] auto error() const -> int { return status == mod::mm::virt::UserVirtualRangeStatus::GateBusy ? -EAGAIN : 0; }
+};
+
 auto loader_owned_ranges_are_available(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const DebugMetadataPlan& metadata_plan,
-                                       bool is_primary_image) -> bool {
+                                       bool is_primary_image, ElfRangeProbe& probe) -> bool {
     if (!is_primary_image) {
         return true;
     }
@@ -1354,7 +1383,7 @@ auto loader_owned_ranges_are_available(const ElfFile& elf, ker::mod::mm::virt::P
         uint64_t const HEADER_BYTES = sizeof(Elf64_Ehdr) + static_cast<uint64_t>(elf.elf_head.e_phnum) * sizeof(Elf64_Phdr);
         uint64_t header_size = 0;
         if (!checked_page_align_up(HEADER_BYTES, header_size) || load_segments_overlap_runtime_range(elf, HEADER_COPY_VADDR, header_size) ||
-            !mod::mm::user_layout::range_is_free(pagemap, HEADER_COPY_VADDR, header_size) ||
+            !probe.range_is_free(pagemap, HEADER_COPY_VADDR, header_size) ||
             load_segments_overlap_runtime_range(elf, DEBUG_SECTION_HEADERS_VADDR, DEBUG_SECTION_HEADERS_MAX_SIZE) ||
             load_segments_overlap_runtime_range(elf, DEBUG_STRING_TABLE_VADDR, DEBUG_STRING_TABLE_MAX_SIZE)) {
             return false;
@@ -1366,8 +1395,8 @@ auto loader_owned_ranges_are_available(const ElfFile& elf, ker::mod::mm::virt::P
     }
     uint64_t const SECTION_BYTES = metadata_plan.section_headers_pages * mod::mm::virt::PAGE_SIZE;
     uint64_t const STRING_BYTES = metadata_plan.string_table_pages * mod::mm::virt::PAGE_SIZE;
-    return (SECTION_BYTES == 0 || mod::mm::user_layout::range_is_free(pagemap, DEBUG_SECTION_HEADERS_VADDR, SECTION_BYTES)) &&
-           (STRING_BYTES == 0 || mod::mm::user_layout::range_is_free(pagemap, DEBUG_STRING_TABLE_VADDR, STRING_BYTES));
+    return (SECTION_BYTES == 0 || probe.range_is_free(pagemap, DEBUG_SECTION_HEADERS_VADDR, SECTION_BYTES)) &&
+           (STRING_BYTES == 0 || probe.range_is_free(pagemap, DEBUG_STRING_TABLE_VADDR, STRING_BYTES));
 }
 
 auto reserve_image_address_space(const ElfFile& elf, mod::mm::virt::PageTable* pagemap, const ElfLoadOptions& options,
@@ -1432,7 +1461,8 @@ auto runtime_image_extent(const ElfFile& elf, uint64_t& start, uint64_t& end) ->
            checked_add(elf.load_base, extent.max_vaddr, end);
 }
 
-auto applied_image_range_is_valid(const LoadImageExtent& extent, uint64_t load_base, ker::mod::mm::virt::PageTable* pagemap) -> bool {
+auto applied_image_range_is_valid(const LoadImageExtent& extent, uint64_t load_base, ker::mod::mm::virt::PageTable* pagemap,
+                                  ElfRangeProbe& probe) -> bool {
     constexpr uint64_t USER_ADDRESS_LIMIT = 0x0000800000000000ULL;
     uint64_t start = 0;
     uint64_t end = 0;
@@ -1440,10 +1470,11 @@ auto applied_image_range_is_valid(const LoadImageExtent& extent, uint64_t load_b
         !checked_add(load_base, extent.max_vaddr, end) || start < mod::mm::virt::PAGE_SIZE || end > USER_ADDRESS_LIMIT || start >= end) {
         return false;
     }
-    return mod::mm::user_layout::range_is_free(pagemap, start, end - start);
+    return probe.range_is_free(pagemap, start, end - start);
 }
 
-auto select_image_load_base(ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const ElfLoadOptions& options) -> bool {
+auto select_image_load_base(ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const ElfLoadOptions& options, ElfRangeProbe& probe)
+    -> bool {
     LoadImageExtent extent{};
     if (!load_image_extent(elf, extent)) {
         return false;
@@ -1451,7 +1482,7 @@ auto select_image_load_base(ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap
 
     if (elf.elf_head.e_type == ET_EXEC) {
         if (options.image_role != mod::mm::user_layout::ImageRole::MAIN || options.base_address != 0 ||
-            !applied_image_range_is_valid(extent, 0, pagemap)) {
+            !applied_image_range_is_valid(extent, 0, pagemap, probe)) {
             return false;
         }
         elf.load_base = 0;
@@ -1459,11 +1490,11 @@ auto select_image_load_base(ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap
     }
 
     uint64_t load_base = options.base_address;
-    if (load_base == 0 &&
-        !mod::mm::user_layout::choose_image_base(pagemap, options.image_role, extent.min_vaddr, extent.max_vaddr, load_base)) {
+    if (load_base == 0 && !mod::mm::user_layout::choose_image_base_with_query(pagemap, options.image_role, extent.min_vaddr,
+                                                                              extent.max_vaddr, load_base, ElfRangeProbe::query, &probe)) {
         return false;
     }
-    if (!applied_image_range_is_valid(extent, load_base, pagemap)) {
+    if (!applied_image_range_is_valid(extent, load_base, pagemap, probe)) {
         return false;
     }
     for (Elf64_Half i = 0; i < elf.elf_head.e_phnum; ++i) {
@@ -1605,9 +1636,10 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
         mod::dbg::log("ERROR: Invalid or out-of-bounds ELF source metadata (pid=%d, logical_size=%lu)", pid, elf_file.logical_size);
         return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
     }
-    if (!select_image_load_base(elf_file, pagemap, options) || !runtime_program_header_ranges_fit(elf_file)) {
+    ElfRangeProbe range_probe{options.layout_cooperation};
+    if (!select_image_load_base(elf_file, pagemap, options, range_probe) || !runtime_program_header_ranges_fit(elf_file)) {
         mod::dbg::log("ERROR: Unable to select a collision-free ELF load range (pid=%d)", pid);
-        return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
+        return {.error = range_probe.error()};
     }
 
     bool has_dynamic_interp = false;
@@ -1629,9 +1661,9 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
 
     DebugMetadataPlan debug_metadata_plan{};
     if (!make_debug_metadata_plan(elf_file, IS_PRIMARY_IMAGE, debug_metadata_plan) ||
-        !loader_owned_ranges_are_available(elf_file, pagemap, debug_metadata_plan, IS_PRIMARY_IMAGE)) {
+        !loader_owned_ranges_are_available(elf_file, pagemap, debug_metadata_plan, IS_PRIMARY_IMAGE, range_probe)) {
         mod::dbg::log("ERROR: ELF collides with loader-owned metadata ranges (pid=%d)", pid);
-        return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
+        return {.error = range_probe.error()};
     }
 
     uint64_t elf_header_vaddr = 0;
@@ -1646,9 +1678,9 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
     } else if (IS_PRIMARY_IMAGE) {
         uint64_t const TOTAL_HEADERS_SIZE = sizeof(Elf64_Ehdr) + (static_cast<uint64_t>(elf_file.elf_head.e_phnum) * sizeof(Elf64_Phdr));
         uint64_t const TOTAL_HEADERS_PAGES = page_align_up(TOTAL_HEADERS_SIZE) / mod::mm::virt::PAGE_SIZE;
-        if (!mod::mm::user_layout::range_is_free(pagemap, HEADER_COPY_VADDR, TOTAL_HEADERS_PAGES * mod::mm::virt::PAGE_SIZE)) {
+        if (!range_probe.range_is_free(pagemap, HEADER_COPY_VADDR, TOTAL_HEADERS_PAGES * mod::mm::virt::PAGE_SIZE)) {
             mod::dbg::log("ERROR: Fixed ELF-header copy range collides with an existing mapping (pid=%d)", pid);
-            return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
+            return {.error = range_probe.error()};
         }
     }
 

@@ -1148,6 +1148,9 @@ struct Task {
     std::atomic<ker::syscall::process::PreparedNativeExecImage*> owned_exec_preparation{nullptr};
     // Published before native exec snapshots faulting user pointers.
     std::atomic<ker::syscall::process::ExecRequestArguments*> owned_exec_arguments{nullptr};
+    // Defers fatal/local-worker handoff through synchronous exec cleanup,
+    // publication/activation and the bounded pre-adoption layout cooperation.
+    // Layout cooperation owns a false->true CAS and restores IF before release.
     std::atomic<bool> exec_preparation_teardown_in_progress{false};
     // Queued worker owns this request until the owner acknowledges it. Claim,
     // cancellation and preparation-slot transfer use the owner's resource_lock.

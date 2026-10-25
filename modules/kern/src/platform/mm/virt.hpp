@@ -758,6 +758,10 @@ auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
 auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool;
 // Same publication/root-lifetime contract as counting, but stops at the first
 // present or reserved leaf. Invalid/empty ranges and teardown fail closed.
+enum class UserVirtualRangeStatus : uint8_t { Free, Occupied, Invalid, ReaderUnavailable, GateBusy };
+// One nonblocking attempt. GateBusy denotes an actual teardown refusal, not
+// occupied VA. No reader or preemption guard remains held on return.
+[[nodiscard]] auto query_user_virtual_range(PageTable* page_table, uint64_t start, uint64_t end) -> UserVirtualRangeStatus;
 auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t end) -> bool;
 void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out);
 void register_anonymous_swap_shrinker();

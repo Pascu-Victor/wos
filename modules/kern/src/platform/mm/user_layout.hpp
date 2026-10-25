@@ -4,6 +4,10 @@
 
 #include "platform/mm/paging.hpp"
 
+namespace ker::mod::mm::virt {
+enum class UserVirtualRangeStatus : uint8_t;
+}
+
 namespace ker::mod::mm::user_layout {
 
 enum class ImageRole : uint8_t {
@@ -42,6 +46,12 @@ inline constexpr AddressWindow THREAD_WINDOW{0x0000740000000000ULL, 0x00007F0000
 // is [base + image_min_vaddr, base + image_max_vaddr).
 [[nodiscard]] auto choose_image_base(paging::PageTable* page_table, ImageRole role, uint64_t image_min_vaddr, uint64_t image_max_vaddr,
                                      uint64_t& base) -> bool;
+
+using ImageRangeQuery = auto (*)(paging::PageTable*, uint64_t start, uint64_t size, void* context) -> virt::UserVirtualRangeStatus;
+// The query may resolve contention on the same range. Only Occupied consumes
+// a collision probe; other failures abort without redrawing entropy.
+[[nodiscard]] auto choose_image_base_with_query(paging::PageTable* page_table, ImageRole role, uint64_t image_min_vaddr,
+                                                uint64_t image_max_vaddr, uint64_t& base, ImageRangeQuery query, void* context) -> bool;
 
 // Choose the low address of a total_span-byte, page-aligned thread layout.
 [[nodiscard]] auto choose_thread_region(paging::PageTable* page_table, uint64_t total_span, uint64_t& start) -> bool;

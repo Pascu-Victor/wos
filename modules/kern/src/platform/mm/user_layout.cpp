@@ -97,6 +97,15 @@ auto range_is_free(paging::PageTable* page_table, uint64_t start, uint64_t size)
 
 auto choose_image_base(paging::PageTable* page_table, ImageRole role, uint64_t image_min_vaddr, uint64_t image_max_vaddr, uint64_t& base)
     -> bool {
+    // Preserve the Boolean API's try-only, fail-closed collision behavior.
+    auto query = [](paging::PageTable* root, uint64_t start, uint64_t size, void*) {
+        return range_is_free(root, start, size) ? virt::UserVirtualRangeStatus::Free : virt::UserVirtualRangeStatus::Occupied;
+    };
+    return choose_image_base_with_query(page_table, role, image_min_vaddr, image_max_vaddr, base, query, nullptr);
+}
+
+auto choose_image_base_with_query(paging::PageTable* page_table, ImageRole role, uint64_t image_min_vaddr, uint64_t image_max_vaddr,
+                                  uint64_t& base, ImageRangeQuery query, void* context) -> bool {
     AddressWindow window{};
     switch (role) {
         case ImageRole::MAIN:
@@ -108,8 +117,9 @@ auto choose_image_base(paging::PageTable* page_table, ImageRole role, uint64_t i
         default:
             return false;
     }
-    if (page_table == nullptr || image_min_vaddr >= image_max_vaddr || (image_min_vaddr & (paging::PAGE_SIZE - 1)) != 0 ||
-        (image_max_vaddr & (paging::PAGE_SIZE - 1)) != 0 || image_max_vaddr > window.end) {
+    if (page_table == nullptr || query == nullptr || image_min_vaddr >= image_max_vaddr ||
+        (image_min_vaddr & (paging::PAGE_SIZE - 1)) != 0 || (image_max_vaddr & (paging::PAGE_SIZE - 1)) != 0 ||
+        image_max_vaddr > window.end) {
         return false;
     }
 
@@ -141,10 +151,12 @@ auto choose_image_base(paging::PageTable* page_table, ImageRole role, uint64_t i
             return false;
         }
         uint64_t const RUNTIME_START = candidate_bias + image_min_vaddr;
-        if (range_is_free(page_table, RUNTIME_START, IMAGE_SPAN)) {
+        auto const STATUS = query(page_table, RUNTIME_START, IMAGE_SPAN, context);
+        if (STATUS == virt::UserVirtualRangeStatus::Free) {
             base = candidate_bias;
             return true;
         }
+        if (STATUS != virt::UserVirtualRangeStatus::Occupied) return false;
         index = index + 1 == CANDIDATES.count ? 0 : index + 1;
     }
     return false;

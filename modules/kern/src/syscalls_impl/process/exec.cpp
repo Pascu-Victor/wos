@@ -59,6 +59,7 @@
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/signal.hpp>
+#include <platform/sys/syscall_preparation.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
 #include <span>
@@ -1822,6 +1823,85 @@ class ExecRequestArguments {
 };
 
 WorkerExecHandoff::~WorkerExecHandoff() { delete remote_request; }
+
+// Ordinary exec alone may cooperate while it still owns a private new image.
+// The callback and token remain on this synchronous stack, never in Task or
+// lazy-image metadata. Main and interpreter consume the same hard budget.
+class ExecLayoutContext {
+   public:
+    ExecLayoutContext(ker::mod::sched::task::Task& executor, ExecRequestArguments* request, ker::mod::mm::virt::PageTable* root)
+        : executor_(executor), published_root_(executor.pagemap), request_(request), root_(root), cooperation_(cooperate, this) {}
+
+    auto cooperation() -> ker::loader::elf::ElfLayoutCooperation* { return &cooperation_; }
+
+   private:
+    class HandoffDeferral {
+       public:
+        explicit HandoffDeferral(ker::mod::sched::task::Task& executor) : executor_(executor) {
+            bool expected = false;
+            owned_ = executor_.exec_preparation_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+        }
+        ~HandoffDeferral() {
+            if (owned_) executor_.exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+        }
+        HandoffDeferral(const HandoffDeferral&) = delete;
+        auto operator=(const HandoffDeferral&) -> HandoffDeferral& = delete;
+        [[nodiscard]] auto ready() const -> bool { return owned_; }
+
+       private:
+        ker::mod::sched::task::Task& executor_;
+        bool owned_{};
+    };
+
+    [[nodiscard]] auto eligible(ker::mod::mm::virt::PageTable* root, bool deferring = false) const -> bool {
+        using namespace ker::mod;
+        // get_return_task reads the local run queue without masking IRQs. Keep
+        // both task samples and scalar checks on one CPU, then restore IF.
+        uint64_t flags = 0;
+        asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
+        bool const READY = sched::can_query_current_task() && sched::get_current_task() == &executor_ &&
+                           sched::get_return_task() == &executor_ && executor_.type == sched::task::TaskType::PROCESS &&
+                           executor_.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+                           executor_.syscall_account_start_us != 0 && !executor_.cpu_accounting_finalized.load(std::memory_order_acquire) &&
+                           sched::preempt_count() == 0 && !executor_.scheduler_transition_active.load(std::memory_order_acquire) &&
+                           !executor_.deferred_task_switch && !executor_.wants_block && !executor_.has_exited &&
+                           !executor_.exit_in_progress.load(std::memory_order_acquire) &&
+                           !executor_.process_exit_requested.load(std::memory_order_acquire) &&
+                           executor_.exec_preparation_teardown_in_progress.load(std::memory_order_acquire) == deferring &&
+                           !executor_.usercopy_pagemap_closing.load(std::memory_order_acquire) && request_ != nullptr &&
+                           executor_.owned_exec_arguments.load(std::memory_order_acquire) == request_ &&
+                           executor_.owned_exec_preparation.load(std::memory_order_acquire) == nullptr &&
+                           executor_.pagemap == published_root_ && published_root_ != nullptr && root == root_ && root_ != nullptr &&
+                           root_ != published_root_ && root_ != mm::virt::get_kernel_pagemap();
+        if ((flags & cpu::GATE_IF_MASK) != 0) asm volatile("sti" ::: "memory");
+        return READY;
+    }
+
+    static auto cooperate(void* context, ker::mod::mm::virt::PageTable* root) -> bool {
+        using namespace ker::mod;
+        auto& self = *static_cast<ExecLayoutContext*>(context);
+        // Check before the scope can enable IF. No reader, preemption/IRQ or
+        // publication guard spans this ordinary scalar cooperation boundary.
+        if (sched::interrupts_enabled() || !self.eligible(root)) return false;
+        // With voluntary-only scheduling a timer just after STI can retain an
+        // old USER_RETURN snapshot. Defer fatal/local-worker handoff until this
+        // nested scope has restored the syscall's IF=0, even on refusal.
+        HandoffDeferral deferral(self.executor_);
+        if (!deferral.ready()) return false;
+        sys::SyscallPreparationScope preparation(self.executor_);
+        if (!preparation.ready() || !sched::interrupts_enabled() || !self.eligible(root, true)) return false;
+        sched::kern_yield();
+        // Accounting can renew its timestamp across a yield; the exact owned
+        // request and roots, rather than that timestamp, identify this exec.
+        return sched::interrupts_enabled() && self.eligible(root, true);
+    }
+
+    ker::mod::sched::task::Task& executor_;
+    ker::mod::mm::virt::PageTable* published_root_;
+    ExecRequestArguments* request_;
+    ker::mod::mm::virt::PageTable* root_;
+    ker::loader::elf::ElfLayoutCooperation cooperation_;
+};
 
 // Owns prepared/retired storage and temporary admission independently of the
 // preparing stack. The Task slot survives publication through final cleanup.
@@ -6147,6 +6227,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
     mm::virt::copy_kernel_mappings_to(new_pagemap);
 
+    ExecLayoutContext layout_context(*task, request, new_pagemap);
+
     // --- Create new thread (user stack + TLS) ---
     ker::loader::elf::TlsModule tls_info{};
     bool const ELF_CONTRACT_VALID = FILE_BACKED_ELF ? loader::elf::inspect_tls(prepared_elf.view, tls_info)
@@ -6213,6 +6295,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         .policy_owner = task,
         .allocation_context = request->allocation_context,
         .allocation_origin = request->allocation_origin,
+        .layout_cooperation = layout_context.cooperation(),
     };
     loader::elf::ElfLoadResult elf_result =
         FILE_BACKED_ELF
@@ -6345,6 +6428,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             .policy_owner = task,
             .allocation_context = request->allocation_context,
             .allocation_origin = request->allocation_origin,
+            .layout_cooperation = layout_context.cooperation(),
         };
         loader::elf::ElfLoadResult const INTERP_RESULT =
             FILE_BACKED_INTERP

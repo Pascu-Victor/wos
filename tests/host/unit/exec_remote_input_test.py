@@ -27,6 +27,7 @@ code = r'''
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <utility>
 namespace alloc {
@@ -46,6 +47,13 @@ void operator delete[](void*p,size_t)noexcept{alloc::put(p);}
 void operator delete(void*p,const std::nothrow_t&)noexcept{alloc::put(p);}
 void operator delete[](void*p,const std::nothrow_t&)noexcept{alloc::put(p);}
 namespace ker::mod::security {struct Snapshot{int identity=7;};struct ExecIdentity{uint32_t uid{},gid{};bool set_uid{},set_gid{},nosuid{};uint32_t mode{};};}
+// Value-only production interfaces; no allocator or loader implementation is modeled.
+namespace ker::mod::mm::numa {
+enum class Mode:uint8_t{LOCAL,PREFERRED,BIND,INTERLEAVE};
+struct Policy{uint64_t nodes{};Mode mode{Mode::LOCAL};auto operator==(const Policy&)const->bool=default;};
+struct AllocationContext{Policy policy{};uint16_t local_node{UINT16_MAX};uint64_t virtual_page_index{};};
+}
+namespace ker::loader::elf{enum class ElfAllocationOrigin:uint8_t{MISSING=0,EXECUTOR_CAPTURE=1,TRUSTED_LOCAL=2};}
 namespace ker::mod::perf {enum class WkiPerfLocalProcOp{REMOTE_SPAWN};}
 struct Lock{bool held=false;auto lock_irqsave()->uint64_t{assert(!held);held=true;return 0;}void unlock_irqrestore(uint64_t){assert(held);held=false;}};
 struct ExecRequestArguments;struct WorkerExecHandoff;
@@ -85,6 +93,7 @@ struct WkiRemoteSpawnSpec{
  const TaskExecSignals*exec_signals{};uint32_t*deferred_proxy_id{};
  const Task::FilesystemContext*filesystem{};const TaskExecCredentialTransition*exec_credentials{};
  const WkiRemoteExecCandidate*exec_candidate{};
+ std::optional<ker::mod::mm::numa::Policy>memory_policy{};
 };
 auto wki_try_remote_spawn(Task*,const WkiRemoteSpawnSpec&)->WkiRemoteSpawnResult;
 }
@@ -96,7 +105,7 @@ constexpr size_t EXEC_ARG_BYTES_MAX=2*1024*1024;
 void consume_successful_one_shot_wki_target(Task*,Result){}
 #define WOS_PERF_CALLSITE() 0
 PLAN
-struct ExecRequestArguments{std::unique_ptr<RemoteExecPlan>remote;ker::mod::security::Snapshot admitted_credentials;WorkerExecHandoff handoff;bool remote_worker_committed{};Trace trace;uint32_t remote_proxy_id{};};
+struct ExecRequestArguments{std::unique_ptr<RemoteExecPlan>remote;ker::mod::security::Snapshot admitted_credentials;WorkerExecHandoff handoff;bool remote_worker_committed{};Trace trace;uint32_t remote_proxy_id{};ker::mod::mm::numa::Policy memory_policy{};ker::mod::mm::numa::AllocationContext allocation_context{};ker::loader::elf::ElfAllocationOrigin allocation_origin{ker::loader::elf::ElfAllocationOrigin::MISSING};};
 WorkerExecHandoff::~WorkerExecHandoff(){delete remote_request;}
 struct RemoteExecOutcome{Result result=Result::FAILED;int error{};WorkerExecHandoff*pending{};};
 int prepare_remote_exec_owner(Task&,void*){return 0;}
@@ -111,10 +120,12 @@ Result outcome=Result::LOCAL;size_t submits=0;bool worker_mode=false;
 const char*const*original_args{};const char*const*original_env{};const uint8_t*original_elf{};size_t original_size{};
 char* mutable_arg{};char*mutable_env{};uint8_t*mutable_elf{};
 bool new_version=false;
+constexpr ker::mod::mm::numa::Policy captured_policy{4,ker::mod::mm::numa::Mode::BIND};
 }
 auto ker::net::wki::wki_try_remote_spawn(Task*t,const WkiRemoteSpawnSpec&s)->Result{
  ++test::submits;assert(t&&s.exec_candidate&&s.argv&&s.envp&&s.context&&s.prepare&&s.accepted&&s.cutover);
  auto&plan=*static_cast<RemoteExecPlan*>(s.context);auto&c=*s.exec_candidate;
+ if(EXPECT_REDUCED)assert(s.memory_policy && *s.memory_policy==test::captured_policy);
  assert(c.bytes.size()==test::original_size&&c.complete&&std::strcmp(c.path,"/bin/true")==0);
  assert(std::strcmp(t->exe_path.data(),"/old")==0&&!t->wki_skip_legacy_placement);
  assert(plan.actor->refs==2&&s.filesystem->root_anchor==11&&s.filesystem->cwd_anchor==12);
@@ -134,6 +145,11 @@ void wake_task_for_signal(Task*){}
 void wake_task_from_event(Task*owner){
  auto*h=owner->pending_exec_handoff.exchange(nullptr);assert(h&&h->remote_request);
  auto*r=std::exchange(h->remote_request,nullptr);owner->active_exec_handoff.store(h);owner->owned_exec_arguments.store(r);
+ if(EXPECT_REDUCED){
+  assert(r->memory_policy==test::captured_policy && r->allocation_context.policy==test::captured_policy);
+  assert(r->allocation_context.local_node==2 && r->allocation_context.virtual_page_index==123);
+  assert(r->allocation_origin==ker::loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE);
+ }
  auto result=run_remote_exec_owner(*owner,*r,h);assert(result.pending==nullptr);
  owner->active_exec_handoff.store(nullptr);owner->owned_exec_arguments.store(nullptr);delete r;
 }
@@ -153,6 +169,8 @@ int main(){
   for(size_t fail=0;fail<=allocations;++fail){
    Task owner,actor;auto&subject=worker?actor:owner;subject.canonical=&owner;std::memcpy(owner.exe_path.data(),"/old",5);
    ExecRequestArguments request;subject.owned_exec_arguments.store(&request);
+   request.memory_policy=test::captured_policy;request.allocation_context={test::captured_policy,2,123};
+   request.allocation_origin=ker::loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE;
    char arg[]="true",env[]="K=value";const char*args[]={arg,nullptr};const char*envs[]={env,nullptr};std::array<uint8_t,64>elf{};elf[0]=0x7f;
    test::outcome=outcome;test::worker_mode=worker;test::submits=0;test::original_args=args;test::original_env=envs;test::original_elf=elf.data();test::original_size=elf.size();test::mutable_arg=arg;test::mutable_env=env;test::mutable_elf=elf.data();
    alloc::attempts=alloc::live=0;alloc::fail_at=fail;alloc::tracking=true;int error=99;
