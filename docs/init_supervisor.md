@@ -85,7 +85,7 @@ are the only repeatable fields.
 | `environment` | 1 | `init`, `empty` | Start from PID 1's bounded base environment or an empty base before applying `env`. |
 | `readiness` | 1 | `immediate`, `ipv4`, `exit-success` | Readiness adapter. |
 | `readiness-interface` | Conditional | Interface name, at most 15 bytes | Required only for `readiness=ipv4`; forbidden otherwise. |
-| `readiness-timeout-ms` | 1 | `1`–`600000` | Deadline for becoming ready. |
+| `readiness-timeout-ms` | 1 | `1`–`900000` | Deadline for becoming ready, at most 15 minutes. |
 | `restart` | 1 | `never`, `on-failure`, `always` | Restart eligibility after a completed generation. |
 | `backoff-initial-ms` | 1 | At least `1` and no greater than the maximum | First restart delay. |
 | `backoff-max-ms` | 1 | `1`–`3600000`, and at least the initial delay | Cap for exponential restart delay. |

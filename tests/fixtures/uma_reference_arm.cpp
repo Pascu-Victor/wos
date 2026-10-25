@@ -312,7 +312,7 @@ auto running(const init::StatusSnapshot& s, pid_t controller, uint64_t& deadline
     if (!snapshot_valid(s, row) || row.state != init::ServiceState::RUNNING || row.readiness != init::ReadinessState::NOT_READY ||
         row.flags != 3 || row.generation != 1 || row.restart_count || row.pid != controller || row.pgid != controller || row.last_error ||
         row.last_wait_status || row.deadline_mono_ns <= row.state_since_mono_ns ||
-        row.deadline_mono_ns - row.state_since_mono_ns != 600 * SECOND)
+        row.deadline_mono_ns - row.state_since_mono_ns != CONTROLLER_ALLOWANCE)
         return false;
     bool exec = false;
     for (size_t i = 0; i < row.history_count; ++i)

@@ -298,7 +298,7 @@ def init_wire(data,final=False,finalizer=False,prior=None,original_deadline=None
             if final or finalizer:
                 if h[2]!=1 or(state,ready,flags,pid,pgid,generation,restarts,wait,error,deadline)!=(6,2,3,-1,-1,1,0,0,0,0)or not any(t[3]==5 and t[2]==6 and t[0]>=since for t in history):raise ValueError('actual consumed EXITED/READY/raw0')
             else:
-                if(state,ready,flags,generation,restarts,wait,error)!=(3,1,3,1,0,0,0)or pid<=1 or pgid!=pid or deadline-since!=600_000_000_000 or not any(t[3]==3 and t[2]==3 and t[0]==since for t in history):raise ValueError('actual EXEC600s authority')
+                if(state,ready,flags,generation,restarts,wait,error)!=(3,1,3,1,0,0,0)or pid<=1 or pgid!=pid or deadline-since!=750_000_000_000 or not any(t[3]==3 and t[2]==3 and t[0]==since for t in history):raise ValueError('actual EXEC750s authority')
             selected=dict(pid=pid,deadline=deadline,since=since)
     if seen!=set(SERVICES)or selected is None:raise ValueError('complete init services')
     if final:

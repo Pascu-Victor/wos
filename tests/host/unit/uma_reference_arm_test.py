@@ -226,6 +226,19 @@ def main():
                 import struct
                 def wire_field(raw,row,offset,fmt,value):
                     changed=bytearray(raw);struct.pack_into(fmt,changed,64+row*256+offset,value);return bytes(changed)
+                initial_raw=(case_root/'init-start.bin').read_bytes()
+                initial_since=struct.unpack_from('<Q',initial_raw,64+6*256+120)[0]
+                initial_deadline=struct.unpack_from('<Q',initial_raw,64+6*256+128)[0]
+                check('actual initial authority is750s',initial_deadline-initial_since==750_000_000_000)
+                codec.init_wire(initial_raw)
+                for label,deadline in (('old600',initial_since+600_000_000_000),
+                                       ('renewed750',initial_deadline+1)):
+                    changed=wire_field(initial_raw,6,128,'<Q',deadline)
+                    try:
+                        codec.init_wire(changed)
+                    except ValueError as error:
+                        check('initial decoder directly rejects '+label,'actual EXEC750s authority' in str(error))
+                    else:raise AssertionError('initial decoder accepted '+label)
                 final_raw=(case_root/'init-exit.bin').read_bytes()
                 observer=struct.unpack_from('<q',final_raw,64+7*256+80)[0]
                 controls.extend([
@@ -329,6 +342,9 @@ def main():
         previous_consumed='auto consumed(const init::StatusSnapshot& s, pid_t) -> bool {\n    init::ServiceStatus row{};\n    if (!snapshot_valid(s, row) || s.state != init::SupervisorState::RUNNING || row.state != init::ServiceState::EXITED ||\n        row.readiness != init::ReadinessState::READY || row.flags != 3 || row.generation != 1 || row.restart_count || row.pid != -1 ||\n        row.pgid != -1 || row.last_wait_status || row.last_error || row.deadline_mono_ns)\n        return false;\n    for (size_t i = 0; i < row.history_count; ++i)\n        if (row.history[i].reason == init::TransitionReason::EXIT && row.history[i].to_state == init::ServiceState::EXITED &&\n            row.history[i].timestamp_mono_ns >= row.state_since_mono_ns)\n            return true;\n    return false;\n}\n'
         for name,source,old,new,mode,object_label in (
             ('old-aggregate-premise',support[0],arm_text[a:b],previous_consumed,'consumed','arm'),
+            ('old600-controller-authority',support[0],
+             'row.deadline_mono_ns - row.state_since_mono_ns != CONTROLLER_ALLOWANCE',
+             'row.deadline_mono_ns - row.state_since_mono_ns != 600 * SECOND','validators','arm'),
             ('old-pending-exec-guard',support[5],'!arm::awaiting_exec(final, ::getpid()) &&','','pending-exec','observer'),
             ('missing-child-profile',owner,'if (!arm::process_admitted(expected_parent))','if (false)','child-refuse','owner'),
             ('wrong-daemon-readiness',support[0],'row.readiness != init::ReadinessState::READY','row.readiness != init::ReadinessState::NOT_READY','bad-init','arm')):
@@ -346,6 +362,9 @@ def main():
             command('link-'+name,[args.cxx]+linked+['-o',mutant])
             refused=command('reject-'+name,[mutant,mode,tree(name+'-case')],expected=1)
             check(name+' compiled real oracle rejects','FAIL actual 'in refused)
+            if name=='old600-controller-authority':
+                check('old600 compiled authority fails same actual750 positive',
+                      'FAIL actual EXEC deadline/history positive\n' in refused)
             if name=='old-pending-exec-guard':
                 check('actual old pending guard refuses82', 'PENDING_EXEC_OBSERVER_EXIT=82\n'in refused)
     except BaseException as error:

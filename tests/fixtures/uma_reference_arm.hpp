@@ -11,6 +11,7 @@
 namespace uma_reference::arm {
 namespace init = ker::abi::init_control;
 inline constexpr uint64_t SECOND = 1'000'000'000, MARGIN = 30 * SECOND;
+inline constexpr uint64_t CONTROLLER_ALLOWANCE = 750 * SECOND;
 inline constexpr char ROOT[] = "/var/lib/uma-reference";
 inline constexpr char SERVICE[] = "uma-reference";
 inline constexpr char OBSERVER[] = "uma-reference-exit-witness";

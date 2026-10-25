@@ -189,7 +189,7 @@ auto uma_arm_host_snapshot(ker::abi::init_control::StatusSnapshot& s) -> int64_t
     r.readiness = init::ReadinessState::NOT_READY;
     r.pid = original;
     r.pgid = original;
-    r.deadline_mono_ns = since + 600 * arm::SECOND;
+    r.deadline_mono_ns = since + 750 * arm::SECOND;
     auto& witness = s.services[7];
     witness.state = init::ServiceState::WAITING;
     witness.readiness = init::ReadinessState::NOT_READY;

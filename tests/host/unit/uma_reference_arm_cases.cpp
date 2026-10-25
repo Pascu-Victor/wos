@@ -196,8 +196,16 @@ void validators() {
     uint64_t deadline{};
     check(arm::running(s, ::getpid(), deadline), "actual EXEC deadline/history positive");
     auto x = s;
+    x.services[6].deadline_mono_ns = x.services[6].state_since_mono_ns + 600 * arm::SECOND;
+    uint64_t refused = 0x741;
+    check(!arm::running(x, ::getpid(), refused) && refused == 0x741, "old600 authority refused without changing admitted deadline");
+    x = s;
     x.services[6].deadline_mono_ns += 1;
     check(!arm::running(x, ::getpid(), deadline), "no invented refreshed deadline");
+    x = s;
+    --x.services[6].state_since_mono_ns;
+    --x.services[6].deadline_mono_ns;
+    check(!arm::running(x, ::getpid(), deadline), "same750 span cannot renew actual EXEC history");
     x = s;
     x.services[6].history[0].reason = arm::init::TransitionReason::READINESS;
     check(!arm::running(x, ::getpid(), deadline), "must be actual EXEC/SPAWN transition");
@@ -353,7 +361,6 @@ void consumed_rows() {
     check(!arm::consumed(s, ::getpid() + 1), "actual caller PID must own observer row");
 }
 
-
 void finalized_rows() {
     arm::init::StatusSnapshot earlier{};
     check(uma_arm_host_snapshot(earlier) == 0, "actual nine-row initial snapshot");
@@ -364,32 +371,66 @@ void finalized_rows() {
     uma_arm_host_witness_complete(final, FINALIZER);
     uint64_t const BOUND = earlier.services[7].deadline_mono_ns - 1;
     check(arm::witness_consumed(final, earlier, FINALIZER, BOUND), "two consumed raw0 rows with live finalizer positive");
-    check(final.services[8].state == arm::init::ServiceState::RUNNING &&
-              arm::witness_consumed(final, earlier, FINALIZER, BOUND), "finalizer own consumption is not recursive proof");
+    check(final.services[8].state == arm::init::ServiceState::RUNNING && arm::witness_consumed(final, earlier, FINALIZER, BOUND),
+          "finalizer own consumption is not recursive proof");
     auto pending = final;
     uma_arm_host_final_pending(pending);
-    check(arm::witness_awaiting_exec(pending, earlier, FINALIZER, BOUND) &&
-              !arm::witness_consumed(pending, earlier, FINALIZER, BOUND), "pending finalizer EXEC is polling only");
+    check(arm::witness_awaiting_exec(pending, earlier, FINALIZER, BOUND) && !arm::witness_consumed(pending, earlier, FINALIZER, BOUND),
+          "pending finalizer EXEC is polling only");
     for (unsigned i = 0; i < 17; ++i) {
         auto bad = final;
         switch (i) {
-            case 0: bad.services[7].state = arm::init::ServiceState::RUNNING; break;
-            case 1: bad.services[7].readiness = arm::init::ReadinessState::NOT_READY; break;
-            case 2: bad.services[7].last_wait_status = 1; break;
-            case 3: bad.services[7].generation = 2; break;
-            case 4: bad.services[7].restart_count = 1; break;
-            case 5: bad.services[7].pid = ::getpid(); break;
-            case 6: bad.services[7].deadline_mono_ns = BOUND; break;
-            case 7: bad.services[7].history[0].reason = arm::init::TransitionReason::SPAWN; break;
-            case 8: bad.services[8].pid = FINALIZER + 1; break;
-            case 9: bad.services[8].generation = 2; break;
-            case 10: bad.services[8].deadline_mono_ns++; break;
-            case 11: bad.services[6].last_wait_status = 1; break;
-            case 12: bad.services[0].pid++; break;
-            case 13: bad.published_mono_ns = BOUND; break;
-            case 14: bad.sequence = earlier.sequence; break;
-            case 15: bad.services[8].history[0].from_state = arm::init::ServiceState::WAITING; break;
-            case 16: bad.services[8].history[0].timestamp_mono_ns++; break;
+            case 0:
+                bad.services[7].state = arm::init::ServiceState::RUNNING;
+                break;
+            case 1:
+                bad.services[7].readiness = arm::init::ReadinessState::NOT_READY;
+                break;
+            case 2:
+                bad.services[7].last_wait_status = 1;
+                break;
+            case 3:
+                bad.services[7].generation = 2;
+                break;
+            case 4:
+                bad.services[7].restart_count = 1;
+                break;
+            case 5:
+                bad.services[7].pid = ::getpid();
+                break;
+            case 6:
+                bad.services[7].deadline_mono_ns = BOUND;
+                break;
+            case 7:
+                bad.services[7].history[0].reason = arm::init::TransitionReason::SPAWN;
+                break;
+            case 8:
+                bad.services[8].pid = FINALIZER + 1;
+                break;
+            case 9:
+                bad.services[8].generation = 2;
+                break;
+            case 10:
+                bad.services[8].deadline_mono_ns++;
+                break;
+            case 11:
+                bad.services[6].last_wait_status = 1;
+                break;
+            case 12:
+                bad.services[0].pid++;
+                break;
+            case 13:
+                bad.published_mono_ns = BOUND;
+                break;
+            case 14:
+                bad.sequence = earlier.sequence;
+                break;
+            case 15:
+                bad.services[8].history[0].from_state = arm::init::ServiceState::WAITING;
+                break;
+            case 16:
+                bad.services[8].history[0].timestamp_mono_ns++;
+                break;
         }
         check(!arm::witness_consumed(bad, earlier, FINALIZER, BOUND), "actual dual-consumed validator rejects mutation");
     }
@@ -415,15 +456,20 @@ void dependency_gate() {
     std::array<model::EnablementResult, model::MAX_SERVICES> enabled{};
     enabled.fill(model::EnablementResult::CONDITION_MET);
     check(model::initialize_supervisor(state, manifest, topology, std::span(enabled.data(), manifest.service_count), 1) ==
-              model::SupervisorResult::OK, "actual supervisor initializes corrected manifest");
-    unsigned witness = 99, finalizer = 99;
+              model::SupervisorResult::OK,
+          "actual supervisor initializes corrected manifest");
+    unsigned controller = 99, witness = 99, finalizer = 99;
     for (unsigned i = 0; i < manifest.service_count; ++i) {
+        if (manifest.services[i].name.view() == arm::SERVICE) controller = i;
         if (manifest.services[i].name.view() == arm::OBSERVER) witness = i;
         if (manifest.services[i].name.view() == arm::FINALIZER) finalizer = i;
         state.services[i].state = model::ServiceState::READY;
     }
-    check(witness < 9 && finalizer < 9 &&
-              (manifest.services[finalizer].dependency_mask & (1U << witness)), "actual finalizer depends on original witness");
+    check(controller < 9 && witness < 9 && finalizer < 9 && manifest.services[controller].readiness_timeout_ms == 750000 &&
+              manifest.services[witness].readiness_timeout_ms == 30000 && manifest.services[finalizer].readiness_timeout_ms == 30000,
+          "actual manifest750 controller with unchanged30 witness/finalizer");
+    check(witness < 9 && finalizer < 9 && (manifest.services[finalizer].dependency_mask & (1U << witness)),
+          "actual finalizer depends on original witness");
     if (witness >= 9 || finalizer >= 9) return;
     auto& original = state.services[witness];
     original.state = model::ServiceState::RUNNING;
@@ -575,12 +621,14 @@ auto main(int argc, char** argv) -> int {
                 std::array<char, 512> window{};
                 unsigned long long observer_pid{}, entered{}, bound{};
                 std::array<char, 33> window_nonce{};
-                bool const WINDOW = arm::read("init-exit.bin", &earlier, sizeof(earlier), size) && size == sizeof(earlier) &&
-                                    arm::read("witness-window.txt", window.data(), window.size(), size) &&
-                                    std::sscanf(window.data(), "UMA_WITNESS_WINDOW v=2 nonce=%32[0-9a-f] observer=%llu entered=%llu deadline=%llu",
-                                                window_nonce.data(), &observer_pid, &entered, &bound) == 4;
+                bool const WINDOW =
+                    arm::read("init-exit.bin", &earlier, sizeof(earlier), size) && size == sizeof(earlier) &&
+                    arm::read("witness-window.txt", window.data(), window.size(), size) &&
+                    std::sscanf(window.data(), "UMA_WITNESS_WINDOW v=2 nonce=%32[0-9a-f] observer=%llu entered=%llu deadline=%llu",
+                                window_nonce.data(), &observer_pid, &entered, &bound) == 4;
                 check(WINDOW && observer_pid == uint64_t(observer) && bound == entered + arm::MARGIN &&
-                          bound < earlier.services[7].deadline_mono_ns, "original observer entry precedes EXEC and bounds finalizer");
+                          bound < earlier.services[7].deadline_mono_ns,
+                      "original observer entry precedes EXEC and bounds finalizer");
                 if (!std::strcmp(mode, "pending-final")) ::setenv("UMA_HOST_PENDING_FINAL", "1", 1);
                 if (!std::strcmp(mode, "bad-final")) ::setenv("UMA_HOST_BAD_FINAL", "1", 1);
                 pid_t finalizer = ::fork();
@@ -595,7 +643,10 @@ auto main(int argc, char** argv) -> int {
                 pid_t final_got = 0;
                 while (finalizer > 1 && final_got == 0) {
                     final_got = ::waitpid(finalizer, &final_raw, WNOHANG);
-                    if (final_got < 0 && errno == EINTR) { final_got = 0; continue; }
+                    if (final_got < 0 && errno == EINTR) {
+                        final_got = 0;
+                        continue;
+                    }
                     uint64_t tick{};
                     if (!arm::now(tick) || tick >= until) break;
                     if (!final_got) ::usleep(1000);
@@ -605,7 +656,8 @@ auto main(int argc, char** argv) -> int {
                 bool const EXPECTED = std::strcmp(mode, "bad-final") != 0;
                 check(FINAL_EXIT == (EXPECTED ? 0 : 92), "actual independent finalizer validates original witness consumption");
                 check(present(root + "/host-poweroff.txt") == EXPECTED && present(root + "/init-final.bin") == EXPECTED &&
-                          present(root + "/init-final.txt") == EXPECTED, "only finalizer with saved dual-consumed proof requests poweroff");
+                          present(root + "/init-final.txt") == EXPECTED,
+                      "only finalizer with saved dual-consumed proof requests poweroff");
             }
         }
     }
