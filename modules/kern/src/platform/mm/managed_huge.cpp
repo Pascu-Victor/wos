@@ -337,12 +337,20 @@ struct detail::RangePreparationDriver {
     enum class PublicationPolicy : uint8_t { TryOnly, ForkWait };
     static auto pass(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
                      RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage, RangePrepareWitness* witness,
-                     RangePreparePass phase, uint8_t attempt, uint16_t expected_count = 0,
+                     uint16_t& fork_chunks, RangePreparePass phase, uint8_t attempt, uint16_t expected_count = 0,
                      PublicationPolicy publication_policy = PublicationPolicy::TryOnly) noexcept -> Error {
         while (!cursor.complete) {
             if (target != nullptr && (preparation == nullptr || !range_current_context(*target, *preparation, true))) {
                 record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Context, phase, attempt, &cursor, expected_count);
                 return Error::Invalid;
+            }
+            // Bound cooperation across all passes/retries without halting after
+            // every 16-step lock window of an ordinary, sparse fork survey.
+            // No owner exists here; resumption must revalidate the full context.
+            if (publication_policy == PublicationPolicy::ForkWait && target != nullptr && fork_chunks >= 256) {
+                fork_chunks = 0;
+                sched::kern_yield();
+                continue;
             }
             CurrentRangeRootAccess access;
             RangePrepareSite site = RangePrepareSite::PublicationBusy;
@@ -396,7 +404,11 @@ struct detail::RangePreparationDriver {
                 record_range_prepare_failure(witness, error, site, phase, attempt, &cursor, expected_count);
                 return error;
             }
-            if (!cursor.complete && target != nullptr) sched::kern_yield();
+            if (publication_policy == PublicationPolicy::ForkWait) {
+                ++fork_chunks;
+            } else {
+                if (!cursor.complete && target != nullptr) sched::kern_yield();
+            }
         }
         return Error::None;
     }
@@ -411,13 +423,14 @@ struct detail::RangePreparationDriver {
             record_range_prepare_failure(witness, Error::Invalid, RangePrepareSite::Input, RangePreparePass::Entry, 0);
             return Error::Invalid;
         }
+        uint16_t fork_chunks = 0;
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
             if (witness != nullptr) *witness = {};
             RangeSplitCursor count{};
             count.start = start;
             count.end = end;
-            Error error = pass(target, preparation, unpublished, count, RangeSurveyMode::Count, nullptr, witness, RangePreparePass::Count,
-                               static_cast<uint8_t>(attempt + 1), 0, publication_policy);
+            Error error = pass(target, preparation, unpublished, count, RangeSurveyMode::Count, nullptr, witness, fork_chunks,
+                               RangePreparePass::Count, static_cast<uint8_t>(attempt + 1), 0, publication_policy);
             if (error != Error::None) {
                 if (error == Error::Again && count.epoch_changed) continue;
                 return error;  // Busy is immediate; no hidden contention retries.
@@ -449,7 +462,7 @@ struct detail::RangePreparationDriver {
             fill.start = start;
             fill.end = end;
             error = pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage,
-                         witness, RangePreparePass::Fill, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);
+                         witness, fork_chunks, RangePreparePass::Fill, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);
             if (error == Error::None && fill.count != count.count) {
                 error = Error::Again;
                 record_range_prepare_failure(witness, error, RangePrepareSite::CountMismatch, RangePreparePass::Fill,
@@ -471,9 +484,9 @@ struct detail::RangePreparationDriver {
             final.start = start;
             final.end = end;
             if (error == Error::None)
-                error =
-                    pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count,
-                         storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);
+                error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count,
+                             storage, witness, fork_chunks, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count,
+                             publication_policy);
             if (error == Error::None && final.count != count.count) {
                 error = Error::Again;
                 record_range_prepare_failure(witness, error, RangePrepareSite::CountMismatch, RangePreparePass::Verify,

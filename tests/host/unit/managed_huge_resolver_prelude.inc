@@ -106,6 +106,23 @@ void check_yield_boundary() {
     if (current) EXPECT_EQ(current->usercopy_pagemap_accesses.load(), 0U);
     EXPECT_TRUE(interrupts);
 }
+void after_publication_unlock() {
+    if (!expect_fork_wait || in_fork_chunk_release || on_fork_chunk_release == nullptr) return;
+    check_yield_boundary();
+    EXPECT_EQ(ker::syscall::vmem::g_shared_vmem_publication_owner.load(), nullptr);
+    struct Restore {
+        bool previous{expect_fork_wait};
+        ~Restore() {
+            expect_fork_wait = previous;
+            in_fork_chunk_release = false;
+        }
+    } restore;
+    in_fork_chunk_release = true;
+    // A publication performed by the finite other-CPU endpoint must not be
+    // mistaken for another chunk of the interrupted ordinary fork scan.
+    expect_fork_wait = false;
+    on_fork_chunk_release();
+}
 }  // namespace host_range
 namespace ker::mod::mm::virt {
 using addr::paddr_t;

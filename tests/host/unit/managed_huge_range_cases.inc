@@ -662,7 +662,7 @@ TEST_F(ManagedRange, WitnessDescriptorMismatchComesFromActualFinalSurvey) {
 // Named fork-only preparation executes the actual module against a finite
 // wait-action endpoint. This does not prove WOS Mutex parking or progress.
 namespace {
-std::function<void()> fork_range_wait_action, fork_range_gate_action, fork_range_preempt_action;
+std::function<void()> fork_range_wait_action, fork_range_gate_action, fork_range_preempt_action, fork_range_release_action;
 class ManagedForkRange : public ManagedRange {
    protected:
     void SetUp() override {
@@ -670,6 +670,9 @@ class ManagedForkRange : public ManagedRange {
         host_range::expect_fork_wait = false;
         host_range::range_readers = host_range::allocation_checks = 0;
         fork_range_wait_action = fork_range_gate_action = fork_range_preempt_action = {};
+        fork_range_release_action = {};
+        host_range::on_fork_chunk_release = nullptr;
+        host_range::in_fork_chunk_release = false;
         host_range::gate_yields = 0;
         virt::user_pagemap_access_gates[0].teardown.store(false);
         virt::user_pagemap_access_gates[0].readers.close_after_cas = nullptr;
@@ -694,6 +697,9 @@ class ManagedForkRange : public ManagedRange {
     }
     void TearDown() override {
         host_range::on_blocking = nullptr;
+        host_range::on_fork_chunk_release = nullptr;
+        EXPECT_FALSE(host_range::in_fork_chunk_release);
+        fork_range_release_action = {};
         host_range::on_gate_wait = host_range::on_range_preempt = nullptr;
         fork_range_wait_action = fork_range_gate_action = fork_range_preempt_action = {};
         virt::user_pagemap_access_gates[0].teardown.store(false);
@@ -706,8 +712,11 @@ class ManagedForkRange : public ManagedRange {
                     huge::RangePrepareWitness* witness = nullptr) -> huge::Error {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
         auto const previous = host_range::expect_fork_wait;
+        auto const previous_release = host_range::on_fork_chunk_release;
         host_range::expect_fork_wait = true;
+        host_range::on_fork_chunk_release = fork_range_release_action ? +[] { fork_range_release_action(); } : nullptr;
         auto const result = huge::prepare_current_fork_range_split(actor, preparation, first, end, survey, tables, witness);
+        host_range::on_fork_chunk_release = previous_release;
         host_range::expect_fork_wait = previous;
         return result;
     }
@@ -730,13 +739,33 @@ TEST_F(ManagedForkRange, DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundarie
     EXPECT_EQ(small.count(), 0U);
     EXPECT_FALSE(witness.valid);
     EXPECT_TRUE(tables.empty());
-    for (uint64_t i = 0; i < 96; ++i) ordinary_path(TEST_VA + i * LARGE);
-    huge::RangeSplitSurvey dense;
-    before = host_range::blocking;
-    ASSERT_EQ(fork_proof(0, uint64_t{1} << 47, dense, tables), huge::Error::None);
-    EXPECT_GT(host_range::blocking - before, 3U);
-    EXPECT_GT(host_range::yields, 0U);
-    EXPECT_EQ(dense.count(), 0U);
+    // Independent geometry arithmetic: 256 + 511*(present PML4 + PML3)
+    // steps per full-half pass, each actual chunk containing at most16 steps.
+    // One, two and eight PML3 paths require80,112,304 chunks per pass.
+    unsigned installed = 0;
+    for (auto const [paths, chunks, halts] :
+         {std::array<unsigned, 3>{1, 240, 0}, std::array<unsigned, 3>{2, 336, 1}, std::array<unsigned, 3>{8, 912, 3}}) {
+        SCOPED_TRACE(paths);
+        for (; installed < paths; ++installed) ordinary_path(uint64_t{installed} << 30);
+        unsigned released = 0, last_halt = 0;
+        fork_range_release_action = [&] { ++released; };
+        range_yield_action = [&] {
+            EXPECT_EQ(released - last_halt, 256U);
+            last_halt = released;
+        };
+        auto const yields_before = host_range::yields;
+        before = host_range::blocking;
+        huge::RangeSplitSurvey dense;
+        ASSERT_EQ(fork_proof(0, uint64_t{1} << 47, dense, tables), huge::Error::None);
+        EXPECT_EQ(host_range::blocking - before, chunks);
+        EXPECT_EQ(released, chunks);
+        EXPECT_EQ(host_range::yields - yields_before, halts);
+        EXPECT_EQ(dense.count(), 0U);
+        EXPECT_TRUE(dense.complete());
+        EXPECT_TRUE(tables.empty());
+        no_owners();
+    }
+    fork_range_release_action = range_yield_action = {};
     EXPECT_EQ(table_attempt, 0U);
     huge::Snapshot unready{};
     huge_core.snapshot(unready);
@@ -1100,9 +1129,14 @@ TEST_F(ManagedForkRange, EpochOnlyRetriesStopAtThreeAndSuccessClearsTheWitness) 
     huge::PreparedTables tables;
     huge::RangePrepareWitness witness{};
     unsigned changes = 0;
-    range_yield_action = [&] {
-        ++virt::host_root_control.ps_geometry_epoch;
-        ++changes;
+    unsigned releases = 0;
+    fork_range_release_action = [&] {
+        // Each attempt closes one successful chunk and then the chunk that
+        // observes the changed epoch. Mutate only the first of those two.
+        if ((++releases & 1U) != 0) {
+            ++virt::host_root_control.ps_geometry_epoch;
+            ++changes;
+        }
     };
     EXPECT_EQ(fork_proof(0, uint64_t{1} << 47, survey, tables, &witness), huge::Error::Again);
     EXPECT_EQ(changes, 3U);
@@ -1112,7 +1146,7 @@ TEST_F(ManagedForkRange, EpochOnlyRetriesStopAtThreeAndSuccessClearsTheWitness) 
     EXPECT_TRUE(witness.epoch_changed);
     EXPECT_TRUE(witness.exhausted);
     bool once = false;
-    range_yield_action = [&] {
+    fork_range_release_action = [&] {
         if (!once) {
             once = true;
             ++virt::host_root_control.ps_geometry_epoch;
@@ -1129,8 +1163,10 @@ TEST_F(ManagedForkRange, IndependentFinalZeroPassStillDetectsPublicationAndRebui
     huge::PreparedTables tables;
     unsigned visits = 0;
     bool added = false;
-    range_yield_action = [&] {
-        if (++visits == 31) {
+    fork_range_release_action = [&] {
+        // An empty full half needs16 chunks/pass. Publish after the first
+        // chunk of Verify: its independent scan must detect the epoch change.
+        if (++visits == 33) {
             ASSERT_EQ(prepare(0), huge::Error::None);
             ASSERT_EQ(publish(0), huge::Error::None);
             added = true;
@@ -1171,7 +1207,7 @@ TEST_F(ManagedForkRange, ActualFinalDescriptorRefusalReleasesPublicationBeforeRe
     huge::PreparedTables tables;
     huge::RangePrepareWitness witness{};
     bool altered = false;
-    range_yield_action = [&] {
+    fork_range_release_action = [&] {
         auto* storage = huge::detail::PreparationAccess::plan_storage(tables);
         if (!altered && storage != nullptr && storage->descriptors[0].handle.generation != 0) {
             altered = true;

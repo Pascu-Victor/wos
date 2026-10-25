@@ -381,6 +381,9 @@ inline bool interrupts = true, queryable = true, reader_busy = false, exclusive 
 inline unsigned yields = 0, tries = 0, unlocks = 0, blocking = 0;
 inline ker::mod::sched::task::Task* current = nullptr;
 inline void (*on_yield)() = nullptr;
+// Finite other-CPU action after the actual publication mutex release-store.
+inline void (*on_fork_chunk_release)() = nullptr;
+inline bool in_fork_chunk_release = false;
 inline void (*on_gate_wait)() = nullptr, (*on_range_preempt)() = nullptr;
 inline unsigned gate_yields = 0;
 // Finite Host wait action; not WOS Mutex parking or a progress guarantee.
@@ -389,6 +392,7 @@ inline bool expect_fork_wait = false;
 inline unsigned range_readers = 0, allocation_checks = 0;
 void check_yield_boundary();
 void check_preparation_allocation();
+void after_publication_unlock();
 }
 namespace ker::mod::sched {
 void preempt_disable(); void preempt_enable(); auto preempt_count() -> uint32_t;
@@ -449,9 +453,16 @@ struct Task {
         + "\n}\n"
     )
     mutex = sources["platform/sys/mutex.cpp"].read_text()
+    unlock = definition(mutex, "void Mutex::unlock()")
+    release = "held.store(false, std::memory_order_release);"
+    if unlock.count(release) != 1:
+        raise RuntimeError("actual publication mutex release-store changed")
+    # Retain the complete actual unlock, adding only a Host transport endpoint
+    # after its release-store. clear_owner() still runs while held is true.
+    unlock = unlock.replace(release, release + "\n    if (this == &g_shared_vmem_publication_lock) host_range::after_publication_unlock();")
     mutex_methods = (
         "namespace ker::mod::sys {\n"
-        + "\n".join(definition(mutex, anchor) for anchor in ("auto Mutex::try_lock()", "void Mutex::unlock()"))
+        + definition(mutex, "auto Mutex::try_lock()") + "\n" + unlock
         + "\n}\n"
     )
     cpp = sources["syscalls_impl/vmem/sys_vmem.cpp"].read_text()
@@ -972,6 +983,43 @@ def main() -> int:
             obj.unlink()
             path.unlink()
 
+        def module_mutant(label: str, text: str, test: str, require_assertion: bool = False) -> None:
+            control_case_names(test, baseline_names)
+            path = scratch / f"{label}.cpp"
+            path.write_text(text)
+            obj = scratch / f"{label}.o"
+            run(f"compile-{label}", flags + ["-iquote", module.parent, "-c", path, "-o", obj])
+            binary = link(label, [obj, objects[1], objects[2]])
+            controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
+            run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
+            if require_assertion:
+                log = (output / f"run-{label}.log").read_text()
+                if commands[-1]["exit"] != 1 or f"[  FAILED  ] {test}" not in log:
+                    raise RuntimeError(f"{label}: intended GTest assertion failure absent")
+                controls[-1]["required_assertion_failure"] = test
+            binary.unlink()
+            obj.unlink()
+            path.unlink()
+
+        if options.fork_contract_only or not any(selected_profiles):
+            module_text = CppText(module.read_text())
+            budget = "if (publication_policy == PublicationPolicy::ForkWait && target != nullptr && fork_chunks >= 256) { fork_chunks = 0; sched::kern_yield(); continue; }"
+            increment = "if (publication_policy == PublicationPolicy::ForkWait) { ++fork_chunks; }"
+            pass_entry = "PublicationPolicy publication_policy = PublicationPolicy::TryOnly) noexcept -> Error { while (!cursor.complete)"
+            if any(module_text.count(needle) != 1 for needle in (budget, increment, pass_entry)):
+                raise RuntimeError("shared fork cooperation control boundary changed")
+            case = "ManagedForkRange.DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundaries"
+            old_cadence = module_text.replace(budget, "").replace(
+                increment, "if (publication_policy == PublicationPolicy::ForkWait) { ++fork_chunks; if (!cursor.complete && target != nullptr) sched::kern_yield(); }"
+            )
+            module_mutant("fork-original-per-chunk-halt", old_cadence, case, True)
+            module_mutant(
+                "fork-budget-reset-per-pass",
+                module_text.replace(pass_entry, "PublicationPolicy publication_policy = PublicationPolicy::TryOnly) noexcept -> Error { fork_chunks = 0; while (!cursor.complete)"),
+                case, True,
+            )
+            module_mutant("fork-never-cooperates", module_text.replace(budget, ""), case, True)
+
         actual = CppText(composite.read_text())
         if policy_fixture is not None:
             for label, bad, test in policy_fixture.controls(composite.read_text()):
@@ -1105,19 +1153,6 @@ def main() -> int:
                 "ManagedRange.HeldOriginalExclusiveCommitsWithoutAcquiringAReader",
             )
 
-            def module_mutant(label: str, text: str, test: str) -> None:
-                control_case_names(test, baseline_names)
-                path = scratch / f"{label}.cpp"
-                path.write_text(text)
-                obj = scratch / f"{label}.o"
-                run(f"compile-{label}", flags + ["-iquote", module.parent, "-c", path, "-o", obj])
-                binary = link(label, [obj, objects[1], objects[2]])
-                controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
-                run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
-                binary.unlink()
-                obj.unlink()
-                path.unlink()
-
             needle = "g_shared_vmem_publication_owner.store(this, std::memory_order_release);"
             if actual.count(needle) != 1:
                 raise RuntimeError("actual blocking held-state boundary changed")
@@ -1130,7 +1165,7 @@ def main() -> int:
                 raise RuntimeError("actual blocking context boundary changed")
             module_mutant("blocking-forgets-context", module_text.replace(needle, ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired()) return;"),
                           "ManagedRange.BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof")
-            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage, witness, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);"
+            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage, witness, fork_chunks, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);"
             if module_text.count(needle) != 1:
                 raise RuntimeError("independent final pass mutation boundary changed")
             module_mutant(
@@ -1186,19 +1221,15 @@ def main() -> int:
                 "ManagedForkRange.EnteringPreemptGuardRevalidatesTheAcquiredRootBeforeSurvey",
             )
             boundary = "release_current_range_root(access); } } } } else {"
-            ordinary_yield = "if (!cursor.complete && target != nullptr) sched::kern_yield();"
-            if module_text.count(boundary) != 1 or module_text.count(ordinary_yield) != 1:
+            budget = "if (publication_policy == PublicationPolicy::ForkWait && target != nullptr && fork_chunks >= 256) { fork_chunks = 0; sched::kern_yield(); continue; }"
+            if module_text.count(boundary) != 1 or module_text.count(budget) != 1:
                 raise RuntimeError("fork publication release/yield control boundary changed")
-            bad = module_text.replace(
+            bad = module_text.replace(budget, "").replace(
                 boundary,
-                "release_current_range_root(access); } " + ordinary_yield + " } } } else {",
+                "release_current_range_root(access); } " + budget + " } } } else {",
             )
-            # The inserted yield is inside PUB, after the inner PreemptGuard.
-            # Replace only the original common yield (the last occurrence).
-            pos = str(bad).rfind(ordinary_yield)
-            if pos < 0:
-                raise RuntimeError("common yield control boundary changed")
-            bad = str(bad)[:pos] + "if (publication_policy == PublicationPolicy::TryOnly && !cursor.complete && target != nullptr) sched::kern_yield();" + str(bad)[pos + len(ordinary_yield):]
+            # Move the actual budgeted halt inside PUB after its inner guard.
+            # The dense vector reaches256 with no test-only budget override.
             module_mutant(
                 "fork-wait-retains-publication-over-yield", bad,
                 "ManagedForkRange.DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundaries",
