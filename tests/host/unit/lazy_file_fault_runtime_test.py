@@ -24,12 +24,32 @@ vmem = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_SOURCE", ROOT / "modules/kern/
 scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
 allocator = (ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp").read_text()
 allocator_header = (ROOT / "modules/kern/src/platform/mm/numa_alloc.hpp").read_text()
-virt_header = (ROOT / "modules/kern/src/platform/mm/virt.hpp").read_text()
+virt_header = Path(os.environ.get("WOS_LAZY_BACKING_VIRT_HEADER_SOURCE", ROOT / "modules/kern/src/platform/mm/virt.hpp")).read_text()
+def enclosing_endif(source, start):
+    """Locate the surrounding #endif, preserving nested diagnostic branches."""
+    depth = 0
+    offset = start
+    for line in source[start:].splitlines(keepends=True):
+        directive = line.lstrip()
+        if directive.startswith(("#if ", "#if\t", "#ifdef ", "#ifndef ")):
+            depth += 1
+        elif directive.startswith("#endif"):
+            if depth == 0:
+                return offset
+            depth -= 1
+        offset += len(line)
+    raise AssertionError("missing surrounding #endif")
+
+
 start = virt.index("enum class LazyFileFaultDisposition")
-end = virt.index("\n#endif\n", virt.index("void start_lazy_file_fault_worker()", start))
+end = enclosing_endif(virt, virt.index("void start_lazy_file_fault_worker()", start))
 region = virt[start:end]
+diagnostic_start = virt_header.index("#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS\n")
+diagnostic_body = diagnostic_start + len("#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS\n")
+diagnostic_end = enclosing_endif(virt_header, diagnostic_body) + len("#endif")
+diagnostic_declarations = virt_header[diagnostic_start:diagnostic_end]
 branch_start = virt.index("        auto* const FILE_FAULT_ROOT =", end)
-branch_end = virt.index("\n#endif", branch_start)
+branch_end = enclosing_endif(virt, branch_start)
 branch = virt[branch_start:branch_end]
 control = os.environ.get("WOS_LAZY_FAULT_PROBE_CONTROL", "current")
 if control == "predecessor":
@@ -39,7 +59,7 @@ if control == "predecessor":
     assert region.count(current_probe) == 1
     region = region.replace(current_probe, old_probe)
     old_start = predecessor.index("        auto const FILE_FAULT = probe_lazy_file_fault")
-    branch = predecessor[old_start:predecessor.index("\n#endif", old_start)]
+    branch = predecessor[old_start:enclosing_endif(predecessor, old_start)]
 elif control == "retry-all-failures":
     assert "return LazyFileFaultDisposition::FAILED;" in region
     region = region.replace("return LazyFileFaultDisposition::FAILED;", "return LazyFileFaultDisposition::RETRY;")
@@ -67,7 +87,7 @@ using vaddr_t=uint64_t; using paddr_t=uint64_t;
 constexpr paddr_t PADDR_INVALID=UINT64_MAX;
 constexpr uint64_t page_align_down(uint64_t p){return p&~uint64_t{4095};}
 uint64_t capture_nodes=0,observed_nodes=0,observed_index=0;unsigned capture_mode=0,observed_mode=0;uint16_t capture_local=0,observed_local=0;bool fail_capture=false;
-int guards=0, created=0, destroyed=0, reads=0, allocated=0, dropped=0, puts=0, parks=0, wakes=0;
+int guards=0, created=0, destroyed=0, reads=0, allocated=0, dropped=0, puts=0, parks=0, wakes=0, translations=0;
 bool fail_create=false, fail_post=false, shutdown_requested=false, fail_alloc=false, fail_read=false, software_prefault=false;
 std::function<void()> read_hook, pin_hook, park_hook, put_hook;
 std::function<void()> clean_exit_hook, task_release_hook, atomic_gate_hook;
@@ -203,7 +223,7 @@ enum class LazyFilePageInstallResult{STALE_RANGE,ALREADY_MAPPED,MAPPED};
 void service_user_pagemap_gate_wait(uint64_t&){std::abort();}
 @GATE_FUNCTIONS@
 uint32_t reader_count(PageTable*root){return user_pagemap_access_gates.at(user_pagemap_access_gate_index(root)).readers.load();}
-uint64_t translate(PageTable*p,uint64_t va){return p&&p->page&&p->address==va?reinterpret_cast<uint64_t>(p->page):PADDR_INVALID;}
+uint64_t translate(PageTable*p,uint64_t va){++translations;return p&&p->page&&p->address==va?reinterpret_cast<uint64_t>(p->page):PADDR_INVALID;}
 void map_page(PageTable*p,uint64_t va,uint64_t pa,uint64_t){assert(guards==2&&p&&!p->page);p->address=va;p->page=reinterpret_cast<void*>(pa);}
 void invalidate_local_tlb_if_current(PageTable*,uint64_t,bool){assert(guards==0);}
 bool lazy_file_range_matches(const sched::task::LazyVmemRange&,const sched::task::LazyVmemRange&,uint64_t);
@@ -227,6 +247,7 @@ bool materialize_lazy_file_page(ker::mod::sched::task::Task*t,const LazyVmemRang
 }}
 namespace ker::mod::mm::virt{
 @MATCH@
+@FATAL_DIAGNOSTICS@
 @REGION@
 // Explicit RAW-only boundary: the actual NATIVE route is tested separately.
 bool materialize_issued_native_file_fault(const LazyFileFaultWork&,size_t){std::abort();}
@@ -238,7 +259,11 @@ bool exercise_lazy_fault(sched::task::Task*t,uint64_t address,const paging::Page
  return handle_lazy_vmem_fault(t,address,fault,demand,rip,rsp,file_io);
 }
 bool handle_file_fault_frame(sched::task::Task*current_task,uint64_t control_register,paging::PageFault PAGEFAULT,
-                             sched::Frame&frame,sched::GPRegs&gpr){
+                             sched::Frame&frame,sched::GPRegs&gpr
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                             ,FileFaultFailureDiagnostic* diagnostic=nullptr
+#endif
+){
  uint64_t wait_generation=0;
 @BRANCH@
 @FALLBACK@
@@ -266,7 +291,7 @@ void reset(){assert(guards==0&&lazy_file_fault_worker==nullptr);for(auto const&w
  sched::return_override=nullptr;sched::queryable=true;kernel_pagemap=nullptr;task_release_hook=atomic_gate_hook={};
  lazy_file_fault_work={};lazy_file_fault_admission=false;lazy_file_fault_worker_starting=false;lazy_file_fault_next_sequence=1;
  capture_nodes=observed_nodes=observed_index=0;capture_mode=observed_mode=0;capture_local=observed_local=0;fail_capture=false;
- fail_create=fail_post=shutdown_requested=fail_alloc=fail_read=software_prefault=false;reads=parks=wakes=puts=0;read_hook=pin_hook=park_hook=put_hook=clean_exit_hook={};unlock_hook={};}
+ fail_create=fail_post=shutdown_requested=fail_alloc=fail_read=software_prefault=false;reads=parks=wakes=puts=translations=0;read_hook=pin_hook=park_hook=put_hook=clean_exit_hook={};unlock_hook={};}
 void start(){sched::current=nullptr;start_lazy_file_fault_worker();assert(lazy_file_fault_worker&&lazy_file_fault_admission);}
 void run_worker(Task*t){clean_exit_hook=[](){assert(!lazy_file_fault_worker&&!lazy_file_fault_admission);
  for(auto const&work:lazy_file_fault_work)assert(!work.task);};bool exited=false;
@@ -428,7 +453,160 @@ void retry_cases(){
   end_user_pagemap_exclusive(index);one();drain();assert(f.map.page&&f.task.lazy_file_fault_completion_generation.load()==generation);
  }
 }
+
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+using Diagnostic=FileFaultFailureDiagnostic;
+using FailureSite=FileFaultFailureSite;
+bool diag_has(const Diagnostic&d,uint64_t bits){return (d.valid&bits)==bits;}
+void diagnostic_cases(){
+ // A POD that has not passed the actual probe/handler has no invented facts.
+ {Diagnostic d;assert(d.valid==0&&d.site==FailureSite::NOT_PROBED&&d.disposition==UINT8_MAX);}
+ {uint64_t g=0;Diagnostic d;
+  assert(probe_lazy_file_fault(nullptr,0x10000,Fault{},true,g,false,&d)==LazyFileFaultDisposition::NOT_TRACKED);
+  assert(d.site==FailureSite::NO_TASK_ROOT&&d.valid==0&&d.task==0&&d.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::NOT_TRACKED));}
+ reset();{Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges.clear();uint64_t g=0;Diagnostic d;
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,false,&d)==LazyFileFaultDisposition::NOT_TRACKED);
+  assert(d.site==FailureSite::NO_FILE_RANGE&&d.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::NOT_TRACKED));
+  assert(!diag_has(d,FILE_FAULT_DIAG_RANGE)&&!diag_has(d,FILE_FAULT_DIAG_POOL)&&!diag_has(d,FILE_FAULT_DIAG_COMPLETION));
+  assert(f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reads==0);}
+ // Unsafe context/protection, acquisition and revalidation failures are
+ // attributed at their actual return sites, without publishing work or I/O.
+ for(unsigned axis=0;axis<11;++axis){
+  reset();start();Fixture f;sched::current=&f.task;uint64_t g=0;Diagnostic d;Fault fault;bool user=true;uint8_t invalid=0;
+  FailureSite expected=FailureSite::CONTEXT_OR_PROTECTION;
+  switch(axis){
+   case 0:user=false;invalid=FILE_FAULT_CONTEXT_USER_FRAME;break;
+   case 1:f.task.preempt_disable_depth=1;invalid=FILE_FAULT_CONTEXT_PREEMPT;break;
+   case 2:f.task.lazy_vmem_ranges[0].prot=1;fault.fetch=1;invalid=FILE_FAULT_CONTEXT_FETCH;break;
+   case 3:fail_capture=true;expected=FailureSite::DEMAND_CAPTURE;break;
+   case 4:f.task.state.store(sched::task::TaskState::EXITING);expected=FailureSite::TASK_LIFETIME;break;
+   case 5:f.task.refuse_pin=true;expected=FailureSite::ROOT_LEASE;break;
+   case 6:pin_hook=[&]{f.task.lazy_vmem_ranges[0].file_offset+=4096;};expected=FailureSite::RANGE_REVALIDATION;break;
+   case 7:f.task.type=sched::task::TaskType::DAEMON;invalid=FILE_FAULT_CONTEXT_TASK_TYPE;break;
+   case 8:f.task.lazy_vmem_ranges[0].file=nullptr;invalid=FILE_FAULT_CONTEXT_BACKING;break;
+   case 9:f.task.lazy_vmem_ranges[0].prot=0;invalid=FILE_FAULT_CONTEXT_PROT;break;
+   case 10:f.task.lazy_vmem_ranges[0].prot=1;fault.writable=1;invalid=FILE_FAULT_CONTEXT_WRITE;break;
+  }
+  assert(probe_lazy_file_fault(&f.task,0x10000,fault,user,g,false,&d)==LazyFileFaultDisposition::FAILED);
+  assert(d.site==expected&&d.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::FAILED)&&d.context_invalid==invalid);
+  assert(diag_has(d,FILE_FAULT_DIAG_RANGE)&&!diag_has(d,FILE_FAULT_DIAG_COMPLETION)&&!diag_has(d,FILE_FAULT_DIAG_TRANSLATION));
+  assert(diag_has(d,FILE_FAULT_DIAG_CONTEXT)&&d.task==reinterpret_cast<uint64_t>(&f.task)&&d.pid==23&&
+         d.raw_root==reinterpret_cast<uint64_t>(&f.map)&&d.page==0x10000&&d.preempt_depth==(axis==1?1U:0U));
+  assert(d.range_start==0x10000&&d.range_end==0x11000&&d.file_offset==0&&d.file_dev==1&&d.file_ino==2&&d.file_size==4096);
+  assert(f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0&&reads==0&&g==0);
+  empty_work();f.task.preempt_disable_depth=0;f.task.type=sched::task::TaskType::PROCESS;drain();
+ }
+ // Entry preemption depth is copied before the original first range lock,
+ // rather than reconstructed from a later changed context.
+ reset();start();{Fixture f;sched::current=&f.task;uint64_t g=0;Diagnostic d;
+  unlock_hook=[&](Lock*lock){if(lock==&f.task.lazy_vmem_lock){unlock_hook={};f.task.preempt_disable_depth=7;}};
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,false,&d)==LazyFileFaultDisposition::FAILED);
+  assert(d.site==FailureSite::CONTEXT_OR_PROTECTION&&diag_has(d,FILE_FAULT_DIAG_CONTEXT)&&d.preempt_depth==0&&f.task.preempt_disable_depth==7&&d.context_invalid==FILE_FAULT_CONTEXT_PREEMPT);
+  assert(!diag_has(d,FILE_FAULT_DIAG_ROOT_LEASE)&&!diag_has(d,FILE_FAULT_DIAG_POOL));
+  f.task.preempt_disable_depth=0;empty_work();drain();}
+ reset();start();{Fixture f;sched::current=&f.task;uint64_t g=0;Diagnostic d;
+  auto&gate=user_pagemap_access_gates.at(user_pagemap_access_gate_index(&f.map));gate.readers.store(UINT32_MAX);
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,true,&d)==LazyFileFaultDisposition::FAILED);
+  assert(d.site==FailureSite::READER_GATE&&diag_has(d,FILE_FAULT_DIAG_ROOT_LEASE)&&!diag_has(d,FILE_FAULT_DIAG_POOL));
+  assert(d.retained_root==reinterpret_cast<uint64_t>(&f.map)&&f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reads==0);
+  gate.readers.store(0);empty_work();drain();}
+ // All old worker/sticky/overflow refusal predicates remain authoritative.
+ for(unsigned axis=0;axis<6;++axis){
+  reset();start();Fixture f;sched::current=&f.task;auto*worker=lazy_file_fault_worker;uint64_t g=0;Diagnostic d;
+  switch(axis){
+   case 0:lazy_file_fault_admission=false;break;
+   case 1:lazy_file_fault_worker=nullptr;break;
+   case 2:lazy_file_fault_worker_starting=true;break;
+   case 3:f.task.lazy_file_fault_generation=1;f.task.lazy_file_fault_completion_generation.store(1);
+          f.task.lazy_file_fault_vaddr=0x10000;f.task.lazy_file_fault_status=-EIO;break;
+   case 4:f.task.lazy_file_fault_generation=UINT64_MAX;f.task.lazy_file_fault_completion_generation.store(UINT64_MAX);break;
+   case 5:lazy_file_fault_next_sequence=UINT64_MAX;break;
+  }
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,false,&d)==LazyFileFaultDisposition::FAILED);
+  assert(d.site==FailureSite::ADMISSION_OR_STICKY&&diag_has(d,FILE_FAULT_DIAG_POOL));
+  assert(d.admission==lazy_file_fault_admission&&d.worker_present==(lazy_file_fault_worker!=nullptr)&&
+         d.worker_starting==lazy_file_fault_worker_starting&&d.pool_used==0&&d.task_slots==0&&
+         d.pool_next_sequence==lazy_file_fault_next_sequence&&d.context_invalid==0);
+  assert(d.pool_generation==f.task.lazy_file_fault_generation&&d.pool_completed==f.task.lazy_file_fault_completion_generation.load());
+  assert(diag_has(d,FILE_FAULT_DIAG_POOL_STATUS)==(axis==3||axis==4));
+  if(axis==3)assert(d.pool_status==-EIO);
+  assert(!diag_has(d,FILE_FAULT_DIAG_COMPLETION)&&!diag_has(d,FILE_FAULT_DIAG_TRANSLATION));
+  assert(f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0&&reads==0);
+  empty_work();lazy_file_fault_worker=worker;lazy_file_fault_worker_starting=false;drain();
+ }
+ // A published generation without its completion admits pending metadata,
+ // never a poison status belonging to that unfinished epoch.
+ reset();start();{Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges[0].end=0x12000;uint64_t g=0;
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::PARK);
+  f.task.lazy_file_fault_status=-EIO;
+  for(bool same_page:{false,true}){Diagnostic d;uint64_t pending=0;
+   auto result=probe_lazy_file_fault(&f.task,same_page?0x10000:0x11000,Fault{},true,pending,false,&d);
+   assert(result==(same_page?LazyFileFaultDisposition::PARK:LazyFileFaultDisposition::FAILED)&&pending==1);
+   assert(d.disposition==static_cast<uint8_t>(result)&&d.site==(same_page?FailureSite::NONE:FailureSite::OTHER_PENDING_PAGE));
+   assert(diag_has(d,FILE_FAULT_DIAG_POOL)&&d.pool_generation==1&&d.pool_completed==0&&d.pool_page==0x10000&&d.pool_next_sequence==2);
+   assert(d.pool_status==0&&!diag_has(d,FILE_FAULT_DIAG_POOL_STATUS)&&!diag_has(d,FILE_FAULT_DIAG_COMPLETION)&&!diag_has(d,FILE_FAULT_DIAG_TRANSLATION));
+   assert(diag_has(d,FILE_FAULT_DIAG_REQUEST)==same_page&&d.requested_generation==(same_page?1U:0U));
+   assert(d.pool_used==1&&d.task_slots==1&&d.slot_page==0x10000&&d.slot_generation==1&&d.slot_sequence==1&&!d.slot_issued);
+  }
+  assert(f.task.refs==2&&f.task.pins==1&&f.file.refs==2&&reads==0);drain();}
+ // Pool capacity is observed under the original pool lock, without changing
+ // ownership of any of its already-published work.
+ reset();start();{std::array<Fixture,65> fixtures;uint64_t g=0;
+  for(size_t i=0;i<64;++i){sched::current=&fixtures[i].task;
+   assert(probe_lazy_file_fault(&fixtures[i].task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::PARK);}
+  auto&f=fixtures[64];sched::current=&f.task;Diagnostic d;g=0;
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,false,&d)==LazyFileFaultDisposition::FAILED);
+  assert(d.site==FailureSite::POOL_FULL&&diag_has(d,FILE_FAULT_DIAG_POOL)&&d.pool_used==64&&d.task_slots==0&&d.pool_next_sequence==65);
+  assert(!diag_has(d,FILE_FAULT_DIAG_REQUEST)&&!diag_has(d,FILE_FAULT_DIAG_COMPLETION));
+  assert(f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0&&g==0);drain();}
+ // A future/mismatched completion cannot authorize status or translation.
+ // The exact original != generation loop must park, retaining pending work.
+ reset();start();{Fixture f;sched::current=&f.task;Diagnostic d;sched::Frame frame;sched::GPRegs regs;
+  auto before_frame=frame;auto before_regs=regs;int at_park=-1;
+  park_hook=[&]{f.task.lazy_file_fault_status=-EIO;f.task.lazy_file_fault_completion_generation.store(2);
+               at_park=translations;};
+  assert(handle_file_fault_frame(&f.task,0x10000,Fault{},frame,regs,&d));park_hook={};
+  assert(at_park>=0&&translations==at_park&&parks==1&&reads==0&&f.task.lazy_file_fault_generation==1);
+  assert(f.task.lazy_file_fault_completion_generation.load()==2&&f.task.lazy_file_fault_status==-EIO);
+  assert(diag_has(d,FILE_FAULT_DIAG_REQUEST)&&d.requested_generation==1&&d.site==FailureSite::NONE&&
+         d.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::PARK));
+  assert(!diag_has(d,FILE_FAULT_DIAG_COMPLETION)&&!diag_has(d,FILE_FAULT_DIAG_TRANSLATION)&&
+         d.completion_generation==0&&d.completion_status==0&&!d.mapped);
+  assert(frame==before_frame&&regs==before_regs&&f.task.refs==2&&f.task.pins==1&&f.file.refs==2&&reader_count(&f.map)==1);
+  f.task.lazy_file_fault_completion_generation.store(0);f.task.lazy_file_fault_status=0;drain();
+  assert(f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0&&reads==1&&
+         f.task.lazy_file_fault_completion_generation.load()==1);
+ }
+ // The handler reads status only after exact-generation acquire. Keep the
+ // original short-circuit translation count: error=0, status0=one walk.
+ for(unsigned mode=0;mode<3;++mode){
+  reset();start();Fixture f;sched::current=&f.task;Diagnostic d;sched::Frame frame;sched::GPRegs regs;
+  auto before_frame=frame;auto before_regs=regs;int before_final_translate=-1;
+  park_hook=[&]{
+   if(mode==0)fail_read=true;
+   one();
+   if(mode==1){assert(f.map.page);delete[]static_cast<uint8_t*>(f.map.page);f.map.page=nullptr;++dropped;}
+   before_final_translate=translations;
+  };
+  bool result=handle_file_fault_frame(&f.task,0x10000,Fault{},frame,regs,&d);park_hook={};
+  assert(result==(mode==2)&&before_final_translate>=0&&translations-before_final_translate==(mode==0?0:1));
+  assert(d.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::PARK)&&
+         diag_has(d,FILE_FAULT_DIAG_REQUEST|FILE_FAULT_DIAG_COMPLETION)&&d.requested_generation==1&&d.completion_generation==1);
+  assert(d.completion_status==(mode==0?-EFAULT:0)&&d.mapped==(mode==2));
+  assert(diag_has(d,FILE_FAULT_DIAG_TRANSLATION)==(mode!=0));
+  assert(d.site==(mode==0?FailureSite::COMPLETED_ERROR:mode==1?FailureSite::COMPLETED_UNMAPPED:FailureSite::NONE));
+  assert(diag_has(d,FILE_FAULT_DIAG_POOL)&&d.pool_generation==1&&d.pool_completed==0&&d.pool_status==0&&
+         !diag_has(d,FILE_FAULT_DIAG_POOL_STATUS)&&d.pool_used==1&&d.task_slots==1&&!d.slot_issued);
+  assert(frame==before_frame&&regs==before_regs&&f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0);
+  empty_work();drain();
+ }
+}
+#endif
+
 int main(){
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+ diagnostic_cases();
+#endif
  retry_cases();
  reset();{Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges.clear();uint64_t g=0;
   assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::NOT_TRACKED);
@@ -552,6 +730,7 @@ for key, value in {
     "GATE_FUNCTIONS": "\n".join(gate_functions),
     "CLEAN_EXIT": block(scheduler, r'^\[\[noreturn\]\] void exit_current_kernel_thread\([^;{]*\{'),
     "MATCH": function(virt, "lazy_file_range_matches"),
+    "FATAL_DIAGNOSTICS": diagnostic_declarations,
     "REGION": region,
     "INSTALL": function(virt, "install_lazy_file_page_if_current"),
     "ANONYMOUS_RANGE": function(virt, "anonymous_lazy_range_allows_fault"),
@@ -571,13 +750,15 @@ for key, value in {
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 with tempfile.TemporaryDirectory(prefix="wos-file-fault-") as temporary:
     source = Path(temporary) / "trace.cpp"
-    binary = Path(temporary) / "trace"
     source.write_text(code)
-    subprocess.run(
-        [os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++"), "-std=c++23", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT / "modules/kern/src"),
-         "-I", str(ROOT / "modules"), str(source), "-o", str(binary)],
-        check=True,
-    )
-    subprocess.run([str(binary)], check=True, timeout=30)
-print("actual deferred file-fault ownership and materialization traces pass")
+    for diagnostics in ((False, True) if control == "current" else (False,)):
+        binary = Path(temporary) / ("trace-diagnostics-on" if diagnostics else "trace-diagnostics-off")
+        diagnostic_flags = ["-DWOS_FILE_FAULT_FATAL_DIAGNOSTICS=1"] if diagnostics else []
+        subprocess.run(
+            [os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++"), "-std=c++23", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+             "-fsanitize=address,undefined", "-fno-omit-frame-pointer", *diagnostic_flags,
+             "-I", str(ROOT / "modules/kern/src"), "-I", str(ROOT / "modules"), str(source), "-o", str(binary)],
+            check=True,
+        )
+        subprocess.run([str(binary)], check=True, timeout=30)
+print("actual deferred file-fault ownership and materialization traces pass with diagnostics OFF/ON")

@@ -704,7 +704,9 @@ def main() -> int:
     result = dict(pass_=False, commands=[], scratch_removed=False, native_executor_runtime_qualified=False)
     try:
         sources = [args.virt_source.resolve(strict=True), args.virt_header.resolve(strict=True), args.vmem_source.resolve(strict=True)]
-        compiler = Path(args.cxx).resolve(strict=True)
+        # Preserve clang++'s multicall spelling while checking the actual ELF.
+        compiler_driver = Path(args.cxx).absolute()
+        compiler = compiler_driver.resolve(strict=True)
         if not compiler.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError('--cxx must name one executable compiler ELF')
         with compiler.open('rb') as executable:
@@ -736,7 +738,7 @@ def main() -> int:
             result.setdefault('actual_definitions', {})[control] = actual
             translation, binary = scratch / (control + '.cpp'), scratch / control
             translation.write_text(source)
-            argv = [str(compiler), '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
+            argv = [str(compiler_driver), '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I', str(include),
                     str(translation), str(KERN / 'platform/mm/file_mapping_lifetime.cpp'),
                     str(scratch / 'family-seams.cpp'), '-o', str(binary)]

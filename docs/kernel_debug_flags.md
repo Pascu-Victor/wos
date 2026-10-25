@@ -58,6 +58,7 @@ enabled here until the target supports them.
 | `WOS_KERNEL_EVERYTHING_WARNINGS` | `OFF` | `modules/kern/CMakeLists.txt` | none | Adds a Clang `-Weverything` C++ warning audit profile with only compatibility/padding suppressions. | Very noisy and intentionally not a default. |
 | `WOS_SELFTEST` | `OFF` | `modules/kern/CMakeLists.txt` | `WOS_SELFTEST=1` | Builds kernel selftest sources and enables `--selftest` boot handling. | Includes test code in the kernel image. Selftests run only when requested by the kernel command line. |
 | `WOS_ASYNC_BLOCK_IO` | `ON` | `modules/kern/CMakeLists.txt` | `WOS_ASYNC_BLOCK_IO=1` | Bounded physical-root request queues, safe sync bridge and negotiated AHCI NCQ; additive `/proc/blockq` counters. | Normal storage policy, enabled after Goal 30 host, KTEST, local/remote recovery and fixed paired performance qualification. Set OFF for the synchronous compatibility profile; see `docs/asynchronous_block_io.md`. |
+| `WOS_FILE_FAULT_FATAL_DIAGNOSTICS` | `OFF` | `modules/kern/CMakeLists.txt` | `WOS_FILE_FAULT_FATAL_DIAGNOSTICS=1` | Carries the actual file-fault decision to unrecovered CPL3 fatal logging. | Diagnostic build only; adds fault-path scalar capture and a bounded pool scan, and uses the existing journal locks/UART polling after all MM locks are released. No performance qualification. |
 | `WOS_SCHED_TRANSITION_VALIDATION` | `OFF` | `modules/kern/CMakeLists.txt` | `WOS_SCHED_TRANSITION_VALIDATION=1` | Checks scheduler queue, ownership, publication, handoff, accounting, and GC invariants at stable runqueue-lock boundaries, recording a bounded allocation-free failure snapshot. Enabled by the isolated KTEST profile. | Adds bounded scans to scheduler transition paths; keep it off for normal builds and scheduler performance comparisons. |
 | `WOS_PREEMPT_GUARD_TIMING` | `OFF` | `modules/kern/CMakeLists.txt` | `WOS_PREEMPT_GUARD_TIMING=1` | Samples the outermost preemption guard's start and maximum hold duration. Enabled by KTEST; when off, timing fields remain zero/unavailable while guard depth, owner tracking and pending reschedules remain active. | Two clock reads per outermost guard, including spinlocks; HPET fallback reads cause device accesses and can dominate normal lock costs. Keep off for normal performance measurements. |
 | `WOS_NET_TRACE` | `OFF` | `modules/kern/CMakeLists.txt` | `NET_TRACE=1` | Network hot-path span timing through `NET_TRACE_SPAN()` and periodic trace dumps. | Adds cycle counting and periodic logging in RX/TX/TCP paths. |
@@ -244,3 +245,29 @@ This fixture qualifies software IRQ-schedule publication loss on that real
 single-pair vNIC. It does not establish physical IRQ-loss, multiqueue recovery,
 four-node throughput, or idle CPU bounds. Host hook tests use clock and DMA
 seams; they separately exercise eligibility, ownership and rejected verdicts.
+
+## Fatal file-fault decision records
+
+`WOS_FILE_FAULT_FATAL_DIAGNOSTICS=ON` is a separate diagnostic kernel profile.
+With the flag absent, the original probe, handler and exception-path tokens are
+unchanged. No Task, core, syscall or wire layout changes. Recovered page faults,
+ptrace stops and synchronous-signal recovery emit no decision record.
+
+At the existing unrecovered user page-fault boundary, `file_fault_decision`
+identifies the actual probe return site/disposition and the handler's exact
+completion outcome. All three records carry the same stack-POD-address `attempt`
+key and captured Task/PID, so concurrent fatal records can be joined. This key
+is local to a live attempt; stack reuse does not make it a global event ID. `file_fault_pool` is an earlier probe-return snapshot,
+collected under the existing pool lock; it is not the final completion epoch.
+`file_fault_range` is the copied probe range, not a later borrowed File read.
+Validity bits in `virt.hpp` distinguish unavailable data. With RANGE valid,
+`context_invalid` records the actual composite guard bits; the pool snapshot
+also includes its locked next-sequence value. Pool status is valid
+only for a nonzero matching published/completed generation; completion status
+comes from the handler's exact-generation acquire. Translation is recorded only
+when the original status-zero short-circuit actually performs that walk.
+Preemption depth is captured before probe locks. Raw and retained root values
+are labelled separately; neither printing a pointer nor a missing core page
+proves a page-table state. If `same_task=0`, the record must not be interpreted
+as the current fault's coherent context. The logger is allocation-free here but
+is not wait-free: existing journal/serial locking and UART polling still apply.

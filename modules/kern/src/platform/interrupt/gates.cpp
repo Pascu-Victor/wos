@@ -118,6 +118,42 @@ void wait_for_irq_context_readers(IrqContext& context) {
            ker::mod::mm::kernel_image::contains(addr);
 }
 
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+// Called only at the existing unrecovered CPL3 page-fault boundary. All probe
+// locks/leases have ended. These are local scalars; no user/backing pointers are
+// dereferenced. The existing journal uses fixed buffers, locks and UART polling.
+void log_file_fault_failure_diagnostic(const mm::virt::FileFaultFailureDiagnostic& d, const ker::mod::sched::task::Task* current) {
+    uint64_t const ATTEMPT = reinterpret_cast<uint64_t>(&d);
+    bool const SAME_TASK = d.task == reinterpret_cast<uint64_t>(current);
+    journal::warn(
+        " file_fault_decision: attempt=0x%lx site=%u disposition=%u valid=0x%lx same_task=%u task=0x%lx pid=%llu raw_root=0x%lx "
+        "retained_root=0x%lx page=0x%lx preempt=%u context_invalid=%u request=%llu completion_valid=%u completion=%llu status=%d "
+        "translation_valid=%u mapped=%u",
+        ATTEMPT, static_cast<unsigned>(d.site), static_cast<unsigned>(d.disposition), d.valid, SAME_TASK ? 1U : 0U, d.task,
+        static_cast<unsigned long long>(d.pid), d.raw_root, d.retained_root, d.page, d.preempt_depth,
+        static_cast<unsigned>(d.context_invalid), static_cast<unsigned long long>(d.requested_generation),
+        (d.valid & mm::virt::FILE_FAULT_DIAG_COMPLETION) != 0 ? 1U : 0U, static_cast<unsigned long long>(d.completion_generation),
+        d.completion_status, (d.valid & mm::virt::FILE_FAULT_DIAG_TRANSLATION) != 0 ? 1U : 0U, d.mapped ? 1U : 0U);
+    journal::warn(
+        " file_fault_pool: attempt=0x%lx task=0x%lx pid=%llu valid=%u generation=%llu completed=%llu page=0x%lx status_valid=%u status=%d "
+        "used=%u "
+        "admission=%u worker=%u starting=%u next_sequence=%llu task_slots=%u issued=%u slot_page=0x%lx slot_generation=%llu sequence=%llu",
+        ATTEMPT, d.task, static_cast<unsigned long long>(d.pid), (d.valid & mm::virt::FILE_FAULT_DIAG_POOL) != 0 ? 1U : 0U,
+        static_cast<unsigned long long>(d.pool_generation), static_cast<unsigned long long>(d.pool_completed), d.pool_page,
+        (d.valid & mm::virt::FILE_FAULT_DIAG_POOL_STATUS) != 0 ? 1U : 0U, d.pool_status, d.pool_used, d.admission ? 1U : 0U,
+        d.worker_present ? 1U : 0U, d.worker_starting ? 1U : 0U, static_cast<unsigned long long>(d.pool_next_sequence), d.task_slots,
+        d.slot_issued ? 1U : 0U, d.slot_page, static_cast<unsigned long long>(d.slot_generation),
+        static_cast<unsigned long long>(d.slot_sequence));
+    journal::warn(
+        " file_fault_range: attempt=0x%lx task=0x%lx pid=%llu valid=%u start=0x%lx end=0x%lx prot=0x%lx flags=0x%lx kind=%llu "
+        "file_offset=%llu dev=%llu ino=%llu size=%llu",
+        ATTEMPT, d.task, static_cast<unsigned long long>(d.pid), (d.valid & mm::virt::FILE_FAULT_DIAG_RANGE) != 0 ? 1U : 0U, d.range_start,
+        d.range_end, d.prot, d.flags, static_cast<unsigned long long>(d.kind), static_cast<unsigned long long>(d.file_offset),
+        static_cast<unsigned long long>(d.file_dev), static_cast<unsigned long long>(d.file_ino),
+        static_cast<unsigned long long>(d.file_size));
+}
+#endif
+
 void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t cr2) {
     if (task == nullptr) {
         return;
@@ -277,6 +313,9 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
     // (especially COW resolution) are normal concurrent events. If two CPUs
     // hit a COW fault at the same time the old code would make the second CPU
     // think it was a nested panic and halt.
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    mm::virt::FileFaultFailureDiagnostic file_fault_diagnostic;
+#endif
     if (frame.int_num == 14) {
         // NOLINTNEXTLINE(misc-const-correctness)
         uint64_t cr2{};
@@ -285,7 +324,12 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         // If pagefault_handler resolved a COW fault, we're done.
         // Otherwise fall through to the normal exception path which will
         // crash the userspace process or kernel-panic as appropriate.
-        if (mm::virt::pagefault_handler(cr2, frame, gpr)) {
+        if (mm::virt::pagefault_handler(cr2, frame, gpr
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                        ,
+                                        &file_fault_diagnostic
+#endif
+                                        )) {
             return;
         }
     }
@@ -333,6 +377,9 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         }
 
         auto* current_task_for_dump = ker::mod::sched::get_current_task();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        if (frame.int_num == 14) log_file_fault_failure_diagnostic(file_fault_diagnostic, current_task_for_dump);
+#endif
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
         uint32_t const APIC_ID = apic::get_apic_id();

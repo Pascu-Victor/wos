@@ -477,7 +477,74 @@ void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);
 void copy_kernel_mappings_to(PageTable* pagemap);
 void copy_kernel_mappings(sched::task::Task* t);
 void switch_pagemap(sched::task::Task* t);
-bool pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+// Exception-stack-only diagnostics; no Task/core/syscall ABI and no owners.
+// POOL describes the probe-return epoch; COMPLETION describes the later exact
+// generation acquire. Their status fields must never be conflated.
+enum class FileFaultFailureSite : uint8_t {
+    NOT_PROBED,
+    NONE,
+    NO_TASK_ROOT,
+    NO_FILE_RANGE,
+    CONTEXT_OR_PROTECTION,
+    DEMAND_CAPTURE,
+    TASK_LIFETIME,
+    ROOT_LEASE,
+    READER_GATE,
+    OTHER_PENDING_PAGE,
+    ADMISSION_OR_STICKY,
+    POOL_FULL,
+    RANGE_REVALIDATION,
+    RETRY_CONTEXT_REVALIDATION,
+    COMPLETED_ERROR,
+    COMPLETED_UNMAPPED,
+    RETRY_CONTEXT_AFTER_RELEASE,
+    ANONYMOUS_SWAP_FAILED,
+};
+enum FileFaultInvalidContext : uint8_t {
+    FILE_FAULT_CONTEXT_USER_FRAME = 1U << 0,
+    FILE_FAULT_CONTEXT_TASK_TYPE = 1U << 1,
+    FILE_FAULT_CONTEXT_PREEMPT = 1U << 2,
+    FILE_FAULT_CONTEXT_BACKING = 1U << 3,
+    FILE_FAULT_CONTEXT_PROT = 1U << 4,
+    FILE_FAULT_CONTEXT_WRITE = 1U << 5,
+    FILE_FAULT_CONTEXT_FETCH = 1U << 6,
+};
+enum FileFaultDiagnosticValid : uint64_t {
+    FILE_FAULT_DIAG_CONTEXT = 1U << 0,
+    FILE_FAULT_DIAG_RANGE = 1U << 1,
+    FILE_FAULT_DIAG_ROOT_LEASE = 1U << 2,
+    FILE_FAULT_DIAG_POOL = 1U << 3,
+    FILE_FAULT_DIAG_REQUEST = 1U << 4,
+    FILE_FAULT_DIAG_COMPLETION = 1U << 5,
+    FILE_FAULT_DIAG_TRANSLATION = 1U << 6,
+    FILE_FAULT_DIAG_POOL_STATUS = 1U << 7,  // Nonzero pool generation == completion.
+};
+struct FileFaultFailureDiagnostic {
+    uint64_t valid{};
+    FileFaultFailureSite site{FileFaultFailureSite::NOT_PROBED};
+    uint8_t disposition{UINT8_MAX};  // Actual private probe enum; 255 = not called.
+    uint8_t context_invalid{};       // Actual composite-guard predicates; bit map above.
+    uint32_t preempt_depth{};        // Captured before any diagnostic/probe lock.
+    uint64_t task{}, pid{}, raw_root{}, retained_root{}, page{};
+    uint64_t range_start{}, range_end{}, prot{}, flags{}, kind{};
+    uint64_t file_offset{}, file_dev{}, file_ino{}, file_size{};
+    uint64_t requested_generation{}, completion_generation{};
+    int completion_status{};
+    bool mapped{};
+    uint64_t pool_generation{}, pool_completed{}, pool_page{}, pool_next_sequence{};
+    int pool_status{};
+    uint32_t pool_used{}, task_slots{};
+    bool admission{}, worker_present{}, worker_starting{}, slot_issued{};
+    uint64_t slot_page{}, slot_generation{}, slot_sequence{};
+};
+#endif
+bool pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                       ,
+                       FileFaultFailureDiagnostic* diagnostic = nullptr
+#endif
+);
 void map_to_kernel_page_table(vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 void map_range_to_kernel_page_table(Range range, uint64_t flags, uint64_t offset);
 // assume hhdm as offset

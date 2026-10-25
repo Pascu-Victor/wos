@@ -1161,6 +1161,68 @@ uint64_t lazy_file_fault_next_sequence{1};
 bool lazy_file_fault_admission{};
 bool lazy_file_fault_worker_starting{};
 
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+auto file_fault_diag_result(FileFaultFailureDiagnostic* diagnostic, LazyFileFaultDisposition disposition, FileFaultFailureSite site,
+                            uint64_t generation) -> LazyFileFaultDisposition {
+    if (diagnostic != nullptr) {
+        diagnostic->disposition = static_cast<uint8_t>(disposition);
+        diagnostic->site = disposition == LazyFileFaultDisposition::PARK || disposition == LazyFileFaultDisposition::RESOLVED
+                               ? FileFaultFailureSite::NONE
+                               : site;
+        if (disposition == LazyFileFaultDisposition::PARK) {
+            diagnostic->requested_generation = generation;
+            diagnostic->valid |= FILE_FAULT_DIAG_REQUEST;
+        }
+    }
+    return disposition;
+}
+
+void file_fault_diag_range(FileFaultFailureDiagnostic* diagnostic, const sched::task::LazyVmemRange& range) {
+    if (diagnostic == nullptr) return;
+    diagnostic->range_start = range.start;
+    diagnostic->range_end = range.end;
+    diagnostic->prot = range.prot;
+    diagnostic->flags = range.flags;
+    diagnostic->kind = static_cast<uint64_t>(range.kind);
+    diagnostic->file_offset = range.file_offset;
+    diagnostic->file_dev = range.file_dev;
+    diagnostic->file_ino = range.file_ino;
+    diagnostic->file_size = range.file_size;
+    diagnostic->valid |= FILE_FAULT_DIAG_RANGE;
+}
+
+// Caller already owns lazy_file_fault_lock. This is the probe-return epoch,
+// not the later completion. Never inspect backing/worker pointers or RQs here.
+void file_fault_diag_pool(FileFaultFailureDiagnostic* diagnostic, const sched::task::Task* task) {
+    if (diagnostic == nullptr) return;
+    diagnostic->pool_generation = task->lazy_file_fault_generation;
+    diagnostic->pool_completed = task->lazy_file_fault_completion_generation.load(std::memory_order_acquire);
+    diagnostic->pool_page = task->lazy_file_fault_vaddr;
+    if (diagnostic->pool_generation != 0 && diagnostic->pool_completed == diagnostic->pool_generation) {
+        diagnostic->pool_status = task->lazy_file_fault_status;
+        diagnostic->valid |= FILE_FAULT_DIAG_POOL_STATUS;
+    }
+    diagnostic->pool_next_sequence = lazy_file_fault_next_sequence;
+    diagnostic->admission = lazy_file_fault_admission;
+    diagnostic->worker_present = lazy_file_fault_worker != nullptr;
+    diagnostic->worker_starting = lazy_file_fault_worker_starting;
+    diagnostic->pool_used = 0;
+    diagnostic->task_slots = 0;
+    for (const auto& work : lazy_file_fault_work) {
+        if (work.task != nullptr) ++diagnostic->pool_used;
+        if (work.task == task) {
+            if (diagnostic->task_slots++ == 0) {
+                diagnostic->slot_issued = work.issued;
+                diagnostic->slot_page = work.vaddr;
+                diagnostic->slot_generation = work.generation;
+                diagnostic->slot_sequence = work.sequence;
+            }
+        }
+    }
+    diagnostic->valid |= FILE_FAULT_DIAG_POOL;
+}
+#endif
+
 void wake_lazy_file_fault_worker() {
     uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
     auto* worker = lazy_file_fault_worker;
@@ -1173,8 +1235,31 @@ void wake_lazy_file_fault_worker() {
 }
 
 auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, bool user_frame, uint64_t& generation,
-                           bool retry_user_if = false) -> LazyFileFaultDisposition {
+                           bool retry_user_if = false
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                           ,
+                           FileFaultFailureDiagnostic* diagnostic = nullptr
+#endif
+                           ) -> LazyFileFaultDisposition {
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    if (diagnostic != nullptr) {
+        *diagnostic = {};
+        diagnostic->task = reinterpret_cast<uint64_t>(task);
+        diagnostic->page = page_align_down(vaddr);
+        if (task != nullptr) {
+            diagnostic->pid = task->pid;
+            diagnostic->raw_root = reinterpret_cast<uint64_t>(task->pagemap);
+            diagnostic->preempt_depth = task->preempt_disable_depth;
+            diagnostic->valid |= FILE_FAULT_DIAG_CONTEXT;
+        }
+    }
+#endif
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    if (task == nullptr || task->pagemap == nullptr)
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::NOT_TRACKED), FileFaultFailureSite::NO_TASK_ROOT, 0);
+#else
     if (task == nullptr || task->pagemap == nullptr) return LazyFileFaultDisposition::NOT_TRACKED;
+#endif
     uint64_t const PAGE_VADDR = page_align_down(vaddr);
     sched::task::LazyVmemRange snapshot;
     bool found = false;
@@ -1187,27 +1272,72 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         }
     }
     task->lazy_vmem_lock.unlock_irqrestore(flags);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    if (!found) return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::NOT_TRACKED), FileFaultFailureSite::NO_FILE_RANGE, 0);
+#else
     if (!found) return LazyFileFaultDisposition::NOT_TRACKED;
+#endif
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    file_fault_diag_range(diagnostic, snapshot);
+#endif
     // The existing exception-wait frame classifier accepts a user PROCESS
     // fault. A kernel PROCESS fault is not a timer frame and cannot be parked
     // through that protocol. Ordinary software-prefault usercopy is unchanged.
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    uint8_t const CONTEXT_INVALID =
+        static_cast<uint8_t>((!user_frame ? FILE_FAULT_CONTEXT_USER_FRAME : 0U) |
+                             (task->type != sched::task::TaskType::PROCESS ? FILE_FAULT_CONTEXT_TASK_TYPE : 0U) |
+                             (task->preempt_disable_depth != 0 ? FILE_FAULT_CONTEXT_PREEMPT : 0U) |
+                             ((sched::task::lazy_vmem_has_lifetime(snapshot) ? snapshot.lifetime == nullptr : snapshot.file == nullptr)
+                                  ? FILE_FAULT_CONTEXT_BACKING
+                                  : 0U) |
+                             (snapshot.prot == 0 ? FILE_FAULT_CONTEXT_PROT : 0U) |
+                             (fault.writable != 0U && (snapshot.prot & 2U) == 0 ? FILE_FAULT_CONTEXT_WRITE : 0U) |
+                             (fault.fetch != 0U && (snapshot.prot & 4U) == 0 ? FILE_FAULT_CONTEXT_FETCH : 0U));
+    if (diagnostic != nullptr) diagnostic->context_invalid = CONTEXT_INVALID;
+    if (CONTEXT_INVALID != 0)
+#else
     if (!user_frame || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0 ||
         (sched::task::lazy_vmem_has_lifetime(snapshot) ? snapshot.lifetime == nullptr : snapshot.file == nullptr) || snapshot.prot == 0 ||
         (fault.writable != 0U && (snapshot.prot & 2U) == 0) || (fault.fetch != 0U && (snapshot.prot & 4U) == 0))
+#endif
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::CONTEXT_OR_PROTECTION, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
     // Capture outside range/pool/MM locks and before this operation acquires
     // root readers. Canonical shared loans never consume this placement value.
     DemandContextStorage demand_storage;
     auto& demand = demand_storage.get();
     if (!sched::task::lazy_vmem_is_tmpfs_shared(snapshot) &&
         !capture_demand_context(task, PAGE_VADDR, DemandOrigin::HardwareFault, user_frame, demand))
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::DEMAND_CAPTURE, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    if (!task->try_acquire())
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::TASK_LIFETIME, 0);
+#else
     if (!task->try_acquire()) return LazyFileFaultDisposition::FAILED;
+#endif
     PageTable* pagemap = nullptr;
     if (!task->try_acquire_usercopy_pagemap(pagemap)) {
         task->release();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::ROOT_LEASE, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
     }
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    if (diagnostic != nullptr) {
+        diagnostic->retained_root = reinterpret_cast<uint64_t>(pagemap);
+        diagnostic->valid |= FILE_FAULT_DIAG_ROOT_LEASE;
+    }
+#endif
     size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
     bool teardown_refusal = false;
     bool const PRIVATE_FILE =
@@ -1220,7 +1350,11 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     if (!ACQUIRED && !sched::task::lazy_vmem_is_tmpfs_shared(snapshot) && !RETRY_GATE) {
         task->release_usercopy_pagemap();
         task->release();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::READER_GATE, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
     }
     auto release_leases = [&] {
         release_user_pagemap_access(gate);
@@ -1235,7 +1369,11 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     }
     if (mapped) {
         release_leases();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::RESOLVED), FileFaultFailureSite::NONE, 0);
+#else
         return LazyFileFaultDisposition::RESOLVED;
+#endif
     }
 
     flags = lazy_file_fault_lock.lock_irqsave();
@@ -1244,16 +1382,31 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     if (PREVIOUS != 0 && COMPLETED != PREVIOUS) {
         generation = PREVIOUS;
         bool const SAME = task->lazy_file_fault_vaddr == PAGE_VADDR;
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        file_fault_diag_pool(diagnostic, task);
+#endif
         lazy_file_fault_lock.unlock_irqrestore(flags);
         release_leases();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (SAME ? LazyFileFaultDisposition::PARK : LazyFileFaultDisposition::FAILED),
+                                      FileFaultFailureSite::OTHER_PENDING_PAGE, SAME ? generation : 0);
+#else
         return SAME ? LazyFileFaultDisposition::PARK : LazyFileFaultDisposition::FAILED;
+#endif
     }
     if ((PREVIOUS != 0 && task->lazy_file_fault_vaddr == PAGE_VADDR && task->lazy_file_fault_status != 0) || !lazy_file_fault_admission ||
         lazy_file_fault_worker == nullptr || lazy_file_fault_worker_starting || PREVIOUS == UINT64_MAX ||
         lazy_file_fault_next_sequence == UINT64_MAX) {
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        file_fault_diag_pool(diagnostic, task);
+#endif
         lazy_file_fault_lock.unlock_irqrestore(flags);
         release_leases();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::ADMISSION_OR_STICKY, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
     }
     size_t index = lazy_file_fault_work.size();
     for (size_t i = 0; i < lazy_file_fault_work.size(); ++i) {
@@ -1263,9 +1416,16 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         }
     }
     if (index == lazy_file_fault_work.size()) {
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        file_fault_diag_pool(diagnostic, task);
+#endif
         lazy_file_fault_lock.unlock_irqrestore(flags);
         release_leases();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::POOL_FULL, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
     }
     // The pool -> range order occurs only here. Revalidate and retain the File
     // once publication is guaranteed, so rejection can never run a last File
@@ -1285,9 +1445,17 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
                 // owner or publishing work for this transient retry.
                 bool const RETRY = lazy_file_fault_retry_context(task, pagemap);
                 task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                file_fault_diag_pool(diagnostic, task);
+#endif
                 lazy_file_fault_lock.unlock_irqrestore(flags);
                 release_leases();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                return file_fault_diag_result(diagnostic, (RETRY ? LazyFileFaultDisposition::RETRY : LazyFileFaultDisposition::FAILED),
+                                              FileFaultFailureSite::RETRY_CONTEXT_REVALIDATION, 0);
+#else
                 return RETRY ? LazyFileFaultDisposition::RETRY : LazyFileFaultDisposition::FAILED;
+#endif
             }
             if (sched::task::lazy_vmem_has_lifetime(snapshot)) {
                 current = family_owned =
@@ -1330,6 +1498,9 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         task->lazy_file_fault_generation = generation;
     }
     task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    file_fault_diag_pool(diagnostic, task);
+#endif
     lazy_file_fault_lock.unlock_irqrestore(flags);
     if (!current) {
         release_user_pagemap_access(gate);
@@ -1337,10 +1508,18 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         if (demand_binding != nullptr) demand_binding->release(file_mapping::BindingOwner::PIN);
         if (family_owned) snapshot.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);
         task->release();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+        return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::FAILED), FileFaultFailureSite::RANGE_REVALIDATION, 0);
+#else
         return LazyFileFaultDisposition::FAILED;
+#endif
     }
     wake_lazy_file_fault_worker();
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    return file_fault_diag_result(diagnostic, (LazyFileFaultDisposition::PARK), FileFaultFailureSite::NONE, generation);
+#else
     return LazyFileFaultDisposition::PARK;
+#endif
 }
 
 auto take_lazy_file_fault(LazyFileFaultWork& work, size_t& index) -> bool {
@@ -8051,7 +8230,12 @@ void switch_pagemap(sched::task::Task* t) {
     note_active_pagemap(t->pagemap);
 }
 
-auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr) -> bool {
+auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                       ,
+                       FileFaultFailureDiagnostic* diagnostic
+#endif
+                       ) -> bool {
     PageFault const PAGEFAULT = paging::create_page_fault(frame.err_code, true);
 
 #ifdef WOS_KASAN
@@ -8096,28 +8280,65 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             return true;
         }
         if (SWAP_FAULT == AnonymousSwapFaultDisposition::FAILED) {
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+            if (diagnostic != nullptr) diagnostic->site = FileFaultFailureSite::ANONYMOUS_SWAP_FAILED;
+#endif
             return false;
         }
 #ifdef WOS_ASYNC_BLOCK_IO
         auto* const FILE_FAULT_ROOT = current_task != nullptr ? current_task->pagemap : nullptr;
         auto const FILE_FAULT = probe_lazy_file_fault(current_task, control_register, PAGEFAULT, (frame.cs & 3U) == 3U, wait_generation,
-                                                      (frame.flags & cpu::GATE_IF_MASK) != 0);
+                                                      (frame.flags & cpu::GATE_IF_MASK) != 0
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                                      ,
+                                                      diagnostic
+#endif
+        );
         if (FILE_FAULT == LazyFileFaultDisposition::PARK) {
             while (current_task->lazy_file_fault_completion_generation.load(std::memory_order_acquire) != wait_generation) {
                 auto const WAIT = sched::place_task_in_wait_queue_if_pending(
                     gpr, frame, current_task->lazy_file_fault_completion_generation, wait_generation);
                 if (WAIT == sched::ExceptionWaitResult::PARKED) return true;
             }
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+            // The loop's acquire observed this exact generation's publication.
+            // Read status once and preserve the original short-circuit walk.
+            int const STATUS = current_task->lazy_file_fault_status;
+            if (diagnostic != nullptr) {
+                diagnostic->completion_generation = wait_generation;
+                diagnostic->completion_status = STATUS;
+                diagnostic->valid |= FILE_FAULT_DIAG_COMPLETION;
+            }
+            if (STATUS != 0) {
+                if (diagnostic != nullptr) diagnostic->site = FileFaultFailureSite::COMPLETED_ERROR;
+                return false;
+            }
+            bool const MAPPED = translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
+            if (diagnostic != nullptr) {
+                diagnostic->mapped = MAPPED;
+                diagnostic->valid |= FILE_FAULT_DIAG_TRANSLATION;
+                if (!MAPPED) diagnostic->site = FileFaultFailureSite::COMPLETED_UNMAPPED;
+            }
+            return MAPPED;
+#else
             return current_task->lazy_file_fault_status == 0 &&
                    translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
+#endif
         }
         if (FILE_FAULT == LazyFileFaultDisposition::RESOLVED) return true;
         if (FILE_FAULT == LazyFileFaultDisposition::RETRY) {
             // No mapping is claimed resolved. IRET restores the original IF1
             // user frame and instruction; ordinary IRQ/timer scheduling may
             // run a preempted exclusive owner before the fault is retried.
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+            bool const RETRY = (frame.cs & 3U) == 3U && (frame.flags & cpu::GATE_IF_MASK) != 0 &&
+                               lazy_file_fault_retry_context(current_task, FILE_FAULT_ROOT);
+            if (!RETRY && diagnostic != nullptr) diagnostic->site = FileFaultFailureSite::RETRY_CONTEXT_AFTER_RELEASE;
+            return RETRY;
+#else
             return (frame.cs & 3U) == 3U && (frame.flags & cpu::GATE_IF_MASK) != 0 &&
                    lazy_file_fault_retry_context(current_task, FILE_FAULT_ROOT);
+#endif
         }
         if (FILE_FAULT == LazyFileFaultDisposition::FAILED) return false;
 #endif

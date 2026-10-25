@@ -646,7 +646,9 @@ def main() -> int:
               "native_owner_method_seams": "fatal unreachable branches, never a native executor model"}
     try:
         virt_path, task_path = args.virt_source.resolve(strict=True), args.task_source.resolve(strict=True)
-        compiler = Path(args.cxx).resolve(strict=True)
+        # Preserve clang++'s multicall spelling while checking the actual ELF.
+        compiler_driver = Path(args.cxx).absolute()
+        compiler = compiler_driver.resolve(strict=True)
         if not compiler.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError("--cxx/CXX must name one host ELF compiler executable")
         with compiler.open("rb") as executable:
@@ -667,7 +669,7 @@ def main() -> int:
         family.write_bytes(FAMILY_HEADER.read_bytes())
         source.write_text(harness)
         commands = [
-            [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
+            [str(compiler_driver), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
              "-fno-omit-frame-pointer", "-I", str(scratch / "include"), "-I", str(ROOT / "modules/kern/src"),
              str(source), "-o", str(binary)],
             [str(binary)],
