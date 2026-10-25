@@ -1127,14 +1127,23 @@ enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAI
 // The probe checks this while retaining Task/root leases; the handler checks
 // the return context again after releasing them. No root is dereferenced here.
 // Retrying preserves the user frame, so closing or return transitions refuse.
-auto lazy_file_fault_retry_context(sched::task::Task* task, PageTable* pagemap) -> bool {
+auto lazy_file_fault_retry_identity(sched::task::Task* task, PageTable* pagemap) -> bool {
     return task != nullptr && pagemap != nullptr && pagemap != get_kernel_pagemap() && sched::can_query_current_task() &&
-           sched::get_current_task() == task && sched::get_return_task() == task && task->type == sched::task::TaskType::PROCESS &&
-           task->preempt_disable_depth == 0 && task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
-           !task->has_exited && !task->exit_in_progress.load(std::memory_order_acquire) &&
-           !task->process_exit_requested.load(std::memory_order_acquire) &&
+           sched::get_current_task() == task && sched::get_return_task() == task && task->type == sched::task::TaskType::PROCESS;
+}
+
+// Call only after the same identity prefix succeeds. These existing liveness
+// predicates neither dereference the root nor acquire another owner.
+auto lazy_file_fault_retry_liveness(sched::task::Task* task, PageTable* pagemap) -> bool {
+    return task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE && !task->has_exited &&
+           !task->exit_in_progress.load(std::memory_order_acquire) && !task->process_exit_requested.load(std::memory_order_acquire) &&
            !task->scheduler_transition_active.load(std::memory_order_acquire) && !task->deferred_task_switch && !task->wants_block &&
            !task->usercopy_pagemap_closing.load(std::memory_order_acquire) && task->pagemap == pagemap;
+}
+
+auto lazy_file_fault_retry_context(sched::task::Task* task, PageTable* pagemap) -> bool {
+    return lazy_file_fault_retry_identity(task, pagemap) && task->preempt_disable_depth == 0 &&
+           lazy_file_fault_retry_liveness(task, pagemap);
 }
 
 struct LazyFileFaultWork {
@@ -1443,7 +1452,10 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
                 // worker, generation and capacity errors. Validate the exact
                 // live range under pool -> range before acquiring any backing
                 // owner or publishing work for this transient retry.
-                bool const RETRY = lazy_file_fault_retry_context(task, pagemap);
+                // RETRY_GATE already established unlocked depth-zero eligibility.
+                // Only our pool/range Spinlocks intervene; revalidate identity and
+                // liveness without mistaking their owned tokens for unsafe entry.
+                bool const RETRY = lazy_file_fault_retry_identity(task, pagemap) && lazy_file_fault_retry_liveness(task, pagemap);
                 task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
 #ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
                 file_fault_diag_pool(diagnostic, task);

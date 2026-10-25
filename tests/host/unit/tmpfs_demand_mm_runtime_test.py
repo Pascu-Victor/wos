@@ -470,7 +470,9 @@ def main() -> int:
                KERN / 'syscalls_impl/vmem/sys_vmem.hpp']
     before = []
     try:
-        compiler = Path(args.cxx).resolve(strict=True)
+        # Preserve clang++'s multicall spelling while checking the actual ELF.
+        compiler_driver = Path(args.cxx).absolute()
+        compiler = compiler_driver.resolve(strict=True)
         watched.append(compiler)
         before = [pin(path) for path in watched]
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -493,7 +495,7 @@ def main() -> int:
         scope=include/'platform/sys/syscall_preparation.hpp';scope.parent.mkdir(parents=True,exist_ok=True)
         scope.write_bytes((KERN/'platform/sys/syscall_preparation.hpp').read_bytes())
         source.write_text(code)
-        commands = [[str(compiler), '-std=c++23', '-O1', '-g0', '-pipe', '-fsanitize=address,undefined',
+        commands = [[str(compiler_driver), '-std=c++23', '-O1', '-g0', '-pipe', '-fsanitize=address,undefined',
                      '-fno-omit-frame-pointer', '-I', str(include), '-MMD', '-MF', str(scratch / 'demand.d'), str(source), '-o', str(binary)],
                     [str(binary)]]
         for i, argv in enumerate(commands):

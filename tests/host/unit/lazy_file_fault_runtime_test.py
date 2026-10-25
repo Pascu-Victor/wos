@@ -4,6 +4,9 @@
 The shared striped-reader atomic body, file probe and handler branch are real.
 Scheduler/physical/File lifetime boundaries are controlled. This verifies
 ordering and ownership, not real IRET/timer progress or guest latency.
+Host locks use maintained token transitions and release the captured current Task.
+The original depth-zero interior retry helper must fail existing positive cases
+when this corrected token seam is paired with the preimage virt source.
 WOS_LAZY_FAULT_PROBE_CONTROL=predecessor with
 WOS_LAZY_FAULT_PREDECESSOR_SOURCE selects the complete actual old probe/handler
 against the SAME new oracle; it must compile then fail. retry-all-failures is a
@@ -83,6 +86,7 @@ code = r'''
 #include <utility>
 #include <vector>
 #include <cerrno>
+#include <platform/sched/preemption_policy.hpp>
 using vaddr_t=uint64_t; using paddr_t=uint64_t;
 constexpr paddr_t PADDR_INVALID=UINT64_MAX;
 constexpr uint64_t page_align_down(uint64_t p){return p&~uint64_t{4095};}
@@ -92,9 +96,14 @@ bool fail_create=false, fail_post=false, shutdown_requested=false, fail_alloc=fa
 std::function<void()> read_hook, pin_hook, park_hook, put_hook;
 std::function<void()> clean_exit_hook, task_release_hook, atomic_gate_hook;
 struct CleanKernelExit {};
+namespace ker::mod::sched::task{struct Task;}
+auto host_lock_preempt_disable()->ker::mod::sched::task::Task*;
+void host_lock_preempt_enable(ker::mod::sched::task::Task*);
 struct Lock;std::function<void(Lock*)>unlock_hook;
-struct Lock{bool held=false;uint64_t lock_irqsave(){assert(!held);held=true;++guards;return 0;}
- void unlock_irqrestore(uint64_t){assert(held);held=false;--guards;if(unlock_hook)unlock_hook(this);}};
+struct Lock{bool held=false;ker::mod::sched::task::Task*preempt_owner=nullptr;
+ uint64_t lock_irqsave(){assert(!held);preempt_owner=host_lock_preempt_disable();held=true;++guards;return 0;}
+ void unlock_irqrestore(uint64_t){assert(held);auto*owner=std::exchange(preempt_owner,nullptr);held=false;--guards;
+  host_lock_preempt_enable(owner);if(unlock_hook)unlock_hook(this);}};
 struct alignas(4096) PageTable{uint64_t address=0;void*page=nullptr;bool closing=false;};
 // An atomic transition endpoint injects an exclusive flag immediately after the
 // actual successful reader CAS, before its actual post-CAS recheck/rollback.
@@ -277,6 +286,31 @@ namespace ker::syscall::vmem{@MATERIALIZE@}
 using namespace ker::mod::mm::virt;
 namespace sched=ker::mod::sched;
 using Task=sched::task::Task;using Range=sched::task::LazyVmemRange;using Fault=ker::mod::mm::paging::PageFault;
+// Model only maintained token depth transitions and captured-owner release.
+// IRQ flags, ticket arbitration and pending reschedule service are endpoints.
+auto host_lock_preempt_disable()->Task*{
+ auto*owner=sched::can_query_current_task()?sched::get_current_task():nullptr;
+ if(owner){auto transition=sched::preempt_disable_transition(owner->preempt_disable_depth);
+  assert(transition.error==sched::PreemptGuardTransitionError::NONE);owner->preempt_disable_depth=transition.depth;}
+ return owner;
+}
+void host_lock_preempt_enable(Task*owner){
+ if(owner){auto transition=sched::preempt_enable_transition(owner->preempt_disable_depth);
+  assert(transition.error==sched::PreemptGuardTransitionError::NONE);owner->preempt_disable_depth=transition.depth;}
+}
+void lock_token_cases(){
+ assert(guards==0);Task first,second;Lock outer,inner;sched::current=&first;
+ outer.lock_irqsave();assert(first.preempt_disable_depth==1&&guards==1);
+ inner.lock_irqsave();assert(first.preempt_disable_depth==2&&guards==2);
+ sched::current=&second;inner.unlock_irqrestore(0);
+ assert(first.preempt_disable_depth==1&&second.preempt_disable_depth==0&&guards==1&&!inner.preempt_owner);
+ sched::current=nullptr;outer.unlock_irqrestore(0);
+ assert(first.preempt_disable_depth==0&&second.preempt_disable_depth==0&&guards==0&&!outer.preempt_owner);
+ sched::current=&first;first.preempt_disable_depth=1;
+ outer.lock_irqsave();assert(first.preempt_disable_depth==2&&guards==1);
+ outer.unlock_irqrestore(0);assert(first.preempt_disable_depth==1&&guards==0);
+ first.preempt_disable_depth=0;sched::current=nullptr;
+}
 namespace ker::syscall::process{
 [[noreturn]] void wos_proc_exit(int status){auto*current=sched::current;
  assert(status==0&&guards==0&&current&&current->type==sched::task::TaskType::DAEMON&&current->holds==0&&current->pins==0);
@@ -288,7 +322,7 @@ struct Fixture{PageTable map;ker::vfs::File file;Task task;bool owns_file_ref=tr
 };
 void reset(){assert(guards==0&&lazy_file_fault_worker==nullptr);for(auto const&w:lazy_file_fault_work)assert(!w.task);
  for(auto const&gate:user_pagemap_access_gates)assert(gate.readers.load()==0&&!gate.teardown.load()&&!gate.readers.close_after_cas);
- sched::return_override=nullptr;sched::queryable=true;kernel_pagemap=nullptr;task_release_hook=atomic_gate_hook={};
+ sched::current=nullptr;sched::return_override=nullptr;sched::queryable=true;kernel_pagemap=nullptr;task_release_hook=atomic_gate_hook={};
  lazy_file_fault_work={};lazy_file_fault_admission=false;lazy_file_fault_worker_starting=false;lazy_file_fault_next_sequence=1;
  capture_nodes=observed_nodes=observed_index=0;capture_mode=observed_mode=0;capture_local=observed_local=0;fail_capture=false;
  fail_create=fail_post=shutdown_requested=fail_alloc=fail_read=software_prefault=false;reads=parks=wakes=puts=translations=0;read_hook=pin_hook=park_hook=put_hook=clean_exit_hook={};unlock_hook={};}
@@ -604,6 +638,7 @@ void diagnostic_cases(){
 #endif
 
 int main(){
+ lock_token_cases();
 #ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
  diagnostic_cases();
 #endif
