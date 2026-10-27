@@ -4,6 +4,8 @@
 The shared striped-reader atomic body, file probe and handler branch are real.
 Scheduler/physical/File lifetime boundaries are controlled. This verifies
 ordering and ownership, not real IRET/timer progress or guest latency.
+Completed-error checks cover a single eligible instruction retry, unchanged
+sticky refusal and shared-root sibling mapping resolution.
 Host locks use maintained token transitions and release the captured current Task.
 The original depth-zero interior retry helper must fail existing positive cases
 when this corrected token seam is paired with the preimage virt source.
@@ -92,6 +94,7 @@ constexpr paddr_t PADDR_INVALID=UINT64_MAX;
 constexpr uint64_t page_align_down(uint64_t p){return p&~uint64_t{4095};}
 uint64_t capture_nodes=0,observed_nodes=0,observed_index=0;unsigned capture_mode=0,observed_mode=0;uint16_t capture_local=0,observed_local=0;bool fail_capture=false;
 int guards=0, created=0, destroyed=0, reads=0, allocated=0, dropped=0, puts=0, parks=0, wakes=0, translations=0;
+uint32_t expected_materializer_readers=1;
 bool fail_create=false, fail_post=false, shutdown_requested=false, fail_alloc=false, fail_read=false, software_prefault=false;
 std::function<void()> read_hook, pin_hook, park_hook, put_hook;
 std::function<void()> clean_exit_hook, task_release_hook, atomic_gate_hook;
@@ -251,7 +254,7 @@ uint64_t file_mapping_page_flags(uint64_t prot,uint64_t flags){return prot|flags
 bool materialize_lazy_file_page_impl(ker::mod::sched::task::Task*,const LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&,const ker::mod::mm::numa::AllocationContext&,const ker::mod::mm::virt::BorrowedFileMappingRootAccess*);
 bool materialize_lazy_file_page(ker::mod::sched::task::Task*t,const LazyVmemRange&r,uint64_t a,const ker::mod::mm::paging::PageFault&f,const ker::mod::mm::numa::AllocationContext&context){
  assert(guards==0&&((software_prefault&&ker::mod::sched::current==t)||
- (ker::mod::sched::current!=t&&t->pins==1&&ker::mod::mm::virt::reader_count(t->pagemap)==1)));
+ (ker::mod::sched::current!=t&&t->pins==1&&ker::mod::mm::virt::reader_count(t->pagemap)==expected_materializer_readers)));
  return materialize_lazy_file_page_impl(t,r,a,f,context,nullptr);}
 }}
 namespace ker::mod::mm::virt{
@@ -325,6 +328,7 @@ void reset(){assert(guards==0&&lazy_file_fault_worker==nullptr);for(auto const&w
  sched::current=nullptr;sched::return_override=nullptr;sched::queryable=true;kernel_pagemap=nullptr;task_release_hook=atomic_gate_hook={};
  lazy_file_fault_work={};lazy_file_fault_admission=false;lazy_file_fault_worker_starting=false;lazy_file_fault_next_sequence=1;
  capture_nodes=observed_nodes=observed_index=0;capture_mode=observed_mode=0;capture_local=observed_local=0;fail_capture=false;
+ expected_materializer_readers=1;
  fail_create=fail_post=shutdown_requested=fail_alloc=fail_read=software_prefault=false;reads=parks=wakes=puts=translations=0;read_hook=pin_hook=park_hook=put_hook=clean_exit_hook={};unlock_hook={};}
 void start(){sched::current=nullptr;start_lazy_file_fault_worker();assert(lazy_file_fault_worker&&lazy_file_fault_admission);}
 void run_worker(Task*t){clean_exit_hook=[](){assert(!lazy_file_fault_worker&&!lazy_file_fault_admission);
@@ -613,6 +617,8 @@ void diagnostic_cases(){
  }
  // The handler reads status only after exact-generation acquire. Keep the
  // original short-circuit translation count: error=0, status0=one walk.
+ // The completed-error policy now permits one eligible instruction retry;
+ // a status-zero completion without a mapped page still fails immediately.
  for(unsigned mode=0;mode<3;++mode){
   reset();start();Fixture f;sched::current=&f.task;Diagnostic d;sched::Frame frame;sched::GPRegs regs;
   auto before_frame=frame;auto before_regs=regs;int before_final_translate=-1;
@@ -623,7 +629,7 @@ void diagnostic_cases(){
    before_final_translate=translations;
   };
   bool result=handle_file_fault_frame(&f.task,0x10000,Fault{},frame,regs,&d);park_hook={};
-  assert(result==(mode==2)&&before_final_translate>=0&&translations-before_final_translate==(mode==0?0:1));
+  assert(result==(mode!=1)&&before_final_translate>=0&&translations-before_final_translate==(mode==0?0:1));
   assert(d.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::PARK)&&
          diag_has(d,FILE_FAULT_DIAG_REQUEST|FILE_FAULT_DIAG_COMPLETION)&&d.requested_generation==1&&d.completion_generation==1);
   assert(d.completion_status==(mode==0?-EFAULT:0)&&d.mapped==(mode==2));
@@ -637,7 +643,169 @@ void diagnostic_cases(){
 }
 #endif
 
+void completed_error_sibling_mapping_cases(){
+ for(unsigned mode=0;mode<3;++mode){
+  reset();start();
+  {
+   Fixture f;Task sibling;sched::current=&f.task;
+   f.task.lazy_vmem_ranges[0].prot=5;
+   sibling.pagemap=&f.map;sibling.lazy_vmem_ranges=f.task.lazy_vmem_ranges;
+   auto flags=f.task.lazy_vmem_lock.lock_irqsave();ker::vfs::vfs_retain_file(&f.file);f.task.lazy_vmem_lock.unlock_irqrestore(flags);
+   Fault fault{};fault.fetch=1;sched::Frame frame{};frame.rip=0x10000;frame.err_code=20;sched::GPRegs regs{};
+   auto saved_frame=frame;auto saved_regs=regs;int before_final_translate=-1;
+   park_hook=[&]{
+    if(mode<2){
+     sched::current=&sibling;uint64_t generation=0;
+     assert(probe_lazy_file_fault(&sibling,0x10000,fault,true,generation,true)==LazyFileFaultDisposition::PARK);
+     assert(generation==1&&reader_count(&f.map)==2&&f.file.refs==4);
+     sched::current=&f.task;
+    }
+    fail_alloc=mode!=1;fail_read=mode==1;
+    expected_materializer_readers=mode<2?2:1;one();expected_materializer_readers=1;
+    assert(f.task.lazy_file_fault_status==-EFAULT&&f.task.lazy_file_fault_completion_generation.load()==1&&!f.map.page);
+    fail_alloc=fail_read=false;
+    if(mode<2){one();assert(sibling.lazy_file_fault_status==0&&sibling.lazy_file_fault_completion_generation.load()==1&&f.map.page);}
+    before_final_translate=translations;
+   };
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   Diagnostic diagnostic;
+#endif
+   bool handled=handle_file_fault_frame(&f.task,0x10000,fault,frame,regs
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                       ,&diagnostic
+#endif
+   );park_hook={};
+   // Returning the original instruction is not a mapping claim. Keep A's
+   // failed generation/status even when B has since mapped the shared page.
+   assert(handled&&f.task.lazy_file_fault_status==-EFAULT&&f.task.lazy_file_fault_completion_generation.load()==1);
+   assert((f.map.page!=nullptr)==(mode<2)&&translations==before_final_translate&&frame==saved_frame&&regs==saved_regs);
+   assert(f.task.refs==1&&sibling.refs==1&&f.task.pins==0&&sibling.pins==0&&reader_count(&f.map)==0&&f.file.refs==2&&guards==0);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   assert(diagnostic.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::PARK)&&diagnostic.site==FailureSite::COMPLETED_ERROR);
+   assert(diag_has(diagnostic,FILE_FAULT_DIAG_REQUEST|FILE_FAULT_DIAG_COMPLETION)&&diagnostic.requested_generation==1&&
+          diagnostic.completion_generation==1&&diagnostic.completion_status==-EFAULT&&!diagnostic.mapped);
+   assert(!diag_has(diagnostic,FILE_FAULT_DIAG_TRANSLATION));
+   Diagnostic next_diagnostic;
+#endif
+   // A fresh probe must revalidate fetch permission before accepting B's
+   // present mapping. This changes the finite range endpoint, not the PTE.
+   if(mode<2){
+    assert(f.map.page&&fault.fetch==1&&f.task.lazy_vmem_ranges[0].prot==5);
+    int before_reads=reads,before_parks=parks,before_translate=translations;
+    f.task.lazy_vmem_ranges[0].prot=1;
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    Diagnostic denied_diagnostic;
+#endif
+    assert(!handle_file_fault_frame(&f.task,0x10000,fault,frame,regs
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                    ,&denied_diagnostic
+#endif
+    ));
+    assert(f.map.page&&reads==before_reads&&parks==before_parks&&translations==before_translate);
+    assert(f.task.lazy_file_fault_generation==1&&f.task.lazy_file_fault_completion_generation.load()==1&&f.task.lazy_file_fault_status==-EFAULT);
+    assert(frame==saved_frame&&regs==saved_regs);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+    assert(denied_diagnostic.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::FAILED)&&
+           denied_diagnostic.site==FailureSite::CONTEXT_OR_PROTECTION&&denied_diagnostic.context_invalid==FILE_FAULT_CONTEXT_FETCH);
+    assert(!diag_has(denied_diagnostic,FILE_FAULT_DIAG_COMPLETION)&&!diag_has(denied_diagnostic,FILE_FAULT_DIAG_TRANSLATION));
+#endif
+    f.task.lazy_vmem_ranges[0].prot=5;
+   }
+   int old_reads=reads;assert(handle_file_fault_frame(&f.task,0x10000,fault,frame,regs
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                                   ,&next_diagnostic
+#endif
+   )==(mode<2));
+   assert(reads==old_reads&&f.task.lazy_file_fault_generation==1&&f.task.lazy_file_fault_status==-EFAULT);
+   assert(parks==1&&f.task.lazy_file_fault_completion_generation.load()==1);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   assert(next_diagnostic.disposition==static_cast<uint8_t>(mode<2?LazyFileFaultDisposition::RESOLVED:LazyFileFaultDisposition::FAILED));
+   assert(next_diagnostic.site==(mode<2?FailureSite::NONE:FailureSite::ADMISSION_OR_STICKY));
+   assert(!diag_has(next_diagnostic,FILE_FAULT_DIAG_COMPLETION));
+#endif
+   empty_work();sibling.lazy_vmem_ranges.clear();sibling.pagemap=nullptr;ker::vfs::vfs_put_file(&f.file);
+   assert(f.file.refs==1&&frame==saved_frame&&regs==saved_regs);
+  }
+  drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+ }
+}
+
+void completed_error_unsafe_context_cases(){
+ // Inject changes only after real work has published its exact completion.
+ // Every unsafe return context keeps the failed status and cannot walk a root
+ // or return a retry. CPL0 is injected after admission so that this exercises
+ // the completed-error branch rather than only the original probe refusal.
+ for(unsigned failure=0;failure<2;++failure)for(unsigned axis=0;axis<19;++axis){
+  reset();start();
+  {
+   Fixture f;Task other;PageTable foreign;sched::current=&f.task;
+   f.task.lazy_vmem_ranges[0].prot=5;Fault fault{};fault.fetch=1;
+   sched::Frame frame{};frame.rip=0x10000;frame.err_code=20;
+   if(axis==0)frame.flags&=~uint64_t{0x200};
+   sched::GPRegs regs{};regs.values[2]=0xa55a;auto expected_regs=regs;auto expected_frame=frame;
+   int after_worker_translate=-1;
+   park_hook=[&]{
+    fail_alloc=failure==0;fail_read=failure==1;one();fail_alloc=fail_read=false;
+    assert(f.task.lazy_file_fault_status==-EFAULT&&f.task.lazy_file_fault_completion_generation.load()==1);
+    assert(!f.map.page&&f.task.refs==1&&f.task.pins==0&&reader_count(&f.map)==0&&f.file.refs==1);
+    switch(axis){
+     case 0:break;
+     case 1:frame.cs=0;break;
+     case 2:f.task.preempt_disable_depth=1;break;
+     case 3:sched::current=&other;break;
+     case 4:sched::return_override=&other;break;
+     case 5:sched::queryable=false;break;
+     case 6:f.task.state.store(sched::task::TaskState::EXITING);break;
+     case 7:f.task.usercopy_pagemap_closing.store(true);break;
+     case 8:f.task.scheduler_transition_active.store(true);break;
+     case 9:f.task.exit_in_progress.store(true);break;
+     case 10:f.task.process_exit_requested.store(true);break;
+     case 11:f.task.has_exited=true;break;
+     case 12:f.task.deferred_task_switch=true;break;
+     case 13:f.task.wants_block=true;break;
+     case 14:f.task.pagemap=&foreign;break;
+     case 15:f.task.pagemap=nullptr;break;
+     case 16:kernel_pagemap=&f.map;break;
+     case 17:f.task.type=sched::task::TaskType::DAEMON;break;
+     case 18:sched::current=nullptr;break;
+    }
+    expected_frame=frame;after_worker_translate=translations;
+   };
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   Diagnostic diagnostic;
+#endif
+   bool handled=handle_file_fault_frame(&f.task,0x10000,fault,frame,regs
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                       ,&diagnostic
+#endif
+   );park_hook={};
+   assert(!handled&&after_worker_translate>=0&&translations==after_worker_translate&&parks==1);
+   assert(frame==expected_frame&&regs==expected_regs&&!f.map.page&&reads==(failure==1?1:0));
+   assert(f.task.refs==1&&f.task.pins==0&&reader_count(&f.map)==0&&f.file.refs==1&&guards==0);
+   assert(f.task.lazy_file_fault_generation==1&&f.task.lazy_file_fault_completion_generation.load()==1&&f.task.lazy_file_fault_status==-EFAULT);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   assert(diagnostic.disposition==static_cast<uint8_t>(LazyFileFaultDisposition::PARK)&&diagnostic.site==FailureSite::COMPLETED_ERROR);
+   assert(diag_has(diagnostic,FILE_FAULT_DIAG_REQUEST|FILE_FAULT_DIAG_COMPLETION)&&diagnostic.requested_generation==1&&
+          diagnostic.completion_generation==1&&diagnostic.completion_status==-EFAULT&&!diagnostic.mapped);
+   assert(!diag_has(diagnostic,FILE_FAULT_DIAG_TRANSLATION));
+#endif
+   empty_work();
+   sched::current=&f.task;sched::return_override=nullptr;sched::queryable=true;kernel_pagemap=nullptr;
+   f.task.pagemap=&f.map;f.task.type=sched::task::TaskType::PROCESS;f.task.preempt_disable_depth=0;
+   f.task.state.store(sched::task::TaskState::ACTIVE);f.task.usercopy_pagemap_closing.store(false);
+   f.task.scheduler_transition_active.store(false);f.task.exit_in_progress.store(false);f.task.process_exit_requested.store(false);
+   f.task.has_exited=f.task.deferred_task_switch=f.task.wants_block=false;
+   sched::Frame fresh_frame{};int old_reads=reads;
+   assert(!handle_file_fault_frame(&f.task,0x10000,fault,fresh_frame,regs));
+   assert(reads==old_reads&&parks==1&&f.task.lazy_file_fault_generation==1&&f.task.lazy_file_fault_status==-EFAULT);
+  }
+  drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+ }
+}
+
 int main(){
+ completed_error_sibling_mapping_cases();
+ completed_error_unsafe_context_cases();
  lock_token_cases();
 #ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
  diagnostic_cases();
@@ -796,4 +964,4 @@ with tempfile.TemporaryDirectory(prefix="wos-file-fault-") as temporary:
             check=True,
         )
         subprocess.run([str(binary)], check=True, timeout=30)
-print("actual deferred file-fault ownership and materialization traces pass with diagnostics OFF/ON")
+print("actual deferred file-fault ownership, completed-error retry and materialization traces pass with diagnostics OFF/ON")

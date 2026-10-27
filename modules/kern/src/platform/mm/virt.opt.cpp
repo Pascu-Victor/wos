@@ -8323,7 +8323,11 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             }
             if (STATUS != 0) {
                 if (diagnostic != nullptr) diagnostic->site = FileFaultFailureSite::COMPLETED_ERROR;
-                return false;
+                // Match a completed park's fresh fault without clearing this
+                // error: the next probe resolves a sibling's mapping or fails
+                // the unchanged sticky-error check for an unmapped page.
+                return (frame.cs & 3U) == 3U && (frame.flags & cpu::GATE_IF_MASK) != 0 &&
+                       lazy_file_fault_retry_context(current_task, FILE_FAULT_ROOT);
             }
             bool const MAPPED = translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
             if (diagnostic != nullptr) {
@@ -8333,8 +8337,13 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             }
             return MAPPED;
 #else
-            return current_task->lazy_file_fault_status == 0 &&
-                   translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
+            if (current_task->lazy_file_fault_status != 0) {
+                // A single eligible instruction retry preserves the failed
+                // generation; it cannot enqueue the same unmapped page again.
+                return (frame.cs & 3U) == 3U && (frame.flags & cpu::GATE_IF_MASK) != 0 &&
+                       lazy_file_fault_retry_context(current_task, FILE_FAULT_ROOT);
+            }
+            return translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
 #endif
         }
         if (FILE_FAULT == LazyFileFaultDisposition::RESOLVED) return true;
