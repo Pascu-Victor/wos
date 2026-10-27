@@ -579,7 +579,8 @@ def main() -> int:
             signal.signal(sig, interrupted)
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         selected = args.vmem_source.resolve(strict=True)
-        compiler = Path(args.cxx).resolve(strict=True)
+        compiler_driver = Path(args.cxx).absolute()
+        compiler = compiler_driver.resolve(strict=True)
         if not compiler.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError("--cxx must be a single executable compiler path")
         with compiler.open("rb") as stream:
@@ -610,7 +611,7 @@ def main() -> int:
         result["staged_sources_before"] = staged_before
         binary = scratch / "file-registry-test"
         depfile = scratch / "dependencies.d"
-        compile_argv = [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-fsanitize=address,undefined",
+        compile_argv = [str(compiler_driver), "-std=c++23", "-O1", "-g0", "-pipe", "-fsanitize=address,undefined",
                         "-fno-omit-frame-pointer", "-MD", "-MF", str(depfile), "-I", str(scratch / "include"),
                         str(scratch / "harness.cpp"), "-o", str(binary)]
         for index, argv in enumerate([compile_argv, [str(binary)]]):
