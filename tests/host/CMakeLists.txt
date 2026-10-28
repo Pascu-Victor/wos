@@ -430,6 +430,12 @@ add_test(NAME task_placement_inheritance_runtime_test
         --host-cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(task_placement_inheritance_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
 
+add_test(NAME weighted_fairness_bootstrap_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/weighted_fairness_bootstrap_runtime_test.py
+        --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+        --host-cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(weighted_fairness_bootstrap_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+
 add_test(NAME kernel_direct_map_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_direct_map_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --negative-controls)

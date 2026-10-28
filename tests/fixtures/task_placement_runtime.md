@@ -256,3 +256,26 @@ No completed disposable VM disks belong in evidence retention. The root runner
 uses exact-owned rootless --no-setup/COW storage and safely prunes inactive disks
 after both PASS and FAIL, preserving only immutable/current seeds and small
 receipts. This fixture has not been built or run by its implementation author.
+
+## Weighted fairness mode
+
+`--weighted-fairness` runs three trials with four measured workers on CPUs 2
+and 3. Each trial has a one-second warmup and a five-second measurement window.
+Equal and unequal nice weights must satisfy the existing five-percentage-point
+band, including the full uncertainty of the thread-CPU-time measurements.
+Setup and all trials share one 60-second monotonic deadline.
+
+Before creating measured workers, the controller pins itself to its current CPU.
+If that CPU is not 0, an unmeasured thread inherits the same singleton affinity
+and moves the runnable controller to CPU 0. The controller yields until the move
+completes, verifies its CPU and affinity, then joins that thread. Joining before
+the move would put the controller in a waiting state that correctly refuses an
+affinity mask excluding its owner. Measured workers inherit CPU 0 before the
+controller places them on CPUs 2 and 3. Yielding alone does not guarantee that
+a sole runnable task becomes eligible for a remote placement change.
+
+This mode writes `weighted-fairness.bin` (6,064 bytes) and
+`weighted-fairness-status`, alongside the two exit-witness files described above.
+The runner must validate all four files and the probe's consumed init exit status.
+The setup thread is excluded from the twelve measured worker rows; joining it
+establishes user-thread completion, without asserting kernel task reclamation.
