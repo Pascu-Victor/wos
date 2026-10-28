@@ -6,6 +6,8 @@ Scheduler/physical/File lifetime boundaries are controlled. This verifies
 ordering and ownership, not real IRET/timer progress or guest latency.
 Completed-error checks cover a single eligible instruction retry, unchanged
 sticky refusal and shared-root sibling mapping resolution.
+Different-page checks execute the actual pending-work wait and fresh retry:
+completion of A cannot claim B's mapping or authorize a second request early.
 Host locks use maintained token transitions and release the captured current Task.
 The original depth-zero interior retry helper must fail existing positive cases
 when this corrected token seam is paired with the preimage virt source.
@@ -18,12 +20,15 @@ import os
 import resource
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
-from raw_typed_file_seams import extend_raw_fixture
-
-from exec_trace_ownership_test import block, function
 
 ROOT = Path(os.environ.get("WOS_LAZY_BACKING_ROOT", Path(__file__).resolve().parents[3]))
+# Private source copies bind the same maintained extractor/seams explicitly.
+sys.path.insert(0, str(ROOT / "tests/host/unit"))
+from raw_typed_file_seams import extend_raw_fixture
+from exec_trace_ownership_test import block, function
+
 virt = Path(os.environ.get("WOS_LAZY_BACKING_VIRT_SOURCE", ROOT / "modules/kern/src/platform/mm/virt.opt.cpp")).read_text()
 vmem = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_SOURCE", ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp")).read_text()
 scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
@@ -63,7 +68,8 @@ if control == "predecessor":
     current_probe = function(virt, "probe_lazy_file_fault")
     assert region.count(current_probe) == 1
     region = region.replace(current_probe, old_probe)
-    old_start = predecessor.index("        auto const FILE_FAULT = probe_lazy_file_fault")
+    old_root = "        auto* const FILE_FAULT_ROOT ="
+    old_start = predecessor.index(old_root if old_root in predecessor else "        auto const FILE_FAULT = probe_lazy_file_fault")
     branch = predecessor[old_start:enclosing_endif(predecessor, old_start)]
 elif control == "retry-all-failures":
     assert "return LazyFileFaultDisposition::FAILED;" in region
@@ -94,6 +100,8 @@ constexpr paddr_t PADDR_INVALID=UINT64_MAX;
 constexpr uint64_t page_align_down(uint64_t p){return p&~uint64_t{4095};}
 uint64_t capture_nodes=0,observed_nodes=0,observed_index=0;unsigned capture_mode=0,observed_mode=0;uint16_t capture_local=0,observed_local=0;bool fail_capture=false;
 int guards=0, created=0, destroyed=0, reads=0, allocated=0, dropped=0, puts=0, parks=0, wakes=0, translations=0;
+std::vector<uint64_t> read_offsets;
+bool completion_won_once=false;
 uint32_t expected_materializer_readers=1;
 bool fail_create=false, fail_post=false, shutdown_requested=false, fail_alloc=false, fail_read=false, software_prefault=false;
 std::function<void()> read_hook, pin_hook, park_hook, put_hook;
@@ -107,7 +115,8 @@ struct Lock{bool held=false;ker::mod::sched::task::Task*preempt_owner=nullptr;
  uint64_t lock_irqsave(){assert(!held);preempt_owner=host_lock_preempt_disable();held=true;++guards;return 0;}
  void unlock_irqrestore(uint64_t){assert(held);auto*owner=std::exchange(preempt_owner,nullptr);held=false;--guards;
   host_lock_preempt_enable(owner);if(unlock_hook)unlock_hook(this);}};
-struct alignas(4096) PageTable{uint64_t address=0;void*page=nullptr;bool closing=false;};
+struct alignas(4096) PageTable{uint64_t address=0;void*page=nullptr;bool closing=false;
+ uint64_t second_address=0;void*second_page=nullptr;};
 // An atomic transition endpoint injects an exclusive flag immediately after the
 // actual successful reader CAS, before its actual post-CAS recheck/rollback.
 struct HookCount{std::atomic<uint32_t>value{0};std::atomic<bool>*close_after_cas=nullptr;
@@ -176,6 +185,7 @@ struct GPRegs{std::array<uint64_t,15>values{};bool operator==(const GPRegs&)cons
 struct Frame{uint64_t cs=3,rip=0,rsp=0,flags=0x202,int_num=14,err_code=4,ss=3;bool operator==(const Frame&)const=default;};
 ExceptionWaitResult place_task_in_wait_queue_if_pending(GPRegs&,Frame&frame,const std::atomic<uint64_t>&token,uint64_t g){
  assert(guards==0&&frame.cs==3);++parks;if(park_hook)park_hook();
+ if(std::exchange(completion_won_once,false))return ExceptionWaitResult::COMPLETION_WON;
  return token.load()==g?ExceptionWaitResult::COMPLETION_WON:ExceptionWaitResult::PARKED;}
 }
 namespace mm{
@@ -235,8 +245,12 @@ enum class LazyFilePageInstallResult{STALE_RANGE,ALREADY_MAPPED,MAPPED};
 void service_user_pagemap_gate_wait(uint64_t&){std::abort();}
 @GATE_FUNCTIONS@
 uint32_t reader_count(PageTable*root){return user_pagemap_access_gates.at(user_pagemap_access_gate_index(root)).readers.load();}
-uint64_t translate(PageTable*p,uint64_t va){++translations;return p&&p->page&&p->address==va?reinterpret_cast<uint64_t>(p->page):PADDR_INVALID;}
-void map_page(PageTable*p,uint64_t va,uint64_t pa,uint64_t){assert(guards==2&&p&&!p->page);p->address=va;p->page=reinterpret_cast<void*>(pa);}
+uint64_t translate(PageTable*p,uint64_t va){++translations;
+ if(p&&p->page&&p->address==va)return reinterpret_cast<uint64_t>(p->page);
+ return p&&p->second_page&&p->second_address==va?reinterpret_cast<uint64_t>(p->second_page):PADDR_INVALID;}
+void map_page(PageTable*p,uint64_t va,uint64_t pa,uint64_t){assert(guards==2&&p);
+ if(!p->page){p->address=va;p->page=reinterpret_cast<void*>(pa);}
+ else{assert(p->address!=va&&!p->second_page);p->second_address=va;p->second_page=reinterpret_cast<void*>(pa);}}
 void invalidate_local_tlb_if_current(PageTable*,uint64_t,bool){assert(guards==0);}
 bool lazy_file_range_matches(const sched::task::LazyVmemRange&,const sched::task::LazyVmemRange&,uint64_t);
 LazyFilePageInstallResult install_lazy_file_page_if_current(sched::task::Task*,const sched::task::LazyVmemRange&,uint64_t,uint64_t,uint64_t,
@@ -248,7 +262,7 @@ namespace numa=ker::mod::mm::numa;
 using LazyVmemRange=ker::mod::sched::task::LazyVmemRange;using LazyVmemKind=ker::mod::sched::task::LazyVmemKind;
 bool file_mmap_can_share(const ker::vfs::Stat&,uint64_t){return false;}
 bool file_mmap_cached_page_for_file(ker::vfs::File*,const ker::vfs::Stat&,uint64_t,void**){assert(false);return false;}
-bool read_file_mapping_exact(ker::vfs::File*f,void*p,size_t n,uint64_t){assert(guards==0&&f->refs>0);++reads;
+bool read_file_mapping_exact(ker::vfs::File*f,void*p,size_t n,uint64_t offset){assert(guards==0&&f->refs>0);++reads;read_offsets.push_back(offset);
  if(read_hook)read_hook();if(fail_read)return false;std::memset(p,f->id,n);return true;}
 uint64_t file_mapping_page_flags(uint64_t prot,uint64_t flags){return prot|flags;}
 bool materialize_lazy_file_page_impl(ker::mod::sched::task::Task*,const LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&,const ker::mod::mm::numa::AllocationContext&,const ker::mod::mm::virt::BorrowedFileMappingRootAccess*);
@@ -321,7 +335,8 @@ namespace ker::syscall::process{
  assert(clean_exit_hook);clean_exit_hook();throw CleanKernelExit{};}}
 struct Fixture{PageTable map;ker::vfs::File file;Task task;bool owns_file_ref=true;
  Fixture(){task.pagemap=&map;Range range;range.file=&file;task.lazy_vmem_ranges.push_back(range);}
- ~Fixture(){assert(task.refs==1&&task.pins==0&&reader_count(&map)==0&&file.refs==(owns_file_ref?1:0));if(map.page){delete[]static_cast<uint8_t*>(map.page);++dropped;}}
+ ~Fixture(){assert(task.refs==1&&task.pins==0&&reader_count(&map)==0&&file.refs==(owns_file_ref?1:0));if(map.page){delete[]static_cast<uint8_t*>(map.page);++dropped;}
+  if(map.second_page){delete[]static_cast<uint8_t*>(map.second_page);++dropped;}}
 };
 void reset(){assert(guards==0&&lazy_file_fault_worker==nullptr);for(auto const&w:lazy_file_fault_work)assert(!w.task);
  for(auto const&gate:user_pagemap_access_gates)assert(gate.readers.load()==0&&!gate.teardown.load()&&!gate.readers.close_after_cas);
@@ -329,6 +344,7 @@ void reset(){assert(guards==0&&lazy_file_fault_worker==nullptr);for(auto const&w
  lazy_file_fault_work={};lazy_file_fault_admission=false;lazy_file_fault_worker_starting=false;lazy_file_fault_next_sequence=1;
  capture_nodes=observed_nodes=observed_index=0;capture_mode=observed_mode=0;capture_local=observed_local=0;fail_capture=false;
  expected_materializer_readers=1;
+ read_offsets.clear();completion_won_once=false;
  fail_create=fail_post=shutdown_requested=fail_alloc=fail_read=software_prefault=false;reads=parks=wakes=puts=translations=0;read_hook=pin_hook=park_hook=put_hook=clean_exit_hook={};unlock_hook={};}
 void start(){sched::current=nullptr;start_lazy_file_fault_worker();assert(lazy_file_fault_worker&&lazy_file_fault_admission);}
 void run_worker(Task*t){clean_exit_hook=[](){assert(!lazy_file_fault_worker&&!lazy_file_fault_admission);
@@ -479,15 +495,31 @@ void retry_cases(){
          lazy_file_fault_next_sequence==sequence);empty_work();end_user_pagemap_exclusive(index);
   lazy_file_fault_worker=worker;lazy_file_fault_worker_starting=false;drain();
  }
- // A duplicate can park only on a genuinely published same-page generation.
- // The pending exclusive flag models an owner waiting for that work's reader;
- // the second probe must drop only its own local leases before using the token.
+ // One published request serializes both its own page and an eligible
+ // different-page fault. Transient teardown must not create a second request;
+ // the second probe drops only its own leases before waiting on A's token.
  for(bool same_page:{false,true}){
   reset();start();Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges[0].end=0x12000;
   uint64_t generation=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,generation)==LazyFileFaultDisposition::PARK);
   auto index=user_pagemap_access_gate_index(&f.map);auto&gate=user_pagemap_access_gates.at(index);gate.teardown.store(true);
-  assert(handle_file_fault(&f.task,same_page?0x10000:0x11000,Fault{})==same_page);
+  sched::Frame frame;frame.rip=0x765123;frame.rsp=0x876040;sched::GPRegs regs;regs.values[6]=0xa55a;
+  auto saved_frame=frame;auto saved_regs=regs;auto sequence=lazy_file_fault_next_sequence;
+  int before_reads=reads,before_allocated=allocated,before_wakes=wakes;bool saw_park=false;int at_park=-1;
+  park_hook=[&]{
+   saw_park=true;at_park=translations;
+   assert(guards==0&&gate.teardown.load()&&f.task.refs==2&&f.task.pins==1&&reader_count(&f.map)==1&&f.file.refs==2);
+   assert(f.task.lazy_file_fault_generation==generation&&f.task.lazy_file_fault_completion_generation.load()==0&&
+          f.task.lazy_file_fault_vaddr==0x10000&&lazy_file_fault_next_sequence==sequence);
+   assert(reads==before_reads&&allocated==before_allocated&&wakes==before_wakes&&!f.map.page&&!f.map.second_page);
+   assert(std::count_if(lazy_file_fault_work.begin(),lazy_file_fault_work.end(),[&](const auto&w){
+    return w.task==&f.task&&w.pagemap==&f.map&&w.vaddr==0x10000&&w.generation==generation&&!w.issued;})==1);
+  };
+  assert(handle_file_fault_frame(&f.task,same_page?0x10000:0x11000,Fault{},frame,regs));park_hook={};
+  assert(saw_park&&parks==1&&translations==at_park&&frame==saved_frame&&regs==saved_regs);
   assert(f.task.lazy_file_fault_generation==generation&&f.task.refs==2&&f.task.pins==1&&reader_count(&f.map)==1&&f.file.refs==2);
+  assert(f.task.lazy_file_fault_completion_generation.load()==0&&f.task.lazy_file_fault_vaddr==0x10000&&
+         lazy_file_fault_next_sequence==sequence&&reads==before_reads&&allocated==before_allocated&&wakes==before_wakes);
+  assert(!f.map.page&&!f.map.second_page&&guards==0);
   end_user_pagemap_exclusive(index);one();drain();assert(f.map.page&&f.task.lazy_file_fault_completion_generation.load()==generation);
  }
 }
@@ -803,7 +835,227 @@ void completed_error_unsafe_context_cases(){
  }
 }
 
+// A and B share one Task but have distinct finite PTE addresses. Waiting for
+// A must never treat A's present page or completion status as B's outcome.
+void pending_other_page_cases(){
+ for(unsigned mode=0;mode<8;++mode){
+  reset();start();
+  {
+   Fixture f;sched::current=&f.task;auto&range=f.task.lazy_vmem_ranges[0];range.end=0x12000;range.file_size=8192;
+   uint64_t g=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,true)==LazyFileFaultDisposition::PARK&&g==1);
+   LazyFileFaultWork issued;size_t issued_index=0;bool has_issued=mode==5||mode==7;
+   bool issued_materialized=false,issued_ok=false;
+   if(has_issued)assert(take_lazy_file_fault(issued,issued_index)&&issued.issued&&issued.generation==1);
+   auto complete_a=[&]{
+    if(!has_issued){one();return;}
+    auto*saved=sched::current;sched::current=sched::posted_worker;sched::Hold hold(sched::current);
+    if(!issued_materialized)issued_ok=ker::syscall::vmem::materialize_lazy_file_page(issued.task,issued.range,issued.vaddr,issued.fault,issued.placement);
+    finish_lazy_file_fault(issued,issued_index,issued_ok?0:-EFAULT);has_issued=false;sched::current=saved;
+   };
+   if(mode==7){
+    auto*saved=sched::current;sched::current=sched::posted_worker;sched::Hold hold(sched::current);
+    issued_ok=ker::syscall::vmem::materialize_lazy_file_page(issued.task,issued.range,issued.vaddr,issued.fault,issued.placement);
+    issued_materialized=true;sched::current=saved;
+    assert(issued_ok&&f.map.page&&f.map.address==0x10000&&f.task.lazy_file_fault_completion_generation.load()==0);
+    assert(translate(&f.map,0x11000)==PADDR_INVALID&&static_cast<uint8_t*>(f.map.page)[0]==f.file.id);
+   }
+   int before_reads=reads,before_wakes=wakes,before_puts=puts;uint64_t sequence=lazy_file_fault_next_sequence;
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   Diagnostic probe_diagnostic;
+#endif
+   uint64_t previous=0;
+   assert(probe_lazy_file_fault(&f.task,0x11000,Fault{},true,previous,true
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                               ,&probe_diagnostic
+#endif
+   )==static_cast<LazyFileFaultDisposition>(5)&&previous==1);
+   assert(reads==before_reads&&wakes==before_wakes&&puts==before_puts&&lazy_file_fault_next_sequence==sequence);
+   assert(f.task.refs==2&&f.task.pins==1&&reader_count(&f.map)==1&&f.file.refs==2&&(f.map.page!=nullptr)==(mode==7)&&!f.map.second_page);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   assert(probe_diagnostic.site==FailureSite::OTHER_PENDING_PAGE&&probe_diagnostic.pool_generation==1&&
+          probe_diagnostic.pool_completed==0&&probe_diagnostic.pool_page==0x10000&&probe_diagnostic.task_slots==1);
+   assert(probe_diagnostic.slot_issued==(mode==5||mode==7)&&probe_diagnostic.slot_page==0x10000&&probe_diagnostic.slot_generation==1);
+   assert(!diag_has(probe_diagnostic,FILE_FAULT_DIAG_REQUEST)&&!diag_has(probe_diagnostic,FILE_FAULT_DIAG_COMPLETION)&&
+          !diag_has(probe_diagnostic,FILE_FAULT_DIAG_TRANSLATION)&&!diag_has(probe_diagnostic,FILE_FAULT_DIAG_POOL_STATUS));
+#endif
+   sched::Frame frame;frame.rip=0x777013;frame.rsp=0x888040;sched::GPRegs regs;regs.values[7]=0xa55a;
+   auto saved_frame=frame;auto saved_regs=regs;int after_seam_translations=-1,after_seam_wakes=-1,calls=0;
+   park_hook=[&]{
+    ++calls;assert(guards==0&&f.task.refs==2&&f.task.pins==1&&reader_count(&f.map)==1&&f.file.refs==2);
+    assert(f.task.lazy_file_fault_generation==1&&lazy_file_fault_next_sequence==sequence&&reads==before_reads);
+    assert(std::count_if(lazy_file_fault_work.begin(),lazy_file_fault_work.end(),[&](const auto&w){return w.task==&f.task;})==1);
+    if(mode>=1&&mode<=3){fail_alloc=mode==2;fail_read=mode==3;complete_a();fail_alloc=fail_read=false;}
+    if((mode==4||mode==6)&&calls==1){completion_won_once=true;
+     if(mode==6)f.task.lazy_file_fault_completion_generation.store(2);}
+    after_seam_translations=translations;after_seam_wakes=wakes;
+   };
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   Diagnostic diagnostic;
+#endif
+   assert(handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                  ,&diagnostic
+#endif
+   ));park_hook={};
+   assert(calls==((mode==4||mode==6)?2:1)&&parks==calls&&after_seam_translations>=0&&translations==after_seam_translations);
+   assert(wakes==after_seam_wakes&&frame==saved_frame&&regs==saved_regs&&lazy_file_fault_next_sequence==sequence);
+   assert(f.task.lazy_file_fault_generation==1&&(!f.map.page||f.map.address==0x10000)&&!f.map.second_page);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+   assert(diagnostic.disposition==5&&diagnostic.site==FailureSite::OTHER_PENDING_PAGE);
+   assert(!diag_has(diagnostic,FILE_FAULT_DIAG_REQUEST)&&!diag_has(diagnostic,FILE_FAULT_DIAG_COMPLETION)&&
+          !diag_has(diagnostic,FILE_FAULT_DIAG_TRANSLATION));
+#endif
+   if(mode==0||mode>=4){
+    assert(reads==before_reads&&f.task.refs==2&&f.task.pins==1&&f.file.refs==2&&reader_count(&f.map)==1);
+    if(mode==6)f.task.lazy_file_fault_completion_generation.store(0);
+    complete_a();
+   }
+   assert(f.task.lazy_file_fault_completion_generation.load()==1&&f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0);
+   bool a_failed=mode==2||mode==3;assert(f.task.lazy_file_fault_status==(a_failed?-EFAULT:0));
+   assert((f.map.page!=nullptr)==!a_failed&&!f.map.second_page);
+   assert(translate(&f.map,0x11000)==PADDR_INVALID);
+   if(!a_failed)assert(f.map.address==0x10000&&static_cast<uint8_t*>(f.map.page)[0]==f.file.id);
+   if(a_failed){int old_reads=reads,old_parks=parks;assert(!handle_file_fault_frame(&f.task,0x10000,Fault{},frame,regs));
+    assert(reads==old_reads&&parks==old_parks&&f.task.lazy_file_fault_status==-EFAULT&&f.task.lazy_file_fault_generation==1);}
+   // A completed; B still needs its own fresh permission/range admission.
+   int old_reads=reads,old_parks=parks;range.prot=0;
+   assert(!handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs));
+   assert(reads==old_reads&&parks==old_parks&&f.task.lazy_file_fault_generation==1&&frame==saved_frame&&regs==saved_regs);
+   range.prot=3;assert(handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs));
+   assert(f.task.lazy_file_fault_generation==2&&f.task.lazy_file_fault_completion_generation.load()==1&&
+          f.task.lazy_file_fault_vaddr==0x11000&&lazy_file_fault_next_sequence==sequence+1&&reads==old_reads&&parks==old_parks+1);
+   one();assert(f.task.lazy_file_fault_completion_generation.load()==2&&f.task.lazy_file_fault_status==0&&reads==old_reads+1);
+   assert(read_offsets.back()==4096&&read_offsets.size()==static_cast<size_t>(reads));
+   void*page_b=f.map.second_page?f.map.second_page:f.map.page;
+   assert(page_b&&static_cast<uint8_t*>(page_b)[0]==f.file.id&&translate(&f.map,0x11000)==reinterpret_cast<uint64_t>(page_b));
+   assert(handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs)&&parks==old_parks+1&&reads==old_reads+1);
+   assert(frame==saved_frame&&regs==saved_regs&&f.task.refs==1&&f.task.pins==0&&f.file.refs==1&&reader_count(&f.map)==0);
+   empty_work();
+  }
+  drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+ }
+}
+
+void pending_other_page_unsafe_cases(){
+ // Before probe, after its lease release, and after exact A completion.
+ for(unsigned stage=0;stage<3;++stage)for(unsigned axis=0;axis<19;++axis){
+  // A pre-entry root is captured by this handler; see the positive case.
+  if(stage==0&&axis==14)continue;
+  reset();start();
+  {
+   Fixture f;Task other;PageTable foreign;sched::current=&f.task;f.task.lazy_vmem_ranges[0].end=0x12000;
+   uint64_t generation=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,generation,true)==LazyFileFaultDisposition::PARK);
+   sched::Frame frame;frame.rip=0x765432;frame.rsp=0x678900;sched::GPRegs regs;regs.values[4]=0x8765;auto saved_regs=regs;
+   auto mutate=[&]{switch(axis){
+    case 0:frame.flags&=~uint64_t{0x200};break;case 1:frame.cs=0;break;
+    case 2:f.task.preempt_disable_depth=1;break;case 3:sched::current=&other;break;
+    case 4:sched::return_override=&other;break;case 5:sched::queryable=false;break;
+    case 6:f.task.state.store(sched::task::TaskState::EXITING);break;case 7:f.task.usercopy_pagemap_closing.store(true);break;
+    case 8:f.task.scheduler_transition_active.store(true);break;case 9:f.task.exit_in_progress.store(true);break;
+    case 10:f.task.process_exit_requested.store(true);break;case 11:f.task.has_exited=true;break;
+    case 12:f.task.deferred_task_switch=true;break;case 13:f.task.wants_block=true;break;
+    case 14:f.task.pagemap=&foreign;break;case 15:f.task.pagemap=nullptr;break;
+    case 16:kernel_pagemap=&f.map;break;case 17:f.task.type=sched::task::TaskType::DAEMON;break;case 18:sched::current=nullptr;break;}};
+   auto expected_frame=frame;int at_seam=-1;
+   if(stage==0){mutate();expected_frame=frame;}
+   if(stage==1)task_release_hook=[&]{mutate();expected_frame=frame;at_seam=translations;};
+   if(stage==2)park_hook=[&]{fail_read=true;one();fail_read=false;mutate();expected_frame=frame;at_seam=translations;};
+   assert(!handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs));park_hook={};task_release_hook={};
+   assert(frame==expected_frame&&regs==saved_regs&&!f.map.page&&!f.map.second_page&&f.task.lazy_file_fault_generation==1);
+   assert(parks==(stage==2?1:0)&&reads==(stage==2?1:0));
+   if(at_seam>=0)assert(translations==at_seam);
+   assert(lazy_file_fault_next_sequence==2&&f.file.refs==(stage==2?1:2)&&f.task.refs==(stage==2?1:2));
+   sched::current=&f.task;sched::return_override=nullptr;sched::queryable=true;kernel_pagemap=nullptr;
+   f.task.pagemap=&f.map;f.task.type=sched::task::TaskType::PROCESS;f.task.preempt_disable_depth=0;
+   f.task.state.store(sched::task::TaskState::ACTIVE);f.task.usercopy_pagemap_closing.store(false);
+   f.task.scheduler_transition_active.store(false);f.task.exit_in_progress.store(false);f.task.process_exit_requested.store(false);
+   f.task.has_exited=f.task.deferred_task_switch=f.task.wants_block=false;
+   if(stage!=2)one();else assert(f.task.lazy_file_fault_status==-EFAULT&&f.task.lazy_file_fault_completion_generation.load()==1);
+   assert(f.task.refs==1&&f.task.pins==0&&reader_count(&f.map)==0&&f.file.refs==1);empty_work();
+  }
+  drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+ }
+ for(unsigned axis=0;axis<7;++axis){
+  reset();start();
+  {
+   Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges[0].end=0x12000;f.task.lazy_vmem_ranges[0].prot=1;
+   uint64_t g=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,true)==LazyFileFaultDisposition::PARK);
+   Fault fault;switch(axis){case 0:fault.present=1;break;case 1:fault.user=0;break;case 2:fault.reserved=1;break;
+    case 3:fault.protection_key=1;break;case 4:fault.shadow_stack=1;break;case 5:fault.writable=1;break;case 6:fault.fetch=1;break;}
+   sched::Frame frame;sched::GPRegs regs;auto saved=frame;
+   assert(!handle_file_fault_frame(&f.task,0x11000,fault,frame,regs)&&parks==0&&reads==0);
+   assert(frame==saved&&f.task.lazy_file_fault_generation==1&&lazy_file_fault_next_sequence==2&&f.task.refs==2&&f.file.refs==2);
+   one();
+  }
+  drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+ }
+}
+
+// Replacing a root before handler entry makes it this fresh fault's captured
+// root. Only replacement after capture is an unsafe return-context mutation.
+void pending_preentry_root_capture_case(){
+ reset();start();
+ {
+  Fixture f;PageTable fresh_root;sched::current=&f.task;f.task.lazy_vmem_ranges[0].end=0x12000;
+  uint64_t g=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,true)==LazyFileFaultDisposition::PARK&&g==1);
+  f.task.pagemap=&fresh_root;
+  sched::Frame frame;frame.rip=0x765001;frame.rsp=0x876040;sched::GPRegs regs;regs.values[3]=0x1234;
+  auto saved_frame=frame;auto saved_regs=regs;int before_reads=reads,before_wakes=wakes,before_allocated=allocated;
+  uint64_t sequence=lazy_file_fault_next_sequence;bool saw_park=false;int at_park=-1;
+  park_hook=[&]{
+   saw_park=true;at_park=translations;
+   assert(guards==0&&f.task.pagemap==&fresh_root&&f.task.refs==2&&f.task.pins==1&&f.file.refs==2);
+   assert(reader_count(&fresh_root)==0&&reader_count(&f.map)==1&&reads==before_reads&&allocated==before_allocated);
+   assert(std::count_if(lazy_file_fault_work.begin(),lazy_file_fault_work.end(),[&](const auto&w){
+    return w.task==&f.task&&w.pagemap==&f.map&&w.vaddr==0x10000&&w.generation==1;})==1);
+  };
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+  Diagnostic diagnostic;
+#endif
+  assert(handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                                 ,&diagnostic
+#endif
+  ));park_hook={};
+  assert(saw_park&&parks==1&&translations==at_park&&reads==before_reads&&wakes==before_wakes&&allocated==before_allocated);
+  assert(frame==saved_frame&&regs==saved_regs&&f.task.pagemap==&fresh_root&&!fresh_root.page&&!fresh_root.second_page);
+  assert(f.task.lazy_file_fault_generation==1&&f.task.lazy_file_fault_completion_generation.load()==0&&lazy_file_fault_next_sequence==sequence);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+  assert(diagnostic.disposition==5&&diagnostic.site==FailureSite::OTHER_PENDING_PAGE&&diagnostic.raw_root==reinterpret_cast<uint64_t>(&fresh_root)&&
+         diagnostic.retained_root==reinterpret_cast<uint64_t>(&fresh_root));
+  assert(!diag_has(diagnostic,FILE_FAULT_DIAG_REQUEST)&&!diag_has(diagnostic,FILE_FAULT_DIAG_COMPLETION)&&
+         !diag_has(diagnostic,FILE_FAULT_DIAG_TRANSLATION));
+#endif
+  // The old work owns the old root, so restore it before completing A.
+  f.task.pagemap=&f.map;one();
+  assert(f.task.lazy_file_fault_completion_generation.load()==1&&f.task.lazy_file_fault_status==0&&f.map.page&&f.map.address==0x10000);
+  assert(!fresh_root.page&&!fresh_root.second_page&&f.task.refs==1&&f.task.pins==0&&reader_count(&f.map)==0&&reader_count(&fresh_root)==0&&f.file.refs==1);
+  empty_work();
+ }
+ drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+}
+
+void pending_other_page_handoff_case(){
+ reset();start();
+ {
+  Fixture f;Task other;sched::current=&f.task;f.task.lazy_vmem_ranges[0].end=0x12000;
+  uint64_t g=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g,true)==LazyFileFaultDisposition::PARK);
+  sched::Frame frame;frame.rip=0x11007;sched::GPRegs regs;auto handoff_frame=frame;auto handoff_regs=regs;
+  handoff_frame.cs=0;handoff_frame.rip=0xbeef;handoff_regs.values[0]=0x9876;int after_handoff=-1;
+  park_hook=[&]{frame=handoff_frame;regs=handoff_regs;sched::current=&other;sched::queryable=false;after_handoff=translations;};
+  assert(handle_file_fault_frame(&f.task,0x11000,Fault{},frame,regs));park_hook={};
+  assert(frame==handoff_frame&&regs==handoff_regs&&translations==after_handoff&&parks==1&&reads==0);
+  assert(f.task.lazy_file_fault_generation==1&&f.task.lazy_file_fault_completion_generation.load()==0&&f.task.refs==2);
+  sched::current=&f.task;sched::queryable=true;one();
+ }
+ drain();assert(created==destroyed&&allocated==dropped&&guards==0);
+}
+
 int main(){
+ pending_other_page_cases();
+ pending_other_page_unsafe_cases();
+ pending_preentry_root_capture_case();
+ pending_other_page_handoff_case();
  completed_error_sibling_mapping_cases();
  completed_error_unsafe_context_cases();
  lock_token_cases();
@@ -964,4 +1216,4 @@ with tempfile.TemporaryDirectory(prefix="wos-file-fault-") as temporary:
             check=True,
         )
         subprocess.run([str(binary)], check=True, timeout=30)
-print("actual deferred file-fault ownership, completed-error retry and materialization traces pass with diagnostics OFF/ON")
+print("actual deferred file-fault ownership, previous-page wait, completed-error retry and materialization traces pass with diagnostics OFF/ON")

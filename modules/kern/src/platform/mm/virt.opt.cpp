@@ -1122,7 +1122,7 @@ auto try_acquire_lazy_file_fault_reader(PageTable* pagemap, size_t& gate_index, 
     });
 }
 
-enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAILED, RETRY };
+enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAILED, RETRY, WAIT_PREVIOUS };
 
 // The probe checks this while retaining Task/root leases; the handler checks
 // the return context again after releasing them. No root is dereferenced here.
@@ -1396,11 +1396,22 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
 #endif
         lazy_file_fault_lock.unlock_irqrestore(flags);
         release_leases();
+        // An unrelated wake can return a user frame before the previous
+        // worker publishes completion. Serialize a different page behind that
+        // work without claiming its mapping or admitting another request.
+        bool const WAIT_FOR_PREVIOUS = !SAME && retry_user_if && fault.present == 0U && fault.user != 0U && fault.reserved == 0U &&
+                                       fault.protection_key == 0U && fault.shadow_stack == 0U &&
+                                       lazy_file_fault_retry_context(task, pagemap);
 #ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
-        return file_fault_diag_result(diagnostic, (SAME ? LazyFileFaultDisposition::PARK : LazyFileFaultDisposition::FAILED),
+        return file_fault_diag_result(diagnostic,
+                                      (SAME                ? LazyFileFaultDisposition::PARK
+                                       : WAIT_FOR_PREVIOUS ? LazyFileFaultDisposition::WAIT_PREVIOUS
+                                                           : LazyFileFaultDisposition::FAILED),
                                       FileFaultFailureSite::OTHER_PENDING_PAGE, SAME ? generation : 0);
 #else
-        return SAME ? LazyFileFaultDisposition::PARK : LazyFileFaultDisposition::FAILED;
+        return SAME                ? LazyFileFaultDisposition::PARK
+               : WAIT_FOR_PREVIOUS ? LazyFileFaultDisposition::WAIT_PREVIOUS
+                                   : LazyFileFaultDisposition::FAILED;
 #endif
     }
     if ((PREVIOUS != 0 && task->lazy_file_fault_vaddr == PAGE_VADDR && task->lazy_file_fault_status != 0) || !lazy_file_fault_admission ||
@@ -8306,6 +8317,30 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
                                                       diagnostic
 #endif
         );
+        if (FILE_FAULT == LazyFileFaultDisposition::WAIT_PREVIOUS) {
+            auto const may_retry_original_fault = [&] {
+                bool const RETRY = (frame.cs & 3U) == 3U && (frame.flags & cpu::GATE_IF_MASK) != 0 &&
+                                   lazy_file_fault_retry_context(current_task, FILE_FAULT_ROOT);
+#ifdef WOS_FILE_FAULT_FATAL_DIAGNOSTICS
+                if (!RETRY && diagnostic != nullptr) diagnostic->site = FileFaultFailureSite::RETRY_CONTEXT_AFTER_RELEASE;
+#endif
+                return RETRY;
+            };
+            if (!may_retry_original_fault()) return false;
+            while (current_task->lazy_file_fault_completion_generation.load(std::memory_order_acquire) != wait_generation) {
+                auto const WAIT = sched::place_task_in_wait_queue_if_pending(
+                    gpr, frame, current_task->lazy_file_fault_completion_generation, wait_generation);
+                // PARKED may have replaced this frame/current Task. Its saved
+                // original user instruction will fault afresh after resuming.
+                if (WAIT == sched::ExceptionWaitResult::PARKED) return true;
+                // COMPLETION_WON also covers generic wake tokens. Recheck the
+                // exact generation instead of retrying userspace while pending.
+                if (!may_retry_original_fault()) return false;
+            }
+            // Completion belongs to the previous page, not this fault. Leave
+            // its status untouched and retry this instruction without a walk.
+            return may_retry_original_fault();
+        }
         if (FILE_FAULT == LazyFileFaultDisposition::PARK) {
             while (current_task->lazy_file_fault_completion_generation.load(std::memory_order_acquire) != wait_generation) {
                 auto const WAIT = sched::place_task_in_wait_queue_if_pending(
