@@ -1,0 +1,3604 @@
+{
+  "kind": "SANITIZED_C78_COMPLETE_TWENTY_ARM_REPORT",
+  "qualification": "FAIL_C10_EXACT_MEDIAN_THROUGHPUT",
+  "successful_arms": 20,
+  "complete_pairs": 10,
+  "sample_count_per_kind": 10,
+  "metrics": {
+    "cat_bee_ipc": {
+      "current": {
+        "elapsed_ns": [
+          14590217918,
+          14630248871,
+          14759626538,
+          14817894142,
+          14569698906,
+          14708332138,
+          14634713055,
+          14690066907,
+          14652071574,
+          14714720111
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 7295108959
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14630248871
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7379813269
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7408947071
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7284849453
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7354166069
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 2926942611
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14690066907
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7326035787
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14714720111
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 29342138481,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 815059402250000000,
+          "denominator": 11957772874900711201
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 14676759016,
+            "denominator": 1
+          },
+          "sample_variance": {
+            "numerator": 52892911735845764,
+            "denominator": 9
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 10661565911086801392846430699376006081211091568689015226456195243833551934002464036150560000000,
+            "denominator": 156473398161949905978466256984635608485927134967919602864970309029613524399863151043972801318123
+          },
+          "sample_variance": {
+            "numerator": 3090328513852509485369102356340335280210601976617633762074008931836494280226180876300196131622972944705253015395722811178446784031368809527688194390873386922246632787036000000000000000,
+            "denominator": 24483924332348108214690032163888395589312170543019160880659580689372692379923182361227176954490335543687764831961176400306885412732239460108322381760083997191940979560839626909119846248243129
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          14142795005,
+          14287088890,
+          14393913723,
+          14459384831,
+          14283636978,
+          14379086054,
+          14270081320,
+          14360420983,
+          14117696301,
+          14282594798
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 200000000,
+            "denominator": 2828559001
+          },
+          {
+            "numerator": 100000000,
+            "denominator": 1428708889
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14393913723
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14459384831
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7141818489
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7189543027
+          },
+          {
+            "numerator": 25000000,
+            "denominator": 356752033
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14360420983
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 14117696301
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 7141297399
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 14285362934,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 714268146700000000,
+          "denominator": 10203579558858848721
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 142976698883,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 345516264937640467,
+            "denominator": 30
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 173355123553847507437787842965979551077314273297629317712443120825030279268108246241397147500000,
+            "denominator": 2478448332425755008808985484710030872353226273461432398597929803984764128501297513874025455312259
+          },
+          "sample_variance": {
+            "numerator": 5105509330702717348055011776198986295268874681317193236567123149223312792055454182910211586556819365262567178352333916238001482296037031192434039782461328714860611248840812687500000000000,
+            "denominator": 18428118409512017421083454269728543038565142407522917736181216973244208373065934209141476338709399731595272991837876196695003064558297013870181906339791032480976442643041940272606962609587049243
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 166330469121076238613228740445,
+        "denominator": 170821125400297238721004023734
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 14142795005,
+          "denominator": 14590217918
+        },
+        {
+          "numerator": 14287088890,
+          "denominator": 14630248871
+        },
+        {
+          "numerator": 14393913723,
+          "denominator": 14759626538
+        },
+        {
+          "numerator": 14459384831,
+          "denominator": 14817894142
+        },
+        {
+          "numerator": 2380606163,
+          "denominator": 2428283151
+        },
+        {
+          "numerator": 7189543027,
+          "denominator": 7354166069
+        },
+        {
+          "numerator": 2854016264,
+          "denominator": 2926942611
+        },
+        {
+          "numerator": 14360420983,
+          "denominator": 14690066907
+        },
+        {
+          "numerator": 4705898767,
+          "denominator": 4884023858
+        },
+        {
+          "numerator": 14282594798,
+          "denominator": 14714720111
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 53337826238909669468,
+        "denominator": 54676645903884485099
+      }
+    },
+    "make_large_file": {
+      "current": {
+        "elapsed_ns": [
+          981426897,
+          1003567610,
+          981055857,
+          990703502,
+          992005993,
+          985252369,
+          986467600,
+          980539097,
+          987177061,
+          981035576
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 981426897
+          },
+          {
+            "numerator": 100000000,
+            "denominator": 100356761
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 981055857
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 495351751
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 992005993
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 985252369
+          },
+          {
+            "numerator": 2500000,
+            "denominator": 2466169
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 980539097
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 987177061
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 122629447
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 1971719969,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 2464649961250000,
+          "denominator": 2429798849604361
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 4934615781,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 2301407465731468,
+            "denominator": 45
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 420508187332234864557392077985066010808953683139370639506966462579953809114964750000,
+            "denominator": 414989824069663024634275981247092801499021815536682103430395234752418416171303880661
+          },
+          "sample_variance": {
+            "numerator": 27379468678979314859773013747434151301492659548900996556064502497169776384069784092937901925861684140711331142615705984801399774745116341610105453810151875000000000,
+            "denominator": 516649662244109606008273933954537279866832712137577843748856391029406934560186385504453984727172496479121078681913583283209239303385786292395353381650976444554389390763
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          950045579,
+          956398982,
+          970542171,
+          977692555,
+          994472305,
+          990665972,
+          973671483,
+          968392610,
+          974544643,
+          961103415
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 950045579
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 478199491
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 970542171
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 195538511
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 198894461
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 247666493
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 973671483
+          },
+          {
+            "numerator": 100000000,
+            "denominator": 96839261
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 974544643
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 192220683
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 972106827,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 324035609000000000,
+          "denominator": 314996411650536531
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 1943505943,
+            "denominator": 2
+          },
+          "sample_variance": {
+            "numerator": 1169166316342387,
+            "denominator": 6
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 175082211565623584110290613429409955757517267202970944285921511907670559363435000000,
+            "denominator": 170105121963059228922950174260650635936860347257388748228199766086362926709563289419
+          },
+          "sample_variance": {
+            "numerator": 18908624385100677442350889385005680502686172877196044785798426342036773966947052929126951503636541400679892499934818422739753298529735197044655677656750000000000000,
+            "denominator": 86807257554201765779080069658476420179676572223587610560086817053286731852576180062982934642580245304878890782245256853228404519468965447160656372898265037334672072683
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 621084715014707127736687539,
+        "denominator": 629873079983238820552679200
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 950045579,
+          "denominator": 981426897
+        },
+        {
+          "numerator": 478199491,
+          "denominator": 501783805
+        },
+        {
+          "numerator": 323514057,
+          "denominator": 327018619
+        },
+        {
+          "numerator": 977692555,
+          "denominator": 990703502
+        },
+        {
+          "numerator": 994472305,
+          "denominator": 992005993
+        },
+        {
+          "numerator": 990665972,
+          "denominator": 985252369
+        },
+        {
+          "numerator": 973671483,
+          "denominator": 986467600
+        },
+        {
+          "numerator": 968392610,
+          "denominator": 980539097
+        },
+        {
+          "numerator": 974544643,
+          "denominator": 987177061
+        },
+        {
+          "numerator": 961103415,
+          "denominator": 981035576
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 1922542868040518263,
+        "denominator": 1947636372279447200
+      }
+    },
+    "vfsbench_read": {
+      "current": {
+        "elapsed_ns": [
+          521741597,
+          510634700,
+          515113103,
+          522871617,
+          515992113,
+          514584003,
+          512630071,
+          509041159,
+          514325223,
+          514122302
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 521741597
+          },
+          {
+            "numerator": 10000000,
+            "denominator": 5106347
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 515113103
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 522871617
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 515992113
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 514584003
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 512630071
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 509041159
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 514325223
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 257061151
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 514454613,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 171484871000000000,
+          "denominator": 88221177365069223
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 2575527944,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 849379998764428,
+            "denominator": 45
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 12119845481694108760423102541479203772071221354527843649832710626199430221567000000,
+            "denominator": 6242602378760152218945623739110254887532370620325642342964260563301827119467799399
+          },
+          "sample_variance": {
+            "numerator": 10349269609553787399197400256577218292241198786738253441080077644349044444515192244908560160472371657437227505931963029108242342663044831916047024890000000000000,
+            "denominator": 38970084459301910983841686208893813020441830227419383595804440660794152053633610333197967740984427874853920170392089604226887685137581543747832524959039239704761201
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          505972848,
+          510069070,
+          507956228,
+          498002363,
+          491744659,
+          509237740,
+          496844512,
+          500408074,
+          500199104,
+          509642820
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 62500000,
+            "denominator": 31623303
+          },
+          {
+            "numerator": 100000000,
+            "denominator": 51006907
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 126989057
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 498002363
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 491744659
+          },
+          {
+            "numerator": 50000000,
+            "denominator": 25461887
+          },
+          {
+            "numerator": 31250000,
+            "denominator": 15526391
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 250204037
+          },
+          {
+            "numerator": 15625000,
+            "denominator": 7815611
+          },
+          {
+            "numerator": 50000000,
+            "denominator": 25482141
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 503190461,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 15724701906250000,
+          "denominator": 7912278073874211
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 2515038709,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 1852609191549008,
+            "denominator": 45
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 93561625375290761942748121879805109997774804377222261410268328353905098437500,
+            "denominator": 47055299808316810455706975904284799932825664512298482180557384622835571431451
+          },
+          "sample_variance": {
+            "numerator": 68429541108085369579190940776835430426209317110176970731539539341890264098827151047648526759104538311769428847375525107737864138089790590820312500000,
+            "denominator": 105438154288122859943585813352911981288292411009900314828314388205255265146345028217767273319522687220593082779142848506495618204952609938576241580569781
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 14472917171354107131325664,
+        "denominator": 14797351636097315872760601
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 505972848,
+          "denominator": 521741597
+        },
+        {
+          "numerator": 51006907,
+          "denominator": 51063470
+        },
+        {
+          "numerator": 507956228,
+          "denominator": 515113103
+        },
+        {
+          "numerator": 498002363,
+          "denominator": 522871617
+        },
+        {
+          "numerator": 70249237,
+          "denominator": 73713159
+        },
+        {
+          "numerator": 509237740,
+          "denominator": 514584003
+        },
+        {
+          "numerator": 496844512,
+          "denominator": 512630071
+        },
+        {
+          "numerator": 500408074,
+          "denominator": 509041159
+        },
+        {
+          "numerator": 500199104,
+          "denominator": 514325223
+        },
+        {
+          "numerator": 254821410,
+          "denominator": 257061151
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 255997212940986019,
+        "denominator": 261812707618853457
+      }
+    },
+    "vfsbench_stat": {
+      "current": {
+        "elapsed_ns": [
+          281672046,
+          285556858,
+          281085825,
+          296892055,
+          281743905,
+          282724216,
+          292527232,
+          288799679,
+          296020744,
+          284190467
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 140836023
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 142778429
+          },
+          {
+            "numerator": 40000000,
+            "denominator": 11243433
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 59378411
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 56348781
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 35340527
+          },
+          {
+            "numerator": 7812500,
+            "denominator": 2285369
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 288799679
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 37002593
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 284190467
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 569747325,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 142436831250000000,
+          "denominator": 40576268415036343
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 2871213027,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 3321181268018281,
+            "denominator": 90
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 71832524111167139129722451017587323012485261368148623593729432491839190718750,
+            "denominator": 20616436449405543128832548499314279869006908778378316265058477614098046764343
+          },
+          "sample_variance": {
+            "numerator": 2256207269728350265187459974947755500476902662303736150955945108878373783535890395172135285907810265626208552165256419656979629204712697236416015625000,
+            "denominator": 425037451872377437886974176626989635025102333972753008663104697174693820835464540680367714248896755676936526262897716628421757955478011003202131776221649
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          274273142,
+          276793392,
+          271578049,
+          270838600,
+          284533677,
+          273911661,
+          283816677,
+          267464568,
+          269015678,
+          283466867
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 137136571
+          },
+          {
+            "numerator": 62500000,
+            "denominator": 17299587
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 271578049
+          },
+          {
+            "numerator": 5000000,
+            "denominator": 1354193
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 284533677
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 273911661
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 283816677
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 33433071
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 134507839
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 283466867
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 548184803,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 137046200750000000,
+          "denominator": 37563305946454431
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 2755692311,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 3636232898357329,
+            "denominator": 90
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 9934368069415774303804963995061041358571239348591499635073064173671786750000,
+            "denominator": 2736305166808893597152064004211966687366703869708310333810863578862804183673
+          },
+          "sample_variance": {
+            "numerator": 465604095074317174461194564951866203813586741772290661548572344498571555665715617093005444685155518586246444835021931263246526102138559050625000000000,
+            "denominator": 67386293693145423125256060864803754171255984299131617755245567970258879184960818820794885471713618622280792817510383514523639813418122850164687277938361
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 1945599371013545936058825,
+        "denominator": 2022117609779256356845039
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 137136571,
+          "denominator": 140836023
+        },
+        {
+          "numerator": 138396696,
+          "denominator": 142778429
+        },
+        {
+          "numerator": 271578049,
+          "denominator": 281085825
+        },
+        {
+          "numerator": 54167720,
+          "denominator": 59378411
+        },
+        {
+          "numerator": 94844559,
+          "denominator": 93914635
+        },
+        {
+          "numerator": 273911661,
+          "denominator": 282724216
+        },
+        {
+          "numerator": 283816677,
+          "denominator": 292527232
+        },
+        {
+          "numerator": 38209224,
+          "denominator": 41257097
+        },
+        {
+          "numerator": 134507839,
+          "denominator": 148010372
+        },
+        {
+          "numerator": 283466867,
+          "denominator": 284190467
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 78236774015950905,
+        "denominator": 80733838801473328
+      }
+    },
+    "cp_large_file": {
+      "current": {
+        "elapsed_ns": [
+          1656490554,
+          1647581969,
+          1653215312,
+          1660017616,
+          1675319855,
+          1665329239,
+          1672684493,
+          1655864704,
+          1656575734,
+          1654491942
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 828245277
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1647581969
+          },
+          {
+            "numerator": 62500000,
+            "denominator": 103325957
+          },
+          {
+            "numerator": 62500000,
+            "denominator": 103751101
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 335063971
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1665329239
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1672684493
+          },
+          {
+            "numerator": 7812500,
+            "denominator": 12936443
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 828287867
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 827245971
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 1656533144,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 414133286000000000,
+          "denominator": 686025513839154159
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 8298785709,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 3475631437282678,
+            "denominator": 45
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 18384067873665236085579422520508492799611962013295551901262451141316180781250,
+            "denominator": 30512320475847980453967239126054000978788109838691230254105331400765669208619
+          },
+          "sample_variance": {
+            "numerator": 67817723413425155678613435893619095048691819954028713743964509890166510998078353407331139819143129291166163091214725955512518227836157141197998046875000,
+            "denominator": 6706005251012596439989237522904684975025969837460460237893514350298534287932500679281872097979122759912432244812379259238481814832693125609666851093219220683
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          1623321714,
+          1641234845,
+          1628141227,
+          1629148107,
+          1651041020,
+          1639220604,
+          1633601721,
+          1635880762,
+          1645495268,
+          1634133050
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 811660857
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 328246969
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1628141227
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1629148107
+          },
+          {
+            "numerator": 50000000,
+            "denominator": 82552051
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 409805151
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1633601721
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 817940381
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 411373817
+          },
+          {
+            "numerator": 20000000,
+            "denominator": 32682661
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 1635006906,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 16350069060000000,
+          "denominator": 26732468190433841
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 8180609159,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 3163595041339558,
+            "denominator": 45
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 1388954262096426568190652291884298852759870232959272110487962917362144591182157000000,
+            "denominator": 2272444745984284918630325630098399399689732390268515870381103827399329691827050071321
+          },
+          "sample_variance": {
+            "numerator": 21659604046443967285285515212768232429443365095414749159495044579050764335856967272524858666194156044698764236844617766950913703743477041893147526425210000000000000,
+            "denominator": 2213145052950677660493123836809264218916665930648263668628506522019841576677291286738301129710264804546119335525550710001044341423490174250056659198127544611744794293589
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 50321840429976546995143300,
+        "denominator": 50984384219055255598346457
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 270553619,
+          "denominator": 276081759
+        },
+        {
+          "numerator": 1641234845,
+          "denominator": 1647581969
+        },
+        {
+          "numerator": 1628141227,
+          "denominator": 1653215312
+        },
+        {
+          "numerator": 1629148107,
+          "denominator": 1660017616
+        },
+        {
+          "numerator": 330208204,
+          "denominator": 335063971
+        },
+        {
+          "numerator": 234174372,
+          "denominator": 237904177
+        },
+        {
+          "numerator": 1633601721,
+          "denominator": 1672684493
+        },
+        {
+          "numerator": 817940381,
+          "denominator": 827932352
+        },
+        {
+          "numerator": 822747634,
+          "denominator": 828287867
+        },
+        {
+          "numerator": 817066525,
+          "denominator": 827245971
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 1091436723868252065,
+        "denominator": 1107865774713447904
+      }
+    },
+    "dd_large_file": {
+      "current": {
+        "elapsed_ns": [
+          1776859055,
+          1779782436,
+          1789055282,
+          1785542129,
+          1790830373,
+          1761358445,
+          1763306377,
+          1753887191,
+          1772826883,
+          1793312034
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 200000000,
+            "denominator": 355371811
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 444945609
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 894527641
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1785542129
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1790830373
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 352271689
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1763306377
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1753887191
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1772826883
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 896656017
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 3556641491,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 88916037275000000,
+          "denominator": 158121126866827899
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 3553352041,
+            "denominator": 2
+          },
+          "sample_variance": {
+            "numerator": 3332324099923385,
+            "denominator": 18
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 61208103173580016710339980148879558029433999515954544606624453549667847561830625000000,
+            "denominator": 108741213693486416612955775468844278767305102554990549331498449594286953540573797954153
+          },
+          "sample_variance": {
+            "numerator": 220911501735359902026147469117528633258067546317062251241500884364399706066060279824623750298371578359298226406190182765922992227498067119500868929033886250000000000000,
+            "denominator": 11824651555532477763955735106353605331027662955337011886506684301480276614857553351878399980351333630609098365509468430002617852840428932212305025236471166195430168289947409
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          1734044069,
+          1730156517,
+          1736321831,
+          1741299314,
+          1757480443,
+          1788598282,
+          1745893056,
+          1744206465,
+          1735666600,
+          1745774397
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 1734044069
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1730156517
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1736321831
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 870649657
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1757480443
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 894299141
+          },
+          {
+            "numerator": 15625000,
+            "denominator": 27279579
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 348841293
+          },
+          {
+            "numerator": 5000000,
+            "denominator": 8678333
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 1745774397
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 3485505779,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 174275288950000000,
+          "denominator": 303718552097886501
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 8729720487,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 4276941417701804,
+            "denominator": 15
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 2422600834192879007802397562303250601446722465108511892120499666162326957240630437500,
+            "denominator": 4229375110077125000550555134895380900073181795497540601214825250378160046247303383757
+          },
+          "sample_variance": {
+            "numerator": 1596080955834731905280350317343991444957830191850807816279719208116496974891226683700828862073021480948652355497505974648234946834088190538811237055311261992187500000,
+            "denominator": 53662841465219679646141369902385067986015643967482327764751101122912247373528158481126292417658587818991262502683493325702010803272294636923948687548493527784986034305147
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 360072667992596074288470997,
+        "denominator": 367421400984213870241952214
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 1734044069,
+          "denominator": 1776859055
+        },
+        {
+          "numerator": 64079871,
+          "denominator": 65917868
+        },
+        {
+          "numerator": 1736321831,
+          "denominator": 1789055282
+        },
+        {
+          "numerator": 1741299314,
+          "denominator": 1785542129
+        },
+        {
+          "numerator": 1757480443,
+          "denominator": 1790830373
+        },
+        {
+          "numerator": 1788598282,
+          "denominator": 1761358445
+        },
+        {
+          "numerator": 1745893056,
+          "denominator": 1763306377
+        },
+        {
+          "numerator": 1744206465,
+          "denominator": 1753887191
+        },
+        {
+          "numerator": 1735666600,
+          "denominator": 1772826883
+        },
+        {
+          "numerator": 581924799,
+          "denominator": 597770678
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 6158194856500969927,
+        "denominator": 6300127000011951130
+      }
+    },
+    "testprog_perf_suite": {
+      "current": {
+        "elapsed_ns": [
+          4521114698,
+          4520319458,
+          4545378872,
+          4506825370,
+          4503449988,
+          4512197332,
+          4524779480,
+          4504719878,
+          4533956655,
+          4551606936
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 2260557349
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 2260159729
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 568172359
+          },
+          {
+            "numerator": 100000000,
+            "denominator": 450682537
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 1125862497
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 1128049333
+          },
+          {
+            "numerator": 25000000,
+            "denominator": 113119487
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 2252359939
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 906791331
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 568950867
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 4520717078,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 1130179269500000000,
+          "denominator": 5109220685304798421
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 45224348667,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 25446135708273361,
+            "denominator": 90
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 1788733303392937268270548411604348986990538953155755566904262391151336980126716792500000,
+            "denominator": 8089329396557306725062850157046031278196627211871570502644169765245876405210996934019049
+          },
+          "sample_variance": {
+            "numerator": 44069978840113464221916140467734180915614759157986357276416229947693332242846429259807158548550523428558707360521069077946663857703726751747775871968995656812500000000000,
+            "denominator": 65437250086006200163589398231671633943084929620131794117565264847751842756936869114354885724331089066573151387702127381257012796279645376430220959956741645443128917191894864401
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          4516067485,
+          4475462252,
+          4511272093,
+          4503576808,
+          4509683832,
+          4521382579,
+          4503753288,
+          4517155636,
+          4497530784,
+          4509300741
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 200000000,
+            "denominator": 903213497
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 1118865563
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 4511272093
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 562947101
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 563710479
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 4521382579
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 562969161
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 1129288909
+          },
+          {
+            "numerator": 31250000,
+            "denominator": 140547837
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 4509300741
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 9018984573,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 62631837312500000,
+          "denominator": 282437786740462771
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 22532592749,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 7635994936650418,
+            "denominator": 45
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 21268827384995220442627660931950931401426858140068874243342580829417161587029375000,
+            "denominator": 95847641712806584127733398267184627652265626747939898032015412608275190738533555147
+          },
+          "sample_variance": {
+            "numerator": 11423031528585408507279446369154008558221166261720047465269645542371088187642508007156881447231505747625594320304733794236906509256614135805407983699218750000000,
+            "denominator": 27560311265719621991747412532481217369805997278449267108298506345648171500797607615018568172611354092588150840687221668671171724579869303133686490796853814200670574827
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 5107285303960528009931612552,
+        "denominator": 5119998060090718306874862137
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 4516067485,
+          "denominator": 4521114698
+        },
+        {
+          "numerator": 2237731126,
+          "denominator": 2260159729
+        },
+        {
+          "numerator": 4511272093,
+          "denominator": 4545378872
+        },
+        {
+          "numerator": 2251788404,
+          "denominator": 2253412685
+        },
+        {
+          "numerator": 375806986,
+          "denominator": 375287499
+        },
+        {
+          "numerator": 4521382579,
+          "denominator": 4512197332
+        },
+        {
+          "numerator": 562969161,
+          "denominator": 565597435
+        },
+        {
+          "numerator": 2258577818,
+          "denominator": 2252359939
+        },
+        {
+          "numerator": 1499176928,
+          "denominator": 1511318885
+        },
+        {
+          "numerator": 1503100247,
+          "denominator": 1517202312
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 5099524334120729353,
+        "denominator": 5114261753059199260
+      }
+    },
+    "mandelbench_large": {
+      "current": {
+        "elapsed_ns": [
+          582894712,
+          571849617,
+          588813257,
+          573141077,
+          584263314,
+          586410415,
+          585394805,
+          581700692,
+          588667666,
+          587777525
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 125000000,
+            "denominator": 72861839
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 571849617
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 588813257
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 573141077
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 292131657
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 117282083
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 117078961
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 145425173
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 294333833
+          },
+          {
+            "numerator": 40000000,
+            "denominator": 23511101
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 1169658119,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 58482905950000000,
+          "denominator": 34202470876768377
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 583091308,
+            "denominator": 1
+          },
+          "sample_variance": {
+            "numerator": 330848442783862,
+            "denominator": 9
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 32452475846330368169750686789043144996713072241985134479055891693960130940541500000,
+            "denominator": 18920896848990719882620709295818109986254549358836766711785767068580918954301941411
+          },
+          "sample_variance": {
+            "numerator": 116160530070531621825839442104868741246353924952538335869171175896043025005361835992255847360566266824870636521770271726282654892684473400393205802722500000000000,
+            "denominator": 358000337570146952513639742875358345645485774646555271943847509502015626782075397529215317225521305447490817099581805408211168498066730251925766989385976803676670921
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          571036366,
+          573633707,
+          566272593,
+          570799336,
+          557838468,
+          572324657,
+          581296272,
+          585488174,
+          578039920,
+          580193761
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 285518183
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 573633707
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 566272593
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 71349917
+          },
+          {
+            "numerator": 250000000,
+            "denominator": 139459617
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 572324657
+          },
+          {
+            "numerator": 62500000,
+            "denominator": 36331017
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 292744087
+          },
+          {
+            "numerator": 12500000,
+            "denominator": 7225499
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 580193761
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 572979182,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 572979182000000000,
+          "denominator": 328304714602413499
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 2868461627,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 969711626793254,
+            "denominator": 15
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 506871843087533825702956569882832457074531103943158303651209387328392633457500000,
+            "denominator": 290736756656450675638717938773346984705818222717195096667833180073628408546262109
+          },
+          "sample_variance": {
+            "numerator": 460046214391474326830515762164423040676814409260759667403962066359145862357816422780986703012665448097755054740775151950693318163070579809877145375000000000000,
+            "denominator": 760750755040009946244110873242214814157868529118830665096984666968836680831544859161224567477861837670271034316000736673548186666513859511076708540685121562150929
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 384004274940690806100548381,
+        "denominator": 391946075706991349138552280
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 285518183,
+          "denominator": 291447356
+        },
+        {
+          "numerator": 573633707,
+          "denominator": 571849617
+        },
+        {
+          "numerator": 566272593,
+          "denominator": 588813257
+        },
+        {
+          "numerator": 570799336,
+          "denominator": 573141077
+        },
+        {
+          "numerator": 10330342,
+          "denominator": 10819691
+        },
+        {
+          "numerator": 572324657,
+          "denominator": 586410415
+        },
+        {
+          "numerator": 581296272,
+          "denominator": 585394805
+        },
+        {
+          "numerator": 292744087,
+          "denominator": 290850346
+        },
+        {
+          "numerator": 289019960,
+          "denominator": 294333833
+        },
+        {
+          "numerator": 580193761,
+          "denominator": 587777525
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 340650090322214913,
+        "denominator": 346005623769006650
+      }
+    },
+    "netbench_loopback": {
+      "current": {
+        "elapsed_ns": [
+          9240321113,
+          9244356215,
+          9239776943,
+          9248942098,
+          9256307033,
+          9249787718,
+          9239828902,
+          9226663184,
+          9237454671,
+          9235294609
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 9240321113
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 1848871243
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9239776943
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 4624471049
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9256307033
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 4624893859
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 4619914451
+          },
+          {
+            "numerator": 62500000,
+            "denominator": 576666449
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9237454671
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9235294609
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 18480150015,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 4620037503750000000,
+          "denominator": 42689493041829103963
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 46209366243,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 351243377340568,
+            "denominator": 5
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 768526436501080073978533915766563894663331829751332234699856853584150100076695414080728358750000,
+            "denominator": 7102618656796810497631680480270858991531818705949661766519827741856947042993566833376202288770971
+          },
+          "sample_variance": {
+            "numerator": 161928023279315931908899853740088745757087873888386906911756525673092099471702403986530800824173825853722975570050321627967149176199466913556542972008704766129172296943283171875000000000,
+            "denominator": 16815730594626042849395247386913910765685715680483229767996739356317429448904215282209586083916839885360104878100709848114235670792467792342813979806840314703354316740047466562067684319230760947
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          9266412218,
+          9216959729,
+          9257587683,
+          9238931402,
+          9256798432,
+          9244066725,
+          9242787195,
+          9236679161,
+          9236607461,
+          9233440079
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 500000000,
+            "denominator": 4633206109
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9216959729
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9257587683
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 4619465701
+          },
+          {
+            "numerator": 31250000,
+            "denominator": 289274951
+          },
+          {
+            "numerator": 40000000,
+            "denominator": 369762669
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 1848557439
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9236679161
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9236607461
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 9233440079
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 18481718597,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 924085929850000000,
+          "denominator": 8539347685788899739
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 18486054017,
+            "denominator": 2
+          },
+          "sample_variance": {
+            "numerator": 1212909279830195,
+            "denominator": 6
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 162833032964981194137826675147837220052828870423076355328327021063332030928908364157479875000,
+            "denominator": 1505066916281780000704192670730696890182205870026258603340987621712192244215263970401701741473
+          },
+          "sample_variance": {
+            "numerator": 564698207291664017912157192135082210643807103915387938424274697227914872643298333481906775227023206257486541005199128500230883986917234664012940583787962080707749313701406250000000,
+            "denominator": 20387037802373519124420667360887855228787728516272562411539099931931283542102912399263415508849352756848310171279288070792757829560541346408066767924158499982489748125327902501968353887561
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 789042131318109753992571730425,
+        "denominator": 788975197447675049608823499911
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 9266412218,
+          "denominator": 9240321113
+        },
+        {
+          "numerator": 9216959729,
+          "denominator": 9244356215
+        },
+        {
+          "numerator": 9257587683,
+          "denominator": 9239776943
+        },
+        {
+          "numerator": 4619465701,
+          "denominator": 4624471049
+        },
+        {
+          "numerator": 38409952,
+          "denominator": 38407913
+        },
+        {
+          "numerator": 9244066725,
+          "denominator": 9249787718
+        },
+        {
+          "numerator": 9242787195,
+          "denominator": 9239828902
+        },
+        {
+          "numerator": 9236679161,
+          "denominator": 9226663184
+        },
+        {
+          "numerator": 9236607461,
+          "denominator": 9237454671
+        },
+        {
+          "numerator": 9233440079,
+          "denominator": 9235294609
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 709569006292524685,
+        "denominator": 709582710690423246
+      }
+    },
+    "renderbench_duck": {
+      "current": {
+        "elapsed_ns": [
+          2453661823,
+          2466977440,
+          2482428829,
+          2510183326,
+          2496334048,
+          2514095479,
+          2465924490,
+          2475794806,
+          2495096637,
+          2515722799
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 2453661823
+          },
+          {
+            "numerator": 6250000,
+            "denominator": 15418609
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2482428829
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 1255091663
+          },
+          {
+            "numerator": 31250000,
+            "denominator": 78010439
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2514095479
+          },
+          {
+            "numerator": 100000000,
+            "denominator": 246592449
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 1237897403
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2495096637
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2515722799
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 2488762733,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 2488762733000000000,
+          "denominator": 6193899822829748073
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 24876219677,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 43484083669196641,
+            "denominator": 90
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 847984830869266673629154238975431377467577834721877564218796649529974400772415532500000,
+            "denominator": 2109317366012980124612545911432249418733297531318009678891512730778874426176107918088969
+          },
+          "sample_variance": {
+            "numerator": 168659969056125706935289593985137563535067811319429127664330616859157450052983318776410489193624699761831260289344617749637288899633193799218760924252102405359375000000000,
+            "denominator": 13347659251691809081549028125642921448707440402685652302187886386760315682349796238369037413326301616709248104645063500212009836026183142486054966238866477281657044162998448883
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          2492106455,
+          2501743851,
+          2508415515,
+          2611983846,
+          2513495138,
+          2556883663,
+          2508289885,
+          2515163809,
+          2495417877,
+          2465831579
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 200000000,
+            "denominator": 498421291
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2501743851
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 501683103
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 1305991923
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 1256747569
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2556883663
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 501657977
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2515163809
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2495417877
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 2465831579
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 2508352700,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 100334108000000000,
+          "denominator": 251673330546062631
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 12584665809,
+            "denominator": 5
+          },
+          "sample_variance": {
+            "numerator": 24523736747755106,
+            "denominator": 15
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 92334252324513839637237926765584018936974782429943121451957784758344582925509280000000,
+            "denominator": 232346229010527068425137994134502053901949600024298177744844196841267347507852975236239
+          },
+          "sample_variance": {
+            "numerator": 19033754072235790836669341958593397238057203705509703967888852320798929475018181606262118700874146072889808086595808474848506748488223309987826522067584676000000000000000,
+            "denominator": 485862931218710612719101443878609914255864958973221742455469798280339557532376696075902674505137099555124333181842367258655426389286640968340200235278472289493846800729786089
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 208785068651010405305576841,
+        "denominator": 207153137921660269589724628
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": true,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 2492106455,
+          "denominator": 2453661823
+        },
+        {
+          "numerator": 147161403,
+          "denominator": 145116320
+        },
+        {
+          "numerator": 2508415515,
+          "denominator": 2482428829
+        },
+        {
+          "numerator": 1305991923,
+          "denominator": 1255091663
+        },
+        {
+          "numerator": 1256747569,
+          "denominator": 1248167024
+        },
+        {
+          "numerator": 2556883663,
+          "denominator": 2514095479
+        },
+        {
+          "numerator": 501657977,
+          "denominator": 493184898
+        },
+        {
+          "numerator": 2515163809,
+          "denominator": 2475794806
+        },
+        {
+          "numerator": 831805959,
+          "denominator": 831698879
+        },
+        {
+          "numerator": 2465831579,
+          "denominator": 2515722799
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 722729634158063269,
+        "denominator": 712132748556502720
+      }
+    },
+    "fork_cow": {
+      "current": {
+        "elapsed_ns": [
+          136624671,
+          134935279,
+          138981152,
+          145215505,
+          139654952,
+          140432723,
+          132817688,
+          160802125,
+          135112329,
+          130687727
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 136624671
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 134935279
+          },
+          {
+            "numerator": 31250000,
+            "denominator": 4343161
+          },
+          {
+            "numerator": 200000000,
+            "denominator": 29043101
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 17456869
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 140432723
+          },
+          {
+            "numerator": 125000000,
+            "denominator": 16602211
+          },
+          {
+            "numerator": 8000000,
+            "denominator": 1286417
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 135112329
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 130687727
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 275605823,
+          "denominator": 2
+        },
+        "median_rate": {
+          "numerator": 4306340984375000,
+          "denominator": 593382942725031
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 1395264151,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 6582690354719029,
+            "denominator": 90
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 14193242619109157366602546472233800740121182858141271017134546677853675000,
+            "denominator": 1974184914680745254987603317642931871983121093519361389285761734355276007
+          },
+          "sample_variance": {
+            "numerator": 232577351180163720338884212031870622913635311462236935155904415225313892501337759808901853180235811797313006025710973874128216497568900418750000000,
+            "denominator": 1414758406079146776117259980683594730570004247260214176545766857040636224413270071775392619548545249815831448141571409568336768321091354125400649787
+          }
+        }
+      },
+      "reference": {
+        "elapsed_ns": [
+          137489031,
+          118357350,
+          143393334,
+          140511062,
+          130187786,
+          118481200,
+          122679322,
+          104638421,
+          126285934,
+          135230069
+        ],
+        "invocation_rates": [
+          {
+            "numerator": 1000000000,
+            "denominator": 137489031
+          },
+          {
+            "numerator": 20000000,
+            "denominator": 2367147
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 71696667
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 70255531
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 65093893
+          },
+          {
+            "numerator": 2500000,
+            "denominator": 296203
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 61339661
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 104638421
+          },
+          {
+            "numerator": 500000000,
+            "denominator": 63142967
+          },
+          {
+            "numerator": 1000000000,
+            "denominator": 135230069
+          }
+        ],
+        "median_duration_ns": {
+          "numerator": 128236860,
+          "denominator": 1
+        },
+        "median_rate": {
+          "numerator": 32059215000000000,
+          "denominator": 4110221537600531
+        },
+        "duration_statistics": {
+          "mean": {
+            "numerator": 1277253509,
+            "denominator": 10
+          },
+          "sample_variance": {
+            "numerator": 1444920399817101,
+            "denominator": 10
+          }
+        },
+        "rate_statistics": {
+          "mean": {
+            "numerator": 1519758572505907865565211584711094674307762234159803756780547597136356750000,
+            "denominator": 192482282366393465214142299235302860864183734981446059555206848391168871217
+          },
+          "sample_variance": {
+            "numerator": 68765087393090059750148933554274532087088623098873945184283155402307130730909539416144982400505295070554207687829769249299271354646971316875000000000,
+            "denominator": 111148287074928074168566884632108406978507030323064806244030009384942571623889775440058091301769755899631813861936113525782231421690221523545793183267
+          }
+        }
+      },
+      "median_throughput_ratio": {
+        "numerator": 1132800989582719791492013,
+        "denominator": 1217497045641885101482560
+      },
+      "threshold": {
+        "numerator": 19,
+        "denominator": 20
+      },
+      "passes": false,
+      "paired_throughput_ratios": [
+        {
+          "numerator": 15276559,
+          "denominator": 15180519
+        },
+        {
+          "numerator": 118357350,
+          "denominator": 134935279
+        },
+        {
+          "numerator": 71696667,
+          "denominator": 69490576
+        },
+        {
+          "numerator": 140511062,
+          "denominator": 145215505
+        },
+        {
+          "numerator": 2244617,
+          "denominator": 2407844
+        },
+        {
+          "numerator": 118481200,
+          "denominator": 140432723
+        },
+        {
+          "numerator": 61339661,
+          "denominator": 66408844
+        },
+        {
+          "numerator": 104638421,
+          "denominator": 160802125
+        },
+        {
+          "numerator": 126285934,
+          "denominator": 135112329
+        },
+        {
+          "numerator": 135230069,
+          "denominator": 130687727
+        }
+      ],
+      "paired_ratio_median_diagnostic_only": {
+        "numerator": 607352259049289,
+        "denominator": 650658821417352
+      }
+    }
+  },
+  "kernels": {
+    "current": {
+      "sha256": "c8d74b05c4a47c6576b87518176359083e842d8ea7cc8dbf3ed85bfc49684c4e",
+      "build_id": "9e9b0598fa360a550976dedaf097b1937168fc28",
+      "build_proof": {
+        "bytes": 235688,
+        "sha256": "d7157c13d4634cc41fc4a28d70a6688aaa89b243ad542c1f7ef0e4cd5ec9d8ec"
+      }
+    },
+    "reference": {
+      "sha256": "32dbb5005cdf956f5d3f9ee814c13090b56561d1346709feb3b84f028f0aa6ee",
+      "build_id": "b238da3dab1bd87cd96d71ec11398a59138cad52",
+      "build_proof": {
+        "bytes": 706669,
+        "sha256": "71820458d456fc7a95246d04f57d482f3b0dadb6a4b2ce862ef0ea87f1893328"
+      }
+    }
+  },
+  "normal_profiles": {
+    "current": {
+      "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+      "WOS_FILE_FAULT_FATAL_DIAGNOSTICS": "OFF",
+      "WOS_KASAN": "OFF",
+      "WOS_KCFI": "OFF",
+      "WOS_KCOV": "OFF",
+      "WOS_KERNEL_LIBCXX_HARDENING_MODE": "fast",
+      "WOS_KERNEL_UBSAN_TRAP": "OFF",
+      "WOS_KUBSAN": "OFF",
+      "WOS_MM_PROVENANCE_PERF_CONTROL": "ON",
+      "WOS_NET_TRACE": "OFF",
+      "WOS_SELFTEST": "OFF"
+    },
+    "reference": {
+      "build_type": "RelWithDebInfo",
+      "target": "wos",
+      "jobs": 2,
+      "libcxx_hardening": "fast",
+      "selftest": false,
+      "kasan": false,
+      "kcfi": false,
+      "kcov": false,
+      "kubsan": false,
+      "ubsan_trap": false,
+      "net_trace": false,
+      "mm_provenance_perf_control": true
+    }
+  },
+  "original_order": [
+    {
+      "pair_index": 0,
+      "order": [
+        "reference",
+        "current"
+      ]
+    },
+    {
+      "pair_index": 1,
+      "order": [
+        "current",
+        "reference"
+      ]
+    },
+    {
+      "pair_index": 2,
+      "order": [
+        "reference",
+        "current"
+      ]
+    },
+    {
+      "pair_index": 3,
+      "order": [
+        "current",
+        "reference"
+      ]
+    },
+    {
+      "pair_index": 4,
+      "order": [
+        "reference",
+        "current"
+      ]
+    },
+    {
+      "pair_index": 5,
+      "order": [
+        "current",
+        "reference"
+      ]
+    },
+    {
+      "pair_index": 6,
+      "order": [
+        "reference",
+        "current"
+      ]
+    },
+    {
+      "pair_index": 7,
+      "order": [
+        "current",
+        "reference"
+      ]
+    },
+    {
+      "pair_index": 8,
+      "order": [
+        "reference",
+        "current"
+      ]
+    },
+    {
+      "pair_index": 9,
+      "order": [
+        "current",
+        "reference"
+      ]
+    }
+  ],
+  "arithmetic": "Ratio of medians of per-invocation Fraction(1000000000, elapsed_ns); threshold19/20; sample variance divisor9.",
+  "paired_ratio_scope": "Diagnostic only; never substitutes for the median-rate gate.",
+  "input_commitments": {
+    "plan": {
+      "bytes": 310178,
+      "sha256": "146b2d7b081778449747c30dc548fefaec448315683cf6b40bd71426bf0e6ecf"
+    },
+    "arms": {
+      "bytes": 98837,
+      "sha256": "0fa931a966635d77829ecc5b977ce2412303057af0fc864b189d2ce8c1f2a4a1"
+    },
+    "reduction": {
+      "bytes": 196532,
+      "sha256": "2006f02671d0ef378d8cf6700f76636bee4c423c3d9343b1ba09b07d9a06040e"
+    },
+    "freeze": {
+      "bytes": 85606,
+      "sha256": "29633a8abc7a5bf6cf808391471c65f38441a6a08106f087aafcbe652c4bc9ac"
+    },
+    "reducer_owner": {
+      "bytes": 1281,
+      "sha256": "5595f0ebafda1fb9cf5d36c308773a7f24b3bf4f4afcfa584e1fd44d741332a1"
+    },
+    "operator_outcome": {
+      "bytes": 465509,
+      "sha256": "e60789bcb929e78036cf824e414bf395bd73ed7cf6befa646623c4839aa71d2d"
+    }
+  },
+  "reducer_source_sha256": "c532e0daf1f12cd14c4641a6e02af7c464b723b8227767fd8a626b0ee2e71126",
+  "artifact_commitments": {
+    "current": {
+      "audit_source": {
+        "bytes": 22510,
+        "sha256": "cb13fbba7d024bb77c25f152a08e5b39195ea176dee62f2ec32aec801c6a5c8f"
+      },
+      "bootloader": {
+        "bytes": 376832,
+        "sha256": "94308b4e9ee1783a65cfd60570240a80595baf125c5b18e729d3dd977194ad51"
+      },
+      "control": {
+        "bytes": 305008,
+        "sha256": "e0ea9c72974a71b5dbd72be360f2cede5e77d39ae0550fe9394413785781b440"
+      },
+      "current_kernel": {
+        "bytes": 76377480,
+        "sha256": "c8d74b05c4a47c6576b87518176359083e842d8ea7cc8dbf3ed85bfc49684c4e"
+      },
+      "decoder": {
+        "bytes": 26530,
+        "sha256": "a3e67c67eb851c24cbadc28b73df4776b1aa1a3055c5240d21fe301b6e38bd07"
+      },
+      "diagnostic_kernel": {
+        "bytes": 76377480,
+        "sha256": "c8d74b05c4a47c6576b87518176359083e842d8ea7cc8dbf3ed85bfc49684c4e"
+      },
+      "firmware": {
+        "bytes": 4194304,
+        "sha256": "2a489a243844bc210f46c6d2093766830a97763ee1456ef83f8b3ae033f41f4c"
+      },
+      "init": {
+        "bytes": 8921928,
+        "sha256": "f8276733992a964d25ca0849bb0539c46f65aabbc8884786e6be1a4e17ab9e12"
+      },
+      "kernel": {
+        "bytes": 76377480,
+        "sha256": "c8d74b05c4a47c6576b87518176359083e842d8ea7cc8dbf3ed85bfc49684c4e"
+      },
+      "newc": {
+        "bytes": 8927744,
+        "sha256": "823b470bc2dbecd73554bd706ff42208499ada0ba5338bb2e6358cba6f725dde"
+      },
+      "normal_cache": {
+        "bytes": 33229,
+        "sha256": "182779ea091e5fcd2d7eaa1c8a7754c98ac5cf021280b0c230fb1d8786c02d6f"
+      },
+      "reference_kernel": {
+        "bytes": 74834800,
+        "sha256": "3dcf65a19d1e66ad5d033b7af50e5799c019d9584a773a1217234a41bef89ea4"
+      },
+      "seed_boot": {
+        "bytes": 86048768,
+        "sha256": "4e598d34bf6e31d73c2a7dbc747826a1d7dcc30d04d0eacc5082db0e814658d8"
+      },
+      "seed_rootfs": {
+        "bytes": 2387148800,
+        "sha256": "6239a56cdd5b5097e723332bef734625d5c5d2158c7253f98623169a6345d9c2"
+      },
+      "service_template": {
+        "bytes": 5653,
+        "sha256": "45f43a2a71b004fe7fc3483de20bb456e648f3451f5d7f97ac42a88d9ba9270e"
+      },
+      "stamp": {
+        "bytes": 104312,
+        "sha256": "f6eb82d53d5a646ebd54158e20688464245a87d8a8ec671be53329a3daaaeef6"
+      },
+      "suite": {
+        "bytes": 35246,
+        "sha256": "256347441cfc663d1c1e53724fd32886d6715cf3ac8698a852cb87df77072c42"
+      },
+      "witness": {
+        "bytes": 251408,
+        "sha256": "2b9d98383e71eb95d8014605ff0f1f3ed74185cb4067c60298986dbabbe57885"
+      }
+    },
+    "reference": {
+      "audit_source": {
+        "bytes": 22510,
+        "sha256": "cb13fbba7d024bb77c25f152a08e5b39195ea176dee62f2ec32aec801c6a5c8f"
+      },
+      "bootloader": {
+        "bytes": 376832,
+        "sha256": "94308b4e9ee1783a65cfd60570240a80595baf125c5b18e729d3dd977194ad51"
+      },
+      "control": {
+        "bytes": 305008,
+        "sha256": "e0ea9c72974a71b5dbd72be360f2cede5e77d39ae0550fe9394413785781b440"
+      },
+      "current_kernel": {
+        "bytes": 76377480,
+        "sha256": "c8d74b05c4a47c6576b87518176359083e842d8ea7cc8dbf3ed85bfc49684c4e"
+      },
+      "decoder": {
+        "bytes": 26530,
+        "sha256": "a3e67c67eb851c24cbadc28b73df4776b1aa1a3055c5240d21fe301b6e38bd07"
+      },
+      "diagnostic_kernel": {
+        "bytes": 74972640,
+        "sha256": "32dbb5005cdf956f5d3f9ee814c13090b56561d1346709feb3b84f028f0aa6ee"
+      },
+      "firmware": {
+        "bytes": 4194304,
+        "sha256": "2a489a243844bc210f46c6d2093766830a97763ee1456ef83f8b3ae033f41f4c"
+      },
+      "init": {
+        "bytes": 8921928,
+        "sha256": "f8276733992a964d25ca0849bb0539c46f65aabbc8884786e6be1a4e17ab9e12"
+      },
+      "kernel": {
+        "bytes": 74972640,
+        "sha256": "32dbb5005cdf956f5d3f9ee814c13090b56561d1346709feb3b84f028f0aa6ee"
+      },
+      "newc": {
+        "bytes": 8927744,
+        "sha256": "823b470bc2dbecd73554bd706ff42208499ada0ba5338bb2e6358cba6f725dde"
+      },
+      "normal_cache": {
+        "bytes": 33229,
+        "sha256": "182779ea091e5fcd2d7eaa1c8a7754c98ac5cf021280b0c230fb1d8786c02d6f"
+      },
+      "reference_kernel": {
+        "bytes": 74834800,
+        "sha256": "3dcf65a19d1e66ad5d033b7af50e5799c019d9584a773a1217234a41bef89ea4"
+      },
+      "seed_boot": {
+        "bytes": 86048768,
+        "sha256": "4e598d34bf6e31d73c2a7dbc747826a1d7dcc30d04d0eacc5082db0e814658d8"
+      },
+      "seed_rootfs": {
+        "bytes": 2387148800,
+        "sha256": "6239a56cdd5b5097e723332bef734625d5c5d2158c7253f98623169a6345d9c2"
+      },
+      "service_template": {
+        "bytes": 5653,
+        "sha256": "45f43a2a71b004fe7fc3483de20bb456e648f3451f5d7f97ac42a88d9ba9270e"
+      },
+      "stamp": {
+        "bytes": 104312,
+        "sha256": "f6eb82d53d5a646ebd54158e20688464245a87d8a8ec671be53329a3daaaeef6"
+      },
+      "suite": {
+        "bytes": 35246,
+        "sha256": "256347441cfc663d1c1e53724fd32886d6715cf3ac8698a852cb87df77072c42"
+      },
+      "witness": {
+        "bytes": 251408,
+        "sha256": "2b9d98383e71eb95d8014605ff0f1f3ed74185cb4067c60298986dbabbe57885"
+      }
+    }
+  },
+  "fixed_receipt_commitments": {
+    "current": {
+      "bundle_manifest": {
+        "bytes": 20053864,
+        "sha256": "98630bcf322f1bdeaa6c158653350f42a874f183ba5c424188855774e9407e73"
+      },
+      "bundle_proof": {
+        "bytes": 55442,
+        "sha256": "66376317628e66751178cfd48c7e0d47f72500015f5bc39162ed3d32e2e489c4"
+      },
+      "cpio_check": {
+        "bytes": 2445,
+        "sha256": "db37db811662d7fb342daee2627871b34672e9df3e3a3bc919c1c24773f45bdc"
+      },
+      "cpio_origin_metadata_revalidation": {
+        "bytes": 6633,
+        "sha256": "a4fd9272a9099019c590787750fb583fe0b7c9c183301b07b2d5baa309c79986"
+      },
+      "current_kernel_retention": {
+        "bytes": 3911,
+        "sha256": "bf3f6f254f681db4f48e931f103726e8a02d004b5f41402cbaf37362502379bf"
+      },
+      "current_source_metadata_bridge": {
+        "bytes": 7663,
+        "sha256": "69d90e319f3054315771a2a04274d8e77af9a74fd31b2718abed9beb2b0bf93d"
+      },
+      "diagnostic_kernel_build": {
+        "bytes": 235688,
+        "sha256": "d7157c13d4634cc41fc4a28d70a6688aaa89b243ad542c1f7ef0e4cd5ec9d8ec"
+      },
+      "helper_binding": {
+        "bytes": 834472,
+        "sha256": "ffb9b324c18d27dac77f4cef7ccb0154bb10859d4aa2e02a469ba109e9291f29"
+      },
+      "helper_build": {
+        "bytes": 834393,
+        "sha256": "12782225fbdeafc8a540ee2e524e685e58e9d01a524a6353393e25644cdeda0b"
+      },
+      "normal_artifacts": {
+        "bytes": 4569,
+        "sha256": "d9a09e4a99ed1fc208933ad5da41a9b22d2a555222968f8860a6e0df1437be60"
+      },
+      "normal_build_result": {
+        "bytes": 465326,
+        "sha256": "b1a46ddfdaa5d255b643dcffaa6a6eb1c6403b6a572bd1aad2429df1ba69e774"
+      },
+      "normal_kernel_proof": {
+        "bytes": 235688,
+        "sha256": "d7157c13d4634cc41fc4a28d70a6688aaa89b243ad542c1f7ef0e4cd5ec9d8ec"
+      },
+      "normal_log": {
+        "bytes": 1909,
+        "sha256": "b8982b81b55e4b85f4a40a5d36bcc239c4de89d44fd4083d3f5a46cccf6f269c"
+      },
+      "normal_owner": {
+        "bytes": 461,
+        "sha256": "12f0f82f37843f5520e78b4bab0e01682a3989665053056d18e30f3d83f00d1d"
+      },
+      "reference_audit": {
+        "bytes": 21410800,
+        "sha256": "cfaef3b02327d1209c6bf3784dc1d59974f9e633e81daa132090c9fb433e85ee"
+      },
+      "reference_provenance": {
+        "bytes": 11982,
+        "sha256": "649c2e9d6af987c614404cec2a91008d5dd0412f80eba1a9a3362c5e3117ded6"
+      }
+    },
+    "reference": {
+      "bundle_manifest": {
+        "bytes": 20053864,
+        "sha256": "98630bcf322f1bdeaa6c158653350f42a874f183ba5c424188855774e9407e73"
+      },
+      "bundle_proof": {
+        "bytes": 55442,
+        "sha256": "66376317628e66751178cfd48c7e0d47f72500015f5bc39162ed3d32e2e489c4"
+      },
+      "cpio_check": {
+        "bytes": 2445,
+        "sha256": "db37db811662d7fb342daee2627871b34672e9df3e3a3bc919c1c24773f45bdc"
+      },
+      "cpio_origin_metadata_revalidation": {
+        "bytes": 6633,
+        "sha256": "a4fd9272a9099019c590787750fb583fe0b7c9c183301b07b2d5baa309c79986"
+      },
+      "current_kernel_retention": {
+        "bytes": 3911,
+        "sha256": "bf3f6f254f681db4f48e931f103726e8a02d004b5f41402cbaf37362502379bf"
+      },
+      "current_source_metadata_bridge": {
+        "bytes": 7663,
+        "sha256": "69d90e319f3054315771a2a04274d8e77af9a74fd31b2718abed9beb2b0bf93d"
+      },
+      "diagnostic_kernel_build": {
+        "bytes": 706669,
+        "sha256": "71820458d456fc7a95246d04f57d482f3b0dadb6a4b2ce862ef0ea87f1893328"
+      },
+      "helper_binding": {
+        "bytes": 834472,
+        "sha256": "ffb9b324c18d27dac77f4cef7ccb0154bb10859d4aa2e02a469ba109e9291f29"
+      },
+      "helper_build": {
+        "bytes": 834393,
+        "sha256": "12782225fbdeafc8a540ee2e524e685e58e9d01a524a6353393e25644cdeda0b"
+      },
+      "normal_artifacts": {
+        "bytes": 4569,
+        "sha256": "d9a09e4a99ed1fc208933ad5da41a9b22d2a555222968f8860a6e0df1437be60"
+      },
+      "normal_build_result": {
+        "bytes": 465326,
+        "sha256": "b1a46ddfdaa5d255b643dcffaa6a6eb1c6403b6a572bd1aad2429df1ba69e774"
+      },
+      "normal_kernel_proof": {
+        "bytes": 235688,
+        "sha256": "d7157c13d4634cc41fc4a28d70a6688aaa89b243ad542c1f7ef0e4cd5ec9d8ec"
+      },
+      "normal_log": {
+        "bytes": 1909,
+        "sha256": "b8982b81b55e4b85f4a40a5d36bcc239c4de89d44fd4083d3f5a46cccf6f269c"
+      },
+      "normal_owner": {
+        "bytes": 461,
+        "sha256": "12f0f82f37843f5520e78b4bab0e01682a3989665053056d18e30f3d83f00d1d"
+      },
+      "reference_audit": {
+        "bytes": 21410800,
+        "sha256": "cfaef3b02327d1209c6bf3784dc1d59974f9e633e81daa132090c9fb433e85ee"
+      },
+      "reference_provenance": {
+        "bytes": 11982,
+        "sha256": "649c2e9d6af987c614404cec2a91008d5dd0412f80eba1a9a3362c5e3117ded6"
+      }
+    }
+  },
+  "arm_receipt_commitments": [
+    {
+      "pair_index": 0,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 219974,
+          "sha256": "08458f2bab3af48d3a617b3e89b725a54534a20359bd27725d7ba69788d4b3ce"
+        },
+        "package": {
+          "bytes": 71822,
+          "sha256": "789b7e1b63acd90d08fbac85d14561df7ac48e1a12822acfb4cf082cf8f41677"
+        },
+        "native": {
+          "bytes": 3809356,
+          "sha256": "4dacd71be6109af2bcd13537ae9a6ac0844c8ce735e892f80460713520acbf78"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "906c75698401399bc01c93fc6393d034e1eef554e35bda1bdb773bfa49d26a0e"
+        },
+        "continuous": {
+          "bytes": 6290,
+          "sha256": "bfefefdf6e056917747b032bfb452f3156e161a9d82a37f48485b1267b82f099"
+        },
+        "owner": {
+          "bytes": 1447,
+          "sha256": "633a0d4def1f560b42c0e638625d75d8ed50e2269e99ecf3ea0f0a63c675b8b5"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 0,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219391,
+          "sha256": "9ea5ada4ffc5bde7bff1ad70d3775838b219571e5199d7c46247bff414a1eab4"
+        },
+        "package": {
+          "bytes": 71699,
+          "sha256": "cf4346258dc89833ee8cffa4119c460b0956b42330e9aa719a13924d5de59d07"
+        },
+        "native": {
+          "bytes": 3804461,
+          "sha256": "0942ef95b9dc175cc500d4d3b07abf70aa52e073c6e49894ca5b84d41aa94c01"
+        },
+        "zero": {
+          "bytes": 138647,
+          "sha256": "d31a4ff3069757d3a8044474f140446578533e57b669374c072db8a020e6aaf5"
+        },
+        "continuous": {
+          "bytes": 6260,
+          "sha256": "4b0de39601844aab77ad5060652837abd86f1f99346bb3af1bfd13228fd4a4f6"
+        },
+        "owner": {
+          "bytes": 1439,
+          "sha256": "d33f363add4d8c7436b93c0dc6213aeb61d673d2cf5d5c5e1b8784bb29107e3c"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 1,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219379,
+          "sha256": "b2ad26ca7ab1c28382c746b75cfb1052c1c4d6b0e7dc6624248f666b25ad956a"
+        },
+        "package": {
+          "bytes": 71699,
+          "sha256": "d3e971098d64671e6aae7dccdc6a20c62ba4627d1d6d9f16149d6e945f61b763"
+        },
+        "native": {
+          "bytes": 3804435,
+          "sha256": "298da7240785af24d51ce596228621b2c685ca57768072dd68033a15f5d6e9b6"
+        },
+        "zero": {
+          "bytes": 138654,
+          "sha256": "66d258e2e250a768829a9e0fb87afa50daaae98c3bc9a5f74fd018828c92a2b4"
+        },
+        "continuous": {
+          "bytes": 6258,
+          "sha256": "3254ada3547ab9290f5274f0384646bf447ed797d6f3613b2a11b2a468fc7983"
+        },
+        "owner": {
+          "bytes": 1441,
+          "sha256": "95094b0a9b5c672959f43c5ab64f69671f6c821acfadaa188ccd5fc352642a78"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 1,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221236,
+          "sha256": "c40756bec07edd205cd232b2fe05104bee8fa50f6b6cbd3005bd489881fc9c4b"
+        },
+        "package": {
+          "bytes": 71822,
+          "sha256": "dfb06f1e8be3db439ce02fce8c3ba116741b594fae22396bf457882a8f3857f5"
+        },
+        "native": {
+          "bytes": 3809468,
+          "sha256": "a10054aab6b406c5838b6a2e5f1c511f2a6ed3e779166e6810752896815511f4"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "582b2f5e3dfbdf1aeb937adfd3d3e3792b3dfeabbb7ebbcea321e036f64ad7b5"
+        },
+        "continuous": {
+          "bytes": 6292,
+          "sha256": "e5202632e41edf3782940fc25b7782b2ea710583a54c658a87898d5bfe845b52"
+        },
+        "owner": {
+          "bytes": 1447,
+          "sha256": "be09557d6b227dc6e9d226f5277da2db2eff1c605f468d7e203587d6592f1dce"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 2,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221248,
+          "sha256": "97340c0bdc5f16843dc088bca73fa11ede8b0019bacbed9d4fc49699b1db92cf"
+        },
+        "package": {
+          "bytes": 71821,
+          "sha256": "518489a28c9512eb4428686f3f0b38d0f8ac44709e6c80cacfedeac6245dc0ff"
+        },
+        "native": {
+          "bytes": 3809597,
+          "sha256": "d5f361358b626062ad784cb0cc6a39d56a185836441a3024ebedbbdbf17a008b"
+        },
+        "zero": {
+          "bytes": 138680,
+          "sha256": "657268b72b65ec3caf9bbc883eea952c8fa109013ec29f0da61a5f700c2b38d9"
+        },
+        "continuous": {
+          "bytes": 6290,
+          "sha256": "51a9fda7a68c6ca190f1ce1a93f82b922c6ada82d7bd8fbcfbd3c7433fce5b85"
+        },
+        "owner": {
+          "bytes": 1444,
+          "sha256": "f80eaeaf24bbb4fd0c4b303ca55744b0f0ff60223f6223e422867adae76dd8c1"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 2,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219391,
+          "sha256": "14755e6da72a8836f899e6a1e96aea5cb4df8fe34a3a6d70dc410c1c5c8c7cc7"
+        },
+        "package": {
+          "bytes": 71698,
+          "sha256": "dfca863e5a5da789f3cc2a8c291e2954c7394fc83f4032bb9f4ef2503e0cd2fc"
+        },
+        "native": {
+          "bytes": 3804517,
+          "sha256": "6ad4959205191fd799f64b0419d72968702d06f8f8c142e9a9c9e74428b1273b"
+        },
+        "zero": {
+          "bytes": 138652,
+          "sha256": "4ca1251b7502c772c9f2c26830158100bb53f78836130ae11ca3b3ad659869c9"
+        },
+        "continuous": {
+          "bytes": 6261,
+          "sha256": "e13ac21ab81afa75dd3907eb3417aa33c1e7ea801dc79facd45c3162e5244369"
+        },
+        "owner": {
+          "bytes": 1439,
+          "sha256": "4603a32122a85a16463134664f483637aeeb9062ef586329c259a3d75aa57ca0"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 3,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219379,
+          "sha256": "7b78fc903dacfa9f8e24ba2dc607f9715c5c6708b88742cf7c143974525f8612"
+        },
+        "package": {
+          "bytes": 71698,
+          "sha256": "54c5f8e27ca1a53683e526b1bd3b812041284257123a2db666e51649c46e1f4c"
+        },
+        "native": {
+          "bytes": 3804351,
+          "sha256": "26ce546dfb567829446a233a77939c7a3dcf85dd0698be6b34a899f76bee04e7"
+        },
+        "zero": {
+          "bytes": 138653,
+          "sha256": "8f09267b4ebccc97a5af22425c7c8f567d41f4210959d80b828bc54da2586cc6"
+        },
+        "continuous": {
+          "bytes": 6260,
+          "sha256": "e4c077b45ea8065d7bb13f4b9669cc6d74c770a808812ac8c5ff67e94b241504"
+        },
+        "owner": {
+          "bytes": 1441,
+          "sha256": "14a762e03cd34c1f148e55570f8e14d92bc9202fb5d3fe93c35d0fcc85e5f014"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 3,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221236,
+          "sha256": "b54486e583c6a75b8f774fd73ccf53dc14f3bfd3b65c7b3804a2b9cbf533dc66"
+        },
+        "package": {
+          "bytes": 71821,
+          "sha256": "9470ba35a319b322941e81a75aa3a9a8d9c8c1beb75f7e570ad96511ada02b7d"
+        },
+        "native": {
+          "bytes": 3809490,
+          "sha256": "641e7b0a2af20ceec26853889ac89b41c468c57f8cead6bcd9d0ff42e90c8977"
+        },
+        "zero": {
+          "bytes": 138680,
+          "sha256": "0f17fbfa6f942fe2c5410f9f60e10ff9d9982e72704351ef4de85f01edb32df4"
+        },
+        "continuous": {
+          "bytes": 6291,
+          "sha256": "e101a82182de388c8a61f4777c5a448fa2b3a46a518535a18967b9ff301c209f"
+        },
+        "owner": {
+          "bytes": 1446,
+          "sha256": "b75ba560d54c1b8129060de33bfa7adfa25677382fe4a5bf14bd92a374dfa2aa"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 4,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221248,
+          "sha256": "7e9187de3d2ee17598f4014091c8d64d4d1b942b5a899f98ec09e847a2f6ab11"
+        },
+        "package": {
+          "bytes": 71821,
+          "sha256": "b871582b092bc541d56351a92b6b544449375daf544a76460ccdf90b4c7960bf"
+        },
+        "native": {
+          "bytes": 3809547,
+          "sha256": "c81b9645a34168da879d734c0f73fc75edeabb4bdefac4d89200dd04e9e6d1e7"
+        },
+        "zero": {
+          "bytes": 138680,
+          "sha256": "d6755f929aae6aa133f8dd5068981e357683444090b57ca4370d512281b78b70"
+        },
+        "continuous": {
+          "bytes": 6291,
+          "sha256": "da3e145076163f2bf57dcb7a5ae5637d999572c1806f420018b2b73e1df8b4a4"
+        },
+        "owner": {
+          "bytes": 1447,
+          "sha256": "a2eb4164d79d743a122cd4348ff5f988916f475fa8204cc91f5db2b2c163e012"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 4,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219391,
+          "sha256": "d6ffa23b5afdc76063976e739dab69ed2b5503c2173a07d77d71f2831f054b93"
+        },
+        "package": {
+          "bytes": 71700,
+          "sha256": "2f43585352bd43d8865522ce184063742bfc8a1e3822609b7ded6e4838322507"
+        },
+        "native": {
+          "bytes": 3804427,
+          "sha256": "7f90313cece94434449993359f4ab339a6768f6a06ec33bd3849a13ee2df0949"
+        },
+        "zero": {
+          "bytes": 138648,
+          "sha256": "cb67eb8792be08c86f26460d3b34305b419400b28cb54968da958e8d8f3ab2cf"
+        },
+        "continuous": {
+          "bytes": 6261,
+          "sha256": "570b698f0a3bd3b718e5bb9b251a2d8a3471a71b78e5be9c63c3bf4b4014c55d"
+        },
+        "owner": {
+          "bytes": 1441,
+          "sha256": "600e06547f627d96be7a090fa32d01136a7ea5506a020750828bbacf63dd0bfe"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 5,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219379,
+          "sha256": "efaa81fb876d2ea6e8acb331ba51aab267f425567c4f261a7ec66a8cba52c8f2"
+        },
+        "package": {
+          "bytes": 71699,
+          "sha256": "82e5236379a62401c246dcddf96763f9e1af31846b13f8a90bfb1950eeac7405"
+        },
+        "native": {
+          "bytes": 3804536,
+          "sha256": "9829f11a7d2496ecdf2676c8e1f80b6a20501b4b3f6489bc2f524fd3c45ac89a"
+        },
+        "zero": {
+          "bytes": 138647,
+          "sha256": "350eaaa0fa2e1bb0d591c4fbc32ae569ee9462e7fcd603bb25e38b850ab541e6"
+        },
+        "continuous": {
+          "bytes": 6262,
+          "sha256": "65e6f2c450cf16d766df63323ca330026f227abbbf77cfd4d4e982aa2073c5e6"
+        },
+        "owner": {
+          "bytes": 1441,
+          "sha256": "b4d342374d8435ba106b52e52f54fd790d3b6f7a33ba2cbf87b4231c4efe43c6"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 5,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221236,
+          "sha256": "a11277a878bb6e64720e6ec6f425c55b168034d9de94076b795744c5466af670"
+        },
+        "package": {
+          "bytes": 71821,
+          "sha256": "25c8309c4cc5f30bc5a37607b85227d81aefdaa198870aaa3ad5417c3a9671fe"
+        },
+        "native": {
+          "bytes": 3809505,
+          "sha256": "7d25a638dd1825415ac31c43741db84fd4f9e158aa7e1d64fbed7ed760752001"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "135a144cdc52765895fb500f3fedfbcdec258a443216d11b6bf6ff55623d74d4"
+        },
+        "continuous": {
+          "bytes": 6289,
+          "sha256": "01f5de2b9d1770301a50f1e9fd3b1534637111ed91cdc5eddd992f3af775e4ca"
+        },
+        "owner": {
+          "bytes": 1446,
+          "sha256": "42f84103602fccb8fda560edb21f46f5703949adf04f27079db108ed51471933"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 6,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221248,
+          "sha256": "1939f8304bb67ef216bf0e3223384dd8123638deddadeac533c7cc5981a665c7"
+        },
+        "package": {
+          "bytes": 71820,
+          "sha256": "19b4b2f9643a9914ecfb15e87dc31dc91e53d9d6fa7b94e66cdb576a0ce418de"
+        },
+        "native": {
+          "bytes": 3809464,
+          "sha256": "71b40b213991bad114088b1916a3aa7721d027d514e18e1bb74679febcec4b65"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "b411e1c367517e672aa9202d87dd6835e05f6d4bd41bd339b396d9d80375102b"
+        },
+        "continuous": {
+          "bytes": 6292,
+          "sha256": "b66b03f5bddc2700e16e90b84ae210fc6bb82de83d90c7593611128382d3ece8"
+        },
+        "owner": {
+          "bytes": 1446,
+          "sha256": "0df96d5566685f271d20b8ad818bc529792496e7d6cd2e94dd641f763e482180"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 6,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219391,
+          "sha256": "af11f18085482d64a8fb990f443f9fc0a676ae03e965ecada8ccacff21b912eb"
+        },
+        "package": {
+          "bytes": 71699,
+          "sha256": "a458a157ab00ac9bb73662a51c3cb19ebe7625fee63b0a3609d2edc9d4f83b05"
+        },
+        "native": {
+          "bytes": 3804562,
+          "sha256": "02754b5a83eb9e37d324619bc361fdee02a1b50c05db0e2ad633055950adce06"
+        },
+        "zero": {
+          "bytes": 138650,
+          "sha256": "8218ce786cac5884b36226ebc4cb06c7df5054049943ba24556b51d78d8725f6"
+        },
+        "continuous": {
+          "bytes": 6260,
+          "sha256": "1b29e58c72479bedc7a48f3b55032462fba20e288becb9c6d579e6cd72bbbf19"
+        },
+        "owner": {
+          "bytes": 1441,
+          "sha256": "e56efe1f8b2f6f0640b8d2ca2bf46b91d1880ec312303c0a950ac733c70fa54f"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 7,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219379,
+          "sha256": "99d54c373cd8553071d39622b1c3aaae077884d6cdd394218eafb30664bacf20"
+        },
+        "package": {
+          "bytes": 71700,
+          "sha256": "ec4a164cb8f04eb7fa982094ed5fdf86f797ef39763d4ec75e35cee029d8ecdd"
+        },
+        "native": {
+          "bytes": 3804524,
+          "sha256": "6b36bec10d2e117c463ce614f8e5b8c3826acaf0d937071cc689c002ab15cb72"
+        },
+        "zero": {
+          "bytes": 138649,
+          "sha256": "bad4a1afe6ce30963723955a1cb09842b17783227de342a0d9893daee1bea1bf"
+        },
+        "continuous": {
+          "bytes": 6259,
+          "sha256": "93a37fed1baf52bd748758caffaae6e88bb8a1c2cd3f442d0a39f7bbfd1d5652"
+        },
+        "owner": {
+          "bytes": 1440,
+          "sha256": "717facd60fc491a54ee9841311ffe31af115fcdc8b75eb298d1bac8d8c954cd8"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 7,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221236,
+          "sha256": "4574fada08e8a7ae9719760a53b1c51db9c1fc3ded8cc22fc08326faec6e6e42"
+        },
+        "package": {
+          "bytes": 71821,
+          "sha256": "e61c79fea437ee2dfc96d2676c88e3e6530c740fedea72109aad7a0b89ecfbfa"
+        },
+        "native": {
+          "bytes": 3809536,
+          "sha256": "ec5e4cc9c4416fa9073d79f4a0622621bd22d8a1899b14a34e777a8bf77043c1"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "683eec6b84b087c5e98c37d6691bc016b48e5d901139a6ed9c9cc2921a5a3233"
+        },
+        "continuous": {
+          "bytes": 6292,
+          "sha256": "736dbe4238d223137df2ec2671dfceb4f111ce594b80337a38cdb87f215d0e18"
+        },
+        "owner": {
+          "bytes": 1446,
+          "sha256": "7553d4946278c7e8b979c4bf98659313437f2966c86f9f39c1376f272596e7c0"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 8,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221248,
+          "sha256": "51d936bf91d720f15de3fbc086107fa00d024c6a243c64c1022194e307924662"
+        },
+        "package": {
+          "bytes": 71820,
+          "sha256": "17e913ecd23bb7e7fe37d07263d2936e015e1c01dc17f5adc987da26c078d118"
+        },
+        "native": {
+          "bytes": 3809578,
+          "sha256": "a29c9ef053f90a85f6ee79909bdbce01199220de2e5b3c935e6820bc08a82a91"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "a7abcc80635599ac4f056a18434d1c9d38dbad4c57e9320347b1ec0f71cb77d0"
+        },
+        "continuous": {
+          "bytes": 6292,
+          "sha256": "e6446f9028ecb016f4740fb5045c3ecbf100f238302d4a3563cb5ab6c39a2fe8"
+        },
+        "owner": {
+          "bytes": 1447,
+          "sha256": "dfaa6770c5f52a06a6543ef5ed018fd6e0401d3608b7cc208805bb479a06d2da"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 8,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219391,
+          "sha256": "292fae4a48a0af9e7a96ccf65fb74cb99975cb09f62a3216485ab08a3d088c46"
+        },
+        "package": {
+          "bytes": 71699,
+          "sha256": "2a4f7420a21ab6a1d35de4ef3c776dba4fa45e4f7a55dc4544c3c569f3ab8a13"
+        },
+        "native": {
+          "bytes": 3804480,
+          "sha256": "4085b3b91ddd00958324a2f8a493c748532f15cfb1afd42d123dc223ea1e0e27"
+        },
+        "zero": {
+          "bytes": 138652,
+          "sha256": "3a467f5f06d7a5cef36d36f492d2318985bcd3de1a77678e4d530feb59fb6c35"
+        },
+        "continuous": {
+          "bytes": 6261,
+          "sha256": "e57c1757f903647c881e9d344c6b445f98686f5b5da04453c97c993fa3f4d5e5"
+        },
+        "owner": {
+          "bytes": 1439,
+          "sha256": "0ee9c91c2606c62c2434be801a000f4d89591d9a6f1f28d92cf86b0cb8d51631"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 9,
+      "kind": "current",
+      "receipts": {
+        "admission": {
+          "bytes": 219379,
+          "sha256": "f1a99c692c0efd2dd607e1a062d383180944e038270799bcc430081487b548da"
+        },
+        "package": {
+          "bytes": 71699,
+          "sha256": "ca0d4c47e315650501878f46e03adeb08636f716e7bfaafdfdd21e10fa215050"
+        },
+        "native": {
+          "bytes": 3804465,
+          "sha256": "133168c52ef1088e696e7df5f4367237657e3c0a3848929ee25804a855d7a75d"
+        },
+        "zero": {
+          "bytes": 138656,
+          "sha256": "bfd66bdce9f22d09990515d1419f70a0d5cea1591f8cbc6bbe54aedb602896b3"
+        },
+        "continuous": {
+          "bytes": 6261,
+          "sha256": "fc0620aae94b18edefa96a578c3fae135b436b81ef96275c6f725d4f3421e7e7"
+        },
+        "owner": {
+          "bytes": 1440,
+          "sha256": "8f18e9424a8ce1429889765d886b29a2a2756cc2c6c43fbf8cdd9e00b27ee864"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    },
+    {
+      "pair_index": 9,
+      "kind": "reference",
+      "receipts": {
+        "admission": {
+          "bytes": 221236,
+          "sha256": "a9ff18debe55cade6aeec5653168f2eafce96f7ee56164a2d691aaa31c485fd6"
+        },
+        "package": {
+          "bytes": 71822,
+          "sha256": "d411d1f4b7bd587ef2d2cc365941da71c244b976be783cc2d8d1db84206d2929"
+        },
+        "native": {
+          "bytes": 3809454,
+          "sha256": "de83f0e73d076f09d15fcb2f902f7a72c030b5d70169794d38868b87da2a4213"
+        },
+        "zero": {
+          "bytes": 138676,
+          "sha256": "d99da13c2a023389155904310fb699038a887a0be90a318a08e642ae712dd7f5"
+        },
+        "continuous": {
+          "bytes": 6292,
+          "sha256": "0f02324e123d963f9f6cbfea2a86e762eeed18fc7b584e4cfb1afc59157bf935"
+        },
+        "owner": {
+          "bytes": 1446,
+          "sha256": "a584aed6c06a11305a54a1ada159c3ffe8d2cd7b350a25e8961cd8ed5440eae7"
+        },
+        "review": {
+          "bytes": 192104,
+          "sha256": "730798782f7d25631354184dc720c79ad382d2ba236541ae08dbc1923370206a"
+        }
+      }
+    }
+  ],
+  "prior_excluded_nonce_count": 138,
+  "reference_base_commit": "940daa28982595e2db37f15b6b9a1115f0aae87b",
+  "physical_NUMA_ten_percent": "UNVERIFIED; accepted virtual-NUMA override",
+  "criterion10_pass": false,
+  "global_runtime_qualified": false,
+  "goal40_complete": false
+}

@@ -397,3 +397,51 @@ assertions with zero failures and natural poweroff; its peak was also
 preserved the original launch guard and unrelated VM. These are native kernel
 tests; scheduled userspace, pressure, huge-page lifetime and performance
 qualification remain separate requirements.
+
+## Final C78 comparison, 2026-10-29
+
+The earlier results retain their original scope. Later scheduled placement,
+lifecycle, pressure and huge-page evidence is bound to its saved runs and source
+applicability records. A separate Fast diagnostic KTEST run passed 1,560 tests
+and 197,815 assertions, with zero failures, three recorded skips and natural
+poweroff. Normal scheduling checks also passed the three-trial weighted-fairness
+workload, with four workers per trial (12 total), and the separate bounded
+affinity stress workload. These results do not establish universal scheduler
+progress or validate subsequent kernel edits.
+
+C78 completed all twenty original UMA arms in ten pairs, alternating reference
+and current order. Each arm passed all 117 warmup and 117 measured cases, all
+eleven raw metrics, natural poweroff and its independent physical-zero check.
+The same eighteen checker inputs were held across all arms. Owned process
+forests closed and disposable images were pruned after every arm; the ten
+required immutable images were preserved within the inclusive 20 GiB budget.
+
+The final result is **FAIL_C10_EXACT_MEDIAN_THROUGHPUT**. Only `fork_cow` fails:
+its current/reference median-rate ratio is **0.9304342821**, below 0.95. The
+other ten metrics pass. All 220 measured durations are retained; no trimming,
+replacement samples or threshold adjustment is permitted. Earlier stopped
+C65/C67/C76/C77 campaigns remain excluded and are not resumed or incorporated
+into this dataset.
+
+The gate divides the current median invocation rate by the reference median
+invocation rate and requires at least 19/20 for every metric. Each invocation
+rate is the exact rational 1,000,000,000/elapsed_ns before either median is taken.
+Paired ratios and their median are diagnostic only. Duration and rate sample
+variances use divisor nine. The [110-row sample CSV](evidence/numa-c78/samples.csv)
+contains all 220 measured durations. The [exact report](evidence/numa-c78/summary.json)
+records rational results, variances, distinct Normal profiles, kernel identities
+and content commitments for the input receipts.
+
+The current arm used the retained Normal current845 kernel (`c8d74b05…`), built
+before the later weighted-fairness fixture, Host-test and documentation changes.
+The follow-up Normal build preserved the six canonical artifacts. The fixed
+reference (`32dbb500…`) is the pre-NUMA base plus the explicitly selected common
+correctness corrections through the shared pending-file-fault repair; it is not
+unmodified 940. Exact kernel hashes, build IDs and build-proof hashes are in the
+report. These measurements apply to those frozen artifacts.
+
+Virtual NUMA remains the accepted qualification environment. The original
+requirement for a ten-percent gain on physical NUMA hardware remains
+**UNVERIFIED**. The earlier renderer fault remains causally unresolved; later
+passing runs alone do not prove its repair. C78 fails criterion ten, and this
+appendix makes no Goal40 completion claim.
