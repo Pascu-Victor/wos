@@ -201,11 +201,18 @@ def main():
             root.with_suffix('.clock').write_text(clock)
             root.with_suffix('.services').write_bytes((source_root/'configs/wos-services-uma-reference.conf').read_bytes())
             return root
-        for mode in ('validators','consumed','positive','pending-exec','eintr','cancel','child-refuse','bad-warm','bad-init','storm','pending-final','bad-final'):
+        for mode in ('diagnostics','validators','consumed','positive','pending-exec','eintr','cancel','child-refuse','bad-warm','bad-init','storm','pending-final','bad-final'):
             case_root=tree(mode)
             text=command('arm-'+mode,[binary,mode,case_root])
             check(mode+' actual compiled controller/audit/observer assertions',
                   re.search(r'ARM_CASE mode='+mode+r' checks=[1-9][0-9]* failures=0\n',text)is not None)
+            owner_lines=[line for line in text.splitlines()if line.startswith(('UMA_OWNER_FAILURE ','UMA_OWNER_INSPECTION ','UMA_OWNER_ENTRY '))]
+            if mode in ('cancel','child-refuse','storm'):
+                check(mode+' actual owner rejection emits exactly three bounded diagnostic lines',
+                      len(owner_lines)==3 and all(len(line.encode())+1<512 for line in owner_lines)
+                      and [line.split()[0]for line in owner_lines]==['UMA_OWNER_FAILURE','UMA_OWNER_INSPECTION','UMA_OWNER_ENTRY'])
+            else:
+                check(mode+' no owner rejection diagnostics on healthy or audit-only paths',not owner_lines)
             if mode in ('pending-exec','pending-final'):
                 if mode=='pending-exec':check('actual pending observer reaches final0', 'PENDING_EXEC_OBSERVER_EXIT=0\n'in text)
                 shutil.copyfile(case_root/'host-poweroff.txt',out/'pending-host-poweroff.txt')

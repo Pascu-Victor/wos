@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include "service_manifest.h"
@@ -86,6 +87,84 @@ auto suite(int argc, char** argv) -> int {
     file(r + "/" + phase + "/summary.tsv", summary, 0644);
     std::printf("=== WOS USERLAND SUITE SUMMARY ===\n%sPASS=117 FAIL=0 SKIP=0\n", summary.c_str());
     return 0;
+}
+auto capture_owner_failure(const uma_reference::PhaseRequest& request, const uma_reference::PhaseOutcome& outcome) -> std::string {
+    std::string path = root + ".diagnostics";
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int saved = ::dup(STDERR_FILENO);
+    if (fd < 0 || saved < 0 || std::fflush(stderr) || ::dup2(fd, STDERR_FILENO) != STDERR_FILENO) ::_exit(98);
+    errno = EDOM;
+    uma_reference::report_owner_failure(request, outcome);
+    bool const ERRNO_PRESERVED = errno == EDOM;
+    if (std::fflush(stderr) || ::dup2(saved, STDERR_FILENO) != STDERR_FILENO || ::close(saved)) ::_exit(98);
+    check(ERRNO_PRESERVED, "actual failure reporter preserves caller errno");
+    struct stat status{};
+    std::array<char, 4096> bytes{};
+    if (::fstat(fd, &status) || status.st_size < 0 || uint64_t(status.st_size) >= bytes.size() || ::lseek(fd, 0, SEEK_SET) != 0)
+        ::_exit(98);
+    ssize_t count = ::read(fd, bytes.data(), bytes.size());
+    if (count != status.st_size || ::close(fd) || ::unlink(path.c_str())) ::_exit(98);
+    std::string result(bytes.data(), size_t(count));
+    size_t at{};
+    unsigned lines{};
+    bool bounded = true;
+    while (at < result.size()) {
+        size_t end = result.find('\n', at);
+        if (end == std::string::npos) {
+            bounded = false;
+            break;
+        }
+        bounded = bounded && end - at + 1 < 512;
+        ++lines;
+        at = end + 1;
+    }
+    check(bounded && lines == 3, "actual failure reporter emits exactly three journal-bounded lines");
+    return result;
+}
+void owner_diagnostics() {
+    using namespace uma_reference;
+    PhaseRequest request{};
+    request.nonce = "ffffffffffffffffffffffffffffffffSENTINEL_NONCE";
+    request.phase = "measureSENTINEL_PHASE";
+    PhaseOutcome outcome{};
+    outcome.failure = static_cast<OwnerFailure>(UINT8_MAX);
+    outcome.child = std::numeric_limits<pid_t>::min();
+    outcome.observed_raw = outcome.consumed_raw = outcome.system_error = std::numeric_limits<int>::min();
+    outcome.nonconsuming_completions = outcome.consuming_completions = outcome.term_calls = outcome.kill_calls = UINT32_MAX;
+    outcome.admitted = outcome.consumed = outcome.raw_phase_zero = true;
+    auto& detail = outcome.inspection;
+    detail.check = static_cast<InspectionCheck>(UINT8_MAX);
+    detail.entry_truncated = detail.syscall_error_valid = detail.metadata_valid = true;
+    detail.directory_fd = detail.system_error = detail.syscall_result = std::numeric_limits<int>::min();
+    detail.depth = UINT32_MAX;
+    detail.observed = detail.limit = detail.device = detail.inode = detail.mode = detail.uid = detail.gid = detail.links = UINT64_MAX;
+    detail.size = INT64_MIN;
+    constexpr std::array<unsigned char, 5> RAW = {0x0a, 0x0d, 0x1b, 0x80, 0xff};
+    for (size_t i = 0; i < detail.entry.size() - 1; ++i) detail.entry[i] = static_cast<char>(RAW[i % RAW.size()]);
+    std::string expected_hex;
+    for (unsigned i = 0; i < 25; ++i) expected_hex += "0a0d1b80ff";
+    expected_hex += "0a0d";
+    auto text = capture_owner_failure(request, outcome);
+    check(text.find("SENTINEL") == std::string::npos &&
+              text.find("nonce=ffffffffffffffffffffffffffffffff phase=measure ") != std::string::npos,
+          "actual failure reporter bounds nonce and phase widths");
+    check(text.find("failure=255 check=255 errno_valid=1 error=" + std::to_string(std::numeric_limits<int>::min())) != std::string::npos &&
+              text.find("value=18446744073709551615 limit=18446744073709551615 metadata_valid=1") != std::string::npos &&
+              text.find("size=-9223372036854775808\n") != std::string::npos,
+          "actual failure reporter retains maximum unsigned and minimum signed scalar values");
+    check(text.find("hex=" + expected_hex + " truncated=1\n") != std::string::npos && text.find('\r') == std::string::npos &&
+              text.find('\x1b') == std::string::npos && text.find('\x80') == std::string::npos && text.find('\xff') == std::string::npos,
+          "actual failure reporter hex escapes all127 basename bytes without line injection");
+    detail.entry.back() = 'x';
+    detail.entry_truncated = false;
+    text = capture_owner_failure(request, outcome);
+    check(text.find("hex=" + expected_hex + " truncated=1\n") != std::string::npos,
+          "actual failure reporter bounds an unterminated entry and exposes truncation");
+    text = capture_owner_failure({}, {});
+    check(text.find("failure=0 check=0 errno_valid=0 error=0 old_error=0") != std::string::npos &&
+              text.find("fd=-1 depth=0 result=0 value=0 limit=0 metadata_valid=0") != std::string::npos &&
+              text.find("hex= truncated=0\n") != std::string::npos,
+          "actual failure reporter distinguishes absent inspection and metadata evidence");
 }
 void validators() {
     arm::Profile p{};
@@ -557,7 +636,9 @@ auto main(int argc, char** argv) -> int {
     root = argv[2];
     nonce = "0123456789abcdef0123456789abcdef";
     const char* mode = argv[1];
-    if (!std::strcmp(mode, "validators")) {
+    if (!std::strcmp(mode, "diagnostics")) {
+        owner_diagnostics();
+    } else if (!std::strcmp(mode, "validators")) {
         validators();
         dependency_gate();
     } else if (!std::strcmp(mode, "consumed")) {

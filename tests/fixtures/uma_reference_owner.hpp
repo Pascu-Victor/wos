@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <sys/types.h>
 
+#include <array>
 #include <cstdint>
 
 namespace uma_reference {
@@ -24,6 +25,38 @@ enum class OwnerFailure : uint8_t {
     CLOCK,
     REAP
 };
+// The first rejected inspection predicate only. This supplements OwnerFailure;
+// NONE also covers failures outside inspection and does not imply success.
+enum class InspectionCheck : uint8_t {
+    NONE,
+    DIRECTORY_DEPTH,
+    OPEN_DIRECTORY,
+    DIRECTORY_STREAM,
+    READ_DIRECTORY,
+    ENTRY_COUNT,
+    STAT_ENTRY,
+    OWNER_UID,
+    OWNER_GID,
+    TYPE,
+    LINKS,
+    FILE_SIZE,
+    MODE,
+    OUTPUT_BYTES,
+    TRANSPORT_BYTES,
+    FORMAT_NAME,
+    TIMEOUT_MARKER,
+    CLOSE_DIRECTORY
+};
+struct InspectionDetail {
+    InspectionCheck check{InspectionCheck::NONE};
+    std::array<char, 128> entry{};
+    bool entry_truncated{}, syscall_error_valid{}, metadata_valid{};
+    int directory_fd{-1}, system_error{}, syscall_result{};
+    uint32_t depth{};
+    uint64_t observed{}, limit{};
+    uint64_t device{}, inode{}, mode{}, uid{}, gid{}, links{};
+    int64_t size{};
+};
 struct PhaseRequest {
     const char* phase{};                          // warmup or measure
     const char* nonce{};                          // fixed 32 lower-case hex digits
@@ -39,6 +72,7 @@ struct PhaseRequest {
 };
 struct PhaseOutcome {
     OwnerFailure failure{OwnerFailure::NONE};
+    InspectionDetail inspection{};
     pid_t child{-1};
     int observed_raw{-1}, consumed_raw{-1}, system_error{};
     uint32_t nonconsuming_completions{}, consuming_completions{}, term_calls{}, kill_calls{};
@@ -54,5 +88,9 @@ struct PhaseOutcome {
 // No second phase may start after any failure. Raw phase zero is insufficient
 // without strict full117 decoding and all whole-arm/init/runtime gates.
 [[nodiscard]] auto own_suite_phase(const PhaseRequest& request) -> PhaseOutcome;
+
+// Controller failure path only, after ownership cleanup. Bounded journal lines;
+// entry bytes are hex encoded and the caller's errno is preserved.
+void report_owner_failure(const PhaseRequest& request, const PhaseOutcome& outcome);
 
 }  // namespace uma_reference

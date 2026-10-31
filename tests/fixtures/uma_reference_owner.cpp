@@ -176,26 +176,99 @@ static_assert(sizeof(Admission) == 16);
     ::execve(args[0], args, env);
     ::_exit(126);
 }
+void inspection_failure(InspectionDetail* detail, InspectionCheck check, int dir, const char* name, unsigned depth, int result,
+                        bool error_valid = false, int error = 0, uint64_t observed = 0, uint64_t limit = 0,
+                        const struct stat* metadata = nullptr) noexcept {
+    if (!detail || detail->check != InspectionCheck::NONE) return;
+    int const saved_errno = errno;
+    detail->check = check;
+    detail->directory_fd = dir;
+    detail->depth = depth;
+    detail->syscall_result = result;
+    detail->syscall_error_valid = error_valid;
+    detail->system_error = error_valid ? error : 0;
+    detail->observed = observed;
+    detail->limit = limit;
+    for (char& value : detail->entry) value = '\0';
+    size_t length{};
+    if (name) {
+        while (length + 1 < detail->entry.size() && name[length]) {
+            detail->entry[length] = name[length];
+            ++length;
+        }
+    }
+    detail->entry_truncated = name && name[length] != '\0';
+    detail->metadata_valid = metadata != nullptr;
+    if (metadata) {
+        detail->device = metadata->st_dev;
+        detail->inode = metadata->st_ino;
+        detail->mode = metadata->st_mode;
+        detail->uid = metadata->st_uid;
+        detail->gid = metadata->st_gid;
+        detail->links = metadata->st_nlink;
+        detail->size = metadata->st_size;
+    }
+    errno = saved_errno;
+}
 // Missing files are ordinary while a case is running; every observed object
 // must already satisfy the same ownership/type/size envelope as saved decoding.
-auto observed_file(int dir, const char* name, uint64_t limit, uint64_t& bytes, mode_t mode = 0) -> bool {
+auto observed_file(int dir, const char* name, uint64_t limit, uint64_t& bytes, mode_t mode = 0, InspectionDetail* detail = nullptr)
+    -> bool {
     struct stat s{};
-    if (::fstatat(dir, name, &s, AT_SYMLINK_NOFOLLOW) != 0) return errno == ENOENT;
-    if (!S_ISREG(s.st_mode) || s.st_nlink != 1 || s.st_uid != owner_uid() || s.st_gid != owner_gid() || s.st_size < 0 ||
-        static_cast<uint64_t>(s.st_size) > limit || (mode && (s.st_mode & 07777) != mode))
+    int const result = ::fstatat(dir, name, &s, AT_SYMLINK_NOFOLLOW);
+    if (result != 0) {
+        int const error = errno;
+        if (error == ENOENT) return true;
+        inspection_failure(detail, InspectionCheck::STAT_ENTRY, dir, name, 0, result, true, error);
         return false;
+    }
+    if (!S_ISREG(s.st_mode)) {
+        inspection_failure(detail, InspectionCheck::TYPE, dir, name, 0, result, false, 0, s.st_mode & S_IFMT, S_IFREG, &s);
+        return false;
+    }
+    if (s.st_nlink != 1) {
+        inspection_failure(detail, InspectionCheck::LINKS, dir, name, 0, result, false, 0, s.st_nlink, 1, &s);
+        return false;
+    }
+    uid_t const expected_uid = owner_uid();
+    if (s.st_uid != expected_uid) {
+        inspection_failure(detail, InspectionCheck::OWNER_UID, dir, name, 0, result, false, 0, s.st_uid, expected_uid, &s);
+        return false;
+    }
+    gid_t const expected_gid = owner_gid();
+    if (s.st_gid != expected_gid) {
+        inspection_failure(detail, InspectionCheck::OWNER_GID, dir, name, 0, result, false, 0, s.st_gid, expected_gid, &s);
+        return false;
+    }
+    if (s.st_size < 0 || static_cast<uint64_t>(s.st_size) > limit) {
+        inspection_failure(detail, InspectionCheck::FILE_SIZE, dir, name, 0, result, false, 0, static_cast<uint64_t>(s.st_size), limit, &s);
+        return false;
+    }
+    if (mode && (s.st_mode & 07777) != mode) {
+        inspection_failure(detail, InspectionCheck::MODE, dir, name, 0, result, false, 0, s.st_mode & 07777, mode, &s);
+        return false;
+    }
     bytes += static_cast<uint64_t>(s.st_size);
     return true;
 }
 // Mirrors the saved decoder's retained-output scope (all phase descendants
 // except work/timing), including render/mandel/perf outputs and phase.log.
 // These are finite observations, not a hard filesystem quota between polls.
-auto retained_outputs(int dir, unsigned depth, unsigned& entries, uint64_t& bytes) -> bool {
-    if (depth > 8) return false;
+auto retained_outputs(int dir, unsigned depth, unsigned& entries, uint64_t& bytes, InspectionDetail* detail = nullptr) -> bool {
+    if (depth > 8) {
+        inspection_failure(detail, InspectionCheck::DIRECTORY_DEPTH, dir, ".", depth, 0, false, 0, depth, 8);
+        return false;
+    }
     int fd = ::openat(dir, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        int const error = errno;
+        inspection_failure(detail, InspectionCheck::OPEN_DIRECTORY, dir, ".", depth, fd, true, error);
+        return false;
+    }
     DIR* stream = ::fdopendir(fd);
     if (!stream) {
+        int const error = errno;
+        inspection_failure(detail, InspectionCheck::DIRECTORY_STREAM, fd, ".", depth, 0, true, error);
         (void)::close(fd);
         return false;
     }
@@ -204,63 +277,132 @@ auto retained_outputs(int dir, unsigned depth, unsigned& entries, uint64_t& byte
         errno = 0;
         dirent* entry = ::readdir(stream);
         if (!entry) {
-            if (errno) valid = false;
+            int const error = errno;
+            if (error) {
+                inspection_failure(detail, InspectionCheck::READ_DIRECTORY, fd, ".", depth, 0, true, error);
+                valid = false;
+            }
             break;
         }
         if (!std::strcmp(entry->d_name, ".") || !std::strcmp(entry->d_name, "..")) continue;
         if (++entries > 4096) {
+            inspection_failure(detail, InspectionCheck::ENTRY_COUNT, fd, entry->d_name, depth, 0, false, 0, entries, 4096);
             valid = false;
             break;
         }
         if (depth == 0 && (!std::strcmp(entry->d_name, "work") || !std::strcmp(entry->d_name, "timing"))) continue;
         struct stat s{};
-        if (::fstatat(fd, entry->d_name, &s, AT_SYMLINK_NOFOLLOW) != 0 || s.st_uid != owner_uid() || s.st_gid != owner_gid()) {
+        int const result = ::fstatat(fd, entry->d_name, &s, AT_SYMLINK_NOFOLLOW);
+        if (result != 0) {
+            int const error = errno;
+            inspection_failure(detail, InspectionCheck::STAT_ENTRY, fd, entry->d_name, depth, result, true, error);
+            valid = false;
+            break;
+        }
+        uid_t const expected_uid = owner_uid();
+        if (s.st_uid != expected_uid) {
+            inspection_failure(detail, InspectionCheck::OWNER_UID, fd, entry->d_name, depth, result, false, 0, s.st_uid, expected_uid, &s);
+            valid = false;
+            break;
+        }
+        gid_t const expected_gid = owner_gid();
+        if (s.st_gid != expected_gid) {
+            inspection_failure(detail, InspectionCheck::OWNER_GID, fd, entry->d_name, depth, result, false, 0, s.st_gid, expected_gid, &s);
             valid = false;
             break;
         }
         if (S_ISDIR(s.st_mode)) {
             Fd child(::openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-            if (child.value < 0 || !retained_outputs(child.value, depth + 1, entries, bytes)) {
+            if (child.value < 0) {
+                int const error = errno;
+                inspection_failure(detail, InspectionCheck::OPEN_DIRECTORY, fd, entry->d_name, depth, child.value, true, error, 0, 0, &s);
+                valid = false;
+                break;
+            }
+            if (!retained_outputs(child.value, depth + 1, entries, bytes, detail)) {
                 valid = false;
                 break;
             }
         } else {
-            if (!S_ISREG(s.st_mode) || s.st_nlink != 1 || s.st_size < 0 || static_cast<uint64_t>(s.st_size) > FILE_LIMIT) {
+            if (!S_ISREG(s.st_mode)) {
+                inspection_failure(detail, InspectionCheck::TYPE, fd, entry->d_name, depth, result, false, 0, s.st_mode & S_IFMT, S_IFREG,
+                                   &s);
+                valid = false;
+                break;
+            }
+            if (s.st_nlink != 1) {
+                inspection_failure(detail, InspectionCheck::LINKS, fd, entry->d_name, depth, result, false, 0, s.st_nlink, 1, &s);
+                valid = false;
+                break;
+            }
+            if (s.st_size < 0 || static_cast<uint64_t>(s.st_size) > FILE_LIMIT) {
+                inspection_failure(detail, InspectionCheck::FILE_SIZE, fd, entry->d_name, depth, result, false, 0,
+                                   static_cast<uint64_t>(s.st_size), FILE_LIMIT, &s);
                 valid = false;
                 break;
             }
             bytes += static_cast<uint64_t>(s.st_size);
             if (bytes > OUTPUT_LIMIT) {
+                inspection_failure(detail, InspectionCheck::OUTPUT_BYTES, fd, entry->d_name, depth, result, false, 0, bytes, OUTPUT_LIMIT,
+                                   &s);
                 valid = false;
                 break;
             }
         }
     }
-    return ::closedir(stream) == 0 && valid;
+    int const closed = ::closedir(stream);
+    if (closed != 0) {
+        int const error = errno;
+        inspection_failure(detail, InspectionCheck::CLOSE_DIRECTORY, fd, ".", depth, closed, true, error);
+    }
+    return closed == 0 && valid;
 }
 auto inspect_phase(int phase, int logs, int work, int timing, const PhaseRequest& r, PhaseOutcome& out) -> OwnerFailure {
     uint64_t output = r.prior_output_bytes, transport = r.prior_transport_bytes + RESERVE;
     unsigned entries{};
     uint64_t metadata_only{};
-    if (!retained_outputs(phase, 0, entries, output) || !observed_file(phase, "summary.tsv", 65536, metadata_only, 0644))
+    if (!retained_outputs(phase, 0, entries, output, &out.inspection) ||
+        !observed_file(phase, "summary.tsv", 65536, metadata_only, 0644, &out.inspection))
         return OwnerFailure::OUTPUT;
     for (auto name : CASES) {
         std::array<char, 128> path{};
-        auto filename = [&](const char* suffix) {
+        auto filename = [&](const char* suffix, int dir) {
             int n = std::snprintf(path.data(), path.size(), "%.*s.%s", static_cast<int>(name.size()), name.data(), suffix);
-            return n > 0 && static_cast<size_t>(n) < path.size();
+            bool const valid = n > 0 && static_cast<size_t>(n) < path.size();
+            if (!valid)
+                inspection_failure(&out.inspection, InspectionCheck::FORMAT_NAME, dir, name.data(), 0, n, false, 0,
+                                   n > 0 ? static_cast<uint64_t>(n) : 0, path.size() - 1);
+            return valid;
         };
         struct stat marker{};
-        if (!filename("timeout")) return OwnerFailure::OUTPUT;
-        if (::fstatat(work, path.data(), &marker, AT_SYMLINK_NOFOLLOW) == 0) return OwnerFailure::TIMEOUT_MARKER;
-        if (errno != ENOENT) return OwnerFailure::OUTPUT;
-        if (!filename("log") || !observed_file(logs, path.data(), FILE_LIMIT, metadata_only, 0644)) return OwnerFailure::OUTPUT;
+        if (!filename("timeout", work)) return OwnerFailure::OUTPUT;
+        int const result = ::fstatat(work, path.data(), &marker, AT_SYMLINK_NOFOLLOW);
+        if (result == 0) {
+            inspection_failure(&out.inspection, InspectionCheck::TIMEOUT_MARKER, work, path.data(), 0, result, false, 0, 0, 0, &marker);
+            return OwnerFailure::TIMEOUT_MARKER;
+        }
+        int const error = errno;
+        if (error != ENOENT) {
+            inspection_failure(&out.inspection, InspectionCheck::STAT_ENTRY, work, path.data(), 0, result, true, error);
+            return OwnerFailure::OUTPUT;
+        }
+        if (!filename("log", logs) || !observed_file(logs, path.data(), FILE_LIMIT, metadata_only, 0644, &out.inspection))
+            return OwnerFailure::OUTPUT;
         for (size_t i = 0; i < KINDS.size(); ++i)
-            if (!filename(KINDS[i]) || !observed_file(timing, path.data(), KIND_LIMITS[i], transport, 0600)) return OwnerFailure::OUTPUT;
+            if (!filename(KINDS[i], timing) || !observed_file(timing, path.data(), KIND_LIMITS[i], transport, 0600, &out.inspection))
+                return OwnerFailure::OUTPUT;
     }
     if (output > out.output_highwater) out.output_highwater = output;
     if (transport > out.transport_highwater) out.transport_highwater = transport;
-    return output > OUTPUT_LIMIT || transport > TRANSPORT_LIMIT ? OwnerFailure::OUTPUT : OwnerFailure::NONE;
+    if (output > OUTPUT_LIMIT) {
+        inspection_failure(&out.inspection, InspectionCheck::OUTPUT_BYTES, phase, ".", 0, 0, false, 0, output, OUTPUT_LIMIT);
+        return OwnerFailure::OUTPUT;
+    }
+    if (transport > TRANSPORT_LIMIT) {
+        inspection_failure(&out.inspection, InspectionCheck::TRANSPORT_BYTES, timing, ".", 0, 0, false, 0, transport, TRANSPORT_LIMIT);
+        return OwnerFailure::OUTPUT;
+    }
+    return OwnerFailure::NONE;
 }
 }  // namespace
 

@@ -5,6 +5,7 @@ Linux waitid emulates WOS waitpid(WNOWAIT) only in the C++ Host fixture. Actual
 fork/session/FD/signal/status operations execute. No WOS/runtime qualification.
 """
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -185,7 +186,8 @@ def main():
         for label,source in [('arm',support[0]),('stamp',support[2]),('host',support[3]),('aggregate',aggregate)]:
             obj=scratch/(label+'.o');lib.append(obj)
             command('compile-'+label,common+['-MD','-MF',out/(label+'.d'),'-c',source,'-o',obj])
-        command('link-owner', [args.cxx, scratch / 'owner.o', scratch / 'cases.o']+lib+['-o', binary])
+        wraps = ['-Wl,--wrap=fstatat', '-Wl,--wrap=readdir', '-Wl,--wrap=closedir']
+        command('link-owner', [args.cxx, scratch / 'owner.o', scratch / 'cases.o']+lib+wraps+['-o', binary])
         dependencies = set()
         for dep in [out/(label+'.d')for label in ('owner','cases','arm','stamp','host','aggregate')]:
             text = dep.read_text().replace('\\\n', '')
@@ -199,14 +201,57 @@ def main():
             phase.mkdir(mode=0o700)
             for part in ('logs', 'timing', 'work'):
                 (phase / part).mkdir(mode=0o700)
+            if mode in ('stat-eio-cleanup', 'success-empty'):
+                # Existing summary makes the injected EIO occur in the walk,
+                # before its unconditional real closedir cleanup, not in the
+                # later optional-summary observation.
+                fd = os.open(phase / 'summary.tsv', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                os.close(fd)
+            if mode == 'success-empty':
+                files = [(phase / 'logs/testprog_smoke.log', 0o644)] + [
+                    (phase / ('timing/testprog_smoke.' + suffix), 0o600)
+                    for suffix in ('begin', 'end', 'parent', 'wait')]
+                for path, mode_bits in files:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode_bits)
+                    os.close(fd)
+                    check('empty fixture exact mode ' + str(path.relative_to(root)), path.stat().st_mode & 0o7777 == mode_bits)
+            if mode in ('stat-eio-cleanup', 'success-empty'):
+                check(mode + ' real summary exact0644 empty',
+                      (phase / 'summary.tsv').stat().st_mode & 0o7777 == 0o644 and (phase / 'summary.tsv').stat().st_size == 0)
             if mode == 'setup':
                 (phase / 'work').chmod(0o755)
             return root
 
-        for mode in ('success', 'raw', 'cancel', 'late', 'deadline', 'timeout', 'output', 'setup', 'escape'):
-            text = command('owner-' + mode, [binary, mode, tree(mode)], escape=mode == 'escape')
+        inspection_patterns = {
+            'success': r'check=0 errno_valid=0 error=0 metadata=0 .*stat_faults=0 read_faults=0 cleanup_faults=0 entry=',
+            'success-empty': r'check=0 errno_valid=0 error=0 metadata=0 .*stat_faults=0 read_faults=0 cleanup_faults=0 entry=',
+            'stat-eio-cleanup': rf'check=6 errno_valid=1 error={errno.EIO} metadata=0 legacy_error={errno.ESTALE} stat_faults=1 read_faults=0 cleanup_faults=1 entry=summary\.tsv',
+            'phase-log-enoent': rf'check=6 errno_valid=1 error={errno.ENOENT} metadata=0 .*stat_faults=1 read_faults=0 cleanup_faults=0 entry=phase\.log',
+            'readdir-eio-cleanup': rf'check=4 errno_valid=1 error={errno.EIO} metadata=0 legacy_error={errno.ESTALE} stat_faults=0 read_faults=1 cleanup_faults=1 entry=\.',
+            'close-eio': rf'check=17 errno_valid=1 error={errno.EIO} metadata=0 legacy_error={errno.EIO} stat_faults=0 read_faults=0 cleanup_faults=1 entry=\.',
+            'summary-mode': r'check=12 errno_valid=0 error=0 metadata=1 .*stat_faults=0 read_faults=0 cleanup_faults=0 entry=summary.tsv',
+            'output': r'check=11 errno_valid=0 error=0 metadata=1 .*entry=phase.log',
+            'output-total': r'check=13 errno_valid=0 error=0 metadata=1 .*entry=aggregate-[0-4]',
+            'timeout': r'check=16 errno_valid=0 error=0 metadata=1 .*entry=testprog_smoke.timeout',
+        }
+        for mode in ('success', 'success-empty', 'raw', 'cancel', 'late', 'deadline', 'timeout', 'output', 'output-total',
+                     'stat-eio-cleanup', 'phase-log-enoent', 'readdir-eio-cleanup', 'close-eio', 'summary-mode', 'setup', 'escape'):
+            root = tree(mode)
+            text = command('owner-' + mode, [binary, mode, root], escape=mode == 'escape')
             check(mode + ' actual assertions and explicit unknown closure',
                   re.search(r'OWNER_CASE mode=' + mode + r' checks=[1-9][0-9]* failures=0 .*after=0 closure=UNKNOWN\n', text) is not None)
+            if mode in inspection_patterns:
+                check(mode + ' exact first-inspection diagnostics',
+                      re.search(r'^INSPECTION_CASE mode=' + re.escape(mode) + ' ' + inspection_patterns[mode] + r'\n', text, re.M) is not None)
+            if mode == 'summary-mode':
+                summary = root / 'warmup/summary.tsv'
+                check('wrong summary mode is real0600 empty without chmod or stat replacement',
+                      summary.stat().st_mode & 0o7777 == 0o600 and summary.stat().st_size == 0)
+            if mode == 'output-total':
+                sparse = list((root / 'warmup').glob('aggregate-*'))
+                check('aggregate cap uses real bounded sparse output',
+                      len(sparse) == 5 and all(path.stat().st_size == 16 << 20 for path in sparse) and
+                      sum(path.stat().st_blocks * 512 for path in sparse) < 1 << 20)
 
         # Genuine faulty predecessor control: the first completed "peek" consumes
         # membership. The same actual oracle rejects the subsequent final wait.
@@ -217,7 +262,7 @@ def main():
         broken.write_text(old.replace(needle, 'child_wait(out.child, raw, WNOHANG)'))
         mutant = scratch / 'consuming-peek'
         command('compile-consuming-peek', common + ['-c', broken, '-o', scratch / 'consuming-peek.o'])
-        command('link-consuming-peek', [args.cxx, scratch / 'consuming-peek.o', scratch / 'cases.o']+lib+['-o', mutant])
+        command('link-consuming-peek', [args.cxx, scratch / 'consuming-peek.o', scratch / 'cases.o']+lib+wraps+['-o', mutant])
         rejected = command('reject-consuming-peek', [mutant, 'success', tree('control')], expected=1)
         check('real consumed-membership control fails actual status oracle', 'FAIL actual owner exact failure reason' in rejected)
 

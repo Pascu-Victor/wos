@@ -14,6 +14,43 @@
 #ifdef WOS_UMA_ARM_HOST
 extern void uma_arm_host_request(uma_reference::PhaseRequest&);
 #endif
+namespace uma_reference {
+void report_owner_failure(const PhaseRequest& request, const PhaseOutcome& outcome) {
+    int const saved_error = errno;
+    auto const& detail = outcome.inspection;
+    const char* nonce = request.nonce ? request.nonce : "";
+    const char* phase = request.phase ? request.phase : "";
+    std::fprintf(stderr,
+                 "UMA_OWNER_FAILURE v=1 nonce=%.32s phase=%.7s failure=%u check=%u errno_valid=%u error=%d old_error=%d "
+                 "child=%lld raw=%d/%d admitted=%u consumed=%u zero=%u peek=%u reap=%u term=%u kill=%u\n",
+                 nonce, phase, unsigned(outcome.failure), unsigned(detail.check), unsigned(detail.syscall_error_valid), detail.system_error,
+                 outcome.system_error, static_cast<long long>(outcome.child), outcome.observed_raw, outcome.consumed_raw,
+                 unsigned(outcome.admitted), unsigned(outcome.consumed), unsigned(outcome.raw_phase_zero), outcome.nonconsuming_completions,
+                 outcome.consuming_completions, outcome.term_calls, outcome.kill_calls);
+    std::fprintf(stderr,
+                 "UMA_OWNER_INSPECTION v=1 nonce=%.32s phase=%.7s fd=%d depth=%u result=%d value=%llu limit=%llu "
+                 "metadata_valid=%u device=%llu inode=%llu mode=%llu uid=%llu gid=%llu links=%llu size=%lld\n",
+                 nonce, phase, detail.directory_fd, detail.depth, detail.syscall_result, static_cast<unsigned long long>(detail.observed),
+                 static_cast<unsigned long long>(detail.limit), unsigned(detail.metadata_valid),
+                 static_cast<unsigned long long>(detail.device), static_cast<unsigned long long>(detail.inode),
+                 static_cast<unsigned long long>(detail.mode), static_cast<unsigned long long>(detail.uid),
+                 static_cast<unsigned long long>(detail.gid), static_cast<unsigned long long>(detail.links),
+                 static_cast<long long>(detail.size));
+    constexpr char HEX[] = "0123456789abcdef";
+    std::array<char, 255> escaped{};
+    size_t bytes{};
+    while (bytes < detail.entry.size() - 1 && detail.entry[bytes]) {
+        auto value = static_cast<unsigned char>(detail.entry[bytes]);
+        escaped[2 * bytes] = HEX[value >> 4];
+        escaped[2 * bytes + 1] = HEX[value & 15];
+        ++bytes;
+    }
+    bool const truncated = detail.entry_truncated || (bytes == detail.entry.size() - 1 && detail.entry[bytes]);
+    std::fprintf(stderr, "UMA_OWNER_ENTRY v=1 nonce=%.32s phase=%.7s hex=%s truncated=%u\n", nonce, phase, escaped.data(),
+                 unsigned(truncated));
+    errno = saved_error;
+}
+}  // namespace uma_reference
 namespace {
 using namespace uma_reference;
 namespace arm = uma_reference::arm;
@@ -103,8 +140,10 @@ auto run(const char* nonce) -> int {
         // alone. A cancellation after consumption still prevents all successors.
         if (cancellation.value || outcome.failure != OwnerFailure::NONE || !outcome.admitted || !outcome.consumed ||
             outcome.consuming_completions != 1 || !outcome.nonconsuming_completions || outcome.observed_raw || outcome.consumed_raw ||
-            !outcome.raw_phase_zero || !arm::now(clock) || clock >= stop)
+            !outcome.raw_phase_zero || !arm::now(clock) || clock >= stop) {
+            report_owner_failure(request, outcome);
             return 73;
+        }
         if (!arm::audit_phase(phase, nonce, stop, outcome.child, complete.phases[index]) || cancellation.value) return 74;
         auto const& audit = complete.phases[index];
         if (audit.resolution != resolution || audit.cases != 117 || audit.metrics != 11 ||
