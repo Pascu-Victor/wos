@@ -311,9 +311,16 @@ KTEST(UsercopyWritablePin, RestrictedLeafKeepsWritableSibling) {
     KREQUIRE_NE(sibling, nullptr);
     for (unsigned level = 2; level <= 4; ++level) {
         uint64_t const RAW = entry_raw(fixture.root, SECOND_VA, level);
-        KEXPECT_TRUE(paging::shared_write_restricted(RAW));
-        KEXPECT_NE(RAW & paging::PAGE_WRITE, 0U);
+        constexpr uint64_t REQUIRED = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
+        constexpr uint64_t LEAF_POLICY = paging::PAGE_COW | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED | paging::PAGE_PWT |
+                                         paging::PAGE_PCD | paging::PAGE_PAT_4K | paging::PAGE_NX;
+        KEXPECT_EQ(RAW & REQUIRED, REQUIRED);
+        KEXPECT_EQ(RAW & LEAF_POLICY, 0U);
     }
+    uint64_t const RESTRICTED_LEAF = entry_raw(fixture.root, TEST_VA, 1);
+    KEXPECT_TRUE(paging::shared_write_restricted(RESTRICTED_LEAF));
+    KEXPECT_EQ(RESTRICTED_LEAF & paging::PAGE_WRITE, 0U);
+    KEXPECT_FALSE(paging::shared_write_restricted(entry_raw(fixture.root, SECOND_VA, 1)));
     uint32_t const READERS = virt::selftest_user_pagemap_reader_count(fixture.root);
     ObservedPin held;
     KREQUIRE_TRUE(held.acquire(*fixture.owner, TEST_VA, false, false));
@@ -330,6 +337,68 @@ KTEST(UsercopyWritablePin, RestrictedLeafKeepsWritableSibling) {
     held.reset();
     KEXPECT_EQ(sibling[0], 0xB6);
     KEXPECT_EQ(restricted[0], 0x41);
+    KEXPECT_EQ(phys::page_ref_get(restricted), 1U);
+    KEXPECT_EQ(phys::page_ref_get(sibling), 1U);
+    expect_drained(fixture, READERS);
+}
+
+KTEST(UsercopyWritablePin, LegacyRestrictedAncestorsKeepWritableSibling) {
+    PrivateTask fixture;
+    KREQUIRE_TRUE(fixture.init());
+    auto* restricted = fixture.map(TEST_VA, paging::page_types::USER | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED, 0x41);
+    auto* sibling = fixture.map(SECOND_VA, paging::page_types::USER, 0x52);
+    KREQUIRE_NE(restricted, nullptr);
+    KREQUIRE_NE(sibling, nullptr);
+    uint32_t const READERS = virt::selftest_user_pagemap_reader_count(fixture.root);
+    uint64_t const FLAGS = flags_now();
+    std::array<uint64_t, 3> ancestors{};
+    for (unsigned level = 2; level <= 4; ++level) ancestors.at(level - 2) = entry_raw(fixture.root, SECOND_VA, level);
+    {
+        // Model legacy map-created software tags only in this never-active
+        // owned root. The checked exchanges preserve frames and A/D; every
+        // tag is restored by RAII before the fixture's root can be destroyed.
+        constexpr uint64_t TAGS = paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED;
+        EntryChange pml2(fixture, SECOND_VA, 2, 0, TAGS);
+        KREQUIRE_TRUE(pml2.changed);
+        EntryChange pml3(fixture, SECOND_VA, 3, 0, TAGS);
+        KREQUIRE_TRUE(pml3.changed);
+        EntryChange pml4(fixture, SECOND_VA, 4, 0, TAGS);
+        KREQUIRE_TRUE(pml4.changed);
+        for (unsigned level = 2; level <= 4; ++level) {
+            uint64_t const RAW = entry_raw(fixture.root, SECOND_VA, level);
+            KEXPECT_EQ(RAW, ancestors.at(level - 2) | TAGS);
+            KEXPECT_TRUE(paging::shared_write_restricted(RAW));
+            KEXPECT_NE(RAW & paging::PAGE_WRITE, 0U);
+        }
+        uint64_t const RESTRICTED_LEAF = entry_raw(fixture.root, TEST_VA, 1);
+        KEXPECT_TRUE(paging::shared_write_restricted(RESTRICTED_LEAF));
+        KEXPECT_EQ(RESTRICTED_LEAF & paging::PAGE_WRITE, 0U);
+        KEXPECT_FALSE(paging::shared_write_restricted(entry_raw(fixture.root, SECOND_VA, 1)));
+        ObservedPin held;
+        KREQUIRE_TRUE(held.acquire(*fixture.owner, TEST_VA, false, false));
+        KEXPECT_EQ(held.pin.hhdm_page, restricted);
+        held.reset();
+        KEXPECT_FALSE(held.acquire(*fixture.owner, TEST_VA, true, false));
+        expect_route(held, 0, 0, 0);
+        expect_empty(held.pin);
+        KEXPECT_FALSE(held.acquire(*fixture.owner, TEST_VA));
+        expect_route(held, 1, 0, 1);
+        expect_empty(held.pin);
+        KREQUIRE_TRUE(held.acquire(*fixture.owner, SECOND_VA));
+        expect_route(held, 1, 1, 0);
+        KEXPECT_EQ(held.pin.physical_page, physical(sibling));
+        KEXPECT_EQ(phys::page_ref_get(sibling), 2U);
+        write_byte(held.pin, 0xB6);
+        KEXPECT_TRUE(virt::user_page_pin_still_mapped(held.pin));
+        KEXPECT_TRUE(virt::user_page_pin_commit_write(held.pin));
+        held.reset();
+        KEXPECT_EQ(sibling[0], 0xB6);
+        KEXPECT_EQ(restricted[0], 0x41);
+        KEXPECT_EQ(entry_raw(fixture.root, TEST_VA, 1), RESTRICTED_LEAF);
+        expect_drained(fixture, READERS);
+    }
+    for (unsigned level = 2; level <= 4; ++level) KEXPECT_EQ(entry_raw(fixture.root, SECOND_VA, level), ancestors.at(level - 2));
+    KEXPECT_EQ(flags_now(), FLAGS);
     KEXPECT_EQ(phys::page_ref_get(restricted), 1U);
     KEXPECT_EQ(phys::page_ref_get(sibling), 1U);
     expect_drained(fixture, READERS);

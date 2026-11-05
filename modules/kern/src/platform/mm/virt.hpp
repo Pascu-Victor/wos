@@ -80,6 +80,18 @@ struct Range {
     uint64_t end;
 };
 
+// Immutable bootstrap evidence. Hashes summarize per-page physical/selector
+// pairs; bootstrap also compares every pair directly before root replacement.
+// No inherited root or bootloader metadata is retained by this observation.
+struct BootFramebufferCacheAudit {
+    uint64_t pages{};
+    uint64_t inherited_hash{};
+    uint64_t kernel_hash{};
+    uint8_t selector_mask{};
+    bool complete{};
+};
+[[nodiscard]] auto boot_framebuffer_cache_audit() -> BootFramebufferCacheAudit;
+
 struct PageMapBatch {
     PageTable* root{};
     PageTable* pml3{};

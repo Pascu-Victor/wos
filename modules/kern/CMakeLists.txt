@@ -320,6 +320,8 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         src/platform/mm/mm.opt.cpp
         src/platform/mm/addr.opt.cpp
         src/platform/mm/paging.opt.cpp
+        # PAT observations run before the bootstrap root switch and IDT/shadow.
+        src/platform/mm/cache_policy.cpp
         src/platform/mm/page_alloc.cpp
         src/platform/mm/reclaim.cpp
         # Fixed debugger metadata is built before the IDT/shadow handler;

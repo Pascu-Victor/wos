@@ -53,6 +53,13 @@ set_tests_properties(firmware_packaging_test PROPERTIES LABELS "host;unit;integr
 wos_add_unit_test(power_shutdown_targets_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/power_shutdown_targets_test.cpp
 )
+wos_add_unit_test(cache_pte_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/cache_pte_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/paging.opt.cpp
+)
+wos_add_unit_test(cache_policy_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/cache_policy_test.cpp
+)
 wos_add_unit_test(pci_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/pci.cpp

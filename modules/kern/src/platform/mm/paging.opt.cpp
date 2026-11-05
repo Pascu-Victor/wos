@@ -17,11 +17,17 @@ auto create_page_table_entry(uint64_t frame, uint64_t flags) -> PageTableEntry {
     entry.cache_disabled = ((flags & PAGE_PCD) != 0U) ? 1 : 0;
     entry.accessed = 0;
     entry.dirty = 0;
-    entry.pagesize = 0;  // 4KB pages, not large pages
+    entry.pagesize = 0;  // Legacy/nonleaf role never propagates PAT or PS.
     entry.global = 0;
     entry.available = static_cast<uint8_t>((flags >> 9) & 0x7U);
     entry.reserved = 0;  // x86-64 requires reserved bits to be 0
     entry.no_execute = ((flags & PAGE_NX) != 0U) ? 1 : 0;
+    return entry;
+}
+
+auto create_page_table_leaf_4k(uint64_t frame, uint64_t flags) -> PageTableEntry {
+    auto entry = create_page_table_entry(frame, flags);
+    entry.pagesize = (flags & PAGE_PAT_4K) != 0U;
     return entry;
 }
 

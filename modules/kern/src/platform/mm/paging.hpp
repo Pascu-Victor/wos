@@ -44,7 +44,7 @@ struct PageTableEntry {
     uint8_t cache_disabled : 1;
     uint8_t accessed : 1;
     uint8_t dirty : 1;
-    uint8_t pagesize : 1;
+    uint8_t pagesize : 1;  // PS in level 2/3 entries; PAT in a 4 KiB leaf.
     uint8_t global : 1;
     uint8_t available : 3;
     uint64_t frame : 40;
@@ -80,7 +80,12 @@ const static uint64_t PAGE_WRITE = 0x2;
 const static uint64_t PAGE_USER = 0x4;
 const static uint64_t PAGE_PWT = 0x8;   // Page Write-Through
 const static uint64_t PAGE_PCD = 0x10;  // Page Cache Disable (uncacheable)
+inline constexpr uint64_t PAGE_PAT_4K = uint64_t{1} << 7;
 const static uint64_t PAGE_NX = (1ULL << 63);
+
+// Ancestors must remain present and writable even for nonpresent reserved
+// leaves. Only USER follows the leaf; cache, NX and software policy do not.
+[[nodiscard]] constexpr auto table_flags_for_leaf(uint64_t flags) -> uint64_t { return PAGE_PRESENT | PAGE_WRITE | (flags & PAGE_USER); }
 
 // COW (Copy-on-Write) flag: stored in PTE bit 9 (first "available" OS bit).
 // When set, the page is shared and read-only; a write fault triggers a copy.
@@ -125,6 +130,9 @@ const static uint64_t SHADOW_STACK = 6;
 }  // namespace error_flags
 
 PageTableEntry create_page_table_entry(uint64_t frame, uint64_t flags);
+// Explicit leaf role: preserve 4 KiB PAT bit 7 while retaining the legacy
+// constructor's permissions, software ownership bits and reserved-bit clearing.
+PageTableEntry create_page_table_leaf_4k(uint64_t frame, uint64_t flags);
 PageTableEntry purge_page_table_entry();
 PageFault create_page_fault(uint64_t flags, bool is_critical = false);
 

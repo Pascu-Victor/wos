@@ -3420,6 +3420,11 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
                                                    (prot & ker::abi::vmem::PROT_WRITE) != 0, ker::vfs::file_mount_read_only(*file));
     if (POLICY_RET != 0) return static_cast<uint64_t>(POLICY_RET);
 
+    // A device needs a retained mapping provider, including its cache policy
+    // and backing ownership. Copying bytes (or a size-zero file's zero fill)
+    // cannot implement that contract. Refuse before FIXED can replace pages.
+    if ((st.st_mode & ker::vfs::S_IFMT) != ker::vfs::S_IFREG) return static_cast<uint64_t>(-ENODEV);
+
     uint64_t const REQUESTED_SIZE = size;
     size = page_align_up(size);
     if (size == 0 || size > USER_SPACE_END - USER_SPACE_START) {
@@ -3838,6 +3843,11 @@ auto replace_current_file_fixed(ker::mod::sched::task::Task& actor, const ker::m
 }  // namespace detail
 
 #ifdef WOS_SELFTEST
+auto selftest_file_allocate(ker::mod::sched::task::Task& subject, uint64_t hint, uint64_t length, uint64_t prot, uint64_t flags, int fd,
+                            uint64_t offset) -> uint64_t {
+    return file_allocate(&subject, hint, length, prot, flags, fd, offset);
+}
+
 namespace {
 class SelftestImmutableFileHold {
    public:
@@ -4194,13 +4204,13 @@ auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -
             }
         }
     }
-    // Non-regular files force eager materialization. Replace the FD from its
-    // read callback; MAP_PRIVATE has no registry reference to mask final close.
+    // A genuine regular-file fault can replace the descriptor reentrantly.
+    // Its admitted lazy/File owners must keep the original description live.
     for (bool shared : {false, true}) {
         ker::mod::sched::task::Task task;
         task.pagemap = pagemap;
         State state, replacement_state;
-        auto* file = make_file(state, 0, true, false);
+        auto* file = make_file(state, 0, true, true);
         auto* replacement = make_file(replacement_state, 2, false, false);
         if (file == nullptr || replacement == nullptr) {
             vfs::vfs_put_file(file);
@@ -4218,12 +4228,15 @@ auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -
         state.fd = FD;
         uint64_t const RESULT =
             file_allocate(&task, BASE, SIZE, vm::PROT_READ, vm::MAP_FIXED | (shared ? vm::MAP_SHARED : vm::MAP_PRIVATE), FD, 0);
-        bool ok = RESULT == BASE && state.replaced && state.reads == 1 && replacement_state.reads == 0 && state.close_unlocked;
+        bool ok = RESULT == BASE && state.reads == 0 && !task.lazy_vmem_ranges.empty();
         {
             SharedVmemPublicationGuard guard;
+            if (!task.lazy_vmem_ranges.empty()) {
+                paging::PageFault fault{};
+                ok = materialize_lazy_file_page(&task, task.lazy_vmem_ranges[0], BASE, fault) && ok;
+            }
+            ok = ok && state.replaced && state.reads == 1 && replacement_state.reads == 0 && state.closes == 0 && state.close_unlocked;
             ok = ok && authorize_shared_file_protection_locked(pagemap, BASE, SIZE, vm::PROT_WRITE) == (shared ? -EACCES : 0);
-            ker::util::SmallVec<FileMmapSyncRange, 8> sync;
-            ok = ok && collect_file_mmap_sync_ranges(pagemap, BASE, SIZE, sync) == 0 && sync.empty();
         }
         unregister_file_mmap_range(pagemap, BASE, SIZE);
         remove_lazy_vmem_range(&task, BASE, SIZE);

@@ -25,6 +25,8 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/cache_bits.hpp>
+#include <platform/mm/cache_policy.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/numa_root_reserve.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -4850,20 +4852,6 @@ auto entry_at(PageTable* table, size_t index) -> PageTableEntry& { return table-
 
 auto entry_at(const PageTable* table, size_t index) -> const PageTableEntry& { return table->entries[index]; }
 
-auto table_flags_for_leaf(const uint64_t FLAGS) -> uint64_t {
-    uint64_t table_flags = paging::PAGE_PRESENT | paging::PAGE_WRITE;
-    if ((FLAGS & paging::PAGE_USER) != 0U) {
-        table_flags |= paging::PAGE_USER;
-    }
-    if ((FLAGS & paging::PAGE_PWT) != 0U) {
-        table_flags |= paging::PAGE_PWT;
-    }
-    if ((FLAGS & paging::PAGE_PCD) != 0U) {
-        table_flags |= paging::PAGE_PCD;
-    }
-    return table_flags;
-}
-
 auto is_aligned_to(uint64_t value, uint64_t alignment) -> bool { return (value & (alignment - 1)) == 0; }
 
 auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted = nullptr) -> paging::PageTable*;
@@ -6473,6 +6461,7 @@ struct MappingPermissions {
     bool executable{};
     bool user{};
     paddr_t physical = PADDR_INVALID;
+    uint8_t cache_selector{};
 };
 
 auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
@@ -6494,6 +6483,12 @@ auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
             // Bit 12 is PAT in a large leaf; other low frame bits are reserved.
             uint64_t const FRAME = entry.frame << paging::PAGE_SHIFT;
             if (level != 1 && (FRAME & MASK & ~uint64_t{4096}) != 0) return {};
+            uint64_t const SELECTOR_BITS = FRAME | uint64_t{1} | (static_cast<uint64_t>(entry.write_through) << 3) |
+                                           (static_cast<uint64_t>(entry.cache_disabled) << 4) |
+                                           (static_cast<uint64_t>(entry.pagesize) << 7);
+            auto const SELECTOR = cache::leaf_selector(SELECTOR_BITS, static_cast<unsigned>(level));
+            if (!SELECTOR) return {};
+            result.cache_selector = *SELECTOR;
             result.physical = (FRAME & ~MASK) + (vaddr & MASK);
             return result;
         }
@@ -6623,7 +6618,89 @@ auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags, b
     }
     return stats;
 }
+
+BootFramebufferCacheAudit framebuffer_cache_audit{};
+std::atomic<bool> framebuffer_cache_audit_ready{false};
+constexpr uint64_t CACHE_AUDIT_HASH_SEED = 0xcbf29ce484222325ULL;
+
+void hash_cache_identity(uint64_t& hash, uint64_t physical, uint8_t selector) {
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= (physical >> shift) & 255U;
+        hash *= 0x100000001b3ULL;
+    }
+    hash ^= selector;
+    hash *= 0x100000001b3ULL;
+}
+
+[[noreturn]] void inherited_framebuffer_refusal(uint64_t physical) {
+    log::critical("cannot preserve inherited framebuffer cache identity at physical=%p", physical);
+    hcf();
+}
+
+auto framebuffer_page_range(const limine_memmap_entry* entry) -> Range {
+    // Limine permits an unaligned framebuffer descriptor but maps every page
+    // touched by it. Include both partial pages without wrapping the end.
+    if (entry == nullptr) inherited_framebuffer_refusal(0);
+    auto const EXTENT = cache::framebuffer_page_extent(entry->base, entry->length);
+    if (!EXTENT) inherited_framebuffer_refusal(entry->base);
+    return Range{.start = EXTENT->start, .end = EXTENT->end};
+}
+
+auto inherited_framebuffer_page(PageTable* inherited, uint64_t physical) -> MappingPermissions {
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    if (physical > UINT64_MAX - HHDM) inherited_framebuffer_refusal(physical);
+    auto const OBSERVED = mapping_permissions(inherited, HHDM + physical);
+    if (!OBSERVED.present || OBSERVED.user || OBSERVED.physical != physical) inherited_framebuffer_refusal(physical);
+    return OBSERVED;
+}
+
+auto map_boot_framebuffer_range(PageTable* target, PageTable* inherited, Range range, uint64_t flags) -> BootDirectMapStats {
+    BootDirectMapStats stats{};
+    if (!range_valid(range)) return stats;
+    PageMapBatch batch{};
+    init_page_map_batch(&batch, target, flags);
+    for (uint64_t physical = range.start; physical < range.end; physical += paging::PAGE_SIZE) {
+        auto const BEFORE = inherited_framebuffer_page(inherited, physical);
+        auto const SELECTOR_FLAGS = cache::selector_flags_4k(BEFORE.cache_selector);
+        if (!SELECTOR_FLAGS) inherited_framebuffer_refusal(physical);
+        // Same physical memory and inherited PAT index: no runtime cache-type
+        // conversion, cache flush, framebuffer access or allocator reference.
+        map_page_batched(&batch, reinterpret_cast<vaddr_t>(addr::get_virt_pointer(physical)), physical, flags | *SELECTOR_FLAGS);
+        hash_cache_identity(framebuffer_cache_audit.inherited_hash, physical, BEFORE.cache_selector);
+        framebuffer_cache_audit.selector_mask |= static_cast<uint8_t>(1U << BEFORE.cache_selector);
+        ++framebuffer_cache_audit.pages;
+        ++stats.pages;
+        ++stats.small_4k;
+    }
+    flush_page_map_batch(&batch);
+    return stats;
+}
+
+void audit_boot_framebuffer_ranges(PageTable* target, PageTable* inherited) {
+    uint64_t pages = 0;
+    // Check after all direct-map, kernel-section and page-table fixups, before
+    // the root switch. No later bootstrap mapping may overwrite the selector.
+    for (size_t i = 0; i < memmap_response->entry_count; ++i) {
+        auto const* entry = memmap_response->entries[i];
+        if (entry->type != LIMINE_MEMMAP_FRAMEBUFFER) continue;
+        Range const RANGE = framebuffer_page_range(entry);
+        for (uint64_t physical = RANGE.start; physical < RANGE.end; physical += paging::PAGE_SIZE) {
+            auto const BEFORE = inherited_framebuffer_page(inherited, physical);
+            auto const AFTER = mapping_permissions(target, reinterpret_cast<vaddr_t>(addr::get_virt_pointer(physical)));
+            if (!AFTER.present || AFTER.user || AFTER.physical != physical || AFTER.cache_selector != BEFORE.cache_selector)
+                inherited_framebuffer_refusal(physical);
+            hash_cache_identity(framebuffer_cache_audit.kernel_hash, physical, AFTER.cache_selector);
+            ++pages;
+        }
+    }
+    if (pages != framebuffer_cache_audit.pages || framebuffer_cache_audit.inherited_hash != framebuffer_cache_audit.kernel_hash)
+        inherited_framebuffer_refusal(0);
+}
 }  // namespace
+
+auto boot_framebuffer_cache_audit() -> BootFramebufferCacheAudit {
+    return framebuffer_cache_audit_ready.load(std::memory_order_acquire) ? framebuffer_cache_audit : BootFramebufferCacheAudit{};
+}
 
 void init_tlb_shootdown() {
     bool expected = false;
@@ -7276,12 +7353,12 @@ auto selftest_exchange_unpublished_user_entry(sched::task::Task& task, PageTable
         vaddr >= 0x0000800000000000ULL || level < 1 || level > 4) {
         return false;
     }
-    uint64_t allowed = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITE | paging::PAGE_COW;
+    // Exercise historical ancestor software tags without changing frames or
+    // hardware A/D state. Real table construction never propagates these tags.
+    uint64_t allowed = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITE | paging::PAGE_COW | paging::PAGE_SHARED |
+                       paging::PAGE_WRITE_RESTRICTED;
     if (level == 2 || level == 3) {
         allowed |= 1ULL << 7U;
-    }
-    if (level == 1) {
-        allowed |= paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED;
     }
     if (((expected_raw ^ replacement_raw) & ~allowed) != 0U) {
         return false;
@@ -9835,6 +9912,15 @@ void start_anonymous_swap_worker() {
 }
 
 void init_pagemap() {
+    // Observe inherited policy without writing PAT/MTRRs. This qualifies only
+    // encodings; future device maps still need physical/MTRR/alias ownership.
+    if (!cache::configure_boot_cpu_count(smt::get_early_cpu_count()) || !cache::capture_boot_cpu(0)) {
+        log::critical("cannot record BSP cache policy");
+        hcf();
+    }
+    auto* const INHERITED_ROOT = reinterpret_cast<PageTable*>(addr::get_virt_pointer(rdcr3() & PTE_FRAME_MASK));
+    framebuffer_cache_audit.inherited_hash = CACHE_AUDIT_HASH_SEED;
+    framebuffer_cache_audit.kernel_hash = CACHE_AUDIT_HASH_SEED;
     // PAGE_NX is reserved until EFER.NXE is active. Configure the BSP before
     // constructing or loading any page table that contains NX leaves.
     kernel_nx_supported = cpu::enable_nx();
@@ -9890,12 +9976,17 @@ void init_pagemap() {
     for (size_t i = 0; i < memmap_response->entry_count; i++) {
         auto* entry = memmap_response->entries[i];
         Range entry_range{};
-        if (!memmap_page_range(entry, entry_range)) {
+        if (entry->type == LIMINE_MEMMAP_FRAMEBUFFER) {
+            entry_range = framebuffer_page_range(entry);
+        } else if (!memmap_page_range(entry, entry_range)) {
             continue;
         }
 
-        BootDirectMapStats const ENTRY_STATS = map_boot_direct_range(kernel_pagemap, entry_range, direct_map_flags_for_entry(entry->type),
-                                                                     boot_direct_map_allows_2m(entry->type));
+        BootDirectMapStats const ENTRY_STATS =
+            entry->type == LIMINE_MEMMAP_FRAMEBUFFER
+                ? map_boot_framebuffer_range(kernel_pagemap, INHERITED_ROOT, entry_range, direct_map_flags_for_entry(entry->type))
+                : map_boot_direct_range(kernel_pagemap, entry_range, direct_map_flags_for_entry(entry->type),
+                                        boot_direct_map_allows_2m(entry->type));
         direct_map_stats.pages += ENTRY_STATS.pages;
         direct_map_stats.small_4k += ENTRY_STATS.small_4k;
         direct_map_stats.large_2m += ENTRY_STATS.large_2m;
@@ -10062,6 +10153,7 @@ void init_pagemap() {
     entry_at(kernel_pagemap, 0) = PageTableEntry{};
     log::info("cleared PML4[0] - null derefs will now fault");
 
+    audit_boot_framebuffer_ranges(kernel_pagemap, INHERITED_ROOT);
     switch_to_kernel_pagemap();
     KernelProtectionAudit const AUDIT = audit_kernel_protections();
     bool const BASELINE_VALID = AUDIT.write_protect_active && AUDIT.layout_valid && AUDIT.text_readonly && AUDIT.text_executable &&
@@ -10085,6 +10177,11 @@ void init_pagemap() {
             "kernel W^X active: text=RO+X rodata=RO+NX data=RW+NX emergency-stack=guarded direct-map-alias=RO+NX "
             "debug-metadata=RO+NX");
     }
+    framebuffer_cache_audit.complete = true;
+    framebuffer_cache_audit_ready.store(true, std::memory_order_release);
+    log::info("inherited framebuffer cache preserved pages=%lu selectors=0x%x source=%lx target=%lx", framebuffer_cache_audit.pages,
+              static_cast<unsigned>(framebuffer_cache_audit.selector_mask), framebuffer_cache_audit.inherited_hash,
+              framebuffer_cache_audit.kernel_hash);
 #ifdef WOS_SELFTEST
     selftest_register_kernel_page_tables();
     direct_map_selftest_ready = true;
@@ -10237,9 +10334,10 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     paging::PageTable* pml2 = nullptr;
     paging::PageTable* pml1 = nullptr;
     bool path_promoted = false;
-    pml3 = advance_page_table(page_table, index_of(VADDR, 4), FLAGS, &path_promoted);
-    pml2 = advance_page_table(pml3, index_of(VADDR, 3), FLAGS, &path_promoted);
-    pml1 = advance_page_table(pml2, index_of(VADDR, 2), FLAGS, &path_promoted);
+    auto const TABLE_FLAGS = table_flags_for_leaf(FLAGS);
+    pml3 = advance_page_table(page_table, index_of(VADDR, 4), TABLE_FLAGS, &path_promoted);
+    pml2 = advance_page_table(pml3, index_of(VADDR, 3), TABLE_FLAGS, &path_promoted);
+    pml1 = advance_page_table(pml2, index_of(VADDR, 2), TABLE_FLAGS, &path_promoted);
 
     PageTableEntry old_entry{};
     bool replaced_translation = false;
@@ -10250,7 +10348,7 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     replaced_translation = old_entry.present != 0 || is_reserved_leaf(old_entry);
     replaced_present_frame = old_entry.present != 0 && (static_cast<paddr_t>(old_entry.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(page_table, VADDR, old_entry);
-    entry = paging::create_page_table_entry(PADDR, FLAGS);
+    entry = paging::create_page_table_leaf_4k(PADDR, FLAGS);
     owned_frame_track_private_mapping(page_table, VADDR, PADDR, FLAGS);
     user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
 
@@ -10323,7 +10421,7 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
     old_entry = entry;
     replaced_present_frame = old_entry.present != 0 && (static_cast<paddr_t>(old_entry.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(batch->root, VADDR, entry);
-    entry = paging::create_page_table_entry(PADDR, FLAGS);
+    entry = paging::create_page_table_leaf_4k(PADDR, FLAGS);
     owned_frame_track_private_mapping(batch->root, VADDR, PADDR, FLAGS);
     user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
     batch->dirty = true;

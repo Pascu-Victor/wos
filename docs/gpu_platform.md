@@ -113,6 +113,34 @@ File retirement providers while it returns to userspace. Provider retirement
 belongs after consumer quiescence in the nonreturning finalizer; firmware hashes
 or a successful lifetime test cannot substitute for that ordering.
 
+## Inherited cache policy and device mappings
+
+Bootstrap preserves each framebuffer page's incoming PAT selector when replacing
+Limine's page tables. It verifies the inherited supervisor translation and
+physical address, converts large-leaf PAT bit 12 to 4 KiB leaf bit 7, and audits
+the final root before switching CR3. The audit retains only page counts, selector
+bits and matching physical-address/selector hashes; it never reads framebuffer
+contents or retains the bootloader's page-table root.
+
+The explicit 4 KiB leaf constructor preserves PAT bit 7. Ancestors receive only
+PRESENT, WRITE and the requested USER bit; leaf cache, NX and software flags
+cannot select the page-table memory type or become ancestor policy. The legacy
+entry constructor still clears bit 7 for its nonleaf role.
+
+Read-only per-CPU PAT observations are captured before CPUs enter scheduling.
+CPUID gates the privileged read. All configured CPU reports must arrive before
+WB-at-0, UC-at-3 or WC-at-5 encoding readiness is published. Unsupported PAT
+leaves WC unavailable; mismatches are observable, and duplicate or invalid
+captures permanently invalidate readiness without replacing observations. This
+does not qualify MTRRs, cache aliases or physical resources and grants no new WC
+mapping authority. WOS does not write PAT or MTRRs in this path.
+
+Until retained device mapping providers exist, file-backed mmap rejects
+nonregular Files with ENODEV after open/mount authorization and before allocation,
+reads, lazy publication or MAP_FIXED replacement. Device files cannot silently
+become copied or zero-filled anonymous pages. Regular-file mappings continue
+through their existing retained File and fault paths.
+
 ## Remaining platform work
 
 These records permit one initial MSI-X activation per function and retain boot

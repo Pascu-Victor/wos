@@ -1,6 +1,7 @@
 #include "smt.hpp"
 
 #include <platform/loader/elf_loader.hpp>
+#include <platform/mm/cache_policy.hpp>
 #include <platform/mm/managed_huge.hpp>
 #include <platform/mm/numa_alloc.hpp>
 
@@ -425,6 +426,8 @@ void prepare_selftest_ap_context(uint64_t cpu_no) {
 }
 
 __attribute__((no_stack_protector)) void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
+    // Capture the inherited policy before this AP can enter online scheduling.
+    if (!mm::cache::capture_boot_cpu(static_cast<size_t>(cpu_no))) hcf();
     // Enable CPU features FIRST (must be done on each CPU)
     // FSGSBASE must be enabled before using wrgsbase instruction
     cpu::enable_fsgsbase();
@@ -934,6 +937,9 @@ __attribute__((no_stack_protector)) void selftest_secondary_cpu_park(limine_mp_i
             break;
         }
     }
+
+    // Early --selftest APs bypass cpu_param_init and never enter scheduling.
+    if (!mm::cache::capture_boot_cpu(static_cast<size_t>(cpu_no))) hcf();
 
     uint64_t const STACK_TOP = selftest_ap_stacks != nullptr ? reinterpret_cast<uint64_t>(selftest_ap_stacks[cpu_no]) : 0;
 

@@ -54,6 +54,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
 #ifdef WOS_SELFTEST
+#include <test/cache_policy_runtime_ktest.hpp>
 #include <test/firmware_runtime_ktest.hpp>
 #endif
 
@@ -372,6 +373,12 @@ void sched_init() {
     bool const NUMA_CENSUS = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-lifecycle-census");
     bool const ANONYMOUS_USERCOPY = cmdline_has_token(get_kernel_cmdline(), "--selftest-anonymous-usercopy");
     bool const FIRMWARE = cmdline_has_token(get_kernel_cmdline(), "--selftest-firmware");
+    bool const CACHE_POLICY = cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-policy");
+    if (CACHE_POLICY &&
+        (FIRMWARE || ANONYMOUS_USERCOPY || NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE ||
+         cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") ||
+         cmdline_has_token(get_kernel_cmdline(), "--napi-irq-test")))
+        mod::dbg::panic_handler("conflicting scheduled cache policy diagnostic boot modes");
     if (FIRMWARE &&
         (ANONYMOUS_USERCOPY || NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
          cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") || cmdline_has_token(get_kernel_cmdline(), "--napi-irq-test")))
@@ -434,6 +441,8 @@ void sched_init() {
 
 void kernel_start() {
 #ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-policy") && !ker::test::start_cache_policy_runtime_selftest())
+        mod::dbg::panic_handler("unable to post scheduled cache policy selftest");
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-firmware") && !ker::test::start_firmware_runtime_selftest())
         mod::dbg::panic_handler("unable to post scheduled firmware selftest");
 #endif
