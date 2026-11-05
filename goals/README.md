@@ -38,8 +38,8 @@ an explicit pause/block rule.
 | 37 | [Replicated VM volumes](37-wki-replicated-vm-volumes.md) | durable quorum log, block leases, snapshots, recovery | 20, 25, 30 on block transport; 35–38 on WKI | Not started |
 | 38 | [Disaggregated guest memory](38-wki-disaggregated-guest-memory.md) | remote RAM providers, EPT/NPT cache, page ownership | 25 on transport; 33, 36, 40 on MM/EPT/NPT | Not started |
 | 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | Complete |
-| 40 | [NUMA placement and safe large pages](40-numa-memory-locality.md) | SRAT/SLIT, CPU domains, page policy, compound lifetime | 33, 36, 38 on VM/MM/Task state | Not started |
-| 41 | [Physical GPU platform](41-physical-gpu-platform.md) | PCI resources/reset, firmware, device mmap, AMD-Vi, IRQ remap | 20 on DMA/IOMMU; 40 on VM/page lifetime | Not started |
+| 40 | [NUMA placement and safe large pages](40-numa-memory-locality.md) | SRAT/SLIT, CPU domains, page policy, compound lifetime | 33, 36, 38 on VM/MM/Task state | Complete |
+| 41 | [Physical GPU platform](41-physical-gpu-platform.md) | PCI resources/reset, firmware, device mmap, AMD-Vi, IRQ remap | 20 on DMA/IOMMU; 40 on VM/page lifetime | In progress |
 | 42 | [DRM-compatible GPU kernel core](42-drm-gpu-kernel-core.md) | DRM uAPI, GEM/GPUVM, dma-buf, syncobj, scheduler, KMS | 21, 22, 41 on MM/security/device state | Not started |
 | 43 | [Mesa and windowed graphics platform](43-mesa-graphics-platform.md) | libdrm, Mesa, Vulkan/EGL/GL, LLVM/Rust, Wayland/WSI | 11, 23, 42; vendor userland integration | Not started |
 | 44 | [AMD amdgpu/RADV/RadeonSI graphics](44-amd-amdgpu-mesa-vulkan.md) | AMD firmware/IP, VRAM/GPUVM/rings, display, Vulkan/GL | 41–43; 45 on shared amdgpu state | Not started |

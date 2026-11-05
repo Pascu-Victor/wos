@@ -36,7 +36,9 @@ auto pci_exclusions(pci::PCIDevice* device) -> bool {
         if (TYPE == 3 || (TYPE == 2 && i + 1 == BARS)) return false;
         uint32_t const HIGH = TYPE == 2 ? read(OFFSET + 4) : 0;
         uint64_t const ADDRESS = (uint64_t{HIGH} << 32U) | (LOW & ~uint32_t{15});
-        uint64_t const SIZE = pci::pci_get_bar_size(device, static_cast<int>(i));
+        auto const PROBED = pci::pci_get_bar_size_checked(device, static_cast<int>(i));
+        if (!PROBED) return false;  // Rejected probing must never skip an MMIO exclusion.
+        uint64_t const SIZE = *PROBED;
         if (read(OFFSET) != LOW || (TYPE == 2 && read(OFFSET + 4) != HIGH) ||
             pci::pci_config_read16(device->bus, device->slot, device->function, pci::PCI_COMMAND) != COMMAND)
             return false;

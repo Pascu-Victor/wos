@@ -4,9 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <dev/iommu/domains.hpp>
+#include <dev/pci_bar_probe.hpp>
 #include <dev/pci_extended.hpp>
+#include <dev/pci_resource.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
@@ -99,14 +103,13 @@ void scan_function(uint8_t bus, uint8_t slot, uint8_t func, uint16_t parent) {
     dev->interrupt_line = pci_config_read8(bus, slot, func, PCI_INTERRUPT_LINE);
     dev->interrupt_pin = pci_config_read8(bus, slot, func, PCI_INTERRUPT_PIN);
 
-    // Read BARs for type 0 (normal) devices
-    if ((dev->header_type & 0x7F) == PCI_HEADER_TYPE_NORMAL) {
-        for (size_t i = 0; i < BAR_COUNT; i++) {
+    // Bridges have two BARs; their remaining registers describe bus/windows.
+    auto const HEADER = dev->header_type & 0x7fU;
+    size_t const BARS = HEADER == PCI_HEADER_TYPE_NORMAL ? BAR_COUNT : HEADER == PCI_HEADER_TYPE_BRIDGE ? 2 : 0;
+    dev->bar.fill(0);
+    if (BARS != 0) {
+        for (size_t i = 0; i < BARS; i++) {
             dev->bar.at(i) = pci_config_read32(bus, slot, func, static_cast<uint8_t>(PCI_BAR0 + (i * sizeof(uint32_t))));
-        }
-    } else {
-        for (unsigned int& i : dev->bar) {
-            i = 0;
         }
     }
 
@@ -430,117 +433,51 @@ auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int
 }
 
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t {
-    if (bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) {
-        return 0;
-    }
-
-    auto const BAR_INDEX = static_cast<size_t>(bar_idx);
-    uint32_t const BAR_VAL = dev->bar.at(BAR_INDEX);
-
-    if ((BAR_VAL & 1) != 0U) {
-        // I/O space BAR
-        return BAR_VAL & ~0x3UL;
-    }
-
-    // Memory space BAR
-    uint8_t const TYPE = (BAR_VAL >> 1) & 0x3;
-    if (TYPE == 0x02 && (BAR_INDEX + 1) < BAR_COUNT) {
-        // 64-bit BAR: combine with next BAR register
-        uint64_t addr = BAR_VAL & ~0xFUL;
-        addr |= static_cast<uint64_t>(dev->bar.at(BAR_INDEX + 1)) << 32;
-        return addr;
-    }
-
-    // 32-bit BAR
-    return BAR_VAL & ~0xFUL;
+    if (dev == nullptr || bar_idx < 0) return 0;
+    return resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx)).address;
 }
 
-auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t {
-    if (bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) {
-        return 0;
-    }
-
-    auto const BAR_INDEX = static_cast<size_t>(bar_idx);
-    auto const REG = static_cast<uint8_t>(PCI_BAR0 + (BAR_INDEX * sizeof(uint32_t)));
-    uint32_t const ORIGINAL = pci_config_read32(dev->bus, dev->slot, dev->function, REG);
-
-    // I/O BAR - no MMIO size needed
-    if ((ORIGINAL & 1) != 0U) {
-        return 0;
-    }
-
-    uint8_t const TYPE = (ORIGINAL >> 1) & 0x3;
-
-    // Disable memory decoding before BAR sizing to prevent KVM from trying
-    // to map intermediate bogus addresses (e.g. writing 0xFFFFFFFF to a
-    // 64-bit BAR while the high half still holds the original value).
-    uint16_t const CMD = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD & ~PCI_COMMAND_MEM_SPACE);
-
-    if (TYPE == 0x02 && (BAR_INDEX + 1) < BAR_COUNT) {
-        auto const REG_HI = static_cast<uint8_t>(PCI_BAR0 + ((BAR_INDEX + 1) * sizeof(uint32_t)));
-        uint32_t const ORIGINAL_HI = pci_config_read32(dev->bus, dev->slot, dev->function, REG_HI);
-
-        // For 64-bit BARs, both halves must be all-ones at the same time.
-        pci_config_write32(dev->bus, dev->slot, dev->function, REG, 0xFFFFFFFFU);
-        pci_config_write32(dev->bus, dev->slot, dev->function, REG_HI, 0xFFFFFFFFU);
-        uint32_t const READBACK_LO = pci_config_read32(dev->bus, dev->slot, dev->function, REG) & ~0xFU;
-        uint32_t const READBACK_HI = pci_config_read32(dev->bus, dev->slot, dev->function, REG_HI);
-
-        pci_config_write32(dev->bus, dev->slot, dev->function, REG, ORIGINAL);
-        pci_config_write32(dev->bus, dev->slot, dev->function, REG_HI, ORIGINAL_HI);
-        pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD);
-
-        uint64_t const MASK = (static_cast<uint64_t>(READBACK_HI) << 32) | READBACK_LO;
-        if (MASK == 0) {
-            return 0;
-        }
-        return (~MASK) + 1;
-    }
-
-    pci_config_write32(dev->bus, dev->slot, dev->function, REG, 0xFFFFFFFFU);
-    uint32_t const READBACK = pci_config_read32(dev->bus, dev->slot, dev->function, REG) & ~0xFU;
-    pci_config_write32(dev->bus, dev->slot, dev->function, REG, ORIGINAL);
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, CMD);
-
-    if (READBACK == 0) {
-        return 0;
-    }
-
-    // Keep the complement arithmetic 32-bit. Widening before `~` turns a
-    // 4 KiB BAR mask (0xfffff000) into a huge 64-bit size.
-    return static_cast<uint64_t>(static_cast<uint32_t>(~READBACK + 1U));
+auto pci_get_bar_size_checked(PCIDevice* dev, int bar_idx) -> std::optional<uint64_t> {
+    if (dev == nullptr || bar_idx < 0) return std::nullopt;
+    struct Reader {
+        PCIDevice* device;
+        auto read32(uint8_t offset) -> uint32_t { return pci_config_read32(device->bus, device->slot, device->function, offset); }
+        auto read16(uint8_t offset) -> uint16_t { return pci_config_read16(device->bus, device->slot, device->function, offset); }
+        void write32(uint8_t offset, uint32_t value) { pci_config_write32(device->bus, device->slot, device->function, offset, value); }
+        void write16(uint8_t offset, uint16_t value) { pci_config_write16(device->bus, device->slot, device->function, offset, value); }
+    } reader{dev};
+    return resource::probe_memory_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx), reader);
 }
+
+auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t { return pci_get_bar_size_checked(dev, bar_idx).value_or(0); }
 
 auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
-    if (bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) {
+    if (dev == nullptr || bar_idx < 0) return nullptr;
+    auto const BAR = resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx));
+    if (!BAR.memory() || BAR.address == 0) return nullptr;
+    auto const SIZE = pci_get_bar_size_checked(dev, bar_idx);
+    if (!SIZE || *SIZE == 0) return nullptr;
+    mod::cpu::CpuidContext cpu{.function = static_cast<int>(0x80000000U)};
+    mod::cpu::cpuid(&cpu);
+    if (static_cast<uint32_t>(cpu.eax) < 0x80000008U) return nullptr;
+    cpu.function = static_cast<int>(0x80000008U);
+    mod::cpu::cpuid(&cpu);
+    auto const RANGE = resource::mmio_range(BAR, *SIZE, mod::mm::addr::get_hhdm_offset(), cpu.eax & 255U);
+    if (!RANGE) return nullptr;
+    auto const* memory = mod::mm::boot_memory_map();
+    if (memory == nullptr || memory->entries == nullptr ||
+        !resource::mmio_memory_safe(*RANGE, memory->entry_count, [memory](size_t i) -> std::optional<resource::MemoryRegion> {
+            auto const* entry = memory->entries[i];
+            if (entry == nullptr) return std::nullopt;
+            return resource::MemoryRegion{entry->base, entry->length, entry->type == LIMINE_MEMMAP_RESERVED};
+        }))
         return nullptr;
-    }
-
-    uint64_t const PHYS = pci_get_bar_addr(dev, bar_idx);
-    if (PHYS == 0) {
-        return nullptr;
-    }
-
-    // Don't map I/O space BARs
-    auto const BAR_INDEX = static_cast<size_t>(bar_idx);
-    if ((dev->bar.at(BAR_INDEX) & 1) != 0U) {
-        return nullptr;
-    }
-
-    uint64_t size = pci_get_bar_size(dev, bar_idx);
-    if (size == 0) {
-        size = 0x1000;  // at least one page
-    }
-
-    uint64_t const PHYS_ALIGNED = PHYS & ~0xFFFULL;
-    uint64_t const END = (PHYS + size + 0xFFF) & ~0xFFFULL;
 
     // Map the MMIO range into the kernel page table (uncacheable for MMIO correctness)
-    ker::mod::mm::virt::map_range_to_kernel_page_table(ker::mod::mm::virt::Range{.start = PHYS_ALIGNED, .end = END},
+    ker::mod::mm::virt::map_range_to_kernel_page_table(ker::mod::mm::virt::Range{.start = RANGE->start, .end = RANGE->end},
                                                        ker::mod::mm::virt::kernel_mmio_page_flags());
 
-    return reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+    return reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(BAR.address));
 }
 
 // Legacy wrapper: find AHCI controller using full enumeration

@@ -13,6 +13,12 @@ wos_add_fuzz_target(pci_ecam_fuzz
 wos_add_unit_test(pci_ecam_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_ecam_test.cpp
 )
+wos_add_unit_test(pci_resource_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_resource_test.cpp
+)
+wos_add_unit_test(pci_bar_probe_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_bar_probe_test.cpp
+)
 wos_add_unit_test(virtio_platform_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_platform_test.cpp
 )

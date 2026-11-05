@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <platform/dbg/dbg.hpp>
 
 namespace ker::dev::pci {
@@ -140,9 +141,13 @@ auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t;
 
 // BAR size detection (standard PCI BAR sizing)
 auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t;
+// Distinguishes an unimplemented BAR (zero) from invalid/stale resources or a
+// malformed sizing response (nullopt). Callers must serialize probe/quiescence;
+// the config lock currently protects individual accesses, not the whole probe.
+auto pci_get_bar_size_checked(PCIDevice* dev, int bar_idx) -> std::optional<uint64_t>;
 
 // Map a memory BAR into the kernel page table and return the virtual address.
-// Returns nullptr for I/O BARs or invalid BARs.
+// Returns nullptr for I/O/invalid BARs, failed sizing or unsafe MMIO apertures.
 auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void*;
 
 // Legacy: find AHCI controller (wrapper around enumerate + find_by_class)
