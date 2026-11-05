@@ -128,13 +128,21 @@ auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t;  // config 
 // target_cpu: logical CPU index (0 = BSP).  The MSI/MSI-X message address is
 // programmed to deliver to that CPU's APIC ID.  Defaults to 0 for backward
 // compatibility with callers that don't care about IRQ steering.
-auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu = 0) -> int;   // 0 = success
+auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu = 0) -> int;  // 0 = success
+// Quiescent boot/task probe, before BME/IRQ publication. Retains validated BAR
+// mappings/table state: 0 ready, 1 no MSI-X, -1 invalid/busy/failed. No reset,
+// BAR relocation or rebinding is supported by these kernel-lifetime records.
+auto pci_prepare_msix(PCIDevice* dev) -> int;
+// Consumes prepared state only; does not probe or map a BAR.
 auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu = 0) -> int;  // 0 = success, entry 0
 
 // Configure a single MSI-X table entry (0-based index) after pci_enable_msix has
 // enabled the capability.  entry_idx must be within the table size reported by the
 // device capability header.  Returns 0 on success, -1 on error.
 auto pci_configure_msix_entry(PCIDevice* dev, uint32_t entry_idx, uint8_t vector, uint64_t target_cpu = 0) -> int;
+// Serialized entry mask update/readback. Failure inhibits function IRQ/DMA
+// delivery. The caller retains its callback/vector ownership until IRQ drain.
+auto pci_mask_msix_entry(PCIDevice* dev, uint32_t entry_idx, bool masked) -> int;
 
 // BAR address resolution (handles 64-bit BARs)
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t;
@@ -142,8 +150,9 @@ auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t;
 // BAR size detection (standard PCI BAR sizing)
 auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t;
 // Distinguishes an unimplemented BAR (zero) from invalid/stale resources or a
-// malformed sizing response (nullopt). Callers must serialize probe/quiescence;
-// the config lock currently protects individual accesses, not the whole probe.
+// malformed sizing response (nullopt). First sizing requires BME off and caller
+// quiescence; the complete transaction is config-locked. Later calls return the
+// retained immutable size. Only exact boot-registry device pointers are valid.
 auto pci_get_bar_size_checked(PCIDevice* dev, int bar_idx) -> std::optional<uint64_t>;
 
 // Map a memory BAR into the kernel page table and return the virtual address.

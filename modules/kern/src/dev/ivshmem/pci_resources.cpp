@@ -54,6 +54,7 @@ auto PciResources::prepare(pci::PCIDevice* pci_device, size_t minimum_shared) ->
             return false;
         auto* table_bar = static_cast<uint8_t*>(pci::pci_map_bar(device, 1));
         if (table_bar == nullptr) return false;
+        if (pci::pci_prepare_msix(device) != 0) return false;
         vector_control = reinterpret_cast<volatile uint32_t*>(table_bar + (TABLE & ~uint32_t{7}) + 12);
     }
     pci::pci_enable_memory_space(device);
@@ -175,6 +176,8 @@ void PciResources::ring(uint16_t peer, uint16_t vector) const {
     if (mode == model::Mode::msix && activated && irq_owned && regs != nullptr) regs[3] = model::doorbell(peer, vector);
 }
 void PciResources::mask_vector(bool masked) const {
-    if (vector_control != nullptr) *vector_control = masked ? *vector_control | 1U : *vector_control & ~uint32_t{1};
+    // Share the prepared entry's IRQ-safe serialization and readback barrier.
+    // Failed updates inhibit hardware delivery in the PCI layer.
+    if (vector_control != nullptr) (void)pci::pci_mask_msix_entry(device, 0, masked);
 }
 }  // namespace ker::dev::ivshmem

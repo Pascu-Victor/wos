@@ -19,6 +19,19 @@ wos_add_unit_test(pci_resource_test
 wos_add_unit_test(pci_bar_probe_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_bar_probe_test.cpp
 )
+wos_add_unit_test(pci_boot_resource_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_boot_resource_test.cpp
+)
+wos_add_unit_test(pci_msix_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_msix_test.cpp
+)
+wos_add_unit_test(pci_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/pci.cpp
+)
+target_include_directories(pci_runtime_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_shim)
+target_compile_options(pci_runtime_test PRIVATE -UNDEBUG)
+set_tests_properties(pci_runtime_test PROPERTIES TIMEOUT 30)
 wos_add_unit_test(virtio_platform_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_platform_test.cpp
 )

@@ -28,6 +28,7 @@ template <typename Reader>
     constexpr uint16_t MEMORY_DECODE = 2;
     constexpr uint16_t BUS_MASTER = 4;
     uint16_t const COMMAND = reader.read16(COMMAND_REG);
+    if ((COMMAND & BUS_MASTER) != 0) return std::nullopt;
     reader.write16(COMMAND_REG, static_cast<uint16_t>(COMMAND & ~MEMORY_DECODE));
     if (reader.read16(COMMAND_REG) != static_cast<uint16_t>(COMMAND & ~MEMORY_DECODE)) {
         reader.write16(COMMAND_REG, COMMAND);

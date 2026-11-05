@@ -19,7 +19,7 @@ struct Access {
 // contain all ones. Command/status share a dword; status bits are W1C.
 struct Config {
     enum class Failure { none, disable_decode, restore_low, restore_high, restore_command };
-    static constexpr uint16_t COMMAND = 0x557;
+    static constexpr uint16_t COMMAND = 0x553;
     static constexpr uint16_t STATUS = 0xf900;
     std::array<uint32_t, 64> registers{};
     std::array<uint32_t, 6> snapshot{};
@@ -154,7 +154,7 @@ TEST(PciBarProbe, Sizes64BitApertureOnlyWithBothWordsSimultaneouslyAllOnes) {
 
 TEST(PciBarProbe, PreservesInitiallyDisabledDecodeAndEverySavedCommandBit) {
     for (bool wide : {false, true}) {
-        for (uint16_t command : {0, 1, 2, 4, 5, 0x550, 0xffff}) {
+        for (uint16_t command : {0, 1, 2, 0x550, 0xfffb}) {
             Config config(wide);
             config.registers[1] = (uint32_t{Config::STATUS} << 16U) | command;
             auto const BEFORE = config.registers;
@@ -166,6 +166,18 @@ TEST(PciBarProbe, PreservesInitiallyDisabledDecodeAndEverySavedCommandBit) {
             EXPECT_EQ(writes, 2U);
             config.expect_status_preserved();
         }
+    }
+}
+
+TEST(PciBarProbe, ActiveBusMasteringRefusesBeforeAnyConfigWrite) {
+    for (bool wide : {false, true}) {
+        Config config(wide);
+        config.registers[1] |= 4U;
+        auto const BEFORE = config.registers;
+        EXPECT_FALSE(config.probe());
+        EXPECT_EQ(config.registers, BEFORE);
+        EXPECT_EQ(config.mask_reads, 0U);
+        for (auto const& access : config.accesses) EXPECT_TRUE(access.operation == 'r' || access.operation == 'R');
     }
 }
 

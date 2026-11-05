@@ -8,6 +8,29 @@ namespace resource = ker::dev::pci::resource;
 using resource::Bar;
 using resource::BarKind;
 
+TEST(PciResource, RawWriteProtectionCoversEffectiveBarWordsWithoutProtectingBridgeWindows) {
+    for (uint8_t header : {0, 0x80}) {
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0x0f, 4));
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0x0f, 2));
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x10, 1));
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x11, 2));
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x13, 4));
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x27, 1));
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x27, 4));
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0x28, 4));
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0xff, 4));
+    }
+    for (uint8_t header : {1, 0x81}) {
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x14, 4));
+        EXPECT_TRUE(resource::bar_register_overlap(header, 0x17, 2));
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0x18, 1));
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0x19, 4));
+        EXPECT_FALSE(resource::bar_register_overlap(header, 0x20, 4));
+    }
+    EXPECT_FALSE(resource::bar_register_overlap(2, 0x10, 4));
+    EXPECT_TRUE(resource::bar_register_overlap(0, 0x10, 3));
+}
+
 TEST(PciResource, DecodesMemoryIoPrefetchAndAddressesAboveFourGiB) {
     std::array<uint32_t, 6> slots{0x81000000, 0xc0000008, 0x1235, 0x8000000c, 0x12, 0x90000000};
     auto bar = resource::decode_bar(slots, 0, 0);

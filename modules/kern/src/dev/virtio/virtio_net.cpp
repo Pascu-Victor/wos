@@ -950,7 +950,7 @@ auto virtio_net_set_queue_cpu(ker::net::NetDevice* net, uint32_t pair_idx, uint6
         return -EBUSY;
     }
     if (dev->msix_enabled && pair.irq_vector != 0) {
-        ker::dev::pci::pci_configure_msix_entry(dev->pci, pair_idx, pair.irq_vector, cpu);
+        return ker::dev::pci::pci_configure_msix_entry(dev->pci, pair_idx, pair.irq_vector, cpu);
     }
     return 0;
 }
@@ -972,7 +972,12 @@ auto apply_queue_cpu_mask(VirtIONetDevice& dev, uint64_t mask, PinWorkers&& pin_
     if (!pin_workers(std::span<const KernelWorkerCpuPin>(requests).first(count))) return -EBUSY;
     for (size_t i = 0; i < count; ++i) {
         auto const& pair = dev.queue_pairs.at(i);
-        if (dev.msix_enabled && pair.irq_vector != 0) set_interrupt_cpu(static_cast<uint32_t>(i), pair.irq_vector, requests[i].cpu);
+        if (dev.msix_enabled && pair.irq_vector != 0) {
+            // Worker placement is already committed. A failed interrupt update
+            // reports the partial change; the existing vector remains owned.
+            int const RESULT = set_interrupt_cpu(static_cast<uint32_t>(i), pair.irq_vector, requests[i].cpu);
+            if (RESULT != 0) return RESULT;
+        }
     }
     return 0;
 }
@@ -982,9 +987,10 @@ auto virtio_net_set_queue_cpu_mask(ker::net::NetDevice* net, uint64_t mask) -> i
     if (dev == nullptr) return -ENODEV;
     CallbackGuard const GUARD(dev->admission);
     if (!GUARD) return -ENODEV;
-    return apply_queue_cpu_mask(
-        *dev, mask, ker::mod::sched::pin_kernel_workers_to_cpus,
-        [dev](uint32_t pair, uint8_t vector, uint64_t cpu) { ker::dev::pci::pci_configure_msix_entry(dev->pci, pair, vector, cpu); });
+    return apply_queue_cpu_mask(*dev, mask, ker::mod::sched::pin_kernel_workers_to_cpus,
+                                [dev](uint32_t pair, uint8_t vector, uint64_t cpu) {
+                                    return ker::dev::pci::pci_configure_msix_entry(dev->pci, pair, vector, cpu);
+                                });
 }
 
 auto virtio_net_check_mac(ker::net::NetDevice* netdev, const uint8_t* mac) -> int {
@@ -1929,6 +1935,17 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -ENOTSUP;
     }
 
+    // Firmware may leave BME enabled. Cold BAR preparation must inhibit DMA
+    // before sizing/mapping; prepare_probe still requires transport reset before
+    // any new queue backing is exposed. This does not authorize inherited-page
+    // reclamation or replace device-specific firmware handoff.
+    uint16_t const INHERITED_COMMAND = pci::pci_config_read16(pci_dev->bus, pci_dev->slot, pci_dev->function, pci::PCI_COMMAND);
+    if (!pci::pci_set_bus_master(pci_dev, false)) {
+        net_log::error("cannot inhibit bus mastering before modern BAR preparation");
+        return -1;
+    }
+    if ((INHERITED_COMMAND & pci::PCI_COMMAND_BUS_MASTER) != 0)
+        net_log::info("inhibited inherited bus mastering before modern BAR preparation");
     pci::pci_enable_memory_space(pci_dev);
     auto* common_va = map_virtio_cap_region(pci_dev, COMMON_CAP);
     if (common_va == nullptr) {
@@ -2124,6 +2141,11 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
             return fail_probe(dev);
     }
 
+    // Prepare the retained table before BME and DRIVER_OK activate the device.
+    // Runtime steering and selftest IRQ activation must never size/map a BAR.
+    int const MSIX_PREPARED = pci::pci_prepare_msix(pci_dev);
+    if (MSIX_PREPARED < 0) return fail_probe(dev);
+
     // Every ring, packet slot and control mapping is ready before DMA admission.
     // Passthrough is still explicit until translated domains are enabled.
     if (!pci::pci_set_bus_master(pci_dev, true)) return fail_probe(dev);
@@ -2157,6 +2179,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
 
     int const MSIX_RET = ker::dev::pci::pci_enable_msix(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
+    if (MSIX_PREPARED == 0 && MSIX_RET != 0) return fail_probe(dev);
     if (MSIX_RET == 0) {
         dev->msix_enabled = true;
         if (want_mq) {
@@ -2406,6 +2429,10 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint64_t const TXQ_PHYS = pair0.txq->ring.submission.address;
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(TXQ_PHYS / 4096));
 
+    // Present but invalid MSI-X cannot be hidden by an MSI/INTx fallback.
+    // This also precedes the diagnostic path that activates its own IRQ.
+    int const MSIX_PREPARED = pci::pci_prepare_msix(pci_dev);
+    if (MSIX_PREPARED < 0) return fail_probe(dev);
     if (!pci::pci_set_bus_master(pci_dev, true)) return fail_probe(dev);
 #ifdef WOS_SELFTEST
     if (probe_test != nullptr) return selftest_probe_boundary(dev, 1);
@@ -2421,6 +2448,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     pair0.irq_owned = true;
 
     int const MSIX_RET = ker::dev::pci::pci_enable_msix(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
+    if (MSIX_PREPARED == 0 && MSIX_RET != 0) return fail_probe(dev);
     if (MSIX_RET == 0) {
         dev->msix_enabled = true;
 
@@ -2669,6 +2697,7 @@ auto virtio_selftest_queue_affinity_batch() -> bool {
     auto irq = [&](uint32_t pair, uint8_t vector, uint64_t cpu) {
         mapping_ok = pair == interrupts && vector == 40 + pair && cpu == pair * 2 && mapping_ok;
         ++interrupts;
+        return 0;
     };
     bool ok = apply_queue_cpu_mask(*dev, 5, pin, irq) == -EINVAL && admissions == 0 && interrupts == 0;
     dev->num_queue_pairs = 2;
@@ -2678,6 +2707,16 @@ auto virtio_selftest_queue_affinity_batch() -> bool {
     accept = true;
     ok = apply_queue_cpu_mask(*dev, 5, pin, irq) == 0 && admissions == 2 && interrupts == 2 && mapping_ok && ok;
     ok = apply_queue_cpu_mask(*dev, 0, pin, irq) == 0 && admissions == 2 && interrupts == 2 && ok;
+    unsigned failed_interrupts = 0;
+    auto reject_irq = [&](uint32_t pair, uint8_t vector, uint64_t cpu) {
+        ++failed_interrupts;
+        mapping_ok = admissions == 3 && pair == 0 && vector == 40 && cpu == 0 && mapping_ok;
+        return -EIO;
+    };
+    // Placement has committed before this failure. Return its exact error,
+    // without attempting another entry or pretending to roll placement back.
+    ok = apply_queue_cpu_mask(*dev, 5, pin, reject_irq) == -EIO && admissions == 3 && failed_interrupts == 1 && interrupts == 2 &&
+         mapping_ok && ok;
     delete second;
     delete first;
     delete dev;

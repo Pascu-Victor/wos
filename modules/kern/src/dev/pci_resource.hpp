@@ -9,6 +9,16 @@ namespace ker::dev::pci::resource {
 
 enum class BarKind : uint8_t { invalid, io, memory32, memory64 };
 
+// Conventional config accessors align their offset to the actual I/O width.
+// Protect both words of every retained BAR, including byte/word writes.
+[[nodiscard]] constexpr auto bar_register_overlap(uint8_t header_type, uint8_t offset, size_t width) -> bool {
+    if (width != 1 && width != 2 && width != 4) return true;
+    size_t const HEADER = header_type & 0x7fU;
+    size_t const COUNT = HEADER == 0 ? 6 : HEADER == 1 ? 2 : 0;
+    size_t const START = offset & ~(width - 1);
+    return COUNT != 0 && START < 0x10 + COUNT * 4 && START + width > 0x10;
+}
+
 struct Bar {
     BarKind kind = BarKind::invalid;
     uint64_t address = 0;

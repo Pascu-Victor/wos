@@ -43,6 +43,20 @@ def require_order(source: str, *snippets: str) -> None:
         cursor = pos
 
 
+def test_modern_bootstrap_inhibits_dma_before_cold_bar_mapping() -> None:
+    body = function_body(VIRTIO_NET_CPP.read_text(), "init_device_modern")
+    require_order(
+        body,
+        "if (!pci::pci_set_bus_master(pci_dev, false))",
+        "return -1;",
+        "pci::pci_enable_memory_space(pci_dev)",
+        "map_virtio_cap_region(pci_dev, COMMON_CAP)",
+        "prepare_probe(dev)",
+        "pci::pci_prepare_msix(pci_dev)",
+        "pci::pci_set_bus_master(pci_dev, true)",
+    )
+
+
 def test_ctrl_ack_deadline_is_saturating() -> None:
     source = VIRTIO_NET_CPP.read_text()
     helper_body = function_body(source, "future_deadline_ms")
@@ -362,6 +376,7 @@ def test_platform_negotiation_gates_bus_mastering_and_reset_revokes_it() -> None
 
 
 def main() -> None:
+    test_modern_bootstrap_inhibits_dma_before_cold_bar_mapping()
     test_platform_negotiation_gates_bus_mastering_and_reset_revokes_it()
     test_callback_exit_and_worker_storage_ownership()
     test_terminal_callbacks_reject_before_touching_queue_or_transport()

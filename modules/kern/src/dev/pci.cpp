@@ -1,11 +1,15 @@
 #include "pci.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <dev/iommu/domains.hpp>
 #include <dev/pci_bar_probe.hpp>
+#include <dev/pci_boot_resource.hpp>
 #include <dev/pci_extended.hpp>
+#include <dev/pci_msix.hpp>
+#include <dev/pci_port_io.hpp>
 #include <dev/pci_resource.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -24,6 +28,19 @@ using log = ker::mod::dbg::logger<"pci">;
 namespace {
 constexpr int MAX_PCI_DEVICES = 64;
 std::array<PCIDevice, MAX_PCI_DEVICES> discovered_devices = {};
+struct PreparedMsix {
+    bool present = false;
+    msix::Layout layout{};
+    volatile uint32_t* table = nullptr;
+};
+struct DeviceResources {
+    std::array<resource::BootResource<uint64_t>, BAR_COUNT> sizes{};
+    std::array<resource::BootResource<void*>, BAR_COUNT> mappings{};
+    resource::BootResource<PreparedMsix> msix{};
+    std::atomic<bool> poisoned{false};
+    bool activated = false;  // Protected by config_lock; one boot owner only.
+};
+constinit std::array<DeviceResources, MAX_PCI_DEVICES> resources{};
 int device_count = 0;
 bool enumerated = false;
 bool enumeration_error = false;
@@ -31,7 +48,14 @@ std::array<bool, 256> visited_buses{};
 mod::sys::Spinlock config_lock{};
 struct ConfigGuard {
     uint64_t flags = config_lock.lock_irqsave();
-    ~ConfigGuard() { config_lock.unlock_irqrestore(flags); }
+    bool held = true;
+    void release() {
+        if (held) {
+            held = false;
+            config_lock.unlock_irqrestore(flags);
+        }
+    }
+    ~ConfigGuard() { release(); }
     ConfigGuard() = default;
     ConfigGuard(const ConfigGuard&) = delete;
     auto operator=(const ConfigGuard&) -> ConfigGuard& = delete;
@@ -39,22 +63,68 @@ struct ConfigGuard {
 constexpr int PCI_FUNCTION_COUNT = 8;
 constexpr int PCI_SLOT_COUNT = 32;
 
-// 32-bit port I/O using inline assembly
-inline auto inl(uint16_t port) -> uint32_t {
-    // Written by inline asm output constraints.
-    // NOLINTNEXTLINE(misc-const-correctness)
-    uint32_t result = 0;
-    asm volatile("inl %1, %0" : "=a"(result) : "Nd"(port) : "memory");
-    return result;
-}
-
-inline void outl(uint16_t port, uint32_t value) { asm volatile("outl %0, %1" : : "a"(value), "Nd"(port) : "memory"); }
-inline void outw(uint16_t port, uint16_t value) { asm volatile("outw %0, %1" : : "a"(value), "Nd"(port) : "memory"); }
-inline void outb(uint16_t port, uint8_t value) { asm volatile("outb %0, %1" : : "a"(value), "Nd"(port) : "memory"); }
+using port_io::inl;
+using port_io::outb;
+using port_io::outl;
+using port_io::outw;
 
 auto config_address(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint32_t {
     return (static_cast<uint32_t>(bus) << 16) | (static_cast<uint32_t>(slot) << 11) | (static_cast<uint32_t>(func) << 8) |
            (offset & 0xfcU) | 0x80000000U;
+}
+
+// All callers own config_lock. Never call the public locking wrappers from a
+// complete probe/MSI-X transaction.
+auto config_read32_unlocked(const PCIDevice& device, uint8_t offset) -> uint32_t {
+    outl(PCI_CONFIG_ADDRESS, config_address(device.bus, device.slot, device.function, offset));
+    return inl(PCI_CONFIG_DATA);
+}
+auto config_read16_unlocked(const PCIDevice& device, uint8_t offset) -> uint16_t {
+    return static_cast<uint16_t>(config_read32_unlocked(device, offset) >> ((offset & 2U) * 8U));
+}
+void config_write32_unlocked(const PCIDevice& device, uint8_t offset, uint32_t value) {
+    outl(PCI_CONFIG_ADDRESS, config_address(device.bus, device.slot, device.function, offset));
+    outl(PCI_CONFIG_DATA, value);
+}
+void config_write16_unlocked(const PCIDevice& device, uint8_t offset, uint16_t value) {
+    outl(PCI_CONFIG_ADDRESS, config_address(device.bus, device.slot, device.function, offset));
+    outw(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 2U)), value);
+}
+auto device_index(const PCIDevice* device) -> std::optional<size_t> {
+    for (int i = 0; i < device_count; ++i)
+        if (device == &discovered_devices[static_cast<size_t>(i)]) return static_cast<size_t>(i);
+    return std::nullopt;
+}
+auto resource_dma_allowed(size_t index) -> bool {
+    auto const& record = resources[index];
+    auto allowed = [](resource::BootState state) {
+        return state != resource::BootState::preparing && state != resource::BootState::failed;
+    };
+    if (record.poisoned.load(std::memory_order_acquire) || !allowed(record.msix.state())) return false;
+    for (size_t i = 0; i < BAR_COUNT; ++i)
+        if (!allowed(record.sizes[i].state()) || !allowed(record.mappings[i].state())) return false;
+    return true;
+}
+auto resources_sealed(size_t index) -> bool {
+    auto const& record = resources[index];
+    if (record.msix.state() != resource::BootState::empty) return true;
+    for (size_t i = 0; i < BAR_COUNT; ++i)
+        if (record.sizes[i].state() != resource::BootState::empty || record.mappings[i].state() != resource::BootState::empty) return true;
+    return false;
+}
+auto bar_write_allowed(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset, size_t width) -> bool {
+    for (int i = 0; i < device_count; ++i) {
+        auto const& device = discovered_devices[static_cast<size_t>(i)];
+        if (device.bus == bus && device.slot == slot && device.function == function &&
+            resource::bar_register_overlap(device.header_type, offset, width) && resources_sealed(static_cast<size_t>(i)))
+            return false;
+    }
+    return true;
+}
+void authorize_bar_write(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset, size_t width) {
+    if (bar_write_allowed(bus, slot, function, offset, width)) return;
+    mod::dbg::panic_handler("Raw PCI write attempted relocation of retained BAR resources");
+    hcf();
 }
 
 // Pure admission lookup is safe under config_lock. Quarantine publishes its
@@ -63,7 +133,9 @@ auto bus_master_write_allowed(uint8_t bus, uint8_t slot, uint8_t func, uint32_t 
     if ((value & PCI_COMMAND_BUS_MASTER) == 0) return true;
     for (int i = 0; i < device_count; ++i) {
         auto const& device = discovered_devices[static_cast<size_t>(i)];
-        if (device.bus == bus && device.slot == slot && device.function == func && iommu::bus_master_allowed(&device)) return true;
+        if (device.bus == bus && device.slot == slot && device.function == func && resource_dma_allowed(static_cast<size_t>(i)) &&
+            iommu::bus_master_allowed(&device))
+            return true;
     }
     return false;
 }
@@ -72,6 +144,46 @@ void authorize_bus_master_write(uint8_t bus, uint8_t slot, uint8_t func, uint32_
     mod::dbg::panic_handler("Raw PCI command write attempted bus mastering without a ready DMA domain");
     hcf();
 }
+
+struct ConfigReader {
+    PCIDevice* device;
+    auto read32(uint8_t offset) -> uint32_t { return config_read32_unlocked(*device, offset); }
+    auto read16(uint8_t offset) -> uint16_t { return config_read16_unlocked(*device, offset); }
+    void write32(uint8_t offset, uint32_t value) { config_write32_unlocked(*device, offset, value); }
+    void write16(uint8_t offset, uint16_t value) {
+        if (offset == PCI_COMMAND && !bus_master_write_allowed(device->bus, device->slot, device->function, value))
+            value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
+        config_write16_unlocked(*device, offset, value);
+    }
+};
+void poison_unlocked(size_t index, uint8_t capability = 0) {
+    resources[index].poisoned.store(true, std::memory_order_release);
+    auto const& device = discovered_devices[index];
+    if (capability == 0) {
+        auto const* prepared = resources[index].msix.get();
+        if (prepared && prepared->present) capability = prepared->layout.capability;
+    }
+    if (capability != 0) {
+        auto const OFFSET = static_cast<uint8_t>(capability + 2);
+        config_write16_unlocked(device, OFFSET, static_cast<uint16_t>(config_read16_unlocked(device, OFFSET) | 0x4000U));
+        (void)config_read16_unlocked(device, OFFSET);
+    }
+    config_write16_unlocked(device, PCI_COMMAND,
+                            static_cast<uint16_t>(config_read16_unlocked(device, PCI_COMMAND) & ~PCI_COMMAND_BUS_MASTER));
+    (void)config_read16_unlocked(device, PCI_COMMAND);
+}
+auto destination(uint64_t cpu, uint8_t vector) -> std::optional<uint32_t> {
+    if (cpu >= mod::smt::get_core_count() || vector < 32 || vector == 255) return std::nullopt;
+    uint32_t const APIC = mod::smt::get_apic_id_for_cpu(cpu);
+    return APIC <= 255 ? std::optional<uint32_t>{APIC} : std::nullopt;
+}
+struct TableReader {
+    size_t index;
+    const PreparedMsix& prepared;
+    auto read32(uint32_t word) -> uint32_t { return prepared.table[word]; }
+    void write32(uint32_t word, uint32_t value) { prepared.table[word] = value; }
+    void inhibit() { poison_unlocked(index, prepared.layout.capability); }
+};
 
 void scan_bus(uint8_t bus, uint16_t parent = NO_PARENT);
 
@@ -167,6 +279,7 @@ void scan_bus(uint8_t bus, uint16_t parent) {
 
 // Read 32-bit from PCI configuration space
 auto pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint32_t {
+    if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return UINT32_MAX;
     ConfigGuard const GUARD;
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     return inl(PCI_CONFIG_DATA);
@@ -186,8 +299,11 @@ auto pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -
 
 // Write 32-bit to PCI configuration space
 auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) -> void {
+    if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return;
+    authorize_bar_write(bus, slot, func, offset, 4);
     if ((offset & 0xfcU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
     ConfigGuard const GUARD;
+    if (!bar_write_allowed(bus, slot, func, offset, 4)) return;
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
     if ((offset & 0xfcU) == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
         value = static_cast<uint32_t>(value & ~PCI_COMMAND_BUS_MASTER);
@@ -197,8 +313,11 @@ auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 
 // Write 16-bit to PCI configuration space
 auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) -> void {
+    if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return;
+    authorize_bar_write(bus, slot, func, offset, 2);
     if ((offset & 0xfeU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
     ConfigGuard const GUARD;
+    if (!bar_write_allowed(bus, slot, func, offset, 2)) return;
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
     if ((offset & 0xfeU) == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
         value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
@@ -208,8 +327,11 @@ auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 
 // Write 8-bit to PCI configuration space
 auto pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value) -> void {
+    if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return;
+    authorize_bar_write(bus, slot, func, offset, 1);
     if (offset == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
     ConfigGuard const GUARD;
+    if (!bar_write_allowed(bus, slot, func, offset, 1)) return;
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
     if (offset == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
         value = static_cast<uint8_t>(value & ~PCI_COMMAND_BUS_MASTER);
@@ -298,9 +420,10 @@ auto pci_enable_bus_master(PCIDevice* dev) -> void {
 }
 
 auto pci_set_bus_master(PCIDevice* dev, bool enable) -> bool {
-    if (dev == nullptr || (enable && !iommu::bus_master_allowed(dev))) return false;
+    auto const INDEX = device_index(dev);
+    if (!INDEX || (enable && (!resource_dma_allowed(*INDEX) || !iommu::bus_master_allowed(dev)))) return false;
     ConfigGuard const GUARD;
-    if (enable && !iommu::bus_master_allowed(dev)) return false;
+    if (enable && (!resource_dma_allowed(*INDEX) || !iommu::bus_master_allowed(dev))) return false;
     outl(PCI_CONFIG_ADDRESS, config_address(dev->bus, dev->slot, dev->function, PCI_COMMAND));
     auto command = static_cast<uint16_t>(inl(PCI_CONFIG_DATA));
     command = enable ? static_cast<uint16_t>(command | PCI_COMMAND_BUS_MASTER) : static_cast<uint16_t>(command & ~PCI_COMMAND_BUS_MASTER);
@@ -309,11 +432,12 @@ auto pci_set_bus_master(PCIDevice* dev, bool enable) -> bool {
 }
 
 auto pci_enable_memory_space(PCIDevice* dev) -> void {
+    auto const INDEX = device_index(dev);
+    if (!INDEX) return;
     ConfigGuard const GUARD;
-    outl(PCI_CONFIG_ADDRESS, config_address(dev->bus, dev->slot, dev->function, PCI_COMMAND));
-    auto cmd = static_cast<uint16_t>(inl(PCI_CONFIG_DATA));
-    cmd |= PCI_COMMAND_MEM_SPACE;
-    outw(PCI_CONFIG_DATA, cmd);
+    if (resources[*INDEX].poisoned.load(std::memory_order_acquire)) return;
+    ConfigReader reader{dev};
+    reader.write16(PCI_COMMAND, static_cast<uint16_t>(reader.read16(PCI_COMMAND) | PCI_COMMAND_MEM_SPACE));
 }
 
 auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t {
@@ -339,6 +463,9 @@ auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t {
 }
 
 auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int {
+    auto const APIC = destination(target_cpu, vector);
+    auto const INDEX = device_index(dev);
+    if (!APIC || !INDEX || !resource_dma_allowed(*INDEX)) return -1;
     uint8_t const MSI_OFF = pci_find_capability(dev, PCI_CAP_ID_MSI);
     if (MSI_OFF == 0) {
         return -1;
@@ -352,10 +479,11 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int 
 
     uint16_t msg_ctrl = pci_config_read16(dev->bus, dev->slot, dev->function, MSI_OFF + 2);
     bool const IS_64BIT = ((msg_ctrl >> 7) & 1) != 0;
+    if (MSI_OFF > (IS_64BIT ? 0xf0 : 0xf4)) return -1;
 
     // Message Address: 0xFEE00000 | (dest APIC ID << 12), physical destination mode.
     // target_cpu is a logical CPU index; translate to APIC ID for the hardware.
-    uint32_t const APIC_ID = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
+    uint32_t const APIC_ID = *APIC;
     uint32_t const MSG_ADDR = 0xFEE00000U | (APIC_ID << 12);
     pci_config_write32(dev->bus, dev->slot, dev->function, MSI_OFF + 4, MSG_ADDR);
 
@@ -378,141 +506,215 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int 
     return 0;
 }
 
+auto pci_prepare_msix(PCIDevice* dev) -> int {
+    auto const INDEX = device_index(dev);
+    if (!INDEX) return -1;
+    auto& record = resources[*INDEX];
+    ConfigGuard guard;
+    if (record.poisoned.load(std::memory_order_acquire)) return -1;
+    if (auto const* prepared = record.msix.get()) return prepared->present ? 0 : 1;
+    if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return -1;
+    auto const* prepared = record.msix.prepare([&]() -> std::optional<PreparedMsix> {
+        ConfigReader reader{dev};
+        auto const CAP = msix::inspect(reader);
+        if (CAP.state == msix::CapabilityState::absent) return PreparedMsix{};
+        if (CAP.state != msix::CapabilityState::ready) {
+            poison_unlocked(*INDEX);
+            return std::nullopt;
+        }
+        auto const CONTROL = static_cast<uint8_t>(CAP.offset + 2);
+        // Some devices expose the table only with MSI-X enabled. FunctionMask
+        // remains set throughout preparation, so this admits no IRQ delivery.
+        reader.write16(CONTROL, static_cast<uint16_t>(CAP.control | 0xc000U));
+        if (reader.read16(CONTROL) != static_cast<uint16_t>(CAP.control | 0xc000U)) {
+            poison_unlocked(*INDEX, CAP.offset);
+            return std::nullopt;
+        }
+        // The preparing record blocks BME/relocation while page-table work is
+        // performed with the original IRQ state restored and no config lock.
+        guard.release();
+        auto fail = [&]() -> std::optional<PreparedMsix> {
+            ConfigGuard const GUARD;
+            poison_unlocked(*INDEX, CAP.offset);
+            return std::nullopt;
+        };
+        std::array<uint64_t, BAR_COUNT> sizes{};
+        for (auto bar : {CAP.table & 7U, CAP.pba & 7U}) {
+            if (bar >= BAR_COUNT) return fail();
+            auto const SIZE = pci_get_bar_size_checked(dev, static_cast<int>(bar));
+            if (!SIZE || *SIZE == 0) return fail();
+            sizes[bar] = *SIZE;
+        }
+        auto const LAYOUT = msix::layout(CAP, dev->bar, dev->header_type, sizes);
+        if (!LAYOUT) return fail();
+        auto* base = static_cast<uint8_t*>(pci_map_bar(dev, LAYOUT->table_bar));
+        if (base == nullptr || pci_map_bar(dev, LAYOUT->pba_bar) == nullptr) return fail();
+        auto* table = reinterpret_cast<volatile uint32_t*>(base + LAYOUT->table_offset);
+        {
+            ConfigGuard const GUARD;
+            uint16_t const COMMAND = config_read16_unlocked(*dev, PCI_COMMAND);
+            reader.write16(PCI_COMMAND, static_cast<uint16_t>(COMMAND | PCI_COMMAND_MEM_SPACE));
+            if (reader.read16(PCI_COMMAND) != static_cast<uint16_t>(COMMAND | PCI_COMMAND_MEM_SPACE)) {
+                poison_unlocked(*INDEX, CAP.offset);
+                return std::nullopt;
+            }
+        }
+        // Do not expose inherited firmware vector entries when activation
+        // clears FunctionMask. Short sections keep the 2048-entry case bounded.
+        for (uint32_t entry = 0; entry < LAYOUT->entries; ++entry) {
+            ConfigGuard const GUARD;
+            uint32_t const WORD = entry * 4U + 3U;
+            uint32_t const MASKED = table[WORD] | 1U;
+            table[WORD] = MASKED;
+            if (table[WORD] != MASKED) {
+                poison_unlocked(*INDEX, CAP.offset);
+                return std::nullopt;
+            }
+        }
+        return PreparedMsix{true, *LAYOUT, table};
+    });
+    return prepared == nullptr ? -1 : prepared->present ? 0 : 1;
+}
+
 auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int {
-    uint8_t const MSIX_OFF = pci_find_capability(dev, PCI_CAP_ID_MSIX);
-    if (MSIX_OFF == 0) {
+    auto const INDEX = device_index(dev);
+    auto const APIC = destination(target_cpu, vector);
+    if (!INDEX || !APIC) return -1;
+    ConfigGuard const GUARD;
+    auto& record = resources[*INDEX];
+    auto const* prepared = record.msix.get();
+    if (!prepared || !prepared->present || record.activated || record.poisoned.load(std::memory_order_acquire) ||
+        !iommu::bus_master_allowed(dev))
+        return -1;
+    ConfigReader reader{dev};
+    auto const OFFSET = static_cast<uint8_t>(prepared->layout.capability + 2);
+    uint16_t const CONTROL = reader.read16(OFFSET);
+    reader.write16(OFFSET, static_cast<uint16_t>(CONTROL | 0xc000U));
+    if (reader.read16(OFFSET) != static_cast<uint16_t>(CONTROL | 0xc000U)) {
+        poison_unlocked(*INDEX, prepared->layout.capability);
         return -1;
     }
-
-    // MSI-X capability layout:
-    // +0: Cap ID (8) | Next (8) | Message Control (16)
-    //     Message Control: bits 10:0 = table size - 1, bit 14 = function mask, bit 15 = enable
-    // +4: Table Offset/BIR (32)
-    //     bits 2:0 = BAR index, bits 31:3 = offset within BAR
-    // +8: PBA Offset/BIR (32)
-
-    uint16_t msg_ctrl = pci_config_read16(dev->bus, dev->slot, dev->function, MSIX_OFF + 2);
-
-    uint32_t const TABLE_OFF_BIR = pci_config_read32(dev->bus, dev->slot, dev->function, MSIX_OFF + 4);
-    uint8_t const TABLE_BIR = TABLE_OFF_BIR & 0x7;
-    uint32_t const TABLE_OFFSET = TABLE_OFF_BIR & ~0x7U;
-
-    // Ensure memory space is enabled for the table BAR
-    pci_enable_memory_space(dev);
-
-    // Map the BAR containing the MSI-X table
-    auto* bar_base = pci_map_bar(dev, TABLE_BIR);
-    if (bar_base == nullptr) {
+    TableReader table{*INDEX, *prepared};
+    if (!msix::program_entry(table, prepared->layout.entries, 0, vector, *APIC)) return -1;
+    uint16_t const COMMAND = reader.read16(PCI_COMMAND);
+    reader.write16(PCI_COMMAND, static_cast<uint16_t>(COMMAND | PCI_COMMAND_INT_DISABLE));
+    if (reader.read16(PCI_COMMAND) != static_cast<uint16_t>(COMMAND | PCI_COMMAND_INT_DISABLE)) {
+        poison_unlocked(*INDEX, prepared->layout.capability);
         return -1;
     }
-
-    auto* table = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<volatile uint8_t*>(bar_base) + TABLE_OFFSET);
-
-    // Enable MSI-X with Function Mask set (mask all vectors while configuring)
-    msg_ctrl |= (1U << 15) | (1U << 14);
-    pci_config_write16(dev->bus, dev->slot, dev->function, MSIX_OFF + 2, msg_ctrl);
-
-    // Configure entry 0 (each entry is 4 x 32-bit words = 16 bytes)
-    // target_cpu is a logical CPU index; translate to APIC ID for physical destination mode.
-    uint32_t const APIC_ID = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
-    table[0] = 0xFEE00000U | (APIC_ID << 12);  // Message Address Lower
-    table[1] = 0;                              // Message Address Upper
-    table[2] = vector;                         // Message Data (interrupt vector)
-    table[3] = 0;                              // Vector Control (0 = unmasked)
-
-    // Clear Function Mask to enable delivery
-    msg_ctrl &= ~(1U << 14);
-    pci_config_write16(dev->bus, dev->slot, dev->function, MSIX_OFF + 2, msg_ctrl);
-
-    // Disable legacy INTx
-    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
-    cmd |= PCI_COMMAND_INT_DISABLE;
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
-
+    uint16_t const ENABLED = static_cast<uint16_t>((CONTROL | 0x8000U) & ~0x4000U);
+    reader.write16(OFFSET, ENABLED);
+    if (reader.read16(OFFSET) != ENABLED) {
+        poison_unlocked(*INDEX, prepared->layout.capability);
+        return -1;
+    }
+    record.activated = true;
     return 0;
 }
 
 auto pci_get_bar_addr(PCIDevice* dev, int bar_idx) -> uint64_t {
-    if (dev == nullptr || bar_idx < 0) return 0;
+    if (!device_index(dev) || bar_idx < 0) return 0;
     return resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx)).address;
 }
 
 auto pci_get_bar_size_checked(PCIDevice* dev, int bar_idx) -> std::optional<uint64_t> {
-    if (dev == nullptr || bar_idx < 0) return std::nullopt;
-    struct Reader {
-        PCIDevice* device;
-        auto read32(uint8_t offset) -> uint32_t { return pci_config_read32(device->bus, device->slot, device->function, offset); }
-        auto read16(uint8_t offset) -> uint16_t { return pci_config_read16(device->bus, device->slot, device->function, offset); }
-        void write32(uint8_t offset, uint32_t value) { pci_config_write32(device->bus, device->slot, device->function, offset, value); }
-        void write16(uint8_t offset, uint16_t value) { pci_config_write16(device->bus, device->slot, device->function, offset, value); }
-    } reader{dev};
-    return resource::probe_memory_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx), reader);
+    auto const INDEX = device_index(dev);
+    if (!INDEX || bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT) ||
+        !resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx)).memory())
+        return std::nullopt;
+    auto& record = resources[*INDEX];
+    auto& cache = record.sizes[static_cast<size_t>(bar_idx)];
+    if (record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
+    if (auto const* value = cache.get()) return *value;
+    ConfigGuard const GUARD;
+    if (record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
+    if (auto const* value = cache.get()) return *value;
+    if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return std::nullopt;
+    auto const* value = cache.prepare([&]() -> std::optional<uint64_t> {
+        ConfigReader reader{dev};
+        auto const SIZE = resource::probe_memory_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx), reader);
+        if (!SIZE) poison_unlocked(*INDEX);
+        return SIZE;
+    });
+    return value ? std::optional<uint64_t>{*value} : std::nullopt;
 }
 
 auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t { return pci_get_bar_size_checked(dev, bar_idx).value_or(0); }
 
 auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
-    if (dev == nullptr || bar_idx < 0) return nullptr;
+    auto const INDEX = device_index(dev);
+    if (!INDEX || bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) return nullptr;
     auto const BAR = resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx));
     if (!BAR.memory() || BAR.address == 0) return nullptr;
-    auto const SIZE = pci_get_bar_size_checked(dev, bar_idx);
-    if (!SIZE || *SIZE == 0) return nullptr;
-    mod::cpu::CpuidContext cpu{.function = static_cast<int>(0x80000000U)};
-    mod::cpu::cpuid(&cpu);
-    if (static_cast<uint32_t>(cpu.eax) < 0x80000008U) return nullptr;
-    cpu.function = static_cast<int>(0x80000008U);
-    mod::cpu::cpuid(&cpu);
-    auto const RANGE = resource::mmio_range(BAR, *SIZE, mod::mm::addr::get_hhdm_offset(), cpu.eax & 255U);
-    if (!RANGE) return nullptr;
-    auto const* memory = mod::mm::boot_memory_map();
-    if (memory == nullptr || memory->entries == nullptr ||
-        !resource::mmio_memory_safe(*RANGE, memory->entry_count, [memory](size_t i) -> std::optional<resource::MemoryRegion> {
-            auto const* entry = memory->entries[i];
-            if (entry == nullptr) return std::nullopt;
-            return resource::MemoryRegion{entry->base, entry->length, entry->type == LIMINE_MEMMAP_RESERVED};
-        }))
-        return nullptr;
-
-    // Map the MMIO range into the kernel page table (uncacheable for MMIO correctness)
-    ker::mod::mm::virt::map_range_to_kernel_page_table(ker::mod::mm::virt::Range{.start = RANGE->start, .end = RANGE->end},
-                                                       ker::mod::mm::virt::kernel_mmio_page_flags());
-
-    return reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(BAR.address));
+    auto& record = resources[*INDEX];
+    auto& cache = record.mappings[static_cast<size_t>(bar_idx)];
+    ConfigGuard guard;
+    if (record.poisoned.load(std::memory_order_acquire)) return nullptr;
+    if (auto const* value = cache.get()) return *value;
+    if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return nullptr;
+    auto const* value = cache.prepare([&]() -> std::optional<void*> {
+        guard.release();
+        auto fail = [&]() -> std::optional<void*> {
+            ConfigGuard const GUARD;
+            poison_unlocked(*INDEX);
+            return std::nullopt;
+        };
+        auto const SIZE = pci_get_bar_size_checked(dev, bar_idx);
+        if (!SIZE || *SIZE == 0) return fail();
+        mod::cpu::CpuidContext cpu{};
+        cpu.function = static_cast<int>(0x80000000U);
+        mod::cpu::cpuid(&cpu);
+        if (static_cast<uint32_t>(cpu.eax) < 0x80000008U) return fail();
+        cpu.function = static_cast<int>(0x80000008U);
+        mod::cpu::cpuid(&cpu);
+        auto const RANGE = resource::mmio_range(BAR, *SIZE, mod::mm::addr::get_hhdm_offset(), cpu.eax & 255U);
+        if (!RANGE) return fail();
+        auto const* memory = mod::mm::boot_memory_map();
+        if (memory == nullptr || memory->entries == nullptr ||
+            !resource::mmio_memory_safe(*RANGE, memory->entry_count, [memory](size_t i) -> std::optional<resource::MemoryRegion> {
+                auto const* entry = memory->entries[i];
+                if (entry == nullptr) return std::nullopt;
+                return resource::MemoryRegion{entry->base, entry->length, entry->type == LIMINE_MEMMAP_RESERVED};
+            }))
+            return fail();
+        mod::mm::virt::map_range_to_kernel_page_table({RANGE->start, RANGE->end}, mod::mm::virt::kernel_mmio_page_flags());
+        return reinterpret_cast<void*>(mod::mm::addr::get_virt_pointer(BAR.address));
+    });
+    return value ? *value : nullptr;
 }
 
 // Legacy wrapper: find AHCI controller using full enumeration
 auto pci_configure_msix_entry(PCIDevice* dev, uint32_t entry_idx, uint8_t vector, uint64_t target_cpu) -> int {
-    uint8_t const MSIX_OFF = pci_find_capability(dev, PCI_CAP_ID_MSIX);
-    if (MSIX_OFF == 0) {
+    auto const INDEX = device_index(dev);
+    auto const APIC = destination(target_cpu, vector);
+    if (!INDEX || !APIC) return -1;
+    ConfigGuard const GUARD;
+    auto const& record = resources[*INDEX];
+    auto const* prepared = record.msix.get();
+    if (!prepared || !prepared->present || !record.activated || record.poisoned.load(std::memory_order_acquire) ||
+        !iommu::bus_master_allowed(dev))
+        return -1;
+    TableReader reader{*INDEX, *prepared};
+    return msix::program_entry(reader, prepared->layout.entries, entry_idx, vector, *APIC) ? 0 : -1;
+}
+
+auto pci_mask_msix_entry(PCIDevice* dev, uint32_t entry_idx, bool masked) -> int {
+    auto const INDEX = device_index(dev);
+    if (!INDEX) return -1;
+    ConfigGuard const GUARD;
+    auto const& record = resources[*INDEX];
+    auto const* prepared = record.msix.get();
+    if (!prepared || !prepared->present || entry_idx >= prepared->layout.entries || record.poisoned.load(std::memory_order_acquire))
+        return -1;
+    if (!masked && (!record.activated || !iommu::bus_master_allowed(dev))) return -1;
+    uint32_t const WORD = entry_idx * 4U + 3U;
+    uint32_t const CONTROL = prepared->table[WORD];
+    uint32_t const VALUE = masked ? CONTROL | 1U : CONTROL & ~uint32_t{1};
+    prepared->table[WORD] = VALUE;
+    if (prepared->table[WORD] != VALUE) {
+        poison_unlocked(*INDEX, prepared->layout.capability);
         return -1;
     }
-
-    // Validate entry_idx against the table size in the capability header.
-    uint16_t const MSG_CTRL = pci_config_read16(dev->bus, dev->slot, dev->function, MSIX_OFF + 2);
-    uint32_t const TABLE_SIZE = (MSG_CTRL & 0x07FFU) + 1U;
-    if (entry_idx >= TABLE_SIZE) {
-        return -1;
-    }
-
-    uint32_t const TABLE_OFF_BIR = pci_config_read32(dev->bus, dev->slot, dev->function, MSIX_OFF + 4);
-    uint8_t const TABLE_BIR = TABLE_OFF_BIR & 0x7;
-    uint32_t const TABLE_OFFSET = TABLE_OFF_BIR & ~0x7U;
-
-    auto* bar_base = pci_map_bar(dev, TABLE_BIR);
-    if (bar_base == nullptr) {
-        return -1;
-    }
-
-    auto* table = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<uint8_t*>(bar_base) + TABLE_OFFSET);
-
-    // Each entry is 4 x 32-bit words = 16 bytes.
-    volatile uint32_t* entry = table + (static_cast<size_t>(entry_idx) * 4);
-    uint32_t const APIC_ID = ker::mod::smt::get_apic_id_for_cpu(target_cpu);
-    entry[0] = 0xFEE00000U | (APIC_ID << 12);  // Message Address Lower
-    entry[1] = 0;                              // Message Address Upper
-    entry[2] = vector;                         // Message Data
-    entry[3] = 0;                              // Vector Control (bit 0 = 0 -> unmasked)
-
     return 0;
 }
 

@@ -1211,6 +1211,14 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     hc->erst_phys = erst.phys;
     hc->erst[0] = {.ring_base = event_ring.phys, .ring_size = EVENT_RING_SIZE, .reserved = 0};
 
+    // The controller is halted and BME is off. Prepare retained MSI-X mappings
+    // before reserving any vector; malformed capabilities are a probe failure.
+    int const MSIX_PREPARED = pci::pci_prepare_msix(pci_device);
+    if (MSIX_PREPARED < 0) {
+        (void)cleanup_controller(hc, false);
+        return -1;
+    }
+
     uint8_t vector = mod::gates::allocate_vector();
     if (vector == 0) {
         cleanup_controller(hc, false);
@@ -1218,7 +1226,13 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     }
     bool vector_reserved = true;
     hc->irq_vector = vector;
-    if (pci::pci_enable_msix(pci_device, vector) != 0 && pci::pci_enable_msi(pci_device, vector) != 0) {
+    int const MSIX_RESULT = pci::pci_enable_msix(pci_device, vector);
+    if (MSIX_PREPARED == 0 && MSIX_RESULT != 0) {
+        mod::gates::free_irq(vector);
+        (void)cleanup_controller(hc, false);
+        return -1;
+    }
+    if (MSIX_RESULT != 0 && pci::pci_enable_msi(pci_device, vector) != 0) {
         mod::gates::free_irq(vector);
         vector_reserved = false;
         if (pci_device->interrupt_line == 0 || pci_device->interrupt_line >= 16) {
