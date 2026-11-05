@@ -2,6 +2,7 @@
 """Compile actual accounting code against an independent logical-occupancy model."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -10,9 +11,12 @@ BASE = Path(os.environ.get('WOS_VAS_REUSE_BASE', ROOT))
 source = (BASE / 'modules/kern/src/platform/sched/resource_as.cpp').read_text()
 header = (BASE / 'modules/kern/src/platform/sched/resource_as.hpp').read_text()
 declaration = header[header.index('class AddressSpaceObservation'):header.index('\n};', header.index('class AddressSpaceObservation')) + 3]
+declaration = re.search(r'enum class MappingAdmission[^;]+;', header).group() + '\n' + declaration
 source = source[source.index('namespace ker::mod::sched::resource {'):]
 fast = 'auto admit_mapping(' in declaration
 mm_source = (BASE / 'modules/kern/src/platform/mm/virt.opt.cpp').read_text()
+mm_header = (BASE / 'modules/kern/src/platform/mm/virt.hpp').read_text()
+count_status = re.search(r'enum class UserVirtualCountStatus[^;]+;', mm_header).group()
 if 'auto validate_user_pagemap_access(' in mm_source:
     begin = mm_source.index('auto validate_user_pagemap_access(')
     gate_check = mm_source[begin:mm_source.index('\n}', begin) + 2]
@@ -29,8 +33,7 @@ def branch(start):
         depth += (vmem[cursor] == '{') - (vmem[cursor] == '}')
     return vmem[begin:cursor + 1]
 
-branches = [branch('if (is_prot_none(prot) ||'), branch('if (lazy_anon_mmap_enabled() &&'),
-            branch('if ((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && lazy_file_mmap_enabled())')]
+branches = [branch('if (RESERVE_ONLY)'), branch('if (USE_LAZY)'), branch('if (PRIVATE_READ)'), branch('if (LAZY_FILE)')]
 mapping_code = r'''
 namespace ker::vfs { constexpr unsigned S_IFMT=0170000, S_IFREG=0100000; }
 bool fail_metadata=false, fail_register=false;
@@ -50,6 +53,10 @@ template<class... T> bool add_shared_lazy_file_vmem_range_locked(task::Task *t,u
  return add_shared_vmem_range_locked(t,va,size,0,0);
 }
 template<class... T> int register_file_mmap_range(T...){return fail_register?-EIO:0;}
+template<class... T> uint64_t private_anon_allocate_locked(task::Task *t,uint64_t va,uint64_t size,T...){
+ return add_shared_vmem_range_locked(t,va,size,0,0)?va:static_cast<uint64_t>(-ENOMEM);
+}
+int perf_status_from_vmem_result(uint64_t result){return static_cast<int64_t>(result)<0?static_cast<int>(result):0;}
 void advance_shared_mmap_cursor_locked(task::Task *,uint64_t,uint64_t){}
 template<class... T> void record_local_vmem_event(T...){}
 uint32_t vmem_latency_since(uint64_t){return 0;}
@@ -57,12 +64,13 @@ uint32_t vmem_latency_since(uint64_t){return 0;}
 for index, body in enumerate(branches):
     mapping_code += f'uint64_t actual_mapping_{index}(task::Task *task) {{' + r'''
  sched::resource::AddressSpaceObservation observation(task);
- uint64_t size=2*P,vaddr=40*P,prot=0,flags=0;
+ uint64_t size=2*P,vaddr=40*P,hint=vaddr,prot=0,flags=0;int placement=0;
+ bool RESERVE_ONLY=BRANCH_INDEX==0,USE_LAZY=BRANCH_INDEX==1,PRIVATE_READ=BRANCH_INDEX==2,LAZY_FILE=BRANCH_INDEX==3;
  bool HAS_ADDRESS_RESERVATION=true,TRACK_FILE_MAPPING=true,WRITEBACK=true;
  uint64_t REQUESTED_SIZE=size-1,offset=0,NUM_PAGES=2,PERF_STARTED_US=0;
  int file=3;struct Stat{unsigned st_mode=ker::vfs::S_IFREG;} st;
  if(!admit(observation,*task,size))return static_cast<uint64_t>(-ENOMEM);
- ''' + body + '\n assert(false);return 0;\n}\n'
+ '''.replace('BRANCH_INDEX', str(index)) + body + '\n assert(false);return 0;\n}\n'
 code = r'''
 #include <algorithm>
 #include <atomic>
@@ -107,6 +115,7 @@ void record_address_space_usage(task::Task *subject, mm::paging::PageTable *root
 }
 }
 namespace ker::mod::mm::virt {
+COUNT_STATUS
 unsigned walks=0, checks=0;
 using paging::PageTable;
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE=static_cast<size_t>(-1);
@@ -118,12 +127,13 @@ bool acquire_user_pagemap_access(PageTable *root,bool wait,size_t &gate) {
  gate=3; ++gate_readers; return true;
 }
 void release_user_pagemap_access(size_t gate) { assert(gate==3 && gate_readers==1);--gate_readers; }
-bool count_user_virtual_bytes(paging::PageTable *root,uint64_t start,uint64_t end,uint64_t &bytes) {
+auto query_user_virtual_bytes(paging::PageTable *root,uint64_t start,uint64_t end,uint64_t &bytes)->UserVirtualCountStatus {
  bytes=0;
- if(start==end) return true;
- ++walks; if (!root->gate) return false;
+ if(!root||start>end||end>0x800000000000ULL||((start|end)&4095))return UserVirtualCountStatus::Invalid;
+ if(start==end) return UserVirtualCountStatus::Counted;
+ ++walks; if (!root->gate) return UserVirtualCountStatus::GateBusy;
  for (auto va:root->pages) if(va>=start && va<end) bytes+=paging::PAGE_SIZE;
- return true;
+ return UserVirtualCountStatus::Counted;
 }
 GATE_CHECK
 }
@@ -246,15 +256,15 @@ int main() {
  {sched::resource::AddressSpaceObservation o(&t);assert(!admit(o,t,P,END,P));commit(o);}
  assert(t.resources.entries[AS].current==reference(t));++cases;
  using Mapping=uint64_t(*)(task::Task*);
- for(Mapping mapping:{actual_mapping_0,actual_mapping_1,actual_mapping_2})
+ for(Mapping mapping:{actual_mapping_0,actual_mapping_1,actual_mapping_2,actual_mapping_3})
  for(bool metadata:{false,true}) for(bool registration:{false,true}) {
   reset(t,root);fail_metadata=metadata;fail_register=registration;
   uint64_t result=mapping(&t);
-  bool failed=metadata || (mapping==actual_mapping_2 && registration);
+  bool failed=metadata || (mapping==actual_mapping_3 && registration);
   assert(failed ? static_cast<int64_t>(result)<0 : result==40*P);
   assert(t.resources.entries[AS].current==reference(t) && t.resources.entries[AS].peak==999*P);
   assert(!t.pins && !mm::virt::gate_readers && sched::records==1);
-  if(REQUIRE_FAST) assert(mm::virt::checks==unsigned(!failed));++cases;
+  if(REQUIRE_FAST) assert(mm::virt::checks==unsigned(!failed && mapping!=actual_mapping_2));++cases;
  }
  printf("actual-source admission/observation/mapping %u semantic cases PASS; require-fast=%d\n",cases,REQUIRE_FAST);
 }
@@ -264,6 +274,7 @@ code = code.replace('using namespace ker::mod;', 'using namespace ker::mod; name
 code = code.replace('ADMIT_CALL', 'return o.admit_mapping(t.pagemap,added,start,removed);' if fast else 'return sched::resource::admit_address_space(&t,t.pagemap,added,start,removed);')
 code = code.replace('COMMIT_CALL', 'o.commit_mapping();' if fast else '(void)o;')
 code = code.replace('GATE_CHECK', gate_check)
+code = code.replace('COUNT_STATUS', count_status)
 code = code.replace('MAPPING_CODE', mapping_code)
 code = code.replace('STAGED_ADMIT', 'assert(o.admit_mapping(&staged,P));' if fast else 'assert(sched::resource::admit_address_space(&t,&staged,P,0,0));')
 code = code.replace('REQUIRE_FAST', 'true' if os.environ.get('WOS_VAS_REUSE_REQUIRE_FAST', '1') == '1' else 'false')

@@ -18,6 +18,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/tlb_shootdown.hpp>
 #include <platform/sched/task.hpp>
+#include <type_traits>
 
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
@@ -45,6 +46,7 @@ using namespace ker::mod::mm::paging;
 namespace detail {
 struct PreparedSwapForkAccess;
 struct IssuedNativeFileFaultAccess;
+struct ForkSourceAccess;
 }  // namespace detail
 // Private caller-born swap metadata owner. Prepare/destroy only ordinary context;
 // no source Mapping/Object/slot pointer survives an allocation or wait.
@@ -166,9 +168,145 @@ enum class PublicReadPrepareResult : uint8_t { NOT_TRACKED, READY, REFUSED };
 
 [[nodiscard]] auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*& prepared, PageTable* root, uint64_t start,
                                                    uint64_t end, uint64_t file_offset) -> bool;
+enum class UnpublishedRootRefusalSite : uint8_t {
+    None,
+    InputRoot,
+    ReaderAdmissionRefused,
+    PageKind,
+    ReferenceCount,
+    MissingControl,
+    ZeroSerial,
+    FileIndexNonempty,
+    UserEntryNonzero,
+    PrivateAuthority,
+};
+struct UnpublishedRootRefusal {
+    bool valid{};
+    UnpublishedRootRefusalSite site{UnpublishedRootRefusalSite::None};
+    uint16_t user_slot{UINT16_MAX};
+};
+enum class ForkCopyRefusalSite : uint8_t {
+    None,
+    WrapperContext,
+    WrapperInput,
+    TaskLease,
+    CopyContext,
+    CopyInput,
+    EagerArguments,
+    EagerPlacement,
+    ChildRoot,
+    PostExclusiveContext,
+    SwapPreflight,
+    SplitCommit,
+    CowWalk,
+    SourceAuthority,
+};
+// Caller-born scalar output. Record only the actual failed predicate; no root
+// pointer, retained owner, later admission sample or inner logging is involved.
+struct ForkCopyRefusalWitness {
+    bool valid{};
+    ForkCopyRefusalSite site{ForkCopyRefusalSite::None};
+    int32_t raw_status{};
+    UnpublishedRootRefusal child{};
+    // Input sites: first rejected condition in original short-circuit order.
+    // EagerArguments: captured eager decision. SplitCommit: returned Error.
+    uint32_t detail{};
+};
+static_assert(std::is_trivially_copyable_v<UnpublishedRootRefusal>);
+static_assert(std::is_trivially_copyable_v<ForkCopyRefusalWitness>);
+static_assert(sizeof(ForkCopyRefusalWitness) <= 32);
 // Caller owns the unpublished root. Bounded nonwaiting observation of all 256
 // user PML4 slots; upper kernel mappings stay outside the first-native profile.
 [[nodiscard]] auto unpublished_user_root_empty(PageTable* root) -> bool;
+// Same predicates and result; optional output identifies the first refusal.
+// ReaderAdmissionRefused describes the try call, not a presumed teardown cause.
+[[nodiscard]] auto unpublished_user_root_empty_observed(PageTable* root, UnpublishedRootRefusal* refusal) -> bool;
+
+// Fork-constructor authority for a newly allocated, never-published child root.
+// The actual raw fork constructor retains Task/root lifetime ownership; this
+// nonowning token adds no reference or fatal-stack recovery obligation. Only
+// the allocating factory can issue it. Matching Task scalars cannot mint one.
+class ForkPrivateChildRoot {
+   public:
+    ForkPrivateChildRoot() noexcept = default;
+    ~ForkPrivateChildRoot() { invalidate(); }
+    ForkPrivateChildRoot(const ForkPrivateChildRoot&) = delete;
+    auto operator=(const ForkPrivateChildRoot&) -> ForkPrivateChildRoot& = delete;
+    ForkPrivateChildRoot(ForkPrivateChildRoot&&) = delete;
+    auto operator=(ForkPrivateChildRoot&&) -> ForkPrivateChildRoot& = delete;
+
+    // Terminal and idempotent; never dereference or release either owner.
+    void invalidate() noexcept {
+        state_ = State::Consumed;
+        creator_ = child_ = nullptr;
+        root_ = nullptr;
+        creator_pid_ = child_pid_ = root_serial_ = 0;
+    }
+
+   private:
+    friend auto create_fork_private_child_root(sched::task::Task&, sched::task::Task&, ForkPrivateChildRoot&) -> PageTable*;
+    friend auto consume_fork_private_child_root(sched::task::Task&, sched::task::Task&, PageTable*, ForkPrivateChildRoot&,
+                                                UnpublishedRootRefusal*) noexcept -> bool;
+    enum class State : uint8_t { Virgin, Issued, Consumed };
+    State state_{State::Virgin};
+    sched::task::Task* creator_{};
+    sched::task::Task* child_{};
+    PageTable* root_{};
+    uint64_t creator_pid_{}, child_pid_{}, root_serial_{};
+};
+static_assert(sizeof(ForkPrivateChildRoot) <= 64);
+static_assert(!std::is_copy_constructible_v<ForkPrivateChildRoot> && !std::is_move_constructible_v<ForkPrivateChildRoot>);
+
+// Same allocation/context/kernel-half-copy placement as the old fork prefix.
+// Child is an exclusively owned new Task with no root. Bind its fresh root and
+// issue once; no raw-root adoption or reissue of an invalidated token exists.
+[[nodiscard]] auto create_fork_private_child_root(sched::task::Task& creator, sched::task::Task& child, ForkPrivateChildRoot& authority)
+    -> PageTable*;
+// Current creator exclusively retains child/root lifetime. Consume once and
+// validate the original structural predicates without a striped child reader.
+// Any copy attempt must invalidate the token even if it fails before this call.
+[[nodiscard]] auto consume_fork_private_child_root(sched::task::Task& creator, sched::task::Task& child, PageTable* expected,
+                                                   ForkPrivateChildRoot& authority, UnpublishedRootRefusal* refusal) noexcept -> bool;
+
+enum class ForkSourceAdmission : uint8_t { NotAttempted, Acquired, Busy, Context, TaskLease, RootStale, OwnerUsed };
+// Actual Task-local lease and try-acquired source exclusive. Construct before
+// PUB; finish before LegacyInterval unwinds. No raw root can mint this owner.
+class ForkSourceOwner {
+   public:
+    ForkSourceOwner() noexcept = default;
+    ~ForkSourceOwner() { finish(); }
+    ForkSourceOwner(const ForkSourceOwner&) = delete;
+    auto operator=(const ForkSourceOwner&) -> ForkSourceOwner& = delete;
+    ForkSourceOwner(ForkSourceOwner&&) = delete;
+    auto operator=(ForkSourceOwner&&) -> ForkSourceOwner& = delete;
+    void finish() noexcept;
+
+   private:
+    friend struct detail::ForkSourceAccess;
+    friend auto try_acquire_fork_source(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                        const ker::syscall::vmem::SharedVmemPublicationGuard&, ForkSourceOwner&) noexcept
+        -> ForkSourceAdmission;
+    enum class State : uint8_t { Virgin, Held, Consumed };
+    State state_{State::Virgin};
+    sched::task::Task* actor_{};
+    PageTable* root_{};
+    const sys::SyscallPreparationScope* preparation_{};
+    const ker::syscall::vmem::SharedVmemPublicationGuard* publication_{};
+    size_t gate_{static_cast<size_t>(-1)};
+};
+static_assert(sizeof(ForkSourceOwner) <= 64);
+static_assert(!std::is_copy_constructible_v<ForkSourceOwner> && !std::is_move_constructible_v<ForkSourceOwner>);
+// One nonwaiting attempt under actual PUB/LegacyInterval, before adoption.
+[[nodiscard]] auto try_acquire_fork_source(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                           const ker::syscall::vmem::SharedVmemPublicationGuard&, ForkSourceOwner&) noexcept
+    -> ForkSourceAdmission;
+// Ordinary-context hint only. Every yield/return has released its brief Task
+// lease; success requires fresh preparation and another actual exclusive try.
+[[nodiscard]] auto wait_for_fork_source(sched::task::Task&, const sys::SyscallPreparationScope&) noexcept -> int;
+namespace detail {
+[[nodiscard]] auto fork_source_owner_root(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                          const ker::syscall::vmem::SharedVmemPublicationGuard&, ForkSourceOwner&) noexcept -> PageTable*;
+}  // namespace detail
 // Ordinary preparation only: the caller owns a stable, exclusively unpublished
 // root and its retirement record. Failure may leave root-owned empty upper
 // tables; no leaf is published. Do not hold publication/lazy/cow/MM guards.
@@ -388,8 +526,13 @@ void drain_kernel_vmap_frees();
 // Drain only when deferred mappings have reached the warm-pool cap. Callers
 // that queue frees under an IRQ lock should retry this after releasing it.
 void drain_kernel_vmap_frees_if_over_limit();
+// BSP-only after immutable topology/node counters, before APs or user roots.
+// Select UMA caching or NUMA physical returns once; reject an initialized,
+// nonempty or busy pool without draining it or changing any counters.
+[[nodiscard]] auto initialize_page_table_pool_after_topology() noexcept -> bool;
 PageTable* create_pagemap();
-// Recoverable private process construction; retains the page-table pool path.
+// Recoverable private process construction; UMA retains the table cache.
+// Physical allocation precedes the origin-bound emergency reserve on NUMA.
 auto create_pagemap_may_fail() -> PageTable*;
 // Exact sole owner of a never-active private root OR fully retired root with
 // no future hardware publishers and completed teardown/ACK. owner_pid is only
@@ -563,6 +706,11 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 // resolution, then transfers that read-side hold into out until unpin.
 [[nodiscard]] auto pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable,
                                           bool fault_in, UserPagePin& out) -> bool;
+enum class UserPagePinAttempt : uint8_t { Pinned, Busy, Failed };
+// Never wait for a striped root gate. Busy owns no root/frame pin; the caller
+// must release its Task lease before scheduling and reacquire a fresh root.
+[[nodiscard]] auto try_pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable,
+                                              bool fault_in, UserPagePin& out) -> UserPagePinAttempt;
 [[nodiscard]] auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool;
 // Futex-only provenance. Caller keeps the original pin live; a busy output is
 // unchanged on refusal. Capture/revalidation allocate nothing and never sleep.
@@ -754,7 +902,11 @@ auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
 [[nodiscard]] auto validate_user_pagemap_access(PageTable* page_table) -> bool;
 // Logical user VA, including non-present reservations. Caller serializes
 // mapping publication or owns an unpublished root. Bounds must be page aligned.
-// A root teardown collision fails closed without blocking or allocating.
+// A stripe-exclusive collision fails closed without blocking or allocating.
+enum class UserVirtualCountStatus : uint8_t { Counted, Invalid, GateBusy, ReaderUnavailable };
+// No partial count escapes a refusal. GateBusy identifies an initial/raced
+// stripe refusal, not which root owns it; no reader remains held on return.
+[[nodiscard]] auto query_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> UserVirtualCountStatus;
 auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool;
 // Same publication/root-lifetime contract as counting, but stops at the first
 // present or reserved leaf. Invalid/empty ranges and teardown fail closed.
@@ -823,6 +975,18 @@ bool deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst);
                                                            const ker::syscall::vmem::SharedVmemPublicationGuard&,
                                                            const huge::RangeSplitSurvey&, huge::PreparedTables&, numa::AllocationContext*,
                                                            numa::AllocationResult*, PreparedAnonymousSwapFork&) noexcept -> int;
+[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(sched::task::Task&, PageTable* child, const sys::SyscallPreparationScope&,
+                                                           const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                                           const huge::RangeSplitSurvey&, huge::PreparedTables&, numa::AllocationContext*,
+                                                           numa::AllocationResult*, PreparedAnonymousSwapFork&,
+                                                           ForkCopyRefusalWitness* refusal) noexcept -> int;
+// Genuine factory-born fork path. The typed call invalidates authority on
+// every exit and consumes the real source owner without another acquisition.
+[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(
+    sched::task::Task& actor, sched::task::Task& child, ForkPrivateChildRoot& authority, ForkSourceOwner& source_owner,
+    const sys::SyscallPreparationScope& preparation, const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+    const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables, numa::AllocationContext* eager_context,
+    numa::AllocationResult* empty_result, PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal = nullptr) noexcept -> int;
 #ifdef WOS_SELFTEST
 // Caller exclusively owns both distinct registered never-active mutable roots.
 // Same walker, local eager decision only. Controlled refusal is not PMM pressure.

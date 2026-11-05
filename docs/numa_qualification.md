@@ -101,6 +101,49 @@ atomic/array helpers from instrumented callers. Their existing libc++ sanitizer
 ignorelist exclusions are part of the current safety boundary; the translation
 unit flag alone does not establish that every selected helper is uninstrumented.
 
+## Address-space admission and retirement
+
+Ordinary public mapping inspection and preparation acquire the actual Task/root
+lease and publication guard before entering a short preemption guard, then
+revalidate that authority inside the guard. Reader-admission waits may yield
+with interrupts enabled while retaining the Task lease and publication guard.
+No striped reader or debt epoch survives that wait. Raw-root inspection keeps
+its nonwaiting contract.
+
+Faulting usercopy uses a separate typed pin attempt. On root-gate contention,
+it releases its unsuccessful frame/root pin and Task pagemap lease before an
+eligible ordinary syscall executor yields. The preparation scope temporarily
+enables interrupts and restores the incoming IF afterward. An otherwise eligible
+ordinary caller may enter with IF clear. Mapped-only access, ineligible contexts,
+preemption-disabled callers, retained pins and actual retained ptrace effects
+refuse this handoff. A pending ptrace operation without a local effect remains
+eligible. Each retry repeats preparation and acquires a fresh target root.
+Callers retain the target Task's lifetime and enter without other
+MM/publication/access owners.
+
+Prepared fork receives a one-use capability issued only by the factory for a
+fresh, unpublished child root. Creator/child identity, page kind, references,
+root incarnation, empty file index and empty user half remain checked. Source
+exclusive admission precedes lazy adoption. A busy attempt releases its owners,
+waits in ordinary context and starts preparation again. Success transfers the
+real source gate and Task lease to the copier, which releases the gate before
+the lease. Copy and adoption failures remain terminal for that attempt.
+
+The BSP selects page-table-pool policy after topology publication and before
+AP startup. UMA retains its cache; multi-node systems return ordinary tables
+to physical ownership, preserving the fixed origin of emergency reserve roots.
+An exiting non-thread `PROCESS` switches its CPU to the kernel root while
+retaining `Task::pagemap` for scheduler-GC retirement under the existing epoch,
+current-task, shared-root and lifetime guards. Waitable zombies may retain
+resources until that retirement. These paths provide no bounded completion or
+starvation-free fork guarantee.
+
+After four optimistic `mkdir` attempts return `-EAGAIN`, a local host-namespace
+request makes one fresh serialized native lookup. Earlier lookup/publication
+owners have ended; captured credentials and the already-masked mode remain.
+Remote operations are not replayed. Mapping, COW, TLB-before-reuse, quota and
+syscall contracts remain in force throughout these progress changes.
+
 ## Virtual NUMA
 
 The optional `vm.numa` section uses this shape:
@@ -369,9 +412,10 @@ The existing strace decoder names both appended operations.
 are absent before volatile CPL3 writes, checks zero tails and records every
 resident page in its local 95% denominator. `testprog numa-lifecycle` defaults to
 1,000 fresh mmap/fork/COW/cross-page pipe-usercopy/wait/unmap cycles, with checked
-FD/map cleanup and bounded waits. These commands are built; their scheduled
-qualification is pending. Their own-resource ledger explicitly does not claim
-a global Task/File/pin/physical census, persistent pins, huge pages or pressure.
+FD/map cleanup and bounded waits. Scheduled results retain their individual
+workload and source scopes, as described below. Their own-resource ledger
+explicitly does not claim a global Task/File/pin/physical census, persistent
+pins, huge pages or pressure.
 
 Current counter/query integration passes Normal Build WOS, isolated fast KTEST,
 33 selected Host tests and C++ formatting/tidy. The repaired counter fixture
@@ -445,3 +489,495 @@ requirement for a ten-percent gain on physical NUMA hardware remains
 **UNVERIFIED**. The earlier renderer fault remains causally unresolved; later
 passing runs alone do not prove its repair. C78 fails criterion ten, and this
 appendix makes no Goal40 completion claim.
+
+## Correctness validation before host tool refresh, 2026-11-01
+
+Normal Build WOS and the subsequent complete-input validation build passed with
+the current Normal kernel `66a869bd…` (build ID `2fd8cb74ce15…`). The isolated
+Fast KTEST kernel is `728c8830…` (build ID `8687d32e9db6…`). The retained fixed
+reference for the next throughput comparison is `83a3efdc…` (build ID
+`48f085979f0b…`), with 17 explicitly selected common-correctness source files.
+That reference retains its recorded baseline and selection; the earlier C78
+artifacts and results above are unchanged.
+
+Fresh Fast KTEST runs on UMA and two-domain virtual NUMA each completed 1,560
+tests, with 197,827 and 214,877 passing assertions respectively, zero failures
+and three skips each. Separate strict lifecycle runs completed 1,000 warmup
+and 1,000 measured cycles per topology, with 1,000 consumed successful child
+exits in each phase. The census checked all 41 physical-owner classes, 23 MM
+fields and combined coverage 511. Global/domain free and ownership totals
+reconciled; the oracle permits changes within the cached-free partition.
+Owned maps and FDs returned to zero. Each phase had 2,000 eligible COW-resident
+pages, all local; NUMA phases each included 500 actual cross-node COW operations.
+Init consumed the workload exits and ordinary shutdown completed.
+
+The final scoped criterion-eight review passed by joining these fresh lifecycle
+results with the separately recorded healthy public policy, eligible first-touch
+and scheduled selected-node exhaustion evidence. Those historical executions,
+public-pressure limits and original diagnostic/completion flags remain unchanged.
+
+Fresh Normal scheduling checks passed six full-interval weighted-share
+comparisons and the affinity workload: 3,072 controller calls, 2,597 successes,
+475 Busy results, 64 destination observations and 256 pipe round trips. These
+two VMs received the expected host QMP quit after init consumed their workload
+exits. A fresh one-CPU Normal run passed 20 serial forks over a 32 MiB mapping,
+5,120 COW writes and 10 CPU-wait checks, then completed ordinary shutdown. Its
+guest and host checks require the workload's quiescent consumed service status
+(`pid=-1 pgid=-1`, generation 1, no restart, successful wait and exit history).
+A captured-status regression exercises only these predicates; the complete
+fresh guest reports and shutdown supply the one-CPU runtime result. The
+finalizer's own consumed exit and fully drained GC are outside that result.
+All seven roles passed separate independent saved-oracle and physical-zero
+checks. Owned process forests closed and disposable images were pruned.
+
+Focused Host tests exercise the actual pin/gate/retry functions, owner release
+before yielding, fresh-root acquisition, interrupt restoration and ptrace-effect
+refusal, with compiled negative controls. Their finite ports retain their stated
+scope alongside the native results. Core placement/large-page policy and measured
+dependent-load loops retain their documented source continuity; the changed pin
+front end has its own source review and correctness tests.
+
+The earlier ten-pair locality and 4 KiB/2 MiB TLB-sensitive measurements retain
+their original artifacts, raw samples and source scopes. They are historical
+timings. The physical NUMA ten-percent threshold remains **UNVERIFIED** under
+the accepted virtual substitute; no hardware TLB-miss count is claimed.
+
+The final combined review accepted criteria one through nine at these recorded
+and source-applicable scopes. Earlier failed batches and individual diagnostic
+flags remain unchanged.
+
+Criterion ten remains open. Its fresh fixed-reference campaign must complete
+all twenty arms in ten pairs, all 117 warmup and 117 measured cases per arm,
+and all eleven metrics at the unchanged 19/20 exact median-rate threshold,
+with raw samples, variance and independent closure evidence. The seven
+correctness roles supply no paired-throughput credit. Goal40 remains incomplete.
+
+## Host tool refresh and throughput status, 2026-11-01
+
+After the host QEMU and Python packages changed, complete-input Normal and Fast
+validation builds passed again. The kernel contents remained `66a869bd…` and
+`728c8830…`, respectively. All seven correctness roles were then repeated and
+passed their independent saved-oracle and cleanup checks. The refreshed UMA
+selftest completed 1,560 tests with 197,826 passing assertions, zero failures
+and three skips; NUMA completed 1,560 tests with 214,877 passing assertions,
+zero failures and three skips. The earlier assertion count above belongs to
+its original run. Both strict lifecycle runs again completed 1,000 warmup and
+1,000 measured cycles with all 41 physical-owner classes, and the Normal
+single-CPU, fairness and affinity checks passed.
+
+The benchmark supervisor checks now accept a positive historical probe error
+only for a currently running, ready daemon with a successful readiness
+transition at its current state timestamp. Workload errors, restarts, identity
+changes and timeouts remain failures. The C++ fixture regressions passed 229
+checks; Python regressions passed 122, including 50 wire-format checks. Both
+benchmark arms use the same corrected helpers.
+
+The C100 throughput attempt stopped during its seventh run and supplies no
+completed-campaign acceptance. C101 published its complete twenty-run plan,
+then stopped during host input validation before any VM or packaging step.
+The updated QEMU executable exceeds the initial reader's size limit and has
+ownership that reader does not accept. The next harness revision exercised
+that same initial path before nonce publication. No sample, threshold or
+runtime deadline is relaxed. Published
+nonces remain spent, and failed campaigns cannot resume or supply replacement
+or prefix credit. Criterion ten remains open.
+
+C102 subsequently passed that shared initial callback and the real launcher
+parent check before publishing its twenty-run plan. The exact host executable
+is verified separately while ordinary receipt ownership, size limits, byte
+accounting and closing checks remain enforced. This establishes the host
+initialization path; it supplies no guest-runtime or throughput acceptance.
+Its first read-only admission then stopped before packaging or VM launch:
+the admission caller still selected the older decoder validator. The active
+selection required correction and a regression against the untouched published
+plan; historical plan validators retain their original decoder identities.
+C103's pre-publication replay then exercised the same corrected loader used
+by admission: the untouched C102 twenty-run plan passed, and the older
+validator rejected it at the expected decoder check. This is a plan-schema
+regression, with no resumed run or throughput credit.
+
+C103 reached its first reference VM but failed qualification. During measured
+`command_mix_064`, the parallel file-operation workflow returned status 1;
+its timing interval contains a file-mapping `ENOMEM` and an unexpected libc
+panic. The later cases, including fork/COW, completed, but controller completion
+was absent and the original 900-second VM deadline expired. The whole campaign
+failed, with zero accepted pairs. Its reports and serial log were preserved and
+all five disposable images were removed.
+
+A deterministic Host test exposed a separate, plausible cause: address-space
+counting returned failure on a transient striped MM gate refusal, which mapping
+admission reported as `ENOMEM`. Counting the same unchanged root succeeded
+before and after the colliding gate was held. The fix preserves a typed Busy
+outcome and lets public file and anonymous mappings release publication and
+reader scopes, cooperate in an ordinary syscall context, then acquire the
+current root and recount. Invalid mappings, reader saturation and genuine
+address-space limit denial remain terminal; legacy boolean interfaces remain
+nonblocking and fail closed. File mappings retain their original open file
+description across retries. Retry work is bounded separately from geometry
+preparation.
+
+The focused gate/accounting Host profile passed 4,933 checks and its negative
+controls. File-mapping integration passed 263 cases and six compiled negative
+controls, including refusal with an incoming preemption guard or Task lease.
+Both Normal (`bef86b5c…`) and isolated Fast (`da006b03…`) kernel builds passed.
+Fresh validation builds held their complete current input sets, respectively
+2,542 and 2,645 entries, before and after each build. Fresh runtime qualification
+is still required. A separate, explicitly nonqualifying run of the unchanged
+reference kernel completed with ordinary shutdown and cleaned its disposable
+images; it did not reproduce the libc panic and no debugger attached. The
+native cause of C103's panic remains unproved. Earlier correctness evidence
+retains its original kernel scope; it is not a runtime result for the newly
+changed kernel. Criterion ten remains open.
+
+The fixed reference now includes the same mapping-accounting correctness
+repair, without the NUMA or large-page implementation. Its Normal kernel
+(`f9b3873e…`, build ID `07fbb7c0…`) built successfully, and a separate validation
+build held 3,464 complete inputs before and after execution. The first build's
+lack of a complete prebuild dependency hold remains recorded separately. Both
+sysroots and the earlier reference were preserved.
+
+Fresh current-kernel selftests passed in UMA and two-domain NUMA: 1,560 tests
+each, with respectively 197,811 and 214,877 passing assertions, zero failures
+and three skips. Both lifecycle runs passed 1,000 warmup and 1,000 measured
+cycles with complete ownership checks; each NUMA phase included 500 actual
+cross-node COW cases. All four runs shut down normally and passed independent
+cleanup checks. The Normal single-CPU fork/COW check also passed.
+
+Fresh Normal fairness qualification failed with a deadline error under the
+weighted helper's original 60-second limit, and no accepted report was collected.
+The failure logs and closed process receipts were retained, and the disposable
+images were removed. Its cause is under investigation. Affinity and the next
+throughput campaign have not advanced; no new throughput pair is accepted.
+
+Three explicitly nonqualifying diagnostic boots added sparse phase logging and
+a bounded atomic snapshot on deadline failure. All three completed the six
+weighted comparisons and passed physical cleanup checks. They did not reproduce
+the original failure. One healthy run spent about 5.5 seconds setting up its
+next trial, with zero affinity `EBUSY` retries; that observation does not locate
+the delay. The original fairness failure remains unresolved, and these
+instrumented runs supply no qualifying fairness or throughput result.
+
+A subsequent nonqualifying replay used the unchanged original fairness helper
+and also completed all six comparisons. It finished before the conditional
+live-capture threshold, so no debugger attached. Reports and independent
+physical cleanup checks passed; the original deadline failure remains
+unresolved, and this replay supplies no qualifying result.
+
+A later, prospectively bounded diagnostic captured a slow run with the unchanged
+helper. Its final trial had a 27.287-second setup gap, followed by passing warmup
+and measurement intervals. The kernel snapshot showed correctly placed runnable
+workers and no active publication-mutex, TLB, GC or teardown stall. Real host
+counters showed the vCPUs receiving CPU time during the slow interval. These
+observations narrow the investigation without establishing the delay's cause.
+The debugger restored the running VM, and independent physical cleanup passed.
+
+One new strict fairness confirmation was declared before execution, followed
+conditionally by one strict affinity confirmation. Both passed with the original
+helpers, limits, raw report oracles and current kernel. Neither used a debugger
+or passive sampler. Fairness passed all six interval comparisons; affinity
+completed 3,072 controller calls, 64 destination observations and 256 pipe round
+trips. Separate independent checks replayed both reports, their complete source
+and kernel dependency checks, process closure and disposable-image cleanup.
+
+The earlier fairness deadline failure remains an unresolved intermittent
+reliability risk. These fresh passes neither erase it nor establish a causal
+repair. The ten-pair fixed-reference throughput campaign is still outstanding;
+criterion ten has zero accepted performance pairs and Goal40 remains incomplete.
+
+The next campaign preparation passed its complete saved-evidence review,
+source bootstrap, initial host-state checks, and both current/reference writer
+preflights. Its twenty declarations were published and permanently recorded,
+but the resulting plan was 1,062,368 bytes, exceeding the unchanged 1 MiB input
+limit by 13,792 bytes. Independent publication and registry audits confirmed
+the declarations and refused operator release. No benchmark VM or disk image
+was created for that campaign, and its plan remains immutable and ineligible.
+
+The corrected writer encoded that same saved plan in 760,001 bytes. An actual
+writer/reader regression confirmed that the original bounded reader rejects
+the old representation and accepts the compact representation, preserving typed
+contents, array order and all twenty declarations. The next campaign preparation
+retains the existing input limits, workload, kernel artifacts and acceptance
+criteria. There are still no accepted performance pairs.
+
+The compact successor plan passed the original reader limit and independent
+declaration audits. Its first reference VM completed all 117 warmup and 117
+measured cases with zero recorded body or wait failures, then shut down normally.
+The required independent post-run validator exceeded its original 30-second
+limit while decoding saved reports. The whole campaign stopped with zero
+accepted arms; the remaining nineteen arms were not launched. The reports and
+failed validation log are retained. A separate fresh physical cleanup check
+confirmed zero disposable image bytes, no readable process or descriptor
+references to the removed images, and preservation of the existing user VM.
+That cleanup check does not qualify the failed benchmark arm.
+
+The timeout stack identifies the validation step active at the deadline, rather
+than its dominant cost. A bounded saved-data comparison preserved the complete
+reference proof, documents and all 5,706 input identities while using scoped
+dependency-path resolution. The original API took 6.97 seconds and the scoped
+version 3.53 seconds in that single ordered comparison. Both completed their
+fresh closing checks under the same limits. A separate full saved-data
+validation then completed in 28.44 seconds under its fresh 30-second diagnostic
+limit, including raw-report replay and closing checks. It reproduced the
+saved audit exactly. The failed campaign remains invalid and no performance
+pair is qualified by these diagnostics.
+
+The prospective successor declares a 60-second host validation budget while
+retaining the 900-second VM limit and 1,200-second arm limit. Its stages borrow
+the earlier parent deadline and reserve the additional check time before VM
+launch. Guest deadlines, workload windows and performance thresholds stay fixed.
+
+The current-kernel acceptance review now carries forward criteria one through
+nine using the current accounting tests, kernel identities, seven correctness
+runs and the applicable earlier topology, pressure, locality and large-page
+evidence. Their recorded scopes and failures remain explicit. Criterion ten's
+ten-pair throughput campaign is the remaining runtime acceptance requirement.
+
+The successor stopped before its first VM launch. Packaging succeeded, then
+startup admission rejected four shared guestfs cache entries whose modification
+and change timestamps had been updated during packaging. Their paths, inodes,
+sizes, ownership and allocated storage were unchanged; the cache still occupied
+1,331,216,384 bytes. The validation rule had incorrectly treated this reusable
+cache's historical timestamps as immutable. The two prepared disk images were
+removed by startup cleanup. A separate physical cleanup observation is pending.
+The campaign remains failed, with zero accepted arms or pairs; its remaining
+nineteen arms were never launched. The prospective correction must measure the
+cache afresh while retaining ownership, path and inclusive storage limits.
+
+The separate read-only physical cleanup check then passed under its fresh
+30-second limit. It found zero disposable image bytes, no readable same-user
+process or descriptor references to the removed paths or two known parent
+inodes, and unchanged required images and protected user VM. Six inaccessible
+desktop-process exceptions are explicitly disclosed. Required images, current
+cache and retained work totalled 11,458,875,392 allocated bytes, within 20 GiB.
+This cleanup result leaves the failed campaign and its benchmark credit unchanged.
+
+Fresh cache-accounting host tests passed 37 checks, including 22 rejection
+cases. They exercised legitimate timestamp changes and allocation growth,
+ownership and link checks, unique allocation accounting, storage and deadline
+limits, and changes during observation. Temporary fixtures were removed; the
+shared cache was neither modified nor read for content. These tests cover the
+cache helper. Integration into the next campaign and actual admission replay
+remain pending, with no new performance pairs accepted.
+
+Admission endpoint tests then passed 43 checks, including 18 rejection cases.
+The complete saved-data validator passed all nine stages in 40.83 seconds after
+adding three omitted historical records to a new source manifest; the first
+failed validation is preserved. The independent source/data review and the
+69-member bootstrap and shared initial checks also passed.
+
+The subsequent complete writer preflight stopped on an inherited function that
+still required the previous campaign's freeze and review identifiers. Earlier
+endpoint tests explicitly modeled that boundary and did not prove this entry
+point. No nonce, plan or VM image was created. A new source version adds an
+explicit current-campaign function and a direct positive/negative regression;
+the ten-pair performance requirement remains open.
+
+The new source generation passed that direct guard regression and a fresh
+admission-endpoint regression. Its complete saved-data validation passed all
+nine stages and five gates in 41.19 seconds, with closed process ownership.
+Independent source/data review, bootstrap, shared initial checks and the complete
+current/reference writer preflight also passed. The preflight recorded 9,722
+closing holds and checked both 17-receipt contexts.
+
+Once-only publication produced a 768,781-byte plan, within the unchanged 1 MiB
+reader limit and its predeclared 768,895-byte upper bound. Independent audits
+checked the actual bounded reader, all twenty declarations and source/spec
+joins, then independently reconstructed the permanent registry as 575 prior
+declarations plus twenty new ones, totalling 595. Earlier failed preparations
+and campaigns remain unchanged; no declaration may be refunded or replaced.
+
+After those audits, Root confirmed one original operator start under its
+30,000-second owner deadline. Admission was in progress at the recorded launch;
+no VM completion or accepted throughput sample is established by that report.
+Criterion ten still has zero accepted arms or pairs, and Goal40 remains
+incomplete. Criteria one through nine retain their scoped acceptance. The eleven
+metrics, all 117 warmup and 117 measured cases per arm, ten paired comparisons,
+95-percent median-throughput floor, raw variance and reader limits stay fixed.
+Physical NUMA's ten-percent improvement remains **UNVERIFIED** under the user's
+accepted virtual-NUMA substitute.
+
+
+The first original reference/current pair has since passed both native runs,
+independent physical cleanup and the unchanged saved-output postchecks. Their
+cleanup observations took 28.60 and 28.30 seconds within the 60-second host
+window; each confirmed zero disposable image bytes and all four images absent.
+Both samples remain in the original twenty-run campaign. The operator advanced
+to the third run; no final throughput acceptance is claimed from this prefix.
+
+A separate numerical auditor has passed independent source review. After the
+complete campaign and closed process ownership, it must replay all twenty
+strict saved-arm checks, decode all 880 measured timing files and independently
+recompute all eleven metrics from 220 measured samples. It preserves the ten
+samples per kernel, exact median invocation rates, 95-percent floor and sample
+variance; warmup values stay recorded outside the performance gate. This source
+review supplies no numerical result. Criterion ten and final goal completion
+remain pending.
+
+
+The C107 campaign completed all twenty original runs and passed their native,
+saved-output and independent cleanup checks, but **failed criterion ten's
+performance gate**. Fork/COW median invocation throughput was 94.6961 percent
+of the corrected Reference132 value, a 5.3039-percent regression against the
+unchanged five-percent limit. The other ten metrics passed. This is a genuine
+performance failure; the campaign cannot be resumed, replaced or reported as
+qualified. All declarations remain spent and the failed raw data is retained.
+The separate qualifying numerical auditor and public-results exporter have not
+run. Investigation now targets the fork/COW path while preserving ownership,
+NUMA policy and teardown correctness. Goal40 remains incomplete.
+
+The subsequent current194 Normal kernel has build ID
+`85d89de4b1498b1de6b4b4f29c9a958d7753c51f`. Three extra preemption scopes used
+for selftest observations are now confined to selftest builds; the production
+mapping locks and lifetime guards remain. This change has no accepted throughput
+result yet. Fresh fairness and affinity confirmations passed with their original
+helpers and limits. The combined current194 review accepts criteria one through
+nine using the current runs and the separately scoped historical evidence; it
+does not establish physical NUMA's ten-percent latency advantage.
+
+The next campaign, C108, stopped before a VM launch because its watchdog source
+binding referenced the wrong preparation directory. Its declarations remain
+spent. C109 then completed five original runs before its sixth run, on the
+current kernel, exceeded the unchanged 900-second VM deadline. The whole C109
+campaign is failed and cannot resume or contribute partial performance samples.
+
+Saved C109 reports show an earlier timing-helper launch reporting `ENOMEM`
+after its command-mix body passed. They also show that the final fork/COW body,
+END stamp and child wait completed; the later suite/controller wait has not yet
+been located. Kernel source contains admission paths that can translate page
+table gate contention into `ENOMEM`, but this has not been established as the
+runtime cause. Separate diagnostic runs must remain outside qualification.
+Cleanup and an independent host check confirmed that C109's disposable images
+were removed and the required seeds and existing user VM were preserved.
+Criterion ten remains unaccepted, and the earlier C107 performance failure
+remains part of the record.
+
+A separate nonqualifying replay on the unchanged current194 kernel also
+reached the 900-second VM deadline. Its bounded snapshot authenticated the
+kernel build ID and restored the running VM. It found 115 tasks in the bounded
+run-queue census but no controller or descendants there; that does not prove
+their global absence or identify their wait. Seven CPUs were idle and the
+remaining CPU was servicing the file-retirement worker's sleep timer. The
+observed publication, COW and pin locks were not held at that instant.
+
+This replay recorded a fork refusal at the legacy file-mapping commit stage:
+private `EAGAIN` became public `ENOMEM`. That commit does not allocate, but the
+record alone cannot distinguish its context, registry-lock or snapshot-match
+refusals, or connect it to C109's earlier helper failure. A shell command-path
+error also does not by itself distinguish fork-before-exec from `execve`.
+Stopped report and journal reads then failed because Linux refused the XFS
+read-only mount with “Structure needs cleaning.” No successful filesystem or
+report readback is claimed. The failed readback logs and kernel snapshot were
+retained, and all disposable images and private appliances were removed.
+
+A second separate diagnostic on the same unchanged kernel completed naturally.
+All 117 warmup and 117 measured cases passed, with matching successful timing
+and child-wait records. It shut down before the conditional debugger snapshot
+was due. Its disposable images and appliances were removed, and an independent
+host check confirmed cleanup. This is diagnostic completion, with no accepted
+performance pairs and no proof that the intermittent earlier failure is fixed.
+
+The current worktree adds a narrow fork optimization: after a locked check
+proves that the source has no legacy file-mapping rows, a single-use certificate
+allows the later empty commit to avoid reacquiring the registry mutex. The
+certificate binds the preparation, tasks and continuously held publication
+guard, including a generation that rejects guard-address reuse. Ordinary and
+nonempty commits retain their original checks and rollback. Eight focused host
+tests passed, including compiled negative controls. Normal Build WOS and the
+isolated Fast diagnostic build also passed. Fresh UMA and two-domain NUMA
+selftests each completed 1,560 tests with zero failed assertions. Both strict
+lifecycle runs completed 1,000 warmup and 1,000 measured cycles with full
+physical-owner accounting; the NUMA run included 500 actual cross-node COW
+operations per phase. Single-CPU boot, weighted fairness and task affinity also
+passed. Each of these seven runs passed its separate saved-evidence and physical
+cleanup check; disposable images and appliances were removed. The fresh
+seven-role index has SHA-256 `973d5d46cf434834fd9417fee731c04ba9c434dc20003979063d57102f9d3052`.
+
+These correctness results do not establish a throughput improvement or repair
+the intermittent C109 failure. The observed diagnostic refusal has not been
+proved to involve an empty source. The revised kernel still requires the full
+ten-pair performance campaign. Criterion ten remains unaccepted; the last
+complete fork/COW result remains 94.6961 percent against the 95-percent floor.
+
+The combined review now accepts criteria one through nine for this revised
+kernel, using the seven fresh runs, their full saved-data validation and the
+separately scoped evidence for unchanged topology and memory-lifetime paths.
+Historical locality and large-page timings retain their original build scope;
+this decision claims no new timing result or physical NUMA latency advantage.
+Criterion ten still requires a complete passing ten-pair campaign.
+
+C110 passed its source, saved-data and publication checks, then stopped before
+creating a VM because the host launch command supplied the campaign plan as the
+VM seed manifest. Its execution claim and all twenty identifiers remain spent;
+it produced no performance samples. A separate host check confirmed that all
+eighty possible disposable images were absent and the ten required seeds and
+existing user VM were preserved. A checked launcher now derives the seed
+manifest from the validated context and keeps it separate from the campaign
+plan. Its three regression checks passed, including rejection of a wrong input
+and refusal to resume the stopped campaign. A fresh complete campaign remains
+required.
+
+## Resident usercopy validation, 2026-11-04
+
+Current-task usercopy now first attempts the existing checked, nonfaulting pin
+for a resident mapping. The common pin path also permits this early check for
+read access. Successful pins retain the existing task/root lease, permission,
+file-binding and physical-frame checks. A failed attempt releases its owners
+before entering the existing fallible preparation path. Exiting tasks retain
+their preparation refusal. NUMA allocation policy and admission still apply
+when a page must actually be allocated.
+
+Normal Build WOS passed with kernel build ID
+`8fadc14227f905297ebe6c40d387f0e4e49232af`. The isolated Fast diagnostic kernel
+has build ID `02e137d3e54828102155538b75184ac6120e0575`. Its UMA and two-domain
+NUMA selftests each completed 1,560 tests with zero failed assertions. Separate
+strict UMA and NUMA lifecycle runs each completed 1,000 warmup and 1,000 measured
+cycles, including physical-owner reconciliation and successful child waits.
+The NUMA fixture exercised 500 cross-node COW operations per phase. Fresh
+single-CPU boot, weighted fairness and task-affinity runs also passed. All seven
+runs passed their saved-output checks and separate cleanup observations;
+disposable images and appliances were removed.
+
+The current review accepts criteria one through nine using these results,
+source continuity and the separately scoped topology, policy, pressure,
+placement and large-page evidence above. Historical locality and TLB-sensitive
+timings retain their measured kernel identities. Physical NUMA's ten-percent
+latency advantage remains unverified under the accepted virtual-NUMA execution.
+
+Criterion ten still requires a complete ten-pair comparison of this Normal
+kernel against the fixed Reference132, with all eleven median invocation-rate
+ratios at least 0.95 and every raw sample and variance retained. The last
+complete fork/COW comparison remains C107's failing 94.6961 percent. The current
+kernel has no accepted ten-pair throughput result, and the earlier intermittent
+C109 timeout has not been established as repaired.
+
+## Owner performance acceptance, 2026-11-05
+
+The owner explicitly directed: "mark the current campain as sufficient in
+performance." Further effort to recover the remaining roughly 0.3
+percentage-point margin was judged excessive for the expected benefit.
+Criterion ten's performance requirement is therefore accepted by owner decision.
+Further optimization and another ten-pair qualification campaign are not required
+for this goal. The existing fairness and affinity results remain applicable.
+
+The measured record is preserved: C107 completed ten pairs, passed ten of eleven
+metrics, and recorded fork/COW throughput at 94.6961 percent of Reference132
+against the original 95-percent floor. The current resident-usercopy kernel has
+no complete ten-pair throughput result. This acceptance changes neither those
+measurements nor the failed campaign records.
+
+Separate diagnostics on the current kernel completed three full-suite replays
+and one observed replay, each with 117 warmup and 117 measured cases passing.
+The observed run also verified bounded live progress collection and temporary
+SSH-forward removal. These runs provide diagnostic evidence only. An
+intermittent full-suite timeout remains unexplained; no timeout fix or physical
+NUMA latency benefit is claimed. Further performance qualification work stops
+under the owner's decision.
+
+The separate Git/Clang diagnostic stress fixture subsequently completed all
+100 pairs (200 successful case exits), followed by stress SSH exit zero and
+ordinary WOS shutdown. Its overall diagnostic receipt remains failed because
+the supplemental journal was 1,147,296 bytes, exceeding the unchanged 512 KiB
+capture bound. No journal truncation or rerun was used. Independent host checks
+confirmed process, temporary-forward and disposable-image cleanup; required
+seeds and the user's VM were preserved. This diagnostic does not establish a
+fix for the earlier timeout.

@@ -90,6 +90,14 @@ namespace debt = ::ker::test::numa_lifecycle::mm_debt;
 using DebtField = ::ker::test::numa_lifecycle::CounterField;
 #endif
 
+namespace detail {
+struct ForkSourceAccess {
+    static auto root(sched::task::Task&, const sys::SyscallPreparationScope&, const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                     ForkSourceOwner&) noexcept -> PageTable*;
+    static auto transfer(ForkSourceOwner&, PageTable*, size_t&, sched::task::Task*&) noexcept -> bool;
+};
+}  // namespace detail
+
 namespace {
 using log = ker::mod::dbg::logger<"virt">;
 
@@ -654,6 +662,13 @@ void end_user_pagemap_exclusive(size_t gate_index) {
 class UserPagemapExclusiveScope {
    public:
     explicit UserPagemapExclusiveScope(PageTable* pagemap) : gate_index(begin_user_pagemap_exclusive(pagemap)), root_(pagemap) {}
+    UserPagemapExclusiveScope(PageTable* pagemap, ForkSourceOwner* owner) : gate_index(USER_PAGEMAP_ACCESS_GATE_NONE), root_(pagemap) {
+        if (owner == nullptr) {
+            gate_index = begin_user_pagemap_exclusive(pagemap);
+        } else if (!detail::ForkSourceAccess::transfer(*owner, pagemap, gate_index, lease_actor_)) {
+            root_ = nullptr;  // A provided owner never falls back to blocking acquisition.
+        }
+    }
     [[nodiscard]] auto owns(PageTable* root) const noexcept -> bool { return gate_index != USER_PAGEMAP_ACCESS_GATE_NONE && root_ == root; }
     ~UserPagemapExclusiveScope() { finish(); }
     void finish() {
@@ -661,6 +676,10 @@ class UserPagemapExclusiveScope {
         end_user_pagemap_exclusive(gate_index);
         gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
         root_ = nullptr;
+        if (lease_actor_ != nullptr) {
+            lease_actor_->release_usercopy_pagemap();
+            lease_actor_ = nullptr;
+        }
     }
 
     UserPagemapExclusiveScope(const UserPagemapExclusiveScope&) = delete;
@@ -671,6 +690,7 @@ class UserPagemapExclusiveScope {
    private:
     size_t gate_index;
     PageTable* root_;
+    sched::task::Task* lease_actor_{};
 };
 
 void invalidate_local_tlb_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3);
@@ -1784,7 +1804,10 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         bool already_mapped = false;
         bool observed = false;
         {
+#ifdef WOS_SELFTEST
+            // Keep the test observer on its captured CPU before taking the PTE lock.
             sched::PreemptGuard const PREEMPT;
+#endif
             observed = demand_is_observed(demand);
             uint64_t const PTE_IRQF = cow_pte_lock.lock_irqsave();
             // A non-present tracked swap leaf still owns saved bytes. Generic
@@ -2988,6 +3011,145 @@ auto migrate_anonymous_swap_area(void* /*context*/, uint32_t area_id) -> int {
 
 }  // namespace
 
+void ForkSourceOwner::finish() noexcept {
+    if (gate_ != USER_PAGEMAP_ACCESS_GATE_NONE) end_user_pagemap_exclusive(gate_);
+    if (actor_ != nullptr) actor_->release_usercopy_pagemap();
+    state_ = State::Consumed;
+    actor_ = nullptr;
+    root_ = nullptr;
+    preparation_ = nullptr;
+    publication_ = nullptr;
+    gate_ = USER_PAGEMAP_ACCESS_GATE_NONE;
+}
+
+auto try_acquire_fork_source(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication, ForkSourceOwner& owner) noexcept
+    -> ForkSourceAdmission {
+    if (owner.state_ != ForkSourceOwner::State::Virgin || owner.actor_ != nullptr || owner.root_ != nullptr ||
+        owner.preparation_ != nullptr || owner.publication_ != nullptr || owner.gate_ != USER_PAGEMAP_ACCESS_GATE_NONE)
+        return ForkSourceAdmission::OwnerUsed;
+    if (!huge::detail::current_fork_context_valid(actor, preparation, publication)) {
+        owner.finish();
+        return ForkSourceAdmission::Context;
+    }
+    // This output belongs to the instrumented caller, not this excluded TU's stack.
+    if (!actor.try_acquire_usercopy_pagemap(owner.root_)) {
+        owner.finish();
+        return ForkSourceAdmission::TaskLease;
+    }
+    owner.actor_ = &actor;  // Only an actually acquired lease can be released.
+    owner.preparation_ = &preparation;
+    owner.publication_ = &publication;
+    if (!huge::detail::current_fork_context_valid(actor, preparation, publication)) {
+        owner.finish();
+        return ForkSourceAdmission::Context;
+    }
+    if (owner.root_ == nullptr || owner.root_ == get_kernel_pagemap() || owner.root_ != actor.pagemap ||
+        actor.usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+        owner.finish();
+        return ForkSourceAdmission::RootStale;
+    }
+    owner.gate_ = try_begin_user_pagemap_exclusive(owner.root_);
+    if (!huge::detail::current_fork_context_valid(actor, preparation, publication)) {
+        owner.finish();
+        return ForkSourceAdmission::Context;
+    }
+    if (owner.root_ != actor.pagemap || actor.usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+        owner.finish();
+        return ForkSourceAdmission::RootStale;
+    }
+    if (owner.gate_ == USER_PAGEMAP_ACCESS_GATE_NONE) {
+        owner.finish();
+        return ForkSourceAdmission::Busy;
+    }
+    owner.state_ = ForkSourceOwner::State::Held;
+    return ForkSourceAdmission::Acquired;
+}
+
+auto detail::ForkSourceAccess::root(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                                    const ker::syscall::vmem::SharedVmemPublicationGuard& publication, ForkSourceOwner& owner) noexcept
+    -> PageTable* {
+    if (owner.state_ != ForkSourceOwner::State::Held || owner.actor_ != &actor || owner.preparation_ != &preparation ||
+        owner.publication_ != &publication || owner.root_ == nullptr || owner.root_ == get_kernel_pagemap() ||
+        owner.root_ != actor.pagemap || owner.gate_ == USER_PAGEMAP_ACCESS_GATE_NONE ||
+        owner.gate_ != user_pagemap_access_gate_index(owner.root_) || actor.usercopy_pagemap_closing.load(std::memory_order_acquire) ||
+        actor.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 ||
+        !huge::detail::current_fork_context_valid(actor, preparation, publication) ||
+        !user_pagemap_access_gates.at(owner.gate_).teardown.load(std::memory_order_acquire))
+        return nullptr;
+    return owner.root_;
+}
+
+auto detail::ForkSourceAccess::transfer(ForkSourceOwner& owner, PageTable* expected, size_t& empty_gate,
+                                        sched::task::Task*& empty_actor) noexcept -> bool {
+    if (expected == nullptr || expected == get_kernel_pagemap() || empty_gate != USER_PAGEMAP_ACCESS_GATE_NONE || empty_actor != nullptr ||
+        owner.actor_ == nullptr || owner.preparation_ == nullptr || owner.publication_ == nullptr ||
+        root(*owner.actor_, *owner.preparation_, *owner.publication_, owner) != expected)
+        return false;
+    empty_gate = owner.gate_;
+    empty_actor = owner.actor_;
+    owner.state_ = ForkSourceOwner::State::Consumed;
+    owner.actor_ = nullptr;
+    owner.root_ = nullptr;
+    owner.preparation_ = nullptr;
+    owner.publication_ = nullptr;
+    owner.gate_ = USER_PAGEMAP_ACCESS_GATE_NONE;
+    return true;
+}
+
+auto detail::fork_source_owner_root(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                                    const ker::syscall::vmem::SharedVmemPublicationGuard& publication, ForkSourceOwner& owner) noexcept
+    -> PageTable* {
+    return ForkSourceAccess::root(actor, preparation, publication, owner);
+}
+
+namespace {
+auto fork_source_wait_context_valid(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                                    uint32_t preempt_depth) noexcept -> bool {
+    return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
+           actor.type == sched::task::TaskType::PROCESS && actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) && !actor.exit_in_progress.load(std::memory_order_acquire) &&
+           actor.syscall_account_start_us != 0 && !actor.usercopy_pagemap_closing.load(std::memory_order_acquire) &&
+           sched::interrupts_enabled() && sched::preempt_count() == preempt_depth;
+}
+}  // namespace
+
+auto wait_for_fork_source(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation) noexcept -> int {
+    for (;;) {
+        if (!fork_source_wait_context_valid(actor, preparation, 0)) return -EWOULDBLOCK;
+        bool busy = false;
+        int status = 0;
+        {
+            sched::PreemptGuard const PREEMPT;
+            {
+                PageTable* root = nullptr;
+#ifdef WOS_KASAN
+                if (kasan::is_enabled()) kasan::unpoison_range(&root, sizeof(root));
+#endif
+                if (!fork_source_wait_context_valid(actor, preparation, 1)) {
+                    status = -EWOULDBLOCK;
+                } else if (!actor.try_acquire_usercopy_pagemap(root)) {
+                    status = -EAGAIN;
+                } else {
+                    if (root == nullptr || root == get_kernel_pagemap() || root != actor.pagemap ||
+                        actor.usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+                        status = -ESTALE;
+                    } else {
+                        auto& gate = user_pagemap_access_gates.at(user_pagemap_access_gate_index(root));
+                        busy = gate.teardown.load(std::memory_order_acquire) || gate.readers.load(std::memory_order_acquire) != 0;
+                        if (!fork_source_wait_context_valid(actor, preparation, 1)) status = -EWOULDBLOCK;
+                    }
+                    actor.release_usercopy_pagemap();
+                }
+            }  // Root pointer and every actual lease end before enabling preemption.
+        }
+        if (status != 0) return status;
+        if (!fork_source_wait_context_valid(actor, preparation, 0)) return -EWOULDBLOCK;
+        if (!busy) return 0;  // Advisory only; the coordinator must prepare and try again.
+        sched::kern_yield();
+    }
+}
+
 struct PreparedAnonymousSwapFork::Storage {
     AnonymousSwapMapping** rows{};
     size_t capacity{};
@@ -3398,7 +3560,13 @@ struct PageTablePool {
 #endif
 };
 
-PageTablePool page_table_pool{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+PageTablePool page_table_pool{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// The legacy cache mixes roots, hierarchy tables and unpublished spares.
+// Multi-node systems use the physical return paths so retained cache backing
+// cannot exchange NUMA domains. Emergency roots keep their fixed origin pool.
+std::atomic<bool> page_table_pool_enabled{true};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// Written once by the BSP under page_table_pool.lock, before APs/user roots.
+bool page_table_pool_topology_initialized{};            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> page_table_pool_alloc_hits{0};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> page_table_pool_alloc_misses{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> page_table_pool_releases{0};      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -3931,6 +4099,10 @@ auto page_table_pool_proof_end(bool tracked) -> uint64_t {
 #endif
 
 auto try_alloc_page_table_from_pool() -> PageTable* {
+    if (!page_table_pool_enabled.load(std::memory_order_acquire)) {
+        page_table_pool_alloc_misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     auto& pool = page_table_pool;
     uint64_t const FLAGS = pool.lock.lock_irqsave();
     if (pool.count == 0) {
@@ -3985,6 +4157,10 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
     }
 
     if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) {
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!page_table_pool_enabled.load(std::memory_order_acquire)) {
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -5710,12 +5886,15 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
     bool initial_path_promoted = false;
 
     {
-        // Hand CPU stability to the existing PTE lock's preemption hold;
-        // no extra guard spans the later shootdown/perf or allocator call.
+#ifdef WOS_SELFTEST
+        // Hand the test observer's CPU stability to the PTE lock's hold.
         sched::preempt_disable();
+#endif
         bool const OBSERVED = demand_is_observed(demand);
         uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+#ifdef WOS_SELFTEST
         sched::preempt_enable();
+#endif
 
         PageTableEntry& pml4e = entry_at(PAGEMAP, IDX4);
         if (!pml4e.present) {
@@ -5855,7 +6034,10 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
     bool observed = false;
     auto const NEW_PHYS = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
     {
+#ifdef WOS_SELFTEST
+        // The observer's captured CPU stays pinned through this commit interval.
         sched::PreemptGuard const PREEMPT;
+#endif
         observed = demand_is_observed(demand);
         uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
         uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
@@ -6518,19 +6700,29 @@ auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool r
 }
 
 auto pin_user_page_common(sched::task::Task* task, PageTable* pagemap, vaddr_t vaddr, bool require_writable, bool fault_in,
-                          bool wait_for_teardown, UserPagePin& out
+                          bool wait_for_teardown, UserPagePin& out, UserPagePinAttempt* attempt = nullptr
 #ifdef WOS_SELFTEST
                           ,
                           UserPagePinPathObservation* observation = nullptr
 #endif
                           ) -> bool {
     out = {};
+    if (attempt != nullptr) *attempt = UserPagePinAttempt::Failed;
     size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)) {
+    bool const ACQUIRED = attempt != nullptr ? admit_user_pagemap_reader(
+                                                   pagemap, access_gate_index,
+                                                   [pagemap, attempt](bool) {
+                                                       auto& gate = user_pagemap_access_gates.at(user_pagemap_access_gate_index(pagemap));
+                                                       if (gate.readers.load(std::memory_order_acquire) == UINT32_MAX) return false;
+                                                       *attempt = UserPagePinAttempt::Busy;
+                                                       return false;
+                                                   })
+                                             : acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index);
+    if (!ACQUIRED) {
         return false;
     }
 
-    if (task != nullptr && require_writable && fault_in && task->pagemap == pagemap) {
+    if (task != nullptr && fault_in && task->pagemap == pagemap) {
 #ifdef WOS_SELFTEST
         if (observation != nullptr) {
             ++observation->early_attempts;
@@ -6579,6 +6771,19 @@ auto pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap
         return false;
     }
     return pin_user_page_common(task, expected_pagemap, vaddr, require_writable, fault_in, fault_in, out);
+}
+
+auto try_pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable, bool fault_in,
+                                UserPagePin& out) -> UserPagePinAttempt {
+    if (task == nullptr || task->pagemap != expected_pagemap) {
+        out = {};
+        return UserPagePinAttempt::Failed;
+    }
+    UserPagePinAttempt attempt = UserPagePinAttempt::Failed;
+    if (pin_user_page_common(task, expected_pagemap, vaddr, require_writable, fault_in, false, out, &attempt)) {
+        return UserPagePinAttempt::Pinned;
+    }
+    return attempt;
 }
 
 auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool {
@@ -7003,7 +7208,7 @@ auto selftest_pin_user_page_for_task_observed(sched::task::Task* task, PageTable
         out = {};
         return false;
     }
-    return pin_user_page_common(task, expected_pagemap, vaddr, require_writable, fault_in, fault_in, out, &observation);
+    return pin_user_page_common(task, expected_pagemap, vaddr, require_writable, fault_in, fault_in, out, nullptr, &observation);
 }
 
 auto selftest_user_pagemap_reader_count(PageTable* pagemap) -> uint32_t {
@@ -7086,8 +7291,83 @@ void switch_to_kernel_pagemap() { wrcr3(reinterpret_cast<uint64_t>(addr::get_phy
 
 auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
+auto initialize_page_table_pool_after_topology() noexcept -> bool {
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology == nullptr || topology->node_count == 0 || topology->node_count > numa::MAX_NODES) return false;
+
+    auto& pool = page_table_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    bool const READY = !page_table_pool_topology_initialized && pool.count == 0
+#ifdef WOS_SELFTEST
+                       && pool.proof_inflight == 0 && !pool.proof_invalid
+#endif
+        ;
+    if (READY) {
+        page_table_pool_enabled.store(topology->node_count == 1, std::memory_order_release);
+        page_table_pool_topology_initialized = true;
+    }
+    pool.lock.unlock_irqrestore(FLAGS);
+    return READY;
+}
+
 auto create_pagemap() -> PageTable* { return create_user_root_common(false); }
 auto create_pagemap_may_fail() -> PageTable* { return create_user_root_common(true); }
+
+namespace {
+auto fork_private_child_constructor_valid(const sched::task::Task& creator, const sched::task::Task& child) -> bool {
+    using Task = sched::task::Task;
+    return &creator != &child && sched::can_query_current_task() && sched::get_current_task() == &creator && creator.pid != 0 &&
+           creator.type == sched::task::TaskType::PROCESS &&
+           creator.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !creator.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !creator.exit_in_progress.load(std::memory_order_acquire) && !creator.has_exited && child.pid != 0 && child.pid != creator.pid &&
+           child.type == sched::task::TaskType::PROCESS && !child.is_thread && child.thread == nullptr &&
+           child.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE && !child.has_run && !child.has_exited &&
+           !child.exit_in_progress.load(std::memory_order_acquire) && !child.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !child.scheduler_published.load(std::memory_order_acquire) &&
+           child.child_membership_state.load(std::memory_order_acquire) == sched::task::ChildMembershipState::UNLINKED &&
+           !child.child_publication_established && child.child_parent == nullptr && child.child_sibling_prev == nullptr &&
+           child.child_sibling_next == nullptr && !child.shares_user_pagemap.load(std::memory_order_acquire) &&
+           !child.usercopy_pagemap_closing.load(std::memory_order_acquire) &&
+           child.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 && !child.gc_queued.load(std::memory_order_acquire) &&
+           child.active_registry_index == Task::ACTIVE_REGISTRY_INDEX_INVALID && child.sched_queue == Task::sched_queue::NONE &&
+           child.heap_index == -1 && child.sched_next == nullptr && child.ref_count.load(std::memory_order_acquire) == 1;
+}
+}  // namespace
+
+auto create_fork_private_child_root(sched::task::Task& creator, sched::task::Task& child, ForkPrivateChildRoot& authority) -> PageTable* {
+    if (authority.state_ != ForkPrivateChildRoot::State::Virgin || child.pagemap != nullptr ||
+        !fork_private_child_constructor_valid(creator, child)) {
+        authority.invalidate();
+        return nullptr;
+    }
+    auto* root = create_user_root_common(false);
+    if (root == nullptr) {
+        authority.invalidate();
+        return nullptr;
+    }
+    child.pagemap = root;
+    copy_kernel_mappings(&child);
+    uint64_t serial = 0;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    if (control != nullptr) serial = control->serial;
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    // Keep the actual constructor's bound root available to ordinary rollback
+    // even if an unexpected registration failure prevents issuing authority.
+    if (serial != 0) {
+        authority.creator_ = &creator;
+        authority.child_ = &child;
+        authority.root_ = root;
+        authority.creator_pid_ = creator.pid;
+        authority.child_pid_ = child.pid;
+        authority.root_serial_ = serial;
+        authority.state_ = ForkPrivateChildRoot::State::Issued;
+    } else {
+        authority.invalidate();
+    }
+    return root;
+}
 
 #ifdef WOS_SELFTEST
 auto selftest_create_pagemap(const SelftestRootFactoryOptions& options, SelftestRootFactoryOutput& output) -> PageTable* {
@@ -7264,19 +7544,82 @@ void selftest_current_root_census_into(SelftestRootCensus& out, lifecycle_census
 
 #endif
 
-auto unpublished_user_root_empty(PageTable* root) -> bool {
-    if (root == nullptr || root == kernel_pagemap || is_current_pagemap(root)) return false;
+auto unpublished_user_root_empty_observed(PageTable* root, UnpublishedRootRefusal* refusal) -> bool {
+    if (refusal != nullptr) *refusal = {};
+    auto refuse = [refusal](UnpublishedRootRefusalSite site, uint16_t slot = UINT16_MAX) {
+        if (refusal != nullptr) *refusal = {.valid = true, .site = site, .user_slot = slot};
+        return false;
+    };
+    if (root == nullptr || root == kernel_pagemap || is_current_pagemap(root)) return refuse(UnpublishedRootRefusalSite::InputRoot);
     size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(root, false, gate)) return false;
+    if (!acquire_user_pagemap_access(root, false, gate)) return refuse(UnpublishedRootRefusalSite::ReaderAdmissionRefused);
     bool empty = false;
-    if (phys::page_kind_get(root) == PageKind::PAGE_TABLE && phys::page_ref_get(root) == 1U) {
+    if (phys::page_kind_get(root) != PageKind::PAGE_TABLE) {
+        (void)refuse(UnpublishedRootRefusalSite::PageKind);
+    } else if (phys::page_ref_get(root) != 1U) {
+        (void)refuse(UnpublishedRootRefusalSite::ReferenceCount);
+    } else {
         uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
         auto* control = find_user_root_control_locked(root);
-        empty = control != nullptr && control->serial != 0 && file_mapping_index.root_empty_locked(root);
-        for (size_t i = 0; empty && i < 256; ++i) empty = pte_raw(entry_at(root, i)) == 0;
+        if (control == nullptr) {
+            (void)refuse(UnpublishedRootRefusalSite::MissingControl);
+        } else if (control->serial == 0) {
+            (void)refuse(UnpublishedRootRefusalSite::ZeroSerial);
+        } else if (!file_mapping_index.root_empty_locked(root)) {
+            (void)refuse(UnpublishedRootRefusalSite::FileIndexNonempty);
+        } else {
+            empty = true;
+            for (size_t i = 0; empty && i < 256; ++i) {
+                if (pte_raw(entry_at(root, i)) != 0) empty = refuse(UnpublishedRootRefusalSite::UserEntryNonzero, static_cast<uint16_t>(i));
+            }
+        }
         user_mapping_pin_lock.unlock_irqrestore(FLAGS);
     }
     release_user_pagemap_access(gate);
+    return empty;
+}
+
+auto unpublished_user_root_empty(PageTable* root) -> bool { return unpublished_user_root_empty_observed(root, nullptr); }
+
+auto consume_fork_private_child_root(sched::task::Task& creator, sched::task::Task& child, PageTable* expected,
+                                     ForkPrivateChildRoot& authority, UnpublishedRootRefusal* refusal) noexcept -> bool {
+    bool const ISSUED = authority.state_ == ForkPrivateChildRoot::State::Issued;
+    auto* const CREATOR = authority.creator_;
+    auto* const CHILD = authority.child_;
+    auto* const ROOT = authority.root_;
+    uint64_t const CREATOR_PID = authority.creator_pid_;
+    uint64_t const CHILD_PID = authority.child_pid_;
+    uint64_t const SERIAL = authority.root_serial_;
+    authority.invalidate();
+    if (refusal != nullptr) *refusal = {};
+    auto refuse = [refusal](UnpublishedRootRefusalSite site, uint16_t slot = UINT16_MAX) {
+        if (refusal != nullptr) *refusal = {.valid = true, .site = site, .user_slot = slot};
+        return false;
+    };
+    if (!ISSUED || CREATOR != &creator || CHILD != &child || creator.pid != CREATOR_PID || child.pid != CHILD_PID || ROOT != expected ||
+        child.pagemap != ROOT || SERIAL == 0 || !fork_private_child_constructor_valid(creator, child))
+        return refuse(UnpublishedRootRefusalSite::PrivateAuthority);
+    if (ROOT == nullptr || ROOT == kernel_pagemap || is_current_pagemap(ROOT)) return refuse(UnpublishedRootRefusalSite::InputRoot);
+    if (phys::page_kind_get(ROOT) != PageKind::PAGE_TABLE) return refuse(UnpublishedRootRefusalSite::PageKind);
+    if (phys::page_ref_get(ROOT) != 1U) return refuse(UnpublishedRootRefusalSite::ReferenceCount);
+    bool empty = false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(ROOT);
+    if (control == nullptr) {
+        (void)refuse(UnpublishedRootRefusalSite::MissingControl);
+    } else if (control->serial == 0) {
+        (void)refuse(UnpublishedRootRefusalSite::ZeroSerial);
+    } else if (control->serial != SERIAL) {
+        (void)refuse(UnpublishedRootRefusalSite::PrivateAuthority);
+    } else if (!file_mapping_index.root_empty_locked(ROOT)) {
+        (void)refuse(UnpublishedRootRefusalSite::FileIndexNonempty);
+    } else {
+        empty = true;
+        for (size_t i = 0; empty && i < 256; ++i) {
+            if (pte_raw(entry_at(ROOT, i)) != 0) empty = refuse(UnpublishedRootRefusalSite::UserEntryNonzero, static_cast<uint16_t>(i));
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
     return empty;
 }
 
@@ -9172,24 +9515,38 @@ auto validate_user_pagemap_access(PageTable* page_table) -> bool {
     return true;
 }
 
-auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
+auto query_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> UserVirtualCountStatus {
     bytes = 0;
     if (page_table == nullptr || start > end || end > 0x0000800000000000ULL || ((start | end) & (paging::PAGE_SIZE - 1)) != 0) {
-        return false;
+        return UserVirtualCountStatus::Invalid;
     }
     if (start == end) {
-        return true;
+        return UserVirtualCountStatus::Counted;
     }
     // The bounded walk cannot block; keep its root pin out of non-unwinding
     // fatal syscall handoffs. Timer accounting remains active.
     sched::PreemptGuard guard;
     size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(page_table, false, gate)) {
-        return false;
+    auto refused = UserVirtualCountStatus::ReaderUnavailable;
+    if (!admit_user_pagemap_reader(page_table, gate, [page_table, &refused](bool) {
+            auto const& access = user_pagemap_access_gates.at(user_pagemap_access_gate_index(page_table));
+            refused = access.readers.load(std::memory_order_acquire) == UINT32_MAX ? UserVirtualCountStatus::ReaderUnavailable
+                                                                                   : UserVirtualCountStatus::GateBusy;
+            return false;
+        })) {
+        return refused;
     }
     bool const VALID = count_virtual_bytes_in_table(page_table, 4, 0, start, end, bytes);
     release_user_pagemap_access(gate);
-    return VALID;
+    if (!VALID) {
+        bytes = 0;
+        return UserVirtualCountStatus::Invalid;
+    }
+    return UserVirtualCountStatus::Counted;
+}
+
+auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
+    return query_user_virtual_bytes(page_table, start, end, bytes) == UserVirtualCountStatus::Counted;
 }
 
 auto query_user_virtual_range(PageTable* page_table, uint64_t start, uint64_t end) -> UserVirtualRangeStatus {
@@ -12344,31 +12701,61 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
                                          const sys::SyscallPreparationScope& preparation,
                                          const ker::syscall::vmem::SharedVmemPublicationGuard& publication, const RangeSplitSurvey& survey,
                                          PreparedTables& tables, numa::AllocationContext* eager_context,
-                                         numa::AllocationResult* empty_result, virt::PreparedAnonymousSwapFork* prepared_swap) noexcept
-    -> int {
+                                         numa::AllocationResult* empty_result, virt::PreparedAnonymousSwapFork* prepared_swap,
+                                         virt::ForkCopyRefusalWitness* refusal, sched::task::Task* private_child,
+                                         virt::ForkPrivateChildRoot* authority, virt::ForkSourceOwner* source_owner) noexcept -> int {
+    if (refusal != nullptr) *refusal = {};
     constexpr uint64_t USER_END = uint64_t{1} << 47;
-    if (!current_fork_context_valid(actor, preparation, publication)) return -EWOULDBLOCK;
-    if (source == nullptr || child == nullptr || source == child || source != actor.pagemap || source == virt::kernel_pagemap ||
-        child == virt::kernel_pagemap || !survey.complete() || survey.start() != 0 || survey.end() != USER_END ||
-        survey.stamp().root.address_bits != reinterpret_cast<uint64_t>(source) || survey.stamp().root.incarnation == 0)
-        return -EINVAL;
+    using Site = virt::ForkCopyRefusalSite;
+    auto refuse = [refusal](Site site, int status, uint32_t detail = 0, virt::UnpublishedRootRefusal child_refusal = {}) {
+        if (refusal != nullptr) *refusal = {.valid = true, .site = site, .raw_status = status, .child = child_refusal, .detail = detail};
+        return status;
+    };
+    if (!current_fork_context_valid(actor, preparation, publication)) return refuse(Site::CopyContext, -EWOULDBLOCK);
+    // Keep the original left-to-right short circuit; detail is its first
+    // rejected condition, not a second inspection after the failure.
+    if (source == nullptr) return refuse(Site::CopyInput, -EINVAL, 1);
+    if (child == nullptr) return refuse(Site::CopyInput, -EINVAL, 2);
+    if (source == child) return refuse(Site::CopyInput, -EINVAL, 3);
+    if (source != actor.pagemap) return refuse(Site::CopyInput, -EINVAL, 4);
+    if (source == virt::kernel_pagemap) return refuse(Site::CopyInput, -EINVAL, 5);
+    if (child == virt::kernel_pagemap) return refuse(Site::CopyInput, -EINVAL, 6);
+    if (!survey.complete()) return refuse(Site::CopyInput, -EINVAL, 7);
+    if (survey.start() != 0) return refuse(Site::CopyInput, -EINVAL, 8);
+    if (survey.end() != USER_END) return refuse(Site::CopyInput, -EINVAL, 9);
+    if (survey.stamp().root.address_bits != reinterpret_cast<uint64_t>(source)) return refuse(Site::CopyInput, -EINVAL, 10);
+    if (survey.stamp().root.incarnation == 0) return refuse(Site::CopyInput, -EINVAL, 11);
     bool const EAGER = virt::fork_eager_copy_requested();
     if (EAGER ? (eager_context == nullptr || empty_result == nullptr) : (eager_context != nullptr || empty_result != nullptr))
-        return -EINVAL;
-    if (EAGER && !virt::valid_fork_placement(source, child, *eager_context, *empty_result)) return -EINVAL;
-    // This nonwaiting child-only validation precedes the source exclusive: its
-    // stripe may collide with the source's. Caller still owns its never-active
-    // root exclusively; emptiness alone cannot prove historical inactivity.
-    if (!virt::unpublished_user_root_empty(child)) return -EINVAL;
+        return refuse(Site::EagerArguments, -EINVAL, static_cast<uint32_t>(EAGER));
+    if (EAGER && !virt::valid_fork_placement(source, child, *eager_context, *empty_result)) return refuse(Site::EagerPlacement, -EINVAL);
+    // Typed authority validates the private child before copy/scope adoption.
+    // The raw path validates before blocking acquisition; no child reader
+    // can span a colliding source exclusive.
+    virt::UnpublishedRootRefusal child_refusal;
+    bool const TYPED = private_child != nullptr || authority != nullptr || source_owner != nullptr;
+    if (TYPED && (private_child == nullptr || authority == nullptr || source_owner == nullptr)) {
+        if (authority != nullptr) authority->invalidate();
+        return refuse(Site::SourceAuthority, -EINVAL);
+    }
+    if (source_owner != nullptr && virt::detail::fork_source_owner_root(actor, preparation, publication, *source_owner) != source)
+        return refuse(Site::SourceAuthority, -EAGAIN);
+    bool const CHILD_EMPTY =
+        private_child != nullptr
+            ? virt::consume_fork_private_child_root(actor, *private_child, child, *authority, refusal != nullptr ? &child_refusal : nullptr)
+            : virt::unpublished_user_root_empty_observed(child, refusal != nullptr ? &child_refusal : nullptr);
+    if (!CHILD_EMPTY) return refuse(Site::ChildRoot, -EINVAL, 0, child_refusal);
 #ifdef WOS_SELFTEST
     virt::selftest_require_mutable_pagemap_root(source, "prepared-fork-source");
     virt::selftest_require_mutable_pagemap_root(child, "prepared-fork-destination");
 #endif
-    virt::UserPagemapExclusiveScope source_usercopy_scope(source);
-    if (!current_fork_context_valid(actor, preparation, publication) || source != actor.pagemap) return -EAGAIN;
+    virt::UserPagemapExclusiveScope source_usercopy_scope(source, source_owner);
+    if (source_owner != nullptr && !source_usercopy_scope.owns(source)) return refuse(Site::SourceAuthority, -EAGAIN);
+    if (!current_fork_context_valid(actor, preparation, publication) || source != actor.pagemap)
+        return refuse(Site::PostExclusiveContext, -EAGAIN);
     if (prepared_swap != nullptr) {
         int const status = virt::detail::PreparedSwapForkAccess::preflight(*prepared_swap, source, child);
-        if (status != 0) return status;
+        if (status != 0) return refuse(Site::SwapPreflight, status);
     }
     // Full user-half proof (including count0) is checked before every child PTE
     // write. This exact original exclusive is retained through split and COW;
@@ -12377,16 +12764,16 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
     if (SPLIT != Error::None) {
         switch (SPLIT) {
             case Error::Invalid:
-                return -EINVAL;
+                return refuse(Site::SplitCommit, -EINVAL, static_cast<uint32_t>(SPLIT));
             case Error::Unsupported:
-                return -EOPNOTSUPP;
+                return refuse(Site::SplitCommit, -EOPNOTSUPP, static_cast<uint32_t>(SPLIT));
             case Error::GenerationExhausted:
-                return -EOVERFLOW;
+                return refuse(Site::SplitCommit, -EOVERFLOW, static_cast<uint32_t>(SPLIT));
             case Error::Capacity:
             case Error::Exhausted:
-                return -ENOMEM;
+                return refuse(Site::SplitCommit, -ENOMEM, static_cast<uint32_t>(SPLIT));
             default:
-                return -EAGAIN;
+                return refuse(Site::SplitCommit, -EAGAIN, static_cast<uint32_t>(SPLIT));
         }
     }
     // Actual split publication, table transfer, ACK, trackers and cap credits
@@ -12409,7 +12796,7 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
         // An old compatible failure may have changed a parent COW prefix.
         // Complete its source invalidation before caller-owned child rollback.
         virt::flush_pagemap_after_update(source, 0, true);
-        return prepared_error != 0 ? prepared_error : -ENOMEM;
+        return refuse(Site::CowWalk, prepared_error != 0 ? prepared_error : -ENOMEM);
     }
     return 0;
 }
@@ -12465,9 +12852,9 @@ auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAcce
     return Error::None;
 }
 
-auto acquire_current_fork_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
-                                     const ker::syscall::vmem::SharedVmemPublicationGuard& publication, CurrentRangeRootAccess& empty,
-                                     RangePrepareSite* failure_site) noexcept -> Error {
+auto acquire_current_ordinary_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                         const ker::syscall::vmem::SharedVmemPublicationGuard& publication, CurrentRangeRootAccess& empty,
+                                         RangePrepareSite* failure_site) noexcept -> Error {
     if (!current_fork_range_context_matches(subject, preparation, publication, 0)) {
         if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
         return Error::Invalid;
@@ -12510,15 +12897,27 @@ auto acquire_current_fork_range_root(sched::task::Task& subject, const sys::Sysc
     }
     return Error::None;
 }
-auto validate_current_fork_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
-                                      const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
-                                      const CurrentRangeRootAccess& access, RangePrepareSite* failure_site) noexcept -> Error {
+auto validate_current_ordinary_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                          const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                          const CurrentRangeRootAccess& access, RangePrepareSite* failure_site) noexcept -> Error {
     if (!current_fork_range_context_matches(subject, preparation, publication, 1) || !current_fork_range_root_matches(subject, access) ||
         access.gate == virt::USER_PAGEMAP_ACCESS_GATE_NONE || access.gate != virt::user_pagemap_access_gate_index(access.root)) {
         if (failure_site != nullptr) *failure_site = RangePrepareSite::Context;
         return Error::Invalid;
     }
     return Error::None;
+}
+
+auto acquire_current_fork_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                     const ker::syscall::vmem::SharedVmemPublicationGuard& publication, CurrentRangeRootAccess& empty,
+                                     RangePrepareSite* failure_site) noexcept -> Error {
+    return acquire_current_ordinary_range_root(subject, preparation, publication, empty, failure_site);
+}
+
+auto validate_current_fork_range_root(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                      const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                      const CurrentRangeRootAccess& access, RangePrepareSite* failure_site) noexcept -> Error {
+    return validate_current_ordinary_range_root(subject, preparation, publication, access, failure_site);
 }
 
 void release_current_range_root(CurrentRangeRootAccess& access) noexcept {

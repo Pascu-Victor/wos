@@ -290,7 +290,7 @@ KTEST(UsercopyWritablePin, CompletePathAndFinalLeafRestrictions) {
         KEXPECT_FALSE(held.acquire(*fixture.owner, TEST_VA));
         expect_route(held, 1, 0, 1);
         KREQUIRE_TRUE(held.acquire(*fixture.owner, TEST_VA, false, true));
-        expect_route(held, 0, 0, 0);
+        expect_route(held, 1, 1, 0);
         held.reset();
     }
     uint64_t const RAW = entry_raw(fixture.root, TEST_VA, 1);

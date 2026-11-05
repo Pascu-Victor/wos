@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import operator
 import os
 import re
 from pathlib import Path
@@ -22,7 +23,7 @@ import subprocess
 import tempfile
 import time
 
-EXPECTED_TESTS = 76
+EXPECTED_TESTS = 84
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -87,8 +88,13 @@ class CppText(str):
     def count(self, needle):
         return len(re.findall(self.pattern(needle), self))
 
-    def replace(self, needle, replacement):
-        return CppText(re.sub(self.pattern(needle), lambda _: replacement, self))
+    def replace(self, needle, replacement, count=-1):
+        count = operator.index(count)
+        if count == 0:
+            return CppText(self)
+        # Regex zero means unlimited; no string has more than len + 1 matches.
+        limit = 0 if count < 0 else min(count, len(self) + 1)
+        return CppText(re.sub(self.pattern(needle), lambda _: replacement, self, count=limit))
 
     def gtest_cases(self) -> list[dict]:
         """Finite TEST/TEST_F discovery; byte offsets always refer to the original."""
@@ -258,7 +264,7 @@ def select_control_source(full: str, test: str, baseline_names: set[str]) -> tup
     return projection, verify_control_source(full, projection, test, baseline_names)
 
 
-def mixed_pch_prefix(source: str) -> str:
+def mixed_pch_prefix(source: str, profile: str = "mixed") -> str:
     """Only the current idempotent declarations/includes, in physical order."""
     boundary = "// Compile the real numa_alloc.cpp and its real phys.hpp declarations."
     if source.count(boundary) != 1:
@@ -276,7 +282,7 @@ namespace ker::mod::mm::paging {struct PageTable;}
 namespace host_managed_remove {extern bool enabled,invoking;void before_decrement(void*);void unmap_ack(ker::mod::mm::paging::PageTable*,uint64_t);}
 #include <cstddef>
 namespace host_fork_alloc {bool refuse(std::size_t,bool);void* null_result();void note_delete(void*);bool free_stack(void*);void guard();}
-namespace host_fork_vm {extern bool enabled;void publication_acquire();void pin_acquire();}
+namespace host_fork_vm {extern bool enabled;extern bool source_wait_observing;extern void(*on_pub_release)();void publication_acquire();void pin_acquire();}
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -299,6 +305,35 @@ namespace host_fork_vm {extern bool enabled;void publication_acquire();void pin_
 #include <utility>
 #include <vector>
 """
+    if profile == "coordinator":
+        expected = """
+#include <cstddef>
+namespace host_fork_alloc {bool refuse(std::size_t,bool);void* null_result();void note_delete(void*);bool free_stack(void*);void guard();}
+namespace host_fork_vm {extern bool enabled;extern bool source_wait_observing;extern void(*on_pub_release)();void publication_acquire();void pin_acquire();}
+#include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <platform/acpi/numa_boot.hpp>
+#include <platform/asm/cpu.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/managed_huge.hpp>
+#include <platform/mm/numa_alloc.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <string>
+#include <utility>
+#include <vector>
+"""
+    elif profile != "mixed":
+        raise ValueError("unsupported PCH prefix profile")
     def tokens(value: str) -> list:
         if not value.isascii():
             raise ValueError("mixed PCH prefix must be ASCII C++")
@@ -322,8 +357,8 @@ namespace host_fork_vm {extern bool enabled;void publication_acquire();void pin_
     return prefix
 
 
-def verify_mixed_pch_consumer(source: str, prefix: str) -> dict:
-    if mixed_pch_prefix(source) != prefix:
+def verify_mixed_pch_consumer(source: str, prefix: str, profile: str = "mixed") -> dict:
+    if mixed_pch_prefix(source, profile) != prefix:
         raise ValueError("mixed PCH consumer prefix differs from the baseline")
     raw, initial = source.encode(), prefix.encode()
     restored = initial + raw[len(initial):]
@@ -356,6 +391,85 @@ def definition(text: str, anchor: str) -> str:
     return text[first:end]
 
 
+def gate_collision_source(kernel_file, cases: Path) -> tuple[str, list[dict], list[Path], dict]:
+    """One standalone Normal-branch TU, with real gate storage/hash/atomics."""
+    virt_path = kernel_file("platform/mm/virt.opt.cpp")
+    header_path = kernel_file("platform/mm/virt.hpp")
+    paging_path = kernel_file("platform/mm/paging.hpp")
+    kind_path = kernel_file("platform/mm/page_alloc.hpp")
+    managed_path = kernel_file("platform/mm/managed_huge.cpp")
+    scheduler_path = kernel_file("platform/sched/scheduler.hpp")
+    source, header, kinds = virt_path.read_text(), header_path.read_text(), kind_path.read_text()
+    rows = []
+
+    def selected(path: Path, anchor: str, text: str, end: str | None = None) -> str:
+        value = bounded(text, anchor, end) if end is not None else definition(text, anchor)
+        rows.append(dict(file=str(path), anchor=anchor, end=end, bytes=len(value.encode()),
+                         sha256=hashlib.sha256(value.encode()).hexdigest()))
+        return value
+
+    gate_functions = {}
+    for anchor in (
+        "[[nodiscard]] auto user_pagemap_access_gate_index(",
+        "template <typename WaitForTeardown>\n[[nodiscard]] auto admit_user_pagemap_reader(",
+        "[[nodiscard]] auto acquire_user_pagemap_access(",
+        "[[nodiscard]] auto try_begin_user_pagemap_exclusive(",
+        "[[nodiscard]] auto begin_user_pagemap_exclusive(",
+        "void end_user_pagemap_exclusive(", "void release_user_pagemap_access(",
+    ):
+        gate_functions[anchor] = selected(virt_path, anchor, source)
+    storage = selected(virt_path, "constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT = 4096;", source,
+                       "std::array<UserPagemapAccessGate, USER_PAGEMAP_ACCESS_GATE_COUNT> user_pagemap_access_gates{};")
+    paging_name = str(paging_path.resolve())
+    if any(char in paging_name for char in ('"', '\n', '\r')):
+        raise ValueError("literal absolute actual paging include")
+    private_functions = {anchor: selected(virt_path, anchor, source) for anchor in (
+        "auto fork_private_child_constructor_valid(", "auto create_fork_private_child_root(",
+        "auto consume_fork_private_child_root(")}
+    owner_functions = {anchor: selected(virt_path, anchor, source) for anchor in (
+        "auto get_kernel_pagemap()", "void ForkSourceOwner::finish()", "auto try_acquire_fork_source(", "auto detail::ForkSourceAccess::root(",
+        "auto detail::ForkSourceAccess::transfer(", "auto detail::fork_source_owner_root(",
+        "auto fork_source_wait_context_valid(", "auto wait_for_fork_source(")}
+    pin_functions = {anchor: selected(virt_path, anchor, source) for anchor in (
+        "auto pin_user_page_common(", "auto try_pin_user_page_for_task(")}
+    borrow_start = header.index("[[nodiscard]] auto fork_source_owner_root(")
+    borrow_declaration = header[borrow_start:header.index(";", borrow_start) + 1]
+    source_scope = selected(virt_path, "class UserPagemapExclusiveScope {", source)
+    parts = {
+        "// ACTUAL_923_PREEMPT_GUARD": selected(scheduler_path, "struct PreemptGuard {", scheduler_path.read_text()),
+        "// ACTUAL_923_SOURCE_TYPE": selected(header_path, "enum class ForkSourceAdmission :", header)
+            + "\n" + selected(header_path, "class ForkSourceOwner {", header)
+            + "\nnamespace detail {\n" + borrow_declaration + "\n}",
+        "// ACTUAL_923_SOURCE_ACCESS": selected(virt_path, "struct ForkSourceAccess {", source),
+        "// ACTUAL_923_EXCLUSIVE_SCOPE": source_scope,
+        "// ACTUAL_923_SOURCE_FUNCTIONS": "\n".join(owner_functions.values()),
+        "// ACTUAL_923_CONTEXT_FUNCTIONS": selected(managed_path, "auto range_current_context(", managed_path.read_text())
+            + "\n" + selected(managed_path, "auto detail::current_fork_context_valid(", managed_path.read_text()),
+        "// ACTUAL_921_PAGING_HEADER": '#include "' + paging_name + '"',
+        "// ACTUAL_921_PAGE_KIND": selected(kind_path, "enum class PageKind :", kinds),
+        "// ACTUAL_921_REFUSAL_TYPES": selected(header_path, "enum class UnpublishedRootRefusalSite :", header,
+                                              "static_assert(sizeof(ForkCopyRefusalWitness) <= 32);"),
+        "// ACTUAL_922_PRIVATE_TYPE": selected(header_path, "class ForkPrivateChildRoot {", header),
+        "// ACTUAL_922_PRIVATE_FUNCTIONS": "\n".join(private_functions.values()),
+        "// ACTUAL_921_ROOT_CONTROL": selected(virt_path, "struct UserRootControl {", source),
+        "// ACTUAL_921_GATE_STORAGE": storage,
+        "// ACTUAL_921_GATE_FUNCTIONS": "\n".join(gate_functions.values()),
+        "// ACTUAL_98_PIN_ATTEMPT_TYPE": selected(header_path, "enum class UserPagePinAttempt :", header) + ";",
+        "// ACTUAL_98_TYPED_PIN_FUNCTIONS": "\n".join(pin_functions.values()),
+        "// ACTUAL_921_CHILD_FUNCTIONS": "\n".join(selected(virt_path, anchor, source) for anchor in (
+            "auto pte_raw(const paging::PageTableEntry& e)", "auto entry_at(PageTable* table, size_t index)",
+            "auto unpublished_user_root_empty_observed(", "auto unpublished_user_root_empty(")),
+    }
+    text = cases.read_text()
+    for marker, value in parts.items():
+        if text.count(marker) != 1:
+            raise ValueError("unique standalone gate insertion: " + marker)
+        text = text.replace(marker, value)
+    if any("ACTUAL_" + version + "_" in text for version in ("921", "922", "923", "98")):
+        raise ValueError("unfilled actual gate insertion")
+    return text, rows, [virt_path, header_path, paging_path, kind_path, managed_path, scheduler_path, cases], gate_functions | private_functions | owner_functions | pin_functions | {"class UserPagemapExclusiveScope {": source_scope}
+
+
 def context_overlay(scratch: Path, kernel_file, source_root: Path) -> tuple[Path, str, list[Path], dict]:
     """Actual guards/Task lease methods; only privileged CPU and backend ports are Host seams."""
     overlay = scratch / "context-include"
@@ -378,6 +492,7 @@ def context_overlay(scratch: Path, kernel_file, source_root: Path) -> tuple[Path
 namespace ker::mod::sched::task { struct Task; }
 namespace host_range {
 inline bool interrupts = true, queryable = true, reader_busy = false, exclusive = false;
+inline bool run_queues = true, wrong_return_task = false, ptrace_effect = false;
 inline unsigned yields = 0, tries = 0, unlocks = 0, blocking = 0;
 inline ker::mod::sched::task::Task* current = nullptr;
 inline void (*on_yield)() = nullptr;
@@ -399,8 +514,10 @@ void preempt_disable(); void preempt_enable(); auto preempt_count() -> uint32_t;
 inline auto interrupts_enabled() -> bool { return host_range::interrupts; }
 inline auto can_query_current_task() -> bool { return host_range::queryable; }
 inline auto get_current_task() -> task::Task* { return host_range::current; }
+inline auto get_return_task() -> task::Task* { return host_range::wrong_return_task ? nullptr : host_range::current; }
+inline auto has_run_queues() -> bool { return host_range::run_queues; }
 void kern_yield();
-""" + guard + "\n}\n"
+""" + guard + "\n}\nnamespace ker::mod::debug::ptrace {\ninline auto has_pending_local_effect(const ker::mod::sched::task::Task&) -> bool { return host_range::ptrace_effect; }\n}\n"
     task = """#pragma once
 #include <atomic>
 #include <cstdint>
@@ -408,13 +525,28 @@ void kern_yield();
 namespace ker::mod::sched::task {
 struct LazyVmemRange;
 enum class TaskType { PROCESS, THREAD, DAEMON };
-enum class TaskState { ACTIVE, EXITED };
+enum class TaskState { ACTIVE, EXITED, EXITING, DEAD };
+enum class ChildMembershipState { UNLINKED, PUBLISHING, LIVE };
 // Explicit layout seam: only fields read by actual extracted methods/guards.
 struct Task {
  TaskType type{TaskType::PROCESS}; std::atomic<TaskState> state{TaskState::ACTIVE};
  std::atomic<bool> scheduler_transition_active{false}, exit_in_progress{false}, usercopy_pagemap_closing{false};
  std::atomic<uint32_t> usercopy_pagemap_accesses{0}; uint64_t syscall_account_start_us{1};
  mm::paging::PageTable* pagemap{};
+ uint64_t pid{1}; bool has_run{}, is_thread{}; Task* owner{};
+ bool has_exited{}; void* thread{};
+ bool deferred_task_switch{}, wants_block{}, voluntary_blocked{};
+ std::atomic<bool> process_exit_requested{false};
+ auto is_voluntary_blocked() const -> bool { return voluntary_blocked; }
+ std::atomic<bool> scheduler_published{}, shares_user_pagemap{false}, gc_queued{}, exit_notify_ready{};
+ std::atomic<uint32_t> ref_count{1};
+ static constexpr uint32_t ACTIVE_REGISTRY_INDEX_INVALID=UINT32_MAX;
+ uint32_t active_registry_index{ACTIVE_REGISTRY_INDEX_INVALID};
+ enum class sched_queue { NONE, RUNNABLE }; enum sched_queue sched_queue{sched_queue::NONE};
+ int heap_index{-1}; Task* sched_next{};
+ std::atomic<ChildMembershipState> child_membership_state{ChildMembershipState::UNLINKED};
+ bool child_publication_established{};
+ Task* child_parent{}; Task* child_sibling_prev{}; Task* child_sibling_next{};
  auto try_acquire_usercopy_pagemap(mm::paging::PageTable*&) -> bool;
  void release_usercopy_pagemap();
 };
@@ -505,7 +637,7 @@ def main() -> int:
     parser.add_argument(
         "--kernel-overlay", type=Path, help="optional explicit staged modules/kern/src include/source overlay"
     )
-    parser.add_argument("--fork-contract-only", action="store_true", help="run all old positive cases plus the focused fork cases and two fork controls")
+    parser.add_argument("--fork-contract-only", action="store_true", help="run retained fork cases/controls plus standalone actual4096-stripe collision checks")
     parser.add_argument("--fork-vm-coordinator-only", action="store_true", help="exercise the private actual-owner fork VM composition")
     parser.add_argument("--anonymous-remove-only", action="store_true", help="exercise unwired managed anonymous removal with the retained original positive vectors")
     parser.add_argument("--mremap-policy-only", action="store_true", help="exercise real counted unsupported-PS mremap admission and recovery")
@@ -547,6 +679,8 @@ def main() -> int:
     emitted: list[dict] = []
     mixed_pch = None
     mixed_pch_proof = {"used": False, "reason": "configured compiler uses the original flat path"}
+    pch_profile = "coordinator" if options.fork_vm_coordinator_only else "mixed"
+    gate_collision_proof = None
     pending_signal = None
 
     def check_interrupted() -> None:
@@ -713,12 +847,40 @@ def main() -> int:
         index = next(line for line in source.splitlines() if line.startswith("auto index_of("))
         user_pin = definition(header.read_text(), "struct UserPagePin {")
         exclusive = definition(source, "class UserPagemapExclusiveScope {")
+        refusal_types = "\n".join(definition(header.read_text(), anchor) for anchor in (
+            "enum class UnpublishedRootRefusalSite :", "struct UnpublishedRootRefusal {",
+            "enum class ForkCopyRefusalSite :", "struct ForkCopyRefusalWitness {"))
+        owner_borrow_start = header.read_text().index("[[nodiscard]] auto fork_source_owner_root(")
+        owner_borrow_declaration = header.read_text()[owner_borrow_start:header.read_text().index(";", owner_borrow_start) + 1]
+        user_pin = refusal_types + "\n" + definition(header.read_text(), "class ForkPrivateChildRoot {") + "\n" + (
+            "namespace detail { struct ForkSourceAccess; }\n"
+            + definition(header.read_text(), "enum class ForkSourceAdmission :") + "\n"
+            + definition(header.read_text(), "class ForkSourceOwner {") + "\nauto get_kernel_pagemap()->PageTable*;\n"
+            + "namespace detail {\n" + definition(source, "struct ForkSourceAccess {") + "\n"
+            + owner_borrow_declaration + "\n}\n") + user_pin
         copier = "\n".join(definition(source, anchor) for anchor in (
             "auto valid_fork_placement(", "auto deep_copy_user_pagemap_cow_held(",
-            "auto fork_eager_copy_requested()", "auto unpublished_user_root_empty("))
+            "auto fork_eager_copy_requested()", "auto unpublished_user_root_empty_observed(",
+            "auto unpublished_user_root_empty("))
+        # Exact production authority/validation bodies; allocator/kernel-copy
+        # remain named finite ports in this composite, independently from the
+        # standalone actual4096 CAS profile below.
+        source_owner_bodies = "\n".join(definition(source, anchor) for anchor in (
+            "void ForkSourceOwner::finish()", "auto try_acquire_fork_source(",
+            "auto detail::ForkSourceAccess::root(", "auto detail::ForkSourceAccess::transfer(",
+            "auto detail::fork_source_owner_root(", "auto fork_source_wait_context_valid(", "auto wait_for_fork_source("))
+        copier += "\n" + source_owner_bodies
+        copier += "\n" + r"""
+auto create_user_root_common(bool may_fail)->PageTable* { EXPECT_FALSE(may_fail); return fork_child; }
+void copy_kernel_mappings(sched::task::Task* child) { EXPECT_NE(child,nullptr); EXPECT_EQ(child->pagemap,fork_child); }
+""" + "\n".join(definition(source, anchor) for anchor in (
+            "auto fork_private_child_constructor_valid(", "auto create_fork_private_child_root(",
+            "auto consume_fork_private_child_root("))
         declaration_start = header.read_text().index("[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(")
-        declaration_end = header.read_text().index(";", declaration_start) + 1
-        copier += "\n" + header.read_text()[declaration_start:declaration_end]
+        declaration_end = header.read_text().index("#ifdef WOS_SELFTEST", declaration_start)
+        # The real header is pragma-once; preserve that contract when the
+        # same complete declaration fragment enters through coordinator/TU paths.
+        copier += "\n#ifndef WOS_HOST_PREPARED_FORK_DECLARATIONS922\n#define WOS_HOST_PREPARED_FORK_DECLARATIONS922\n" + header.read_text()[declaration_start:declaration_end] + "\n#endif\n"
 
         epoch = definition(source, "[[gnu::always_inline]] void advance_ps_geometry_epoch_locked(")
         reader_admission = definition(source, "template <typename WaitForTeardown>\n[[nodiscard]] auto admit_user_pagemap_reader(")
@@ -730,6 +892,8 @@ def main() -> int:
                 "auto current_fork_range_context_matches(",
                 "auto current_fork_range_root_matches(",
                 "auto acquire_current_range_root(sched::task::Task&",
+                "auto acquire_current_ordinary_range_root(sched::task::Task&",
+                "auto validate_current_ordinary_range_root(sched::task::Task&",
                 "auto acquire_current_fork_range_root(sched::task::Task&",
                 "auto validate_current_fork_range_root(sched::task::Task&",
                 "void release_current_range_root(CurrentRangeRootAccess&",
@@ -758,6 +922,21 @@ def main() -> int:
         if prelude_source.count(reader_marker) != 1:
             raise RuntimeError("shared production reader admission extraction marker changed")
         prelude_source = prelude_source.replace(reader_marker, reader_admission)
+        # Explicit child-control/index refusal ports for the actual observed
+        # helper. These classify failed backend predicates, not native PMM,
+        # hashed reader-CAS or file-index concurrency behavior.
+        child_control = "HostRootControl host_child_control{23, 1};"
+        child_lookup = "if (fork_mode && root == fork_child) return &host_child_control;"
+        child_index = "auto root_empty_locked(PageTable*) -> bool { return true; }"
+        for anchor in (child_control, child_lookup, child_index):
+            if prelude_source.count(anchor) != 1:
+                raise RuntimeError("observed child refusal Host endpoint changed")
+        prelude_source = prelude_source.replace(child_control, child_control +
+            "\ninline bool host_child_control_missing = false, host_child_index_empty = true;")
+        prelude_source = prelude_source.replace(child_lookup,
+            "if (fork_mode && root == fork_child) return host_child_control_missing ? nullptr : &host_child_control;")
+        prelude_source = prelude_source.replace(child_index,
+            "auto root_empty_locked(PageTable*) -> bool { return host_child_index_empty; }")
         for anchor in (
             "if (bytes == sizeof(huge::SplitPlanStorage)) {",
             "auto allocate_table() noexcept -> paging::PageTable* {",
@@ -884,11 +1063,31 @@ def main() -> int:
             words = shlex.split(depfile.read_text().replace("\\\n", " ").split(":", 1)[1])
             dependencies.update(Path(word).resolve() for word in words)
             unit_dependencies[index] = {Path(word).resolve() for word in words}
+        if options.fork_contract_only:
+            gate_text, gate_components, gate_inputs, gate_functions = gate_collision_source(
+                kernel_file, support / "managed_huge_gate_collision_cases.inc")
+            known = {entry["path"] for entry in selected}
+            selected.extend(pin(path) for path in gate_inputs if str(path.resolve()) not in known)
+            gate_source = output / "actual-gate-collision921.cpp"
+            with gate_source.open("x") as stream:
+                stream.write(gate_text)
+            gate_cases = CppText(gate_text).gtest_cases()
+            gate_names = {case["name"] for case in gate_cases}
+            if len(gate_names) != 28:
+                raise ValueError("sixteen original gate/private cases plus nine source-owner and three typed pin cases")
+            gate_collision_proof = dict(source=pin(gate_source), actual_components=gate_components,
+                baseline_cases=gate_cases, executed=False, controls=[],
+                scope="Host actual4096 gate/hash/CAS, whole typed pin admission and whole922 factory/token/consume bodies; finite Task/PMM/control/allocation/kernel-copy/mapping/fault endpoints. No native allocator/publication/copier/IRQ/TLB/progress/C92-cause claim.")
+            (output / "gate921-extraction-map.json").write_text(json.dumps(gate_collision_proof, indent=2) + "\n")
+            depfile = scratch / "deps-gate921.d"
+            run("deps-gate921", flags + ["-M", "-MF", depfile, "-MT", "gate921", gate_source])
+            words = shlex.split(depfile.read_text().replace("\\\n", " ").split(":", 1)[1])
+            dependencies.update(Path(word).resolve() for word in words)
         emitted = [pin(path) for path in sorted((dependencies - {composite}) | set(libraries), key=str)]
-        if options.mixed_geometry_only and re.fullmatch(r"clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?", Path(flags[0]).name):
+        if (options.mixed_geometry_only or options.fork_vm_coordinator_only) and re.fullmatch(r"clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?", Path(flags[0]).name):
             actual_source = composite.read_text()
-            prefix = mixed_pch_prefix(actual_source)
-            original_program = verify_mixed_pch_consumer(actual_source, prefix)
+            prefix = mixed_pch_prefix(actual_source, pch_profile)
+            original_program = verify_mixed_pch_consumer(actual_source, prefix, pch_profile)
             # Audit the actual flat unit2 dependency closure, including fresh
             # context headers. Never substitute a PCH dependency-only closure.
             expected_inputs = {entry["path"]: entry for entry in emitted}
@@ -925,7 +1124,7 @@ def main() -> int:
                 raise RuntimeError("mixed PCH exhausted the original scratch budget")
             generated = [prefix_before] + [pin(path) for path in (mixed_pch, prefix_deps)]
             emitted.extend(generated)
-            mixed_pch_proof = dict(used=True, compiler=flags[0], prefix_text=prefix, original_program=original_program,
+            mixed_pch_proof = dict(used=True, profile=pch_profile, compiler=flags[0], prefix_text=prefix, original_program=original_program,
                                    generated_before=generated, audited_flat_inputs=audited,
                                    pch_dependencies=sorted(map(str, pch_dependencies)),
                                    consumer_flags=["-include-pch", str(mixed_pch)],
@@ -935,7 +1134,7 @@ def main() -> int:
             obj = scratch / f"unit-{index}.o"
             extra = ["-include-pch", mixed_pch] if index == 2 and mixed_pch is not None else []
             if extra:
-                verify_mixed_pch_consumer(path.read_text(), prefix)
+                verify_mixed_pch_consumer(path.read_text(), prefix, pch_profile)
             run(f"compile-{index}", flags + extra + ["-c", path, "-o", obj])
             objects.append(obj)
 
@@ -962,8 +1161,8 @@ def main() -> int:
                 original = str(text)
                 text, selection = select_control_source(original, test, baseline_names)
                 if mixed_pch is not None:
-                    selection["precompiled_prefix"] = {"full": verify_mixed_pch_consumer(original, prefix),
-                                                       "projected": verify_mixed_pch_consumer(text, prefix)}
+                    selection["precompiled_prefix"] = {"full": verify_mixed_pch_consumer(original, prefix, pch_profile),
+                                                       "projected": verify_mixed_pch_consumer(text, prefix, pch_profile)}
                 proof_bytes = len(original.encode()) + len(json.dumps(selection).encode())
                 if control_evidence_bytes + proof_bytes > SCRATCH_BYTES:
                     raise RuntimeError("bounded control source evidence exhausted")
@@ -976,7 +1175,7 @@ def main() -> int:
             path.write_text(text)
             obj = scratch / f"{label}.o"
             extra = ["-include-pch", mixed_pch] if replace_index == 2 and mixed_pch is not None else []
-            run(f"compile-{label}", flags + extra + ["-c", path, "-o", obj])
+            run(f"compile-{label}", flags + extra + (["-g0"] if options.fork_vm_coordinator_only else []) + ["-c", path, "-o", obj])
             binary = link(label, [*objects[:replace_index], obj, *objects[replace_index + 1:]])
             controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary),
                              "selected_cases": sorted(selected_cases), "selection": selection, "original_source": original_source})
@@ -1022,6 +1221,31 @@ def main() -> int:
             )
             module_mutant("fork-never-cooperates", module_text.replace(budget, ""), case, True)
 
+            fill_guard = "if (count.count != 0 || publication_policy != PublicationPolicy::ForkWait)"
+            final_pass = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage, witness, fork_chunks, RangePreparePass::Verify, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);"
+            if module_text.count(fill_guard) != 1 or module_text.count(final_pass) != 1:
+                raise RuntimeError("empty-fork preparation control boundary changed")
+            module_mutant(
+                "fork-skips-nonzero-fill",
+                module_text.replace(fill_guard, "if (publication_policy != PublicationPolicy::ForkWait)"),
+                "ManagedForkRange.FillContentionPreservesTheNonzeroDescriptors", True,
+            )
+            module_mutant(
+                "fork-empty-omits-final-geometry",
+                module_text.replace(final_pass,
+                    "if (publication_policy == PublicationPolicy::ForkWait && count.count == 0) { error = Error::None; final.count = count.count; } else " + final_pass),
+                "ManagedForkRange.IndependentFinalEmptyPassRejectsSameEpochUnsupportedGeometry", True,
+            )
+            fork_actual = CppText(composite.read_text())
+            epoch_check = "if (cursor.stamp.epoch != control->ps_geometry_epoch)"
+            if fork_actual.count(epoch_check) != 1:
+                raise RuntimeError("independent survey epoch control boundary changed")
+            mutant(
+                "fork-final-survey-ignores-epoch",
+                fork_actual.replace(epoch_check, "if (false)"),
+                "ManagedForkRange.IndependentFinalZeroPassStillDetectsPublicationAndRebuildsDescriptors",
+            )
+
         actual = CppText(composite.read_text())
         if policy_fixture is not None:
             for label, bad, test in policy_fixture.controls(composite.read_text()):
@@ -1045,7 +1269,7 @@ def main() -> int:
             for label, bad, test in batch_fixture.controls(composite.read_text()):
                 mutant(label, bad, test)
         elif coordinator is not None:
-            for label, bad, test in coordinator.controls(composite.read_text()):
+            for label, bad, test in coordinator.controls(CppText(composite.read_text())):
                 mutant(label, bad, test)
             if not (options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.public_huge_map_only or options.shm_occupancy_only):
                 for label, bad, test in coordinator.public.controls(public_source.read_text()):
@@ -1056,7 +1280,7 @@ def main() -> int:
                 raise RuntimeError("held-owner control changed")
             mutant("fork-lost-owner", composite.read_text().replace(owner_check, "if (false) return false;"),
                    "ManagedFork.HeldWalkerRejectsDifferentOriginalOwnerBeforeWrites")
-            owner_entry = "virt::UserPagemapExclusiveScope source_usercopy_scope(source);"
+            owner_entry = "virt::UserPagemapExclusiveScope source_usercopy_scope(source, source_owner);"
             if composite.read_text().count(owner_entry) != 1:
                 raise RuntimeError("fork reader-order control changed")
             mutant("fork-nested-reader", composite.read_text().replace(owner_entry, owner_entry +
@@ -1256,6 +1480,130 @@ def main() -> int:
                 expected_success=False,
             )
 
+        if options.fork_contract_only:
+            # Separate TU/binary: none of the existing finite-port units,
+            # baseline tests or negative controls are replaced or omitted.
+            gate_object = scratch / "gate921.o"
+            run("compile-gate921", flags + ["-c", gate_source, "-o", gate_object])
+            gate_binary = link("gate921-current", [gate_object])
+            gate_json = output / "gate921-current.json"
+            run("run-gate921", [gate_binary, f"--gtest_output=json:{gate_json}"])
+            gate_tests = json.loads(gate_json.read_text())
+            if (gate_tests["failures"] != 0 or gate_tests["tests"] != 28
+                    or baseline_gtest_names(gate_tests) != gate_names):
+                raise RuntimeError("actual4096 gate cases did not completely pass")
+            gate_collision_proof["baseline_result"] = pin(gate_json)
+            gate_object.unlink()
+            gate_binary.unlink()
+            raw_anchor = "[[nodiscard]] auto acquire_user_pagemap_access("
+            raw_acquire = gate_functions[raw_anchor]
+            body_start = raw_acquire.index("{")
+            refusing = raw_acquire[:body_start + 1] + "\n(void)pagemap; (void)wait_for_teardown; gate_index = USER_PAGEMAP_ACCESS_GATE_NONE; return false;\n}"
+            try_anchor = "[[nodiscard]] auto try_begin_user_pagemap_exclusive("
+            original_try = gate_functions[try_anchor]
+            original_cas = "gate.teardown.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)"
+            if CppText(original_try).count(original_cas) != 1:
+                raise ValueError("unique actual Normal try-exclusive CAS")
+            unowned_try = CppText(original_try).replace(original_cas,
+                "gate.teardown.compare_exchange_strong(expected, false, std::memory_order_acq_rel, std::memory_order_acquire)")
+            gate_test = "GateCollision921.RawReaderCollisionRefusesThenRecovers"
+            private_consume = gate_functions["auto consume_fork_private_child_root("]
+            constructor_guard = gate_functions["auto fork_private_child_constructor_valid("]
+            def replace_private(old: str, new: str) -> str:
+                if CppText(private_consume).count(old) != 1:
+                    raise ValueError("one actual typed-consume predicate: " + old)
+                return str(CppText(private_consume).replace(old, new))
+            raw_typed = private_consume[:private_consume.index("{") + 1] + "\n(void)creator;(void)child;authority.invalidate();return unpublished_user_root_empty_observed(expected,refusal);\n}"
+            forged = constructor_guard[:constructor_guard.index("{") + 1] + "\n(void)creator;(void)child;return true;\n}"
+            gate_controls = [
+                ("gate921-exclusive-without-bit", original_try, str(unowned_try), gate_test),
+                ("gate921-reader-always-refuses", raw_acquire, refusing, gate_test),
+                ("private922-not-consumed", private_consume, replace_private("authority.invalidate();", "/* lost terminal consume */"),
+                 "ForkPrivateRoot922.FactoryBornAuthorityConsumesOnceAndCannotReissue"),
+                ("private922-stale-serial", private_consume, replace_private("control->serial != SERIAL", "false"),
+                 "ForkPrivateRoot922.KindRefControlSerialIndexAndAllUserSlotsStayMandatory"),
+                ("private922-last-slot-omitted", private_consume, replace_private("i < 256", "i < 255"),
+                 "ForkPrivateRoot922.KindRefControlSerialIndexAndAllUserSlotsStayMandatory"),
+                ("private922-generic-stripe-route", private_consume, raw_typed,
+                 "ForkPrivateRoot922.ValidTypedRootIgnoresForeignStripeWhileGenericStillRefuses"),
+                ("private922-forged-constructor", constructor_guard, forged,
+                 "ForkPrivateRoot922.EveryPrivateTaskGuardRejectsWithoutStructuralMutation"),
+                ("private922-threaded-creator-regression", constructor_guard,
+                 str(CppText(constructor_guard).replace("creator.pid != 0", "creator.pid != 0 && !creator.is_thread")),
+                 "ForkPrivateRoot922.ThreadedProcessCreatorRemainsSupportedWithSharedSource"),
+            ]
+            source_finish = gate_functions["void ForkSourceOwner::finish()"]
+            source_try = gate_functions["auto try_acquire_fork_source("]
+            source_root = gate_functions["auto detail::ForkSourceAccess::root("]
+            source_wait = gate_functions["auto wait_for_fork_source("]
+            source_scope = gate_functions["class UserPagemapExclusiveScope {"]
+            def source_mutation(body: str, old: str, new: str) -> str:
+                if CppText(body).count(old) != 1:
+                    raise ValueError("one actual source-owner control predicate: " + old)
+                return str(CppText(body).replace(old, new))
+            reverse_release = source_mutation(source_finish,
+                "if (gate_ != USER_PAGEMAP_ACCESS_GATE_NONE) end_user_pagemap_exclusive(gate_); if (actor_ != nullptr) actor_->release_usercopy_pagemap();",
+                "if (actor_ != nullptr) actor_->release_usercopy_pagemap(); if (gate_ != USER_PAGEMAP_ACCESS_GATE_NONE) end_user_pagemap_exclusive(gate_);")
+            two_yields = source_mutation(source_wait,"for (;;) {","for (unsigned cooperations=0;;++cooperations) {")
+            two_yields = source_mutation(two_yields,"if (!busy) return 0;","if (!busy || cooperations == 2) return 0;")
+            gate_controls += [
+                ("source923-release-lease-before-gate",source_finish,reverse_release,
+                 "ForkSourceGate923.TryOwnsExactlyOneLeaseAndOwnerUsedDoesNotDiscardIt"),
+                ("source923-ownerused-discards-held",source_try,
+                 source_mutation(source_try,"return ForkSourceAdmission::OwnerUsed;","{ owner.finish(); return ForkSourceAdmission::OwnerUsed; }"),
+                 "ForkSourceGate923.TryOwnsExactlyOneLeaseAndOwnerUsedDoesNotDiscardIt"),
+                ("source923-adopted-lease-not-returned",source_scope,
+                 source_mutation(source_scope,"lease_actor_->release_usercopy_pagemap();","/* adopted lease leak */"),
+                 "ForkSourceGate923.PrivateAdoptionTransfersLeaseWithoutNestedAcquireAndReleasesGateFirst"),
+                ("source923-late-reader-count-refusal",source_root,
+                 source_mutation(source_root,"!user_pagemap_access_gates.at(owner.gate_).teardown.load(std::memory_order_acquire)",
+                    "(!user_pagemap_access_gates.at(owner.gate_).teardown.load(std::memory_order_acquire) || user_pagemap_access_gates.at(owner.gate_).readers.load(std::memory_order_acquire) != 0)"),
+                 "ForkSourceGate923.TransientSpeculativeReaderDoesNotInvalidateAnAlreadyIssuedOwner"),
+                ("source923-wait-retains-task-lease",source_wait,
+                 source_mutation(source_wait,"actor.release_usercopy_pagemap();","/* wrong lease retained across yield */"),
+                 "ForkSourceGate923.AdvisoryWaitIsOwnerFreeUntilActualForeignProgressAt3_7_17"),
+                ("source923-arbitrary-two-yield-cap",source_wait,two_yields,
+                 "ForkSourceGate923.AdvisoryWaitIsOwnerFreeUntilActualForeignProgressAt3_7_17"),
+            ]
+            typed_common = gate_functions["auto pin_user_page_common("]
+            typed_try = gate_functions["auto try_pin_user_page_for_task("]
+            gate_controls += [
+                ("pin98-busy-reported-failed", typed_common,
+                 source_mutation(typed_common, "*attempt = UserPagePinAttempt::Busy;", "*attempt = UserPagePinAttempt::Failed;"),
+                 "GateCollision921.TypedFaultingPinReportsForeignBusyThenRecovers"),
+                ("pin98-combined-saturation-is-busy", typed_common,
+                 source_mutation(typed_common, "if (gate.readers.load(std::memory_order_acquire) == UINT32_MAX) return false;", ""),
+                 "GateCollision921.TypedPinSaturationStaysFailedWithAndWithoutTeardown"),
+                ("pin98-stale-target-root-is-busy", typed_try,
+                 source_mutation(typed_try, "task == nullptr || task->pagemap != expected_pagemap", "task == nullptr"),
+                 "GateCollision921.TypedPinInvalidOrMappingFailureIsNeverBusy"),
+            ]
+            for label, old, new, gate_test in gate_controls:
+                if gate_text.count(old) != 1:
+                    raise ValueError("one complete actual gate body for compiled control")
+                control_text = gate_text.replace(old, new)
+                path = output / (label + ".cpp")
+                with path.open("x") as stream:
+                    stream.write(control_text)
+                obj = scratch / (label + ".o")
+                # Each control recompiles this complete independent GTest TU.
+                # Keep the baseline optimized and all sanitizer/oracle checks;
+                # failed-control objects need neither optimization nor debug
+                # tables. Bound the added regressions inside the same deadline.
+                run("compile-" + label, flags + ["-O0", "-g0", "-c", path, "-o", obj])
+                binary = link(label, [obj])
+                run("run-" + label, [binary, "--gtest_filter=" + gate_test], expected_success=False)
+                log = (output / ("run-" + label + ".log")).read_text()
+                if commands[-1]["exit"] != 1 or "[  FAILED  ] " + gate_test not in log:
+                    raise RuntimeError(label + ": compile success plus intended GTest assertion failure required")
+                control = dict(label=label, source=pin(path), selected_cases=[gate_test],
+                               required_assertion_failure=gate_test, compiled=True, log=commands[-1]["log"])
+                controls.append(control)
+                gate_collision_proof["controls"].append(control)
+                obj.unlink()
+                binary.unlink()
+            gate_collision_proof["executed"] = True
+
         check_interrupted()
     except BaseException as error:
         errors.append(str(error))
@@ -1338,7 +1686,8 @@ def main() -> int:
             "emitted_inputs_before": emitted,
             "emitted_inputs_after": emitted_after,
             "emitted_input_count": len(emitted),
-            **({"precompiled_prefix": mixed_pch_proof} if options.mixed_geometry_only else {}),
+            **({"precompiled_prefix": mixed_pch_proof} if options.mixed_geometry_only or options.fork_vm_coordinator_only else {}),
+            **({"actual_gate_collision921": gate_collision_proof} if options.fork_contract_only else {}),
             "scratch_removed": not scratch.exists(),
             "scratch_allocated_bytes_removed": removed,
             "limits": [

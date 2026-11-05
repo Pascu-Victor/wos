@@ -60,7 +60,8 @@ def pin(path: Path) -> dict:
 
 
 def generate(virt: str, virt_header: str, layout: str, layout_header: str,
-             loader: str, loader_header: str, fixture: str) -> dict[str, tuple[str, str | None]]:
+             loader: str, loader_header: str, resource_as: str, resource_header: str,
+             fixture: str) -> dict[str, tuple[str, str | None]]:
     gate_start = virt.index("constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT =")
     gate_end = virt.index("user_pagemap_access_gates{};", gate_start) + len("user_pagemap_access_gates{};")
     # Transport seam only: production bodies below are inserted byte-for-byte.
@@ -68,6 +69,7 @@ def generate(virt: str, virt_header: str, layout: str, layout_header: str,
     gate += "\n" + function(virt, "user_pagemap_access_gate_index")
     admission = "template <typename WaitForTeardown>\n" + function(virt, "admit_user_pagemap_reader")
     admission += "\n" + function(virt, "release_user_pagemap_access")
+    admission += "\n" + function(virt, "acquire_user_pagemap_access")
     status = re.search(r"enum class UserVirtualRangeStatus[^;]+;", virt_header)
     if status is None:
         raise ValueError("missing actual typed range enum")
@@ -75,6 +77,19 @@ def generate(virt: str, virt_header: str, layout: str, layout_header: str,
     query += "template <bool StopAtFirst = false>\n" + function(virt, "count_virtual_bytes_in_table")
     query += "\n" + function(virt, "query_user_virtual_range")
     query += "\n" + function(virt, "is_user_virtual_range_free")
+    count_status = re.search(r"enum class UserVirtualCountStatus[^;]+;", virt_header)
+    if count_status is None:
+        raise ValueError("missing actual typed count enum")
+    count = count_status.group() + "\n"
+    count += "\n".join(function(virt, name) for name in
+                       ("query_user_virtual_bytes", "count_user_virtual_bytes", "validate_user_pagemap_access"))
+    resource_types = re.search(r"enum class MappingAdmission[^;]+;", resource_header).group() + "\n"
+    resource_types += block(resource_header, r"^class AddressSpaceObservation \{") + ";"
+    accounting = "\n".join(function(resource_as, name) for name in
+                           ("query_address_space_count", "count_address_space", "can_reuse_mapping_count",
+                            "try_admit_mapping_count", "observe_mapping_count", "admit_address_space",
+                            "AddressSpaceObservation::try_admit_mapping", "AddressSpaceObservation::admit_mapping",
+                            "AddressSpaceObservation::commit_mapping", "AddressSpaceObservation::observe"))
     types_start = layout_header.index("enum class ImageRole")
     types_end = layout_header.index("// True only when", types_start)
     layout_types = layout_header[types_start:types_end]
@@ -93,7 +108,8 @@ def generate(virt: str, virt_header: str, layout: str, layout_header: str,
     probe = block(loader, r"^struct ElfRangeProbe \{") + ";"
     image = "\n".join(function(loader, name) for name in
                       ("checked_add", "applied_image_range_is_valid", "select_image_load_base"))
-    chunks = dict(ACTUAL_GATE=gate, ACTUAL_ADMISSION=admission, ACTUAL_QUERY=query,
+    chunks = dict(ACTUAL_GATE=gate, ACTUAL_ADMISSION=admission, ACTUAL_QUERY=query, ACTUAL_COUNT=count,
+                  ACTUAL_RESOURCE_TYPES=resource_types, ACTUAL_ACCOUNTING=accounting,
                   ACTUAL_LAYOUT_TYPES=layout_types, ACTUAL_LAYOUT=placement,
                   ACTUAL_COOPERATION=token, ACTUAL_PROBE=probe, ACTUAL_IMAGE_SELECTION=image)
 
@@ -104,6 +120,18 @@ def generate(virt: str, virt_header: str, layout: str, layout_header: str,
         return result
 
     variants = {"actual": (assemble({}), None)}
+    variants["count_busy_as_invalid"] = (assemble({"ACTUAL_COUNT": once(count,
+        ": UserVirtualCountStatus::GateBusy;", ": UserVirtualCountStatus::Invalid;")}), "count-foreign-busy")
+    variants["count_capacity_as_busy"] = (assemble({"ACTUAL_COUNT": once(count,
+        "? UserVirtualCountStatus::ReaderUnavailable", "? UserVirtualCountStatus::GateBusy")}), "count-combined-capacity-terminal")
+    variants["whole_count_busy_as_denied"] = (assemble({"ACTUAL_ACCOUNTING": once(accounting,
+        "if (CURRENT == mm::virt::UserVirtualCountStatus::GateBusy) return MappingAdmission::GateBusy;",
+        "if (CURRENT == mm::virt::UserVirtualCountStatus::GateBusy) return MappingAdmission::Denied;")}), "as-whole-busy")
+    variants["replaced_count_busy_as_denied"] = (assemble({"ACTUAL_ACCOUNTING": once(accounting,
+        "if (REMOVED == mm::virt::UserVirtualCountStatus::GateBusy) return MappingAdmission::GateBusy;",
+        "if (REMOVED == mm::virt::UserVirtualCountStatus::GateBusy) return MappingAdmission::Denied;")}), "as-replaced-busy")
+    variants["partial_as_count_escapes"] = (assemble({"ACTUAL_ACCOUNTING": once(accounting,
+        "if (STATUS != Status::Counted) return STATUS;", "if (STATUS != Status::Counted) { bytes = total; return STATUS; }")}), "as-no-prefix")
     variants["busy_as_occupied"] = (assemble({"ACTUAL_QUERY": once(query,
         ": UserVirtualRangeStatus::GateBusy;", ": UserVirtualRangeStatus::Occupied;")}), "foreign-busy")
     variants["missing_reader_rollback"] = (assemble({"ACTUAL_ADMISSION": once(admission,
@@ -149,9 +177,12 @@ def main() -> int:
     # Preserve the multicall C++ driver's argv[0], while pinning target bytes.
     compiler = Path(shutil.which(args.cxx) or args.cxx).absolute()
     source_paths = [mm / "virt.opt.cpp", mm / "virt.hpp", mm / "user_layout.cpp", mm / "user_layout.hpp",
-                    loader / "elf_loader.cpp", loader / "elf_loader.hpp"]
+                    loader / "elf_loader.cpp", loader / "elf_loader.hpp",
+                    root / "modules/kern/src/platform/sched/resource_as.cpp",
+                    root / "modules/kern/src/platform/sched/resource_as.hpp"]
     inputs = [Path(__file__).resolve(), fixture, worker, compiler, *source_paths,
-              mm / "paging.hpp", root / "modules/defines/defines.hpp"]
+              mm / "paging.hpp", root / "modules/defines/defines.hpp",
+              root / "modules/kern/src/platform/sched/resource_model.hpp", root / "modules/kern/src/abi/resource.hpp"]
     output = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix="wos-elf-layout-result-"))
     if args.output:
         output.mkdir(mode=0o700, parents=True, exist_ok=False)

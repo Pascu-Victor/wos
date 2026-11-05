@@ -16,15 +16,18 @@ constexpr uint64_t USER_END = 0x0000800000000000ULL;
 constexpr unsigned AS = static_cast<unsigned>(Id::AS);
 }  // namespace
 
-auto count_address_space(task::Task& subject, mm::paging::PageTable* root, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
+namespace {
+auto query_address_space_count(task::Task& subject, mm::paging::PageTable* root, uint64_t start, uint64_t end, uint64_t& bytes)
+    -> mm::virt::UserVirtualCountStatus {
+    using Status = mm::virt::UserVirtualCountStatus;
     bytes = 0;
     if (root == nullptr || start > end || end > USER_END || ((start | end) & (mm::paging::PAGE_SIZE - 1)) != 0) {
-        return false;
+        return Status::Invalid;
     }
     if (root != subject.pagemap) {
         // Exec admission walks a private staged root, not the old image's mmap
         // metadata. ELF and automatic layouts carry actual reserved PTEs.
-        return mm::virt::count_user_virtual_bytes(root, start, end, bytes);
+        return mm::virt::query_user_virtual_bytes(root, start, end, bytes);
     }
     // Lazy VM ranges are disjoint but not sorted. Walk their union and only
     // inspect PTEs in the gaps. A sibling fault can materialize any lazy page
@@ -32,12 +35,13 @@ auto count_address_space(task::Task& subject, mm::paging::PageTable* root, uint6
     // The caller's publication guard excludes metadata writers; task teardown
     // cannot discard the current task's metadata from another execution stack.
     uint64_t cursor = start;
+    uint64_t total = 0;
     while (cursor < end) {
         uint64_t next_start = end;
         uint64_t next_end = end;
         for (auto const& range : subject.lazy_vmem_ranges) {
             if (range.start > range.end || range.end > USER_END || ((range.start | range.end) & (mm::paging::PAGE_SIZE - 1)) != 0) {
-                return false;
+                return Status::Invalid;
             }
             if (range.end > cursor && range.start < next_start) {
                 next_start = std::max(cursor, range.start);
@@ -45,13 +49,18 @@ auto count_address_space(task::Task& subject, mm::paging::PageTable* root, uint6
             }
         }
         uint64_t gap_bytes = 0;
-        if (!mm::virt::count_user_virtual_bytes(root, cursor, next_start, gap_bytes)) {
-            return false;
-        }
-        bytes += gap_bytes + next_end - next_start;
+        auto const STATUS = mm::virt::query_user_virtual_bytes(root, cursor, next_start, gap_bytes);
+        if (STATUS != Status::Counted) return STATUS;
+        total += gap_bytes + next_end - next_start;
         cursor = next_end;
     }
-    return true;
+    bytes = total;
+    return Status::Counted;
+}
+}  // namespace
+
+auto count_address_space(task::Task& subject, mm::paging::PageTable* root, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
+    return query_address_space_count(subject, root, start, end, bytes) == mm::virt::UserVirtualCountStatus::Counted;
 }
 
 namespace {
@@ -60,23 +69,25 @@ auto can_reuse_mapping_count(task::Task& subject, mm::paging::PageTable* root) -
            !subject.is_thread && !subject.shares_user_pagemap.load(std::memory_order_acquire);
 }
 
-auto admit_mapping_count(task::Task* subject, mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size,
-                         uint64_t* admitted_bytes) -> bool {
+auto try_admit_mapping_count(task::Task* subject, mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start,
+                             uint64_t replaced_size, uint64_t* admitted_bytes) -> MappingAdmission {
+    if (admitted_bytes != nullptr) *admitted_bytes = 0;
     // Loader selftests and pre-process boot helpers have no policy owner.
     if (subject == nullptr) {
-        return true;
+        return MappingAdmission::Admitted;
     }
     uint64_t current = 0;
     uint64_t removed = 0;
-    bool const VALID = replaced_start <= USER_END && replaced_size <= USER_END - replaced_start &&
-                       count_address_space(*subject, root, 0, USER_END, current) &&
-                       count_address_space(*subject, root, replaced_start, replaced_start + replaced_size, removed);
-    if (!VALID) {
-        return false;
-    }
+    if (replaced_start > USER_END || replaced_size > USER_END - replaced_start) return MappingAdmission::Denied;
+    auto const CURRENT = query_address_space_count(*subject, root, 0, USER_END, current);
+    if (CURRENT == mm::virt::UserVirtualCountStatus::GateBusy) return MappingAdmission::GateBusy;
+    if (CURRENT != mm::virt::UserVirtualCountStatus::Counted) return MappingAdmission::Denied;
+    auto const REMOVED = query_address_space_count(*subject, root, replaced_start, replaced_start + replaced_size, removed);
+    if (REMOVED == mm::virt::UserVirtualCountStatus::GateBusy) return MappingAdmission::GateBusy;
+    if (REMOVED != mm::virt::UserVirtualCountStatus::Counted) return MappingAdmission::Denied;
     Owner owner(subject);
     if (owner.get() == nullptr) {
-        return false;
+        return MappingAdmission::Denied;
     }
     auto& process = *owner.get();
     uint64_t const FLAGS = process.resource_lock.lock_irqsave();
@@ -86,7 +97,7 @@ auto admit_mapping_count(task::Task* subject, mm::paging::PageTable* root, uint6
         // The policy has checked removed <= current and addition overflow.
         *admitted_bytes = current - removed + added;
     }
-    return ADMITTED;
+    return ADMITTED ? MappingAdmission::Admitted : MappingAdmission::Denied;
 }
 
 auto observe_mapping_count(task::Task& subject, mm::paging::PageTable* admitted_root, uint64_t admitted_bytes) -> bool {
@@ -109,22 +120,27 @@ auto observe_mapping_count(task::Task& subject, mm::paging::PageTable* admitted_
 
 auto admit_address_space(task::Task* subject, mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size)
     -> bool {
-    return admit_mapping_count(subject, root, added, replaced_start, replaced_size, nullptr);
+    return try_admit_mapping_count(subject, root, added, replaced_start, replaced_size, nullptr) == MappingAdmission::Admitted;
 }
 
 auto observe_address_space(task::Task& subject) -> bool { return observe_mapping_count(subject, nullptr, 0); }
 
-auto AddressSpaceObservation::admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size)
-    -> bool {
+auto AddressSpaceObservation::try_admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start,
+                                                uint64_t replaced_size) -> MappingAdmission {
     bool const FIRST = !m_admission_attempted;
     m_admission_attempted = true;
     m_admitted_root = nullptr;
     m_committed = false;
-    bool const ADMITTED = admit_mapping_count(m_subject, root, added, replaced_start, replaced_size, &m_admitted_bytes);
-    if (ADMITTED && FIRST && m_subject != nullptr && can_reuse_mapping_count(*m_subject, root)) {
+    auto const ADMISSION = try_admit_mapping_count(m_subject, root, added, replaced_start, replaced_size, &m_admitted_bytes);
+    if (ADMISSION == MappingAdmission::Admitted && FIRST && m_subject != nullptr && can_reuse_mapping_count(*m_subject, root)) {
         m_admitted_root = root;
     }
-    return ADMITTED;
+    return ADMISSION;
+}
+
+auto AddressSpaceObservation::admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size)
+    -> bool {
+    return try_admit_mapping(root, added, replaced_start, replaced_size) == MappingAdmission::Admitted;
 }
 
 void AddressSpaceObservation::commit_mapping() {

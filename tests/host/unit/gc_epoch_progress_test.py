@@ -225,6 +225,7 @@ task::Task daemon;
 task::Task* fixture_current = &daemon;
 bool fixture_can_query = true, fixture_interrupts = true;
 std::atomic<bool> kernel_thread_shutdown_requested{false};
+std::atomic<task::Task*> file_retirement_executor_task{nullptr};
 bool can_query_current_task() { return fixture_can_query; }
 auto get_current_task() -> task::Task* { return fixture_current; }
 bool interrupts_enabled() { return fixture_interrupts; }
@@ -250,6 +251,7 @@ void reset_shutdown_fixture() {
     assert(!daemon.kernel_shutdown_ownership.held());
     fixture_current = &daemon; fixture_can_query = fixture_interrupts = true;
     kernel_thread_shutdown_requested.store(false);
+    file_retirement_executor_task.store(nullptr);
     daemon.type = task::TaskType::DAEMON; daemon.exit_in_progress = daemon.preempt_pending = false;
     daemon.preempt_disable_depth = 0; daemon.kernel_shutdown_requested.store(false);
     daemon.owned_unpublished_process.store(nullptr); daemon.wakeup_pending.store(true);
@@ -339,7 +341,7 @@ void shutdown_cases() {
                    "normal no-shutdown flags and finite budgets preserved without pending-queue drain claim");
 
     // Existing eligibility gates still refuse voluntary shutdown independently.
-    for (unsigned restriction = 0; restriction != 6; ++restriction) {
+    for (unsigned restriction = 0; restriction != 7; ++restriction) {
         reset(); ++shutdown_vectors; request_fixture_shutdown();
         if (restriction == 0) daemon.preempt_disable_depth = 1;
         if (restriction == 1) fixture_interrupts = false;
@@ -347,8 +349,9 @@ void shutdown_cases() {
         if (restriction == 3) daemon.type = task::TaskType::PROCESS;
         if (restriction == 4) daemon.exit_in_progress = true;
         if (restriction == 5) daemon.kernel_shutdown_requested.store(false);
+        if (restriction == 6) file_retirement_executor_task.store(&daemon);
         shutdown_check(!call_exit_hook() && simulated_exit_calls == 0 && daemon.wakeup_pending.load(),
-                       "real hook keeps existing preempt/IF/unpublished/type/exit/request restrictions");
+                       "real hook keeps existing preempt/IF/unpublished/type/exit/request/executor restrictions");
     }
     reset(); ++shutdown_vectors; daemon.kernel_shutdown_requested.store(true);
     shutdown_check(!call_exit_hook(), "global shutdown request remains necessary");

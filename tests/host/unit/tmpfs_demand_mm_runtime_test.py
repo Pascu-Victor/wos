@@ -69,8 +69,8 @@ PRELUDE = r'''
 #include <platform/mm/numa_policy.hpp>
 namespace fixture {
 inline unsigned assertions{},cases{},irq{},preempt{},task_leases{},root_leases{},io_calls{},metadata_calls{},table_allocs{},table_frees{},acks{},yields{};
-inline unsigned fail_table_at{},refuse_readers{};
-inline bool publication{},stop{};
+inline unsigned fail_table_at{},refuse_readers{},pin_busy_attempts{};
+inline bool publication{},stop{},access_window{};
 inline bool interrupts=true;inline unsigned enabled_interrupts{},restored_interrupts{};
 inline int io_error{};
 inline std::function<void()> io_hook;
@@ -154,18 +154,21 @@ enum class TaskType{PROCESS,DAEMON};enum class TaskState{ACTIVE,EXITING};
 struct Task{TaskType type=TaskType::PROCESS;std::atomic<TaskState>state{TaskState::ACTIVE};mm::paging::PageTable*pagemap{};
  uint64_t pid=23; // Finite subject identity for copied worker diagnostics.
  std::atomic<bool>scheduler_transition_active{},exit_in_progress{},process_exit_requested{},usercopy_pagemap_closing{};
- bool has_exited{},deferred_task_switch{},wants_block{};uint64_t syscall_account_start_us{};
+ bool has_exited{},deferred_task_switch{},wants_block{},voluntary_block{};uint64_t syscall_account_start_us{};
+ std::atomic<uint32_t>usercopy_pagemap_accesses{};
+ bool is_voluntary_blocked()const{return voluntary_block;}
  fixture::Lock lazy_vmem_lock;std::vector<LazyVmemRange>lazy_vmem_ranges;unsigned refs=1,preempt_disable_depth{},local{};
  uint64_t lazy_file_fault_generation{},lazy_file_fault_vaddr{};int lazy_file_fault_status{};std::atomic<uint64_t>lazy_file_fault_completion_generation{};
  bool try_acquire(){if(state!=TaskState::ACTIVE)return false;++refs;return true;}void release(){fixture::check(refs>1,"retained Task released once");--refs;}
- bool try_acquire_usercopy_pagemap(mm::paging::PageTable*&out){if(state!=TaskState::ACTIVE||!pagemap)return false;++local;++fixture::task_leases;out=pagemap;return true;}
- void release_usercopy_pagemap(){fixture::check(local&&fixture::task_leases,"local root lease balanced");--local;--fixture::task_leases;}
+ bool try_acquire_usercopy_pagemap(mm::paging::PageTable*&out){if(state!=TaskState::ACTIVE||!pagemap)return false;++local;++fixture::task_leases;++usercopy_pagemap_accesses;out=pagemap;return true;}
+ void release_usercopy_pagemap(){fixture::check(local&&fixture::task_leases&&usercopy_pagemap_accesses,"local root lease balanced");--local;--fixture::task_leases;--usercopy_pagemap_accesses;}
 };
 }
 namespace ker::mod::sched {
 inline task::Task*current{};inline unsigned holds{},wakes{};
 inline bool can_query_current_task(){return current!=nullptr;}inline auto get_current_task(){return current;}
 inline auto get_return_task(){return current;}
+inline bool has_run_queues(){return true;}
 inline void preempt_disable(){++fixture::preempt;}inline void preempt_enable(){fixture::check(fixture::preempt>0,"preempt balanced");--fixture::preempt;}
 inline unsigned preempt_count(){return fixture::preempt;}inline bool interrupts_enabled(){return fixture::interrupts&&fixture::irq==0;}
 struct PreemptGuard{PreemptGuard(){preempt_disable();}~PreemptGuard(){preempt_enable();}};
@@ -173,6 +176,11 @@ struct Hold{Hold(){++holds;}~Hold(){--holds;}};inline Hold hold_kernel_shutdown(
 inline bool kernel_threads_shutdown_requested(){return fixture::stop;}inline void kern_block(){fixture::stop=true;}
 inline void kern_yield(){fixture::check(!fixture::preempt&&!fixture::root_leases&&!fixture::task_leases&&!fixture::irq,"yield outside all root/IRQ leases");++fixture::yields;}
 inline void wake_task_from_event(task::Task*){fixture::check(!fixture::irq,"wake outside IRQ locks");++wakes;}
+}
+namespace ker::mod::debug::ptrace {
+// This TMPFS fixture has no retained ptrace operation. The production retry
+// predicate is extracted whole; ptrace-chain traversal is a separate fixture.
+inline bool has_pending_local_effect(const sched::task::Task&){return false;}
 }
 namespace ker::mod::sys{using Spinlock=fixture::Lock;}
 namespace fixture {inline void interrupt_instruction(const char*instruction){check(!irq&&!root_leases&&!task_leases,"interrupt change outside root/IRQ leases");
@@ -234,10 +242,17 @@ bool prepare_captured_tmpfs_read_shared_page(sched::task::Task&,const sched::tas
 }
 namespace ker::mod::mm::virt {
 struct HostUserPin{void*hhdm_page{};};
+// ACTUAL_PIN_ATTEMPT_TYPE
 inline bool pin_user_page_for_task(sched::task::Task*t,PageTable*r,uint64_t a,bool write,bool,HostUserPin&out){
  auto*leaf=fixture_leaf(r,a);if(!leaf||!leaf->present||!leaf->user||(write&&!leaf->writable))return false;
  fixture::check(t->local>0,"output Task lease precedes nonblocking pin");++fixture::root_leases;
  out.hhdm_page=reinterpret_cast<void*>(leaf->frame<<12);++fixture::frames.at(out.hhdm_page)->refs;return true;}
+// Typed pin admission is an explicit finite Host PTE/ref endpoint, not the
+// production root-reader/frame-pin implementation. Busy acquires no owner.
+inline auto try_pin_user_page_for_task(sched::task::Task*t,PageTable*r,uint64_t a,bool write,bool fault,HostUserPin&out)->UserPagePinAttempt{
+ fixture::check(t&&t->pagemap==r&&t->local>0&&!out.hhdm_page,"typed admission has fresh target lease and empty pin");
+ if(fixture::pin_busy_attempts){--fixture::pin_busy_attempts;return UserPagePinAttempt::Busy;}
+ return pin_user_page_for_task(t,r,a,write,fault,out)?UserPagePinAttempt::Pinned:UserPagePinAttempt::Failed;}
 }
 namespace ker::mod::sys::usercopy {
 inline bool range_valid(uint64_t a,size_t n){return a<0x800000000000ULL&&n<=0x800000000000ULL-a;}
@@ -262,7 +277,7 @@ struct Fixture{
   r.kind=s::task::LazyVmemKind::TMPFS_READ_SHARED;r.lifetime=&family;r.file_size=family.backend.eof();task.lazy_vmem_ranges.push_back(r);++cases;}
  ~Fixture(){check(!irq&&!preempt&&!task_leases&&!root_leases,"all leases retired");check(task.refs==1&&family.refs==1,"Task/family snapshots balanced");
   check(binding.counts[2]==0&&binding.counts[3]==0&&binding.counts[4]==0,"binding transients balanced");
-  io_hook={};io_error=0;fail_table_at=0;refuse_readers=0;publication=false;stop=false;interrupts=true;s::current=nullptr;
+  io_hook={};io_error=0;fail_table_at=0;refuse_readers=0;pin_busy_attempts=0;publication=false;stop=false;access_window=false;interrupts=true;s::current=nullptr;
   v::file_mapping_index.rows.clear();v::controls.clear();
   // Explicit Host root teardown boundary after all actual tested leases end.
   for(auto&[p,owned]:tables){(void)owned;auto*t=static_cast<mm::paging::PageTable*>(p);for(auto&e:t->entries)if(e.present){auto i=frames.find(reinterpret_cast<void*>(e.frame<<12));if(i!=frames.end()){check(i->second->refs>1,"fixture owns remaining PTE");--i->second->refs;}}}
@@ -290,6 +305,20 @@ void run(){
   check(ker::mod::sys::usercopy::pin_task_user_page(f.task,f.address(),false,true,page),"actual software pin prepares demand before output leases");
   check(io_calls==before+1&&task_leases==1&&root_leases==1,"software output pin established only after IO");page.reset();
   check(!ker::mod::sys::usercopy::pin_task_user_page(f.task,f.address(1),false,false,page)&&io_calls==before+1,"mapped-only cold probe never IO");}
+ {Fixture f;check(f.prepare(),"resident software Busy setup");f.task.syscall_account_start_us=1;
+  ker::mod::sys::usercopy::StableUserPage page;unsigned before=yields,reads=io_calls;pin_busy_attempts=2;
+  check(ker::mod::sys::usercopy::pin_task_user_page(f.task,f.address(),false,true,page),"actual typed software Busy retries after releasing target lease");
+  check(yields==before+2&&io_calls==reads&&pin_busy_attempts==0,"advisory retry preserves prepared resident page without repeated IO");
+  check(task_leases==1&&root_leases==1&&f.task.usercopy_pagemap_accesses==1,"only successful output retains final target and frame owners");
+  page.reset();check(!task_leases&&!root_leases&&f.task.usercopy_pagemap_accesses==0,"typed Busy and final pin release all owners");}
+ {Fixture f;check(f.prepare(),"mapped Busy setup");f.task.syscall_account_start_us=1;
+  ker::mod::sys::usercopy::StableUserPage page;unsigned before=yields,reads=io_calls;pin_busy_attempts=1;
+  check(!ker::mod::sys::usercopy::pin_task_user_page(f.task,f.address(),false,false,page),"mapped-only typed Busy refuses without scheduling");
+  check(yields==before&&io_calls==reads&&!task_leases&&!root_leases&&f.task.usercopy_pagemap_accesses==0,"mapped Busy returns empty and performs no IO or yield");}
+ {Fixture f;check(f.prepare(),"unsafe retry setup");f.task.syscall_account_start_us=1;
+  ker::mod::sys::usercopy::StableUserPage page;unsigned before=yields;pin_busy_attempts=1;access_window=true;
+  check(!ker::mod::sys::usercopy::pin_task_user_page(f.task,f.address(),false,true,page),"actual retry predicate refuses retained user-access window");
+  check(yields==before&&!task_leases&&!root_leases&&f.task.usercopy_pagemap_accesses==0,"unsafe Busy refusal releases every output owner");}
  {Fixture f;unsigned before=yields;refuse_readers=2;check(f.prepare()&&yields==before+2,"software capture retries busy hashed gate outside leases");}
  {Fixture f;f.task.syscall_account_start_us=1;interrupts=false;unsigned enabled=enabled_interrupts,restored=restored_interrupts;
   check(f.prepare(),"real syscall preparation scope admits IF-off ordinary demand");check(!interrupts&&enabled_interrupts==enabled+1&&restored_interrupts==restored+1,"actual scope restores original IF after demand owners cleanup");}
@@ -439,9 +468,20 @@ def generate(virt_source: Path) -> tuple[str, list[dict]]:
     async_bodies.append('bool materialize_issued_native_file_fault(const LazyFileFaultWork&,size_t){std::abort();}')
     code = code.replace('// ACTUAL_ASYNC_BODIES', '\n\n'.join(async_bodies))
     user = (KERN / 'platform/sys/usercopy.cpp').read_text()
+    body, row = definition(interface, 'enum class UserPagePinAttempt', True)
+    actual.append(dict(row, source='platform/mm/virt.hpp'))
+    code = code.replace('// ACTUAL_PIN_ATTEMPT_TYPE', body)
+    retry, row = definition(user, 'auto ordinary_usercopy_retry_context(')
+    flags_read = 'asm volatile("pushfq; pop %0" : "=r"(flags)::"memory");'
+    assert retry.count(flags_read) == 1, 'one actual advisory retry FLAGS read'
+    actual.append(dict(row, source='platform/sys/usercopy.cpp',
+                       Host_instruction_port='single FLAGS read; actual context predicate unchanged'))
+    flags_constant = re.search(r'^constexpr uint64_t RFLAGS_AC = .*;$', user, re.M)
+    assert flags_constant is not None
+    retry = flags_constant[0] + '\n' + retry.replace(flags_read, 'flags = fixture::access_window ? RFLAGS_AC : 0;')
     body, row = definition(user, 'auto pin_task_user_page(')
     actual.append(row)
-    code = code.replace('// ACTUAL_USERCOPY_PIN', body)
+    code = code.replace('// ACTUAL_USERCOPY_PIN', retry + '\n\n' + body)
     paging = (KERN / 'platform/mm/paging.opt.cpp').read_text()
     body, row = definition(paging, 'auto create_page_table_entry(')
     actual.append(row)

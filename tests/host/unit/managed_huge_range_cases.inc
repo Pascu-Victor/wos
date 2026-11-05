@@ -76,7 +76,7 @@ TEST_F(ManagedRange, FullEmptyLowerHalfHasIndependentZeroProofAndLexicalAdmissio
     EXPECT_TRUE(tables.empty());
     EXPECT_EQ(huge::detail::PreparationAccess::plan_storage(tables), nullptr);
     EXPECT_EQ(table_attempt, 0U);
-    EXPECT_GT(host_range::yields, 0U);
+    EXPECT_EQ(host_range::yields, 45U);  // Three16-chunk TryOnly passes, fifteen yields each.
     EXPECT_EQ(host_range::blocking, 0U);
     EXPECT_EQ(arm(survey, tables), huge::Error::None);
     EXPECT_EQ(actual_flushes, 0U);
@@ -455,7 +455,9 @@ TEST_F(ManagedRange, BlockingOwnerIdentityIsEmptyExactAndClearedBeforeTryOwner) 
     using Guard = ker::syscall::vmem::SharedVmemPublicationGuard;
     using ker::syscall::vmem::blocking_publication_owner_matches;
     using ker::syscall::vmem::g_shared_vmem_publication_owner;
-    static_assert(std::is_empty_v<Guard> && sizeof(Guard) == 1);
+    // The lazy empty-fork generation adds one private uint64_t; acquired()
+    // still checks only exact live-owner identity without reading object bytes.
+    static_assert(!std::is_empty_v<Guard> && sizeof(Guard) == sizeof(uint64_t));
     static_assert(!std::is_copy_constructible_v<Guard> && !std::is_move_constructible_v<Guard>);
     EXPECT_FALSE(blocking_publication_owner_matches(nullptr));
     EXPECT_EQ(g_shared_vmem_publication_owner.load(), nullptr);
@@ -733,8 +735,8 @@ TEST_F(ManagedForkRange, DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundarie
     witness.valid = true;
     auto before = host_range::blocking;
     ASSERT_EQ(fork_proof(0, LARGE, small, tables, &witness), huge::Error::None);
-    EXPECT_EQ(host_range::blocking - before, 3U);  // Count, Fill and Verify.
-    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_EQ(host_range::blocking - before, 2U);  // Count and independent final Count.
+    EXPECT_EQ(host_range::range_readers, 2U);
     EXPECT_TRUE(small.complete());
     EXPECT_EQ(small.count(), 0U);
     EXPECT_FALSE(witness.valid);
@@ -744,7 +746,7 @@ TEST_F(ManagedForkRange, DenseZeroKeepsIndependentPassesAndOrdinaryWaitBoundarie
     // One, two and eight PML3 paths require80,112,304 chunks per pass.
     unsigned installed = 0;
     for (auto const [paths, chunks, halts] :
-         {std::array<unsigned, 3>{1, 240, 0}, std::array<unsigned, 3>{2, 336, 1}, std::array<unsigned, 3>{8, 912, 3}}) {
+         {std::array<unsigned, 3>{1, 160, 0}, std::array<unsigned, 3>{2, 224, 0}, std::array<unsigned, 3>{8, 608, 2}}) {
         SCOPED_TRACE(paths);
         for (; installed < paths; ++installed) ordinary_path(uint64_t{installed} << 30);
         unsigned released = 0, last_halt = 0;
@@ -789,7 +791,7 @@ TEST_F(ManagedForkRange, FiniteForeignReleaseAllowsTheRealBlockingGuardThenClear
     huge::PreparedTables tables;
     ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
     EXPECT_TRUE(released);
-    EXPECT_EQ(host_range::blocking, 3U);
+    EXPECT_EQ(host_range::blocking, 2U);
     EXPECT_EQ(ker::syscall::vmem::g_shared_vmem_publication_owner.load(), nullptr);
     no_owners();
 }
@@ -897,8 +899,8 @@ TEST_F(ManagedForkRange, ReaderLeaseAndStaleRootStillRefuseWithoutHiddenRetryOrY
     host_range::reader_busy = false;
     huge_root_live = true;
 }
-// Three independent public preparation passes must all tolerate an unrelated
-// foreign teardown without dropping the proof or waiting under PreemptGuard.
+// Both empty-fork scans and the nonzero Fill must tolerate an unrelated foreign
+// teardown without dropping the proof or waiting under PreemptGuard.
 TEST_F(ManagedForkRange, CountContentionYieldsWithOnlyPublicationAndTaskLease) {
     unsigned publications = 0;
     fork_range_wait_action = [&] {
@@ -909,14 +911,39 @@ TEST_F(ManagedForkRange, CountContentionYieldsWithOnlyPublicationAndTaskLease) {
     huge::PreparedTables tables;
     huge::RangePrepareWitness witness{};
     ASSERT_EQ(fork_proof(0, LARGE, survey, tables, &witness), huge::Error::None);
-    EXPECT_EQ(publications, 3U);
+    EXPECT_EQ(publications, 2U);
     EXPECT_EQ(host_range::gate_yields, 1U);
-    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_EQ(host_range::range_readers, 2U);
     EXPECT_FALSE(witness.valid);
     EXPECT_TRUE(survey.complete());
     no_owners();
 }
-TEST_F(ManagedForkRange, FillContentionYieldsAndKeepsTheCompleteZeroProof) {
+TEST_F(ManagedForkRange, FillContentionPreservesTheNonzeroDescriptors) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    unsigned publications = 0;
+    fork_range_wait_action = [&] {
+        if (++publications == 2) virt::user_pagemap_access_gates[0].teardown.store(true);
+    };
+    fork_range_gate_action = [] { virt::user_pagemap_access_gates[0].teardown.store(false); };
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(TEST_VA, TEST_VA + LARGE, survey, tables), huge::Error::None);
+    EXPECT_EQ(publications, 3U);
+    EXPECT_EQ(host_range::gate_yields, 1U);
+    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_TRUE(survey.complete());
+    EXPECT_EQ(survey.count(), 1U);
+    auto* storage = huge::detail::PreparationAccess::plan_storage(tables);
+    ASSERT_NE(storage, nullptr);
+    EXPECT_EQ(storage->descriptors[0].key.va_2m, TEST_VA);
+    EXPECT_EQ(arm(survey, tables), huge::Error::None);
+    mapped[0] = false;
+    cleanup[0].reset();
+    tables.reset();
+    no_owners();
+}
+TEST_F(ManagedForkRange, VerifyContentionYieldsAndStillExecutesTheIndependentPass) {
     unsigned publications = 0;
     fork_range_wait_action = [&] {
         if (++publications == 2) virt::user_pagemap_access_gates[0].teardown.store(true);
@@ -925,25 +952,9 @@ TEST_F(ManagedForkRange, FillContentionYieldsAndKeepsTheCompleteZeroProof) {
     huge::RangeSplitSurvey survey;
     huge::PreparedTables tables;
     ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
-    EXPECT_EQ(publications, 3U);
+    EXPECT_EQ(publications, 2U);
     EXPECT_EQ(host_range::gate_yields, 1U);
-    EXPECT_EQ(host_range::range_readers, 3U);
-    EXPECT_TRUE(survey.complete());
-    EXPECT_EQ(survey.count(), 0U);
-    no_owners();
-}
-TEST_F(ManagedForkRange, VerifyContentionYieldsAndStillExecutesTheIndependentPass) {
-    unsigned publications = 0;
-    fork_range_wait_action = [&] {
-        if (++publications == 3) virt::user_pagemap_access_gates[0].teardown.store(true);
-    };
-    fork_range_gate_action = [] { virt::user_pagemap_access_gates[0].teardown.store(false); };
-    huge::RangeSplitSurvey survey;
-    huge::PreparedTables tables;
-    ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
-    EXPECT_EQ(publications, 3U);
-    EXPECT_EQ(host_range::gate_yields, 1U);
-    EXPECT_EQ(host_range::range_readers, 3U);
+    EXPECT_EQ(host_range::range_readers, 2U);
     EXPECT_TRUE(survey.complete());
     no_owners();
 }
@@ -962,7 +973,7 @@ TEST_F(ManagedForkRange, TeardownRacingReaderCasRollsBackBeforeTheOrdinaryWait) 
     huge::PreparedTables tables;
     ASSERT_EQ(fork_proof(0, LARGE, survey, tables), huge::Error::None);
     EXPECT_EQ(host_range::gate_yields, 1U);
-    EXPECT_EQ(host_range::range_readers, 4U);  // One rolled-back CAS, then all three passes.
+    EXPECT_EQ(host_range::range_readers, 3U);  // One rolled-back CAS, then both independent scans.
     EXPECT_TRUE(survey.complete());
     no_owners();
 }
@@ -1166,7 +1177,7 @@ TEST_F(ManagedForkRange, IndependentFinalZeroPassStillDetectsPublicationAndRebui
     fork_range_release_action = [&] {
         // An empty full half needs16 chunks/pass. Publish after the first
         // chunk of Verify: its independent scan must detect the epoch change.
-        if (++visits == 33) {
+        if (++visits == 17) {
             ASSERT_EQ(prepare(0), huge::Error::None);
             ASSERT_EQ(publish(0), huge::Error::None);
             added = true;
@@ -1176,6 +1187,92 @@ TEST_F(ManagedForkRange, IndependentFinalZeroPassStillDetectsPublicationAndRebui
     EXPECT_TRUE(added);
     EXPECT_EQ(survey.count(), 1U);
     EXPECT_NE(huge::detail::PreparationAccess::plan_storage(tables), nullptr);
+    no_owners();
+}
+TEST_F(ManagedForkRange, IndependentFinalEmptyPassRejectsSameEpochUnsupportedGeometry) {
+    ordinary_path(0);
+    auto* pml3 = reinterpret_cast<mm::paging::PageTable*>(word(runtime_root, 0) & virt::PTE_FRAME_MASK);
+    auto* pml2 = reinterpret_cast<mm::paging::PageTable*>(word(pml3, 0) & virt::PTE_FRAME_MASK);
+    std::array<uint64_t*, 3> slots{&word(pml2, 0), &word(pml3, 0), &word(runtime_root, 0)};
+    std::array<uint64_t, 3> malformed{0x40000087, 0x40000087, 0x20};  // Unknown2MiB,1GiB, nonpresent upper encoding.
+    for (size_t axis = 0; axis < slots.size(); ++axis) {
+        SCOPED_TRACE(axis);
+        auto* slot = slots[axis];
+        auto const original = *slot;
+        auto const epoch = virt::host_root_control.ps_geometry_epoch;
+        unsigned visits = 0;
+        fork_range_release_action = [&] {
+            if (++visits == 1) {
+                no_owners();
+                *slot = malformed[axis];  // After Count; deliberately no epoch change or managed authority.
+            }
+        };
+        huge::RangeSplitSurvey survey;
+        huge::PreparedTables tables;
+        huge::RangePrepareWitness witness{};
+        auto const error = fork_proof(0, LARGE, survey, tables, &witness);
+        *slot = original;
+        fork_range_release_action = {};
+        EXPECT_EQ(error, huge::Error::Unsupported);
+        EXPECT_EQ(visits, 2U);
+        EXPECT_EQ(witness.site, huge::RangePrepareSite::GeometryEncoding);
+        EXPECT_EQ(witness.pass, huge::RangePreparePass::Verify);
+        EXPECT_EQ(witness.attempt, 1U);
+        EXPECT_FALSE(witness.epoch_changed);
+        EXPECT_EQ(virt::host_root_control.ps_geometry_epoch, epoch);
+        EXPECT_FALSE(survey.complete());
+        EXPECT_TRUE(tables.empty());
+        EXPECT_EQ(table_attempt, 0U);
+        no_owners();
+    }
+}
+TEST_F(ManagedForkRange, EmptyNamedForkProofFeedsTheOriginalExclusiveCopier) {
+    struct RestoreForkState {
+        mm::paging::PageTable* child{fork_child};
+        bool mode{fork_mode}, eager{fork_eager};
+        size_t fail_table{fork_fail_table_at};
+        ~RestoreForkState() {
+            fork_child = child;
+            fork_mode = mode;
+            fork_eager = eager;
+            fork_fail_table_at = fail_table;
+        }
+    } restore;
+    auto* child = table();
+    fork_child = child;
+    fork_mode = fork_eager = false;
+    fork_fail_table_at = SIZE_MAX;
+    auto const blocking = host_range::blocking;
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(fork_proof(0, uint64_t{1} << 47, survey, tables), huge::Error::None);
+    EXPECT_EQ(host_range::blocking - blocking, 32U);
+    EXPECT_EQ(host_range::range_readers, 32U);
+    ASSERT_TRUE(survey.complete());
+    ASSERT_EQ(survey.count(), 0U);
+    EXPECT_TRUE(tables.empty());
+    EXPECT_EQ(table_attempt, 0U);
+    no_owners();
+    auto const exclusives = fork_exclusives;
+    auto const readers = fork_reader_attempts;
+    auto const cows = fork_cow_entries;
+    auto const allocations = fork_table_attempts;
+    {
+        ker::mod::sys::SyscallPreparationScope preparation(actor);
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        HostIrqOff irq;
+        fork_mode = true;
+        EXPECT_EQ(virt::deep_copy_current_user_pagemap_prepared(actor, child, preparation, publication, survey, tables, nullptr, nullptr),
+                  0);
+        fork_mode = false;
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+        EXPECT_FALSE(host_range::exclusive);
+        EXPECT_EQ(root_readers, 0U);
+    }
+    EXPECT_EQ(fork_exclusives - exclusives, 1U);
+    EXPECT_EQ(fork_cow_entries - cows, 1U);
+    EXPECT_EQ(fork_reader_attempts - readers, 0U);
+    EXPECT_EQ(fork_table_attempts, allocations);
     no_owners();
 }
 TEST_F(ManagedForkRange, EntryInputAndUnsupportedGeometryKeepOriginalRefusals) {

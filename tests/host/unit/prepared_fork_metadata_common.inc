@@ -11,10 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <type_traits>
 #include <utility>
 #include <vector>
 namespace fixture {
-unsigned cases{}, checks{}, pub{}, spin{}, mutex{}, allocations{}, retains{}, puts{};
+unsigned cases{}, checks{}, pub{}, spin{}, mutex{}, allocations{}, retains{}, puts{}, registry_tries{};
 bool irq = true, ready = true, query = true, try_busy = false;
 unsigned preempt{};
 int fail_after = -1;
@@ -40,6 +41,7 @@ struct Mutex {
         ++mutex;
     }
     bool try_lock() {
+        ++registry_tries;
         if (try_busy) return false;
         lock();
         return true;

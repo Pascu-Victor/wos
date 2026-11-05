@@ -4,7 +4,9 @@
 #include <cstring>
 #include <initializer_list>
 #include <new>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/numa_root_reserve.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -17,6 +19,8 @@ namespace mm = ker::mod::mm;
 namespace paging = ker::mod::mm::paging;
 namespace phys = ker::mod::mm::phys;
 namespace virt = ker::mod::mm::virt;
+namespace numa = ker::mod::mm::numa;
+namespace topology = ker::mod::acpi::numa;
 
 constexpr uint64_t TEST_VA = 0x4D000000ULL;
 constexpr uint64_t OTHER_VA = TEST_VA + paging::PAGE_SIZE;
@@ -148,13 +152,44 @@ struct EmptyRoots {
 };
 
 auto warm_root_pool() -> bool {
+    auto const* published = topology::boot_topology();
+    if (published == nullptr || published->node_count == 0) return false;
     {
         EmptyRoots<ROOT_POOL_CAPACITY> warm;
         if (!warm.init()) return false;
     }
     virt::PageTablePoolStatsSnapshot pool{};
     virt::get_page_table_pool_stats_snapshot(pool);
-    return pool.capacity == ROOT_POOL_CAPACITY && pool.cached_pages == pool.capacity;
+    // UMA retains the old cache warmup; NUMA must physically retire every root.
+    return pool.capacity == ROOT_POOL_CAPACITY && pool.cached_pages == (published->node_count == 1 ? pool.capacity : 0U);
+}
+
+auto identity_reuse_node() -> numa::NodeId {
+    auto const* published = topology::boot_topology();
+    if (published == nullptr || published->node_count <= 1) return numa::INVALID_NODE;
+    numa::root_reserve::Snapshot state{};
+    numa::root_reserve::snapshot(state);
+    if (!state.published || !state.healthy || state.node_count != published->node_count || state.node_count > state.nodes.size())
+        return numa::INVALID_NODE;
+    for (numa::NodeId node = 0; node < state.node_count; ++node)
+        if (state.nodes[node].available != 0 && state.nodes[node].transfers == 0) return node;
+    return numa::INVALID_NODE;
+}
+
+auto init_identity_reuse_root(OwnedRoot& owner, numa::NodeId node) -> bool {
+    if (node == numa::INVALID_NODE) return owner.init();
+    if (owner.root != nullptr) return false;
+    // Only this address-reuse test selects the actual fixed-member reserve.
+    // Ordinary NUMA allocation/free is exercised by the other root cases.
+    virt::SelftestRootFactoryOptions const options{.force_ordinary_failure = true, .use_node_override = true, .node_override = node};
+    virt::SelftestRootFactoryOutput output{};
+    owner.root = virt::selftest_create_pagemap(options, output);
+    bool const valid = owner.root != nullptr && output.source == virt::SelftestRootAllocationSource::EMERGENCY_RESERVE &&
+                       output.ordinary_failure_injected && !output.ordinary_allocator_called && output.override_used &&
+                       output.requested == node && output.reserve_attempted && output.reserve_error == numa::root_reserve::Error::NONE &&
+                       output.control_registered;
+    KEXPECT_TRUE(valid);
+    return valid;
 }
 
 struct RootBalance {
@@ -250,9 +285,12 @@ void expect_identity(const virt::UserFutexIdentity& actual, uint64_t root, uint6
 
 KTEST(RootIdentity, PoolAddressReuseGetsNewIncarnation) {
     KREQUIRE_TRUE(warm_root_pool());
+    bool const NUMA = topology::boot_topology()->node_count > 1;
+    auto const REUSE_NODE = identity_reuse_node();
+    KREQUIRE_TRUE(!NUMA || REUSE_NODE != numa::INVALID_NODE);
     RootBalance balance(true);
     OwnedRoot first;
-    KREQUIRE_TRUE(first.init());
+    KREQUIRE_TRUE(init_identity_reuse_root(first, REUSE_NODE));
     uint64_t const first_serial = virt::selftest_user_root_incarnation(first.root);
     KREQUIRE_NE(first_serial, 0U);
     KEXPECT_EQ(phys::page_kind_get(first.root), mm::PageKind::PAGE_TABLE);
@@ -266,7 +304,7 @@ KTEST(RootIdentity, PoolAddressReuseGetsNewIncarnation) {
     first.reset();
     KEXPECT_EQ(root_stats().control_pages, balance.controls_before.control_pages);
     OwnedRoot replacement;
-    KREQUIRE_TRUE(replacement.init());
+    KREQUIRE_TRUE(init_identity_reuse_root(replacement, REUSE_NODE));
     KEXPECT_EQ(replacement.root, reused_address);
     uint64_t const replacement_serial = virt::selftest_user_root_incarnation(replacement.root);
     KEXPECT_TRUE(replacement_serial > first_serial);

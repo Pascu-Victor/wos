@@ -22,6 +22,7 @@
 #include <optional>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/debug/ptrace.hpp>
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
@@ -79,6 +80,8 @@ inline auto get_current_task() -> ker::mod::sched::task::Task* { return ker::mod
 
 ker::mod::sys::Mutex g_shared_vmem_publication_lock;
 constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};
+// Protected by blocking PUB; used only when issuing an empty fork proof.
+uint64_t g_empty_fork_publication_generation{};
 
 [[nodiscard]] auto blocking_publication_owner_matches(const SharedVmemPublicationGuard* owner) noexcept -> bool {
     return owner != nullptr && g_shared_vmem_publication_owner.load(std::memory_order_acquire) == owner;
@@ -2398,7 +2401,7 @@ extern auto demote_prepared_range_locked(ker::mod::sched::task::Task&, uint64_t,
 // Only actual public dispatch requests the ordinary current-PROCESS coordinator.
 // Legacy internal/nonfixed callers retain their existing unprepared route.
 enum class MutationRoute : uint8_t { Legacy, Public };
-enum class MutationStage : uint8_t { Complete, NeedGeometry, NeedDemotion };
+enum class MutationStage : uint8_t { Complete, NeedGeometry, NeedDemotion, NeedAccounting };
 struct MutationAttempt {
     uint64_t result{};
     MutationStage stage{MutationStage::Complete};
@@ -2406,10 +2409,15 @@ struct MutationAttempt {
     MutationAttempt(MutationStage next) noexcept : stage(next) {}
 };
 
-// Finite pre-mutation handoff only: one fast chunk, at most one complete Count,
+// Finite geometry handoff only: one fast chunk, at most one complete Count,
 // and at most one prepared demotion. No PUB/root/AS owner survives a handoff.
+// Within a publication, ordinary reader admission may yield for a colliding
+// teardown before acquiring a striped reader or disabling preemption.
 class PublicRangeMutation {
    public:
+    static constexpr unsigned MAX_ACCOUNTING_RETRIES = 64;
+    static constexpr unsigned MAX_ATTEMPTS = 3 + MAX_ACCOUNTING_RETRIES;
+
     PublicRangeMutation(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope* preparation, uint64_t start,
                         uint64_t end)
         : actor_(actor), start_(start), end_(end), preparation_(preparation) {
@@ -2417,15 +2425,40 @@ class PublicRangeMutation {
         cursor_.end = end;
     }
 
+    // Admission precedes every reservation/replacement. Only public callers
+    // may leave this publication and retry a transient striped-reader refusal.
+    [[nodiscard]] auto admit_mapping(ker::mod::sched::resource::AddressSpaceObservation& observation, bool retry_allowed,
+                                     ker::mod::mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start = 0,
+                                     uint64_t replaced_size = 0) -> MutationAttempt {
+        using ker::mod::sched::resource::MappingAdmission;
+        if (!retry_allowed)
+            return observation.admit_mapping(root, added, replaced_start, replaced_size) ? uint64_t{0} : static_cast<uint64_t>(-ENOMEM);
+        auto const STATUS = observation.try_admit_mapping(root, added, replaced_start, replaced_size);
+        if (STATUS == MappingAdmission::GateBusy) return MutationStage::NeedAccounting;
+        return STATUS == MappingAdmission::Admitted ? uint64_t{0} : static_cast<uint64_t>(-ENOMEM);
+    }
+
+    // The attempt's observation, publication and MM readers are already gone.
+    // Retain no root/count from it; the next attempt acquires and recounts anew.
+    [[nodiscard]] auto prepare_accounting(const ker::mod::sys::SyscallPreparationScope& preparation) -> int {
+        if (preparation_ != nullptr && preparation_ != &preparation) return -EINVAL;
+        preparation_ = &preparation;
+        if (accounting_retries_ == MAX_ACCOUNTING_RETRIES) return -EAGAIN;
+        if (!accounting_retry_context()) return -EWOULDBLOCK;
+        ++accounting_retries_;
+        ker::mod::sched::kern_yield();
+        return accounting_retry_context() ? 0 : -EWOULDBLOCK;
+    }
+
     [[nodiscard]] auto inspect(const SharedVmemPublicationGuard& publication) -> MutationAttempt {
         using namespace ker::mod;
         if (preparation_ == nullptr) return uint64_t{0};
         if (!ordinary_context()) return static_cast<uint64_t>(-EWOULDBLOCK);
         mm::huge::detail::CurrentRangeRootAccess access{};
-        mm::huge::Error error = mm::huge::Error::Again;
-        {
+        auto error = mm::huge::detail::acquire_current_ordinary_range_root(actor_, *preparation_, publication, access);
+        if (error == mm::huge::Error::None) {
             sched::PreemptGuard preempt;
-            error = mm::huge::detail::acquire_current_range_root(actor_, access);
+            error = mm::huge::detail::validate_current_ordinary_range_root(actor_, *preparation_, publication, access);
             if (error == mm::huge::Error::None) {
                 if (!cursor_.complete && !fast_attempted_) {
                     fast_attempted_ = true;
@@ -2435,6 +2468,8 @@ class PublicRangeMutation {
                     error = mm::huge::detail::validate_current_range_geometry(actor_, *preparation_, publication, access, start_, end_,
                                                                               cursor_);
             }
+            mm::huge::detail::release_current_range_root(access);
+        } else {
             mm::huge::detail::release_current_range_root(access);
         }
         if (error == mm::huge::Error::Again && !count_attempted_ && !demotion_) return MutationStage::NeedGeometry;
@@ -2460,11 +2495,14 @@ class PublicRangeMutation {
                 mm::huge::Error error = mm::huge::Error::Again;
                 {
                     SharedVmemPublicationGuard publication;
-                    {
+                    error = mm::huge::detail::acquire_current_ordinary_range_root(actor_, *preparation_, publication, access);
+                    if (error == mm::huge::Error::None) {
                         sched::PreemptGuard preempt;
-                        error = mm::huge::detail::acquire_current_range_root(actor_, access);
+                        error = mm::huge::detail::validate_current_ordinary_range_root(actor_, *preparation_, publication, access);
                         if (error == mm::huge::Error::None)
                             error = mm::huge::detail::survey_current_range_chunk(actor_, *preparation_, publication, access, cursor_);
+                        mm::huge::detail::release_current_range_root(access);
+                    } else {
                         mm::huge::detail::release_current_range_root(access);
                     }
                 }
@@ -2483,6 +2521,15 @@ class PublicRangeMutation {
     }
 
    private:
+    [[nodiscard]] auto accounting_retry_context() const -> bool {
+        using namespace ker::mod;
+        return ordinary_context() && sched::has_run_queues() && sched::get_return_task() == &actor_ &&
+               !debug::ptrace::has_pending_local_effect(actor_) && !actor_.has_exited &&
+               !actor_.process_exit_requested.load(std::memory_order_acquire) && !actor_.deferred_task_switch && !actor_.wants_block &&
+               !actor_.is_voluntary_blocked() && !actor_.usercopy_pagemap_closing.load(std::memory_order_acquire) &&
+               actor_.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0;
+    }
+
     [[nodiscard]] auto ordinary_context() const -> bool {
         using namespace ker::mod;
         return preparation_ && preparation_->ready() && sched::can_query_current_task() && sched::get_current_task() == &actor_ &&
@@ -2495,6 +2542,7 @@ class PublicRangeMutation {
     ker::mod::sched::task::Task& actor_;
     uint64_t start_{}, end_{};
     bool fast_attempted_{}, count_attempted_{};
+    unsigned accounting_retries_{};
     const ker::mod::sys::SyscallPreparationScope* preparation_{};
     std::optional<PreparedRangeDemotion> demotion_;
     ker::mod::mm::huge::RangeSplitCursor cursor_{};
@@ -2757,7 +2805,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
     if (route == MutationRoute::Public && (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0) ordinary_preparation.emplace(*task);
     PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, hint, hint + size);
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < PublicRangeMutation::MAX_ATTEMPTS; ++attempt) {
         MutationAttempt const outcome = [&]() -> MutationAttempt {
             // Keep address selection/reservation, PTE installation, shared lazy-range
             // metadata, cursor publication, and every rollback in one fork-visible
@@ -2782,13 +2830,12 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
                 }
                 if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
                 vaddr = hint;
-                if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
-                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-                }
+                MutationAttempt const ADMITTED =
+                    mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size, hint, size);
+                if (ADMITTED.stage != MutationStage::Complete || ADMITTED.result != 0) return ADMITTED;
             } else {
-                if (!observation.admit_mapping(task->pagemap, size)) {
-                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-                }
+                MutationAttempt const ADMITTED = mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size);
+                if (ADMITTED.stage != MutationStage::Complete || ADMITTED.result != 0) return ADMITTED;
                 uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
                 if (RESERVE_RET != 0) {
                     if (RESERVE_RET == ker::abi::vmem::VMEM_ENOMEM) {
@@ -2910,6 +2957,12 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             return vaddr;
         }();
         if (outcome.stage == MutationStage::Complete) return outcome.result;
+        if (outcome.stage == MutationStage::NeedAccounting) {
+            if (!ordinary_preparation) ordinary_preparation.emplace(*task);
+            int const RETRY = mutation.prepare_accounting(*ordinary_preparation);
+            if (RETRY != 0) return static_cast<uint64_t>(RETRY);
+            continue;
+        }
         int const PREPARED_NEXT = mutation.prepare_next(outcome.stage);
         if (PREPARED_NEXT != 0) return static_cast<uint64_t>(PREPARED_NEXT);
     }
@@ -3409,7 +3462,7 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
 
     if (route == MutationRoute::Public && (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0) ordinary_preparation.emplace(*task);
     PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, hint, hint + size);
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < PublicRangeMutation::MAX_ATTEMPTS; ++attempt) {
         MutationAttempt const outcome = [&]() -> MutationAttempt {
             // Keep reservation, page-table construction, lazy/file metadata, and
             // rollback indivisible with respect to fork's address-space snapshot.
@@ -3430,13 +3483,12 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
                 }
                 if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
                 vaddr = hint;
-                if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
-                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-                }
+                MutationAttempt const ADMITTED =
+                    mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size, hint, size);
+                if (ADMITTED.stage != MutationStage::Complete || ADMITTED.result != 0) return ADMITTED;
             } else {
-                if (!observation.admit_mapping(task->pagemap, size)) {
-                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-                }
+                MutationAttempt const ADMITTED = mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size);
+                if (ADMITTED.stage != MutationStage::Complete || ADMITTED.result != 0) return ADMITTED;
                 uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
                 if (RESERVE_RET != 0) {
                     return -RESERVE_RET;
@@ -3610,6 +3662,12 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
             return vaddr;
         }();
         if (outcome.stage == MutationStage::Complete) return outcome.result;
+        if (outcome.stage == MutationStage::NeedAccounting) {
+            if (!ordinary_preparation) ordinary_preparation.emplace(*task);
+            int const RETRY = mutation.prepare_accounting(*ordinary_preparation);
+            if (RETRY != 0) return static_cast<uint64_t>(RETRY);
+            continue;
+        }
         int const PREPARED_NEXT = mutation.prepare_next(outcome.stage);
         if (PREPARED_NEXT != 0) return static_cast<uint64_t>(PREPARED_NEXT);
     }
@@ -4864,6 +4922,14 @@ SharedVmemPublicationGuard::~SharedVmemPublicationGuard() {
 
 auto SharedVmemPublicationGuard::acquired() const noexcept -> bool { return blocking_publication_owner_matches(this); }
 
+auto SharedVmemPublicationGuard::try_empty_fork_generation() const noexcept -> uint64_t {
+    if (!acquired()) return 0;
+    if (empty_fork_generation_ != 0) return empty_fork_generation_;
+    if (g_empty_fork_publication_generation == UINT64_MAX) return 0;
+    empty_fork_generation_ = ++g_empty_fork_publication_generation;
+    return empty_fork_generation_;
+}
+
 SharedVmemPublicationTryGuard::SharedVmemPublicationTryGuard() noexcept : acquired_(g_shared_vmem_publication_lock.try_lock()) {}
 
 SharedVmemPublicationTryGuard::~SharedVmemPublicationTryGuard() noexcept {
@@ -5043,7 +5109,9 @@ auto LegacyFileForkPreparation::rows_match_locked() const -> bool {
 
 auto LegacyFileForkPreparation::matches(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
                                         const ker::mod::sys::SyscallPreparationScope& preparation,
-                                        const SharedVmemPublicationGuard& publication, MatchConflict* conflict) const -> int {
+                                        const SharedVmemPublicationGuard& publication, MatchConflict* conflict,
+                                        EmptyMatch* empty_match) const -> int {
+    if (empty_match != nullptr) empty_match->reset();
     if (conflict != nullptr) *conflict = MatchConflict::None;
     if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
     if (!g_file_mmap_ranges_lock.try_lock()) {
@@ -5051,14 +5119,38 @@ auto LegacyFileForkPreparation::matches(ker::mod::sched::task::Task& actor, ker:
         return -EAGAIN;
     }
     bool const matched = rows_match_locked();
+    if (matched && storage_ == nullptr && empty_match != nullptr) {
+        uint64_t const GENERATION = publication.try_empty_fork_generation();
+        if (GENERATION != 0) {
+            empty_match->plan_ = this;
+            empty_match->actor_ = &actor;
+            empty_match->child_ = &child;
+            empty_match->publication_ = &publication;
+            empty_match->generation_ = GENERATION;
+        }
+    }
     g_file_mmap_ranges_lock.unlock();
     return matched ? 0 : -EAGAIN;
 }
 
 auto LegacyFileForkPreparation::commit(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
                                        const ker::mod::sys::SyscallPreparationScope& preparation,
-                                       const SharedVmemPublicationGuard& publication) -> int {
-    if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
+                                       const SharedVmemPublicationGuard& publication, EmptyMatch* empty_match) -> int {
+    if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) {
+        if (empty_match != nullptr) empty_match->reset();
+        return -EAGAIN;
+    }
+    if (empty_match != nullptr) {
+        bool const MATCHED = storage_ == nullptr && empty_match->plan_ == this && empty_match->actor_ == &actor &&
+                             empty_match->child_ == &child && empty_match->publication_ == &publication && empty_match->generation_ != 0 &&
+                             empty_match->generation_ == publication.empty_fork_generation_;
+        empty_match->reset();
+        if (!MATCHED) return -EAGAIN;
+        // The fresh empty match and this commit retain the same PUB. Neither
+        // the coordinator nor foreign teardown can add either absent root.
+        committed_ = true;
+        return 0;
+    }
     if (!g_file_mmap_ranges_lock.try_lock()) return -EAGAIN;
     if (!rows_match_locked()) {
         g_file_mmap_ranges_lock.unlock();

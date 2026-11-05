@@ -2,6 +2,7 @@
 """Run the actual observation destructor with controlled capture/clock endpoints."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -18,6 +19,7 @@ def block(text, start, terminator):
 
 destructor = block(source, 'AddressSpaceObservation::~AddressSpaceObservation()', '\n}')
 declaration = block(header, 'class AddressSpaceObservation', '\n};')
+mapping_admission = re.search(r'enum class MappingAdmission[^;]+;', header).group()
 enum = block(perf_header, 'enum class WkiPerfLocalVmemOp', '\n};')
 name_source = perf_source[perf_source.index('const char* wki_op_name('):]
 names = block(name_source, '        case WkiPerfScope::LOCAL_VMEM:', '\n        case WkiPerfScope::LOCAL_LOADER:')
@@ -85,7 +87,7 @@ void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t 
 }
 }
 namespace ker::mod::sched::resource {
-''' + declaration + r'''
+''' + mapping_admission + '\n' + declaration + r'''
 bool observe_address_space(task::Task &task) {
  assert(task.pid == 73); ++s.observes; s.order.push_back(2);
  if (s.turn_over) ++s.session;

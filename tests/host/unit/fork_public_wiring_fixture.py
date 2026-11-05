@@ -29,13 +29,14 @@ class PublicWiring:
         assert text.count(anchor) == 1
         text = text.replace(anchor, anchor + """
  // Additional explicit layout ports read only by the extracted rollback slices.
- char* name{}; host_fork_public::Thread* thread{};
+ char* name{};
  struct PublicContext {uint64_t syscall_scratch_area{};} context;
 """)
         text = text.replace("namespace ker::vfs { struct File; }", """namespace ker::vfs { struct File; }
 namespace host_fork_alloc {auto initialized_pid()->uint64_t;}
 namespace host_fork_public {using Thread=ker::mod::sched::threading::Thread; void note_delete(void*); bool free_stack(void*); void lazy_lock(unsigned);}
 """)
+        text = text.replace("void* thread{};", "host_fork_public::Thread* thread{};")
         text = text.replace("uint64_t pid{1};", "uint64_t pid{host_fork_alloc::initialized_pid()};")
         path.write_text(text)
 
@@ -95,12 +96,26 @@ void release_cloned_fd_table_refs(ker::mod::sched::task::Task*);
 namespace child_events {void abort_publication(ker::mod::sched::task::Task&);}
 namespace detail {
 """
+        refusal_types = "\n".join(
+            self.owner.body("platform/mm/virt.hpp", anchor)
+            for anchor in (
+                "enum class UnpublishedRootRefusalSite :", "struct UnpublishedRootRefusal {",
+                "enum class ForkCopyRefusalSite :", "struct ForkCopyRefusalWitness {", "class ForkPrivateChildRoot {",
+                "enum class ForkSourceAdmission :",
+            )
+        )
+        prelude = prelude.replace("namespace ker::syscall::process {",
+            "namespace ker::mod::mm::virt {\nusing paging::PageTable;\n" + refusal_types + "\n"
+            "auto create_fork_private_child_root(sched::task::Task&,sched::task::Task&,ForkPrivateChildRoot&)->PageTable*;\n"
+            "}\nnamespace ker::syscall::process {")
         declarations = self.body("enum class ForkVmFailurePoint :")
         translator = self.body("auto public_fork_vm_error(")
         declaration = """
 auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task&,ker::mod::sched::task::Task&,
  const ker::mod::sys::SyscallPreparationScope&,ker::mod::mm::numa::AllocationContext*,
- ker::mod::mm::numa::AllocationResult*,ForkVmFailurePoint*,ker::mod::mm::huge::RangePrepareWitness* = nullptr)->int;
+ ker::mod::mm::numa::AllocationResult*,ForkVmFailurePoint*,ker::mod::mm::huge::RangePrepareWitness* = nullptr,
+ ker::mod::mm::virt::ForkCopyRefusalWitness* = nullptr,
+ ker::mod::mm::virt::ForkPrivateChildRoot* = nullptr)->int;
 }
 """
         start = self.fork.index("    // Preparation and every unpublished VM rollback remain ordinary.")
@@ -111,12 +126,19 @@ auto host_public_vm_stage(ker::mod::sched::task::Task*parent,ker::mod::sched::ta
  bool EAGER_COPY,ker::mod::mm::numa::AllocationContext&fork_placement,
  ker::mod::mm::numa::AllocationResult&fork_page,uint64_t KERNEL_STACK_BASE)->uint64_t {
  using namespace ker::mod;
+ // Actual factory body, finite already-allocated root backend. The original
+ // caller's authority lifetime/invalidation below remains an exact slice.
+ mm::virt::ForkPrivateChildRoot private_child_authority;
+ auto* const expected_child_root=child->pagemap;
+ child->pagemap=nullptr;
+ EXPECT_EQ(mm::virt::create_fork_private_child_root(*parent,*child,private_child_authority),expected_child_root);
  // Diagnostic-only capture endpoint; actual recorder/unwind is exercised by
  // the existing fork_failure_diagnostics_test. Rollback and statuses stay real.
  struct DiagnosticPort {
-  void capture(sched::task::Task&,const char*,int,int,uint32_t,uint32_t,const char*,
-               const mm::huge::RangePrepareWitness*) {
+  void capture(sched::task::Task&,const char*,int raw,int,uint32_t point,uint32_t,const char*,
+               const mm::huge::RangePrepareWitness*,const mm::virt::ForkCopyRefusalWitness* copy = nullptr) {
    EXPECT_TRUE(host_fork_vm::ordinary());
+   if(copy && copy->valid){EXPECT_EQ(point,11U);EXPECT_EQ(copy->raw_status,raw);}
   }
  } refusal;
  auto finish_fork=[](int64_t status,uint64_t bytes,const char*stage){return host_fork_public::finish(status,bytes,stage);};

@@ -301,6 +301,12 @@ def init_wire(data,final=False,finalizer=False,prior=None,original_deadline=None
                 if(state,ready,flags,generation,restarts,wait,error)!=(3,1,3,1,0,0,0)or pid<=1 or pgid!=pid or deadline-since!=750_000_000_000 or not any(t[3]==3 and t[2]==3 and t[0]==since for t in history):raise ValueError('actual EXEC750s authority')
             selected=dict(pid=pid,deadline=deadline,since=since)
     if seen!=set(SERVICES)or selected is None:raise ValueError('complete init services')
+    def recovered_probe_error(name,row):
+        # Init retains the last probe errno after readiness recovers. It is
+        # historical only for a currently ready daemon with current recovery.
+        return(row['error']>0 and name in('journald','netd','httpd','dropbear')
+               and(row['state'],row['ready'])==(3,2)
+               and any(t[3]==4 and t[1:3]==(3,3)and t[0]==row['since']for t in row['history']))
     if final:
         # Exact live witness plus its unstarted dependent finalizer; neither
         # initialized wait0 is credited as consumption.
@@ -310,7 +316,7 @@ def init_wire(data,final=False,finalizer=False,prior=None,original_deadline=None
         observer_pid=observer['pid']
         if not 1<observer_pid<1<<63:raise ValueError('actual live observer PID')
         for name,row in services.items():
-            if row['restarts']or row['wait']or row['error']or any(t[3]in(6,7,8,9)for t in row['history']):raise ValueError('unrestarted successful final services')
+            if row['restarts']or row['wait']or(row['error']and not recovered_probe_error(name,row))or any(t[3]in(6,7,8,9)for t in row['history']):raise ValueError('unrestarted successful final services')
             if name=='uma-reference':continue
             if name=='uma-reference-exit-witness':
                 if(row['state'],row['ready'],row['flags'],row['generation'],row['pgid'])!=(3,1,3,1,observer_pid)or row['since']<selected['since']or row['deadline']<=row['since']or row['deadline']-row['since']!=30_000_000_000 or h[5]>=row['deadline']or not any(t[3]==3 and t[1:3]==(2,3)and t[0]==row['since']for t in row['history']):raise ValueError('actual observer EXEC30s authority')
@@ -330,7 +336,7 @@ def init_wire(data,final=False,finalizer=False,prior=None,original_deadline=None
         if h[5]>=original_deadline:raise ValueError('original witness deadline, never a renewed window')
         observer=services['uma-reference-exit-witness'];actuator=services['uma-reference-finalizer']
         for name,row in services.items():
-            if row['restarts']or row['wait']or row['error']or any(t[3]in(6,7,8,9)for t in row['history']):raise ValueError('clean final consumed status')
+            if row['restarts']or row['wait']or(row['error']and not recovered_probe_error(name,row))or any(t[3]in(6,7,8,9)for t in row['history']):raise ValueError('clean final consumed status')
             if name=='uma-reference-exit-witness':
                 if(row['state'],row['ready'],row['flags'],row['pid'],row['pgid'],row['generation'],row['deadline'])!=(6,2,3,-1,-1,1,0)or row['since']<prior['published']or not any(t[3]==5 and t[2]==6 and t[0]>=row['since']for t in row['history']):raise ValueError('actual original witness consumed EXITED/READY/raw0')
             elif name=='uma-reference-finalizer':

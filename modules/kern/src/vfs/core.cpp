@@ -873,6 +873,10 @@ auto realpath_native_as(ker::mod::sched::task::Task* task, const ker::mod::secur
 auto consume_lookup_locked(const LookupHandle& handle, bool namespace_mutation, LookupConsumer consumer, void* context,
                            const ker::mod::sched::task::Task* request_task = nullptr,
                            const ker::mod::security::Snapshot* request_credentials = nullptr) -> int;
+auto native_lookup_serialized(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, LookupIntent intent,
+                              LookupFollowPolicy follow_policy, bool require_directory, bool apply_task_route, LookupConsumer consumer,
+                              void* context, const ker::mod::security::Snapshot* admitted_credentials, DirectoryViewRef* directory_view,
+                              bool namespace_mutation) -> int;
 auto copy_directory_lookup_path(File* directory, uint64_t namespace_generation, uint64_t mount_generation,
                                 std::array<char, MAX_PATH_LEN>& out, bool namespace_already_locked = false) -> int;
 auto open_local_serialized(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, LookupFollowPolicy follow_policy,
@@ -11274,7 +11278,7 @@ auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathn
         int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::CREATE_DIRECTORY, LookupFollowPolicy::NOFOLLOW_FINAL,
                                                true, true, &lookup, 0, false, &REQUEST_CREDENTIALS);
         if (acquire != 0) {
-            if (acquire == -EAGAIN && attempt != 3) {
+            if (acquire == -EAGAIN) {
                 continue;
             }
             return acquire;
@@ -11283,11 +11287,16 @@ auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathn
         if (synthetic_mkdir_backend(lookup.mount()->fs_type)) return reject_synthetic_mkdir(lookup, task, &REQUEST_CREDENTIALS);
         ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
         int const result = consume_lookup_locked(lookup, true, consume_mkdir, &context, task, &REQUEST_CREDENTIALS);
-        if (result != -EAGAIN || attempt == 3) {
+        if (result != -EAGAIN) {
             return result;
         }
     }
-    return -EAGAIN;
+    // Retire optimistic handles and publication guards before one native fresh walk.
+    // Preserve this request's authority; never replay a remote operation.
+    auto const* scope = task->mount_namespace();
+    if (scope == nullptr || !scope->is_host()) return -EAGAIN;
+    return native_lookup_serialized(task, dirfd, pathname, LookupIntent::CREATE_DIRECTORY, LookupFollowPolicy::NOFOLLOW_FINAL, true, true,
+                                    consume_mkdir, &context, &REQUEST_CREDENTIALS, nullptr, true);
 }
 
 namespace {

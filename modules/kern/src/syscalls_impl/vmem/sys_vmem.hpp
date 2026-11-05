@@ -50,6 +50,12 @@ class SharedVmemPublicationGuard {
     auto operator=(SharedVmemPublicationGuard&&) -> SharedVmemPublicationGuard& = delete;
     // Borrows this live guard's exact singleton publication identity; no object bytes are read.
     [[nodiscard]] auto acquired() const noexcept -> bool;
+
+   private:
+    friend class LegacyFileForkPreparation;
+    // Assigned only for an empty fork match under this already-held PUB.
+    [[nodiscard]] auto try_empty_fork_generation() const noexcept -> uint64_t;
+    mutable uint64_t empty_fork_generation_{};
 };
 
 // Try-only owner for short current-root admission. Construct in an instrumented
@@ -116,12 +122,39 @@ class PublicFileForkPreparation {
     bool prepared_{};
 };
 
-// Unwired prepared legacy fork metadata. Caller retains exact actor/root and
+// Prepared legacy fork metadata. Caller retains exact actor/root and
 // exclusively never-active child through commit, and destroys this holder only
 // outside PUB/root/IF/preempt owners. Real checked File refs own every prefix.
 class LegacyFileForkPreparation {
    public:
     enum class MatchConflict : uint8_t { None, RegistryBusy };
+
+    // A fresh locked empty match under one continuously held PUB. This value
+    // remains on the preparing stack; commit consumes it even on refusal.
+    class EmptyMatch {
+       public:
+        EmptyMatch() = default;
+        EmptyMatch(const EmptyMatch&) = delete;
+        EmptyMatch(EmptyMatch&&) = delete;
+        auto operator=(const EmptyMatch&) -> EmptyMatch& = delete;
+        auto operator=(EmptyMatch&&) -> EmptyMatch& = delete;
+        [[nodiscard]] auto armed() const noexcept -> bool { return generation_ != 0; }
+
+       private:
+        friend class LegacyFileForkPreparation;
+        void reset() noexcept {
+            plan_ = nullptr;
+            actor_ = nullptr;
+            child_ = nullptr;
+            publication_ = nullptr;
+            generation_ = 0;
+        }
+        const LegacyFileForkPreparation* plan_{};
+        const ker::mod::sched::task::Task* actor_{};
+        const ker::mod::sched::task::Task* child_{};
+        const SharedVmemPublicationGuard* publication_{};
+        uint64_t generation_{};
+    };
 
     LegacyFileForkPreparation() = default;
     ~LegacyFileForkPreparation();
@@ -130,9 +163,10 @@ class LegacyFileForkPreparation {
     [[nodiscard]] auto prepare(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&)
         -> int;
     [[nodiscard]] auto matches(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
-                               const SharedVmemPublicationGuard&, MatchConflict* conflict = nullptr) const -> int;
+                               const SharedVmemPublicationGuard&, MatchConflict* conflict = nullptr,
+                               EmptyMatch* empty_match = nullptr) const -> int;
     [[nodiscard]] auto commit(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
-                              const SharedVmemPublicationGuard&) -> int;
+                              const SharedVmemPublicationGuard&, EmptyMatch* empty_match = nullptr) -> int;
 
    private:
     struct Storage;

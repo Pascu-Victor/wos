@@ -79,12 +79,20 @@ void prefault_plain() noexcept {
 
 auto failure(int error) noexcept -> uint64_t { return static_cast<uint64_t>(-error); }
 
+auto channel_free_return_yield(const Task& actor) noexcept -> bool {
+    // Same-CPU syscall wakes defer a yield until the syscall epilogue. Keep
+    // those markers intact; a deferred blocking wait is still inadmissible.
+    return actor.yield_switch && actor.wait_channel == nullptr && actor.wait_channel_kind == sched::task::WaitChannelKind::NONE &&
+           !actor.is_voluntary_blocked() && actor.wki_proxy_task_id == 0;
+}
+
 auto admitted(Task& actor, uint64_t& root_serial) noexcept -> bool {
     if (!boot_enabled.load(std::memory_order_acquire) || !sched::can_query_current_task() || sched::get_current_task() != &actor ||
         actor.pid == 0 || actor.type != sched::task::TaskType::PROCESS || actor.is_thread || actor.credential_owner() != &actor ||
         actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || actor.syscall_account_start_us == 0 ||
         sched::preempt_count() != 0 || !sched::interrupts_enabled() || actor.pagemap == nullptr ||
-        actor.scheduler_transition_active.load(std::memory_order_acquire) || actor.deferred_task_switch || actor.wants_block ||
+        actor.scheduler_transition_active.load(std::memory_order_acquire) ||
+        (actor.deferred_task_switch && !channel_free_return_yield(actor)) || actor.wants_block ||
         actor.shares_user_pagemap.load(std::memory_order_acquire) || actor.resource_thread_owners.load(std::memory_order_acquire) != 0 ||
         actor.resource_cpu_threads.load(std::memory_order_acquire) != 0 || actor.wki_proxy_task ||
         actor.pending_wki_fd_snapshots != nullptr || actor.pending_wki_submissions != nullptr ||

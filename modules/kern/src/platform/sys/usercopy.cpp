@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "platform/asm/cpu.hpp"
+#include "platform/debug/ptrace.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
@@ -27,6 +28,21 @@ constexpr uint64_t RFLAGS_AC = uint64_t{1} << 18U;
     uint64_t const PAGE_OFFSET = user_addr & (mm::paging::PAGE_SIZE - 1);
     uint64_t const PAGE_REMAINING = mm::paging::PAGE_SIZE - PAGE_OFFSET;
     return remaining < PAGE_REMAINING ? remaining : static_cast<size_t>(PAGE_REMAINING);
+}
+
+[[nodiscard]] auto ordinary_usercopy_retry_context(sched::task::Task* executor) -> bool {
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0" : "=r"(flags)::"memory");
+    return executor != nullptr && (flags & RFLAGS_AC) == 0 && sched::has_run_queues() && sched::can_query_current_task() &&
+           sched::get_current_task() == executor && sched::get_return_task() == executor &&
+           !debug::ptrace::has_pending_local_effect(*executor) && executor->type == sched::task::TaskType::PROCESS &&
+           executor->syscall_account_start_us != 0 && executor->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !executor->has_exited && !executor->exit_in_progress.load(std::memory_order_acquire) &&
+           !executor->process_exit_requested.load(std::memory_order_acquire) &&
+           !executor->scheduler_transition_active.load(std::memory_order_acquire) && !executor->deferred_task_switch &&
+           !executor->wants_block && !executor->is_voluntary_blocked() &&
+           !executor->usercopy_pagemap_closing.load(std::memory_order_acquire) &&
+           executor->usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 && sched::preempt_count() == 0;
 }
 
 [[nodiscard]] auto copy_to_task_common(sched::task::Task& task, uint64_t user_addr, const void* src, size_t size, bool fault_in,
@@ -205,39 +221,60 @@ auto pin_task_user_page(sched::task::Task& task, uint64_t user_addr, bool requir
         return false;
     }
 
-    // Demand TMPFS may allocate/page-in. Prepare it before either output lease;
-    // the generic fault-in route refuses public I/O beneath its root reader.
-    if (fault_in &&
-        mm::virt::prepare_tmpfs_read_shared_page(task, user_addr, require_writable) == mm::virt::PublicReadPrepareResult::REFUSED) {
-        return false;
-    }
+    for (;;) {
+        // Demand TMPFS may allocate/page-in. Prepare it before either output
+        // lease, again after any retry that may have changed the target root.
+        if (fault_in &&
+            mm::virt::prepare_tmpfs_read_shared_page(task, user_addr, require_writable) == mm::virt::PublicReadPrepareResult::REFUSED) {
+            return false;
+        }
 
-    mm::paging::PageTable* pagemap = nullptr;
-    if (!task.try_acquire_usercopy_pagemap(pagemap)) {
-        return false;
-    }
+        mm::virt::UserPagePinAttempt attempt = mm::virt::UserPagePinAttempt::Failed;
+        {
+            mm::paging::PageTable* pagemap = nullptr;
+            if (!task.try_acquire_usercopy_pagemap(pagemap)) {
+                return false;
+            }
 #ifdef WOS_SELFTEST
-    debt::begin_change();
+            debt::begin_change();
 #endif
-    out.m_task = &task;
+            out.m_task = &task;
 #ifdef WOS_SELFTEST
-    debt::add(DebtField::STABLE_HANDLES);
-    debt::end_change();
+            debt::add(DebtField::STABLE_HANDLES);
+            debt::end_change();
 #endif
+            attempt = mm::virt::try_pin_user_page_for_task(&task, pagemap, user_addr, require_writable, fault_in, out.m_pin);
+            if (attempt == mm::virt::UserPagePinAttempt::Pinned) {
+                out.m_user_address = user_addr;
+                return true;
+            }
+            out.reset();
+        }  // No root pointer, Task lease, reader or frame pin reaches scheduling.
+        if (attempt != mm::virt::UserPagePinAttempt::Busy || !fault_in) return false;
 
-    if (!mm::virt::pin_user_page_for_task(&task, pagemap, user_addr, require_writable, fault_in, out.m_pin)) {
-        out.reset();
-        return false;
+        // The caller owns task's lifetime, including a foreign target, and
+        // enters without other foreign/raw pins or MM/publication/access guards.
+        // The ordinary executor is the current syscall task, not that target.
+        auto* executor = sched::can_query_current_task() ? sched::get_current_task() : nullptr;
+        if (!ordinary_usercopy_retry_context(executor)) return false;
+        {
+            SyscallPreparationScope preparation{*executor};
+            if (!preparation.ready() || !ordinary_usercopy_retry_context(executor) || !sched::interrupts_enabled()) return false;
+            sched::kern_yield();
+            if (!ordinary_usercopy_retry_context(executor) || !sched::interrupts_enabled()) return false;
+        }  // Restore incoming IF before the fresh target-root acquisition.
     }
-
-    out.m_user_address = user_addr;
-    return true;
 }
 
 auto pin_current_task_user_page(sched::task::Task& task, uint64_t user_addr, bool require_writable, StableUserPage& out) -> bool {
     // A reused old pin must not survive preparation's allocation/I/O interval.
     out.reset();
     if (!range_valid(user_addr, 1)) return false;
+    // A checked resident mapping needs neither anonymous page-in nor a policy
+    // snapshot. Keep preparation's refusal for actors already exiting.
+    if (!task.exit_in_progress.load(std::memory_order_acquire) && !task.has_exited &&
+        pin_task_user_page(task, user_addr, require_writable, false, out))
+        return true;
     {
         SyscallPreparationScope preparation{task};
         if (preparation.ready() && mm::virt::prepare_current_anonymous_user_page(task, user_addr, require_writable, preparation) != 0)

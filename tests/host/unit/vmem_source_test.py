@@ -876,7 +876,7 @@ def test_eager_and_reserved_placement_use_copied_actor_before_publication() -> N
             "if (CAPTURE != numa::AllocationError::NONE)",
             "SharedVmemPublicationGuard publication_guard;",
             "AddressSpaceObservation observation(task);",
-            "observation.admit_mapping(task->pagemap, size, hint, size)",
+            "mutation.admit_mapping(observation, route == MutationRoute::Public,",
             "release_fixed_mmap_range_locked(task, vaddr, size);",
         ],
         "private eager backing decision and actor capture before admission/replacement",
@@ -1163,11 +1163,13 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
                       "ProcessReservation process_reservation", "placement capture before pressure/owners")
     require_cpp_tokens(fork, ["if (EAGER_COPY)",
         "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,",
-        "EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure)"], "prepared route borrows caller-born eager storage only when requested")
+        "EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure, &copy_failure, &private_child_authority)"], "prepared route borrows caller-born eager storage and scalar witness only when requested")
     coordinator = function_body(source, "prepare_fork_vm_snapshot_once")
     require_cpp_tokens(coordinator, [
-        "deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap)"
-    ], "prepared coordinator transfers the same borrowed eager context and result")
+        "deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure)",
+        "if (private_child_authority != nullptr)",
+        "deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure)"
+    ], "prepared coordinator transfers the same borrowed eager context/result through typed or unchanged raw routes")
     virt = VIRT_CPP.read_text()
     wrapper = function_body(virt, "deep_copy_user_pagemap_cow_impl")
     require_cpp_order(wrapper, "UserPagemapExclusiveScope source_usercopy_scope(src);",
@@ -1212,14 +1214,15 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
         "shm.prepare(actor, child, preparation)",
         "prepare_current_fork_range_split(actor, preparation, 0, USER_END, survey, tables, geometry_failure)",
         "SharedVmemPublicationGuard publication;",
+        "LegacyFileForkPreparation::EmptyMatch empty_legacy_match;",
         "!lazy.matches(actor) || !tmpfs.matches(actor)",
-        "legacy_file.matches(actor, child, preparation, publication, conflict)",
+        "legacy_file.matches(actor, child, preparation, publication, conflict, &empty_legacy_match)",
         "shm.matches(actor, child, preparation, publication)",
         "LegacyInterval legacy_context(preparation);",
         "child.mmap_next.store(actor.mmap_next.load(std::memory_order_relaxed)",
         "lazy.consume(child)", "deep_copy_current_user_pagemap_prepared(",
         "tmpfs.attach(child)", "shm.commit(actor, child, preparation, publication)",
-        "legacy_file.commit(actor, child, preparation, publication)",
+        "legacy_file.commit(actor, child, preparation, publication, empty_legacy_match.armed() ? &empty_legacy_match : nullptr)",
     ], "all five actual owners and geometry prepared before the one final PUB then legacy interval")
     if snapshot.count("tmpfs.matches(actor)") != 1 or snapshot.count("SharedVmemPublicationGuard publication;") != 1:
         fail("final snapshot must take one PUB and retain only one TMPFS snapshot")
@@ -1230,10 +1233,11 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
     caller = block_between(fork, "sys::SyscallPreparationScope preparation(*parent);",
                            "// --- Clone thread metadata ---", "ordinary regular fork VM caller")
     require_cpp_tokens(caller, ["detail::ForkVmFailurePoint point{};", "mm::huge::RangePrepareWitness geometry_failure{};",
-        "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr, EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure)",
+        "mm::virt::ForkCopyRefusalWitness copy_failure{};",
+        "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr, EAGER_COPY ? &fork_page : nullptr, &point, &geometry_failure, &copy_failure, &private_child_authority)",
         'return finish_fork(detail::public_fork_vm_error(point, FORK_VM_ERROR), 0, "vm-snapshot");'],
         "public caller passes borrowed storage and translates the witnessed private refusal")
-    require_ordered_tokens(caller, ["detail::prepare_fork_vm_snapshot(", "if (FORK_VM_ERROR != 0)",
+    require_ordered_tokens(caller, ["detail::prepare_fork_vm_snapshot(", "private_child_authority.invalidate();", "if (FORK_VM_ERROR != 0)",
         "shm_cleanup_for_task(child)", "release_file_mmap_ranges_for_pagemap(child->pagemap)",
         "release_lazy_vmem_ranges(*child)", "destroy_user_space(child->pagemap",
         "release_pagemap(child->pagemap", "delete[] child->name", "page_free(", "delete child;",
@@ -1334,22 +1338,22 @@ def test_fork_child_registers_use_immutable_syscall_entry_snapshot() -> None:
 def test_as_admission_precedes_mapping_mutation() -> None:
     source = SYS_VMEM_CPP.read_text()
     for name in ("anon_allocate", "file_allocate"):
-        body = function_body(source, name)
-        require_order(body, "SharedVmemPublicationGuard publication_guard", "observation.admit_mapping(task->pagemap, size",
+        body = re.sub(r"\s+", "", function_body(source, name))
+        require_order(body, "SharedVmemPublicationGuardpublication_guard", "mutation.admit_mapping(observation,",
                       "AS admission must serialize with shared-root publishers")
-        require_order(body, "observation.admit_mapping(task->pagemap, size, hint, size)", "release_fixed_mmap_range_locked",
+        require_order(body, "mutation.admit_mapping(observation,route==MutationRoute::Public,task->pagemap,size,hint,size)", "release_fixed_mmap_range_locked",
                       "AS denial must preserve MAP_FIXED source mappings")
-        require_order(body, "observation.admit_mapping(task->pagemap, size))", "reserve_free_mmap_range_locked",
+        require_order(body, "mutation.admit_mapping(observation,route==MutationRoute::Public,task->pagemap,size)", "reserve_free_mmap_range_locked",
                       "AS denial must precede nonfixed VA reservation")
-        require_tokens(body, ["AddressSpaceObservation observation(task)"], "AS observes commit/rollback before publication unlock")
+        require_tokens(body, ["AddressSpaceObservationobservation(task)"], "AS observes commit/rollback before publication unlock")
     attach = function_body(SHM_CPP.read_text(), "shmat_impl")
     require_order(attach, "admit_address_space(task, task->pagemap, SIZE)", "uint64_t mapped_pages",
                   "AS shm denial must precede mapping references")
     require_tokens(attach, ["abandon_attachment_publication(attachment)"], "shm denial returns segment pin")
     remap = function_body(source, "anon_mremap")
     require_tokens(remap, ["(void)anon_free(NEW_ADDR, NEW_SIZE)"], "failed remap finalization releases destination")
-    walk = function_body(VIRT_CPP.read_text(), "count_user_virtual_bytes")
-    require_ordered_tokens(walk, ["sched::PreemptGuard guard", "acquire_user_pagemap_access", "count_virtual_bytes_in_table",
+    walk = function_body(VIRT_CPP.read_text(), "query_user_virtual_bytes")
+    require_ordered_tokens(walk, ["sched::PreemptGuard guard", "admit_user_pagemap_reader", "count_virtual_bytes_in_table",
                                  "release_user_pagemap_access"], "AS walk root pins cannot survive fatal handoff")
     proc = (ROOT / "modules/kern/src/vfs/fs/procfs.cpp").read_text()
     limits = function_body(proc, "procfs_read_limits")
@@ -1474,7 +1478,7 @@ def test_anonymous_fixed_preparation_preserves_existing_as_and_publication() -> 
         "SharedVmemPublicationGuard publication_guard", "AddressSpaceObservation observation(task)",
         "overlaps_kernel_managed_user_layout_locked(task, hint, size)",
         "public_shared_file_overlap(*task, hint, size)",
-        "observation.admit_mapping(task->pagemap, size, hint, size)",
+        "mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size, hint, size)",
         "demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared)",
         "release_fixed_mmap_range_locked(task, vaddr, size)",
         "if (RESERVE_ONLY)", "if (PRIVATE_READ)", "if (USE_LAZY)", "if (PRIVATE_EAGER)",
@@ -1529,7 +1533,7 @@ def test_file_fixed_preparation_preserves_retained_description_and_publication()
         "SharedVmemPublicationGuard publication_guard", "AddressSpaceObservation observation(task)",
         "overlaps_kernel_managed_user_layout_locked(task, hint, size)",
         "public_shared_file_overlap(*task, hint, size)",
-        "observation.admit_mapping(task->pagemap, size, hint, size)",
+        "mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size, hint, size)",
         "demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared)",
         "release_fixed_mmap_range_locked(task, vaddr, size)",
         "if (LAZY_FILE)", "if (file_mmap_can_share(st, prot))", "read_file_mapping_exact(file",
@@ -1576,16 +1580,47 @@ def test_public_mutations_use_current_geometry_and_finite_owner_free_handoff() -
     record = block_between(source, "class PublicRangeMutation {", "// Allocate anonymous memory", "public mutation state")
     require_cpp_tokens(record, [
         "const ker::mod::sys::SyscallPreparationScope* preparation", "RangeSplitCursor cursor_{}",
-        "CurrentRangeRootAccess access{}", "sched::PreemptGuard preempt", "acquire_current_range_root(actor_, access)",
+        "CurrentRangeRootAccess access{}", "sched::PreemptGuard preempt",
+        "acquire_current_ordinary_range_root(actor_, *preparation_, publication, access)",
+        "validate_current_ordinary_range_root(actor_, *preparation_, publication, access)",
         "survey_current_range_chunk(actor_, *preparation_, publication, access, cursor_)",
         "validate_current_range_geometry(actor_, *preparation_, publication, access, start_, end_, cursor_)",
         "release_current_range_root(access)", "MutationStage::NeedGeometry", "MutationStage::NeedDemotion",
         "if (count_attempted_ || demotion_) return -EAGAIN", "cursor_ = {}", "if (!cursor_.complete) sched::kern_yield()",
         "demotion_.emplace(actor_, *preparation_)", "demotion_->prepare(start_, end_)",
     ], "caller-born records and actual root proof; no invented success sentinel")
+    for name in ("inspect", "prepare_next"):
+        body = function_body(record, name)
+        require_ordered_tokens(re.sub(r"\s+", "", body), [re.sub(r"\s+", "", token) for token in (
+            "CurrentRangeRootAccess access{}",
+            "acquire_current_ordinary_range_root(actor_, *preparation_, publication, access)",
+            "if (error == mm::huge::Error::None) {", "sched::PreemptGuard preempt;",
+            "validate_current_ordinary_range_root(actor_, *preparation_, publication, access)",
+            "if (error == mm::huge::Error::None)",
+            "survey_current_range_chunk(actor_, *preparation_, publication, access, cursor_)",
+            "release_current_range_root(access);", "} else {", "release_current_range_root(access);",
+        )], name + " admits with ordinary depth0, revalidates at depth1 and releases before leaving the guard")
+        if body.count("release_current_range_root(access)") != 2:
+            fail(name + " must release the actual access on both admission outcomes")
+    count = function_body(record, "prepare_next")
+    require_cpp_tokens(count, [
+        "mm::huge::detail::release_current_range_root(access); } else { "
+        "mm::huge::detail::release_current_range_root(access); } } "
+        "if (error != mm::huge::Error::None) return detail::managed_range_error(error); "
+        "if (!cursor_.complete) sched::kern_yield();",
+    ], "geometry chunk handoff drops both PreemptGuard and publication before ordinary yield")
+    ordinary = block_between(record, "auto ordinary_context() const -> bool {",
+                             "ker::mod::sched::task::Task& actor_;", "ordinary mutation context")
+    require_cpp_tokens(ordinary, [
+        "preparation_ && preparation_->ready()", "sched::can_query_current_task()", "sched::get_current_task() == &actor_",
+        "actor_.type == sched::task::TaskType::PROCESS", "actor_.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE",
+        "!actor_.scheduler_transition_active.load(std::memory_order_acquire)", "!actor_.exit_in_progress.load(std::memory_order_acquire)",
+        "actor_.syscall_account_start_us != 0", "sched::interrupts_enabled() && sched::preempt_count() == 0",
+    ], "every owner-free handoff resumes only in the same live accounted ordinary actor")
     for name in ("anon_allocate", "anon_free", "protect_range", "file_allocate"):
         body = function_body(source, name)
-        require_cpp_tokens(body, ["for (unsigned attempt = 0; attempt < 3; ++attempt)",
+        bound = "PublicRangeMutation::MAX_ATTEMPTS" if name in ("anon_allocate", "file_allocate") else "3"
+        require_cpp_tokens(body, [f"for (unsigned attempt = 0; attempt < {bound}; ++attempt)",
             "MutationAttempt const outcome = [&]() -> MutationAttempt", "mutation.inspect(publication_guard)",
             "mutation.demote(publication_guard)", "if (outcome.stage == MutationStage::Complete) return outcome.result",
             "mutation.prepare_next(outcome.stage)"], name + " bounded typed pre-mutation stages")
@@ -1604,6 +1639,46 @@ def test_public_mutations_use_current_geometry_and_finite_owner_free_handoff() -
     if file.count("vfs_get_file_retain_checked") != 1 or file.count("vfs_fstat_file") != 1:
         fail("public File preparation cannot reopen/re-stat its descriptor")
     mm = VIRT_CPP.read_text()
+    context = function_body(mm, "current_fork_range_context_matches")
+    require_cpp_tokens(context, [
+        "preparation.ready() && publication.acquired()", "sched::get_current_task() == &subject",
+        "subject.type == sched::task::TaskType::PROCESS", "subject.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE",
+        "!subject.scheduler_transition_active.load(std::memory_order_acquire)", "!subject.exit_in_progress.load(std::memory_order_acquire)",
+        "subject.syscall_account_start_us != 0", "sched::preempt_count() == preempt_depth && sched::interrupts_enabled()",
+    ], "ordinary admission retains actual PUB, Task and interrupt/depth authority")
+    root = function_body(mm, "current_fork_range_root_matches")
+    require_cpp_tokens(root, ["access.subject == &subject && access.local", "!subject.usercopy_pagemap_closing.load(std::memory_order_acquire)",
+        "access.root != nullptr && access.root == subject.pagemap && access.root != virt::kernel_pagemap"],
+        "ordinary wait revalidates its retained Task lease and exact live root")
+    acquire = function_body(mm, "acquire_current_ordinary_range_root")
+    require_ordered_tokens(re.sub(r"\s+", "", acquire), [re.sub(r"\s+", "", token) for token in (
+        "current_fork_range_context_matches(subject, preparation, publication, 0)", "acquire_current_range_task(subject, empty, failure_site)",
+        "auto const valid = [&]", "current_fork_range_context_matches(subject, preparation, publication, 0)",
+        "current_fork_range_root_matches(subject, empty)", "if (!valid())", "virt::admit_user_pagemap_reader(empty.root, empty.gate",
+        "if (!valid())", "readers.load(std::memory_order_acquire) == UINT32_MAX) return false;", "sched::kern_yield();",
+        "if (!valid())", "return true;", "if (!acquired)", "return context_changed ? Error::Invalid : Error::Again;",
+        "if (!valid())", "return Error::None;",
+    )], "ordinary reader wait checks context before/after yielding and after admission, refusing saturation")
+    if any(token in acquire for token in ("PreemptGuard", "preempt_disable(", "cow_pte_lock", "user_mapping_pin_lock")):
+        fail("ordinary reader wait must not acquire preempt/COW/pin owners across its yield")
+    task_access = function_body(mm, "acquire_current_range_task")
+    require_cpp_order(task_access, "empty.local = subject.try_acquire_usercopy_pagemap(empty.root)",
+                      "empty.root == nullptr || empty.root != subject.pagemap || empty.root == virt::kernel_pagemap",
+                      "real Task lease is retained and checked before reader admission")
+    reader = function_body(mm, "admit_user_pagemap_reader")
+    require_cpp_tokens(reader, ["gate_index = USER_PAGEMAP_ACCESS_GATE_NONE", "gate.readers.compare_exchange_weak",
+        "gate.readers.fetch_sub(1, std::memory_order_acq_rel)"], "one actual shared CAS/rollback reader algorithm")
+    require_ordered_tokens(reader, ["if (!wait_for_teardown(true))", "debt::begin_change();",
+        "gate.readers.fetch_sub(1, std::memory_order_acq_rel);", "debt::end_change();", "if (!wait_for_teardown(false))"],
+        "ordinary callback runs outside both speculative striped reader and debt change")
+    revalidate = function_body(mm, "validate_current_ordinary_range_root")
+    require_cpp_tokens(revalidate, ["current_fork_range_context_matches(subject, preparation, publication, 1)",
+        "current_fork_range_root_matches(subject, access)", "access.gate == virt::USER_PAGEMAP_ACCESS_GATE_NONE",
+        "access.gate != virt::user_pagemap_access_gate_index(access.root)"],
+        "protected geometry survey revalidates the same root and actual reader at depth1")
+    release = function_body(mm, "release_current_range_root")
+    require_ordered_tokens(release, ["release_user_pagemap_access(access.gate)", "access.subject->release_usercopy_pagemap()",
+        "access.root = nullptr", "access.subject = nullptr"], "actual access releases reader before Task lifetime and clears both identities")
     matcher = function_body(mm, "current_mutation_access_matches")
     require_cpp_tokens(matcher, ["publication.acquired()", "preparation.ready()", "sched::get_current_task() == &subject",
         "sched::preempt_count() == 1", "access.subject == &subject", "access.local", "access.root == subject.pagemap",

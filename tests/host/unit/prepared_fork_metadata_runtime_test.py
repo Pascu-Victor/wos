@@ -68,6 +68,25 @@ def generate(root: Path, scratch: Path, mode: str, helper) -> list:
     if mode == "file":
         source = read("syscalls_impl/vmem/sys_vmem.cpp")
         header = read("syscalls_impl/vmem/sys_vmem.hpp")
+        # Compile the real PUB identity/generation implementation for File cases.
+        # Only the physical Mutex endpoint is Host-supplied; no certificate or
+        # generation algorithm is reimplemented by this fixture.
+        guard_start = common.index("namespace ker::syscall::vmem {\nclass SharedVmemPublicationGuard")
+        guard_end = common.index("}  // namespace ker::syscall::vmem", guard_start) + len("}  // namespace ker::syscall::vmem")
+        counter = re.findall(r"^uint64_t g_empty_fork_publication_generation\{\};$", source, re.M)
+        if len(counter) != 1:
+            raise ValueError("actual lazy PUB generation declaration")
+        guard = ["namespace ker::syscall::vmem {", body(header, "class SharedVmemPublicationGuard {", True),
+            "struct PublicationMutex {void lock(){fixture::check(!fixture::pub,\"single PUB owner\");++fixture::pub;}void unlock(){fixture::check(fixture::pub==1,\"PUB unlock\");--fixture::pub;}}; PublicationMutex g_shared_vmem_publication_lock;",
+            "constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};",
+            "namespace {" + counter[0] + "}",
+            body(source, "[[nodiscard]] auto blocking_publication_owner_matches("),
+            body(source, "SharedVmemPublicationGuard::SharedVmemPublicationGuard("),
+            body(source, "SharedVmemPublicationGuard::~SharedVmemPublicationGuard("),
+            body(source, "auto SharedVmemPublicationGuard::acquired("),
+            body(source, "auto SharedVmemPublicationGuard::try_empty_fork_generation("), "}"]
+        common = common[:guard_start] + "\n".join(guard) + common[guard_end:]
+        chunks[0] = common
         inc = scratch / "include"
         (inc / "util").mkdir(parents=True)
         (inc / "platform/mm/dyn").mkdir(parents=True)
@@ -188,6 +207,9 @@ def main():
         choices=[
             "none",
             "file-retain",
+            "empty-reacquires-registry",
+            "empty-ignores-generation",
+            "empty-keeps-proof",
             "swap-transfer",
             "shm-capacity",
             "legacy-swap-allocation",
@@ -203,7 +225,7 @@ def main():
         "commands": [],
         "actual_definitions": {},
         "limits": [
-            "Host Task/current/PUB/IRQ/Spinlock, root serial, PTE lookup and swap I/O endpoints; no scheduling/PTE/TLB/backing qualification.",
+            "Host Task/current/IRQ/Spinlock and physical PUB Mutex endpoints, root serial, PTE lookup and swap I/O; File PUB identity/generation/certificate methods are actual bodies; no scheduling/PTE/TLB/backing qualification.",
             "Actual metadata/container bodies only; private internals inspected for refusal coverage.",
         ],
     }
@@ -223,7 +245,9 @@ def main():
         output.mkdir(exist_ok=False)
     deadline = time.monotonic() + 110
     try:
-        compiler = Path(args.cxx).resolve(strict=True)
+        # Keep the C++ multicall driver's argv[0]; helper.pin below still holds
+        # the resolved compiler target bytes at both original bookends.
+        compiler = Path(shutil.which(args.cxx) or args.cxx).absolute()
         root = args.source_root.resolve(strict=True)
         helper.subreaper()
 
@@ -272,6 +296,18 @@ def main():
             generated = scratch / f"{mode}.cpp"
             text = generated.read_text()
             controls = {
+                "empty-reacquires-registry": (
+                    "if (empty_match != nullptr) {\n        bool const MATCHED",
+                    "if (false && empty_match != nullptr) {\n        bool const MATCHED",
+                ),
+                "empty-ignores-generation": (
+                    "empty_match->generation_ == publication.empty_fork_generation_",
+                    "true",
+                ),
+                "empty-keeps-proof": (
+                    "empty_match->reset();\n        if (!MATCHED)",
+                    "/* Mutant retains consumed authority. */\n        if (!MATCHED)",
+                ),
                 "file-retain": (
                     "bool const acquired = ker::vfs::vfs_try_retain_file(file);",
                     "bool const acquired = true;",

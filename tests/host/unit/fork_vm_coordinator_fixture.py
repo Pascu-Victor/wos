@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class Builder:
-    test_count = 30
+    test_count = 35
 
     def __init__(self, kernel_file, support, definition):
         self.path = kernel_file
@@ -41,7 +41,7 @@ class Builder:
 
         self.public = PublicWiring(self)
         self.inputs.extend(self.public.inputs)
-        self.test_count += self.public.test_count
+        self.test_count += self.public.test_count + 7
 
     def body(self, file, anchor):
         import hashlib
@@ -101,7 +101,6 @@ struct Spin { unsigned tag{};auto lock_irqsave()->uint64_t{return lock_irq(tag);
         source = source.replace(
             " mm::paging::PageTable* pagemap{};",
             """ mm::paging::PageTable* pagemap{};
- uint64_t pid{1}; bool has_run{}, is_thread{}; Task* owner{};
  host_fork_vm::Spin lazy_vmem_lock; LazyVmemRangeVec lazy_vmem_ranges;
  std::atomic<void*> native_file_mapping_retirement{};
  unsigned lifetime_refs{1};
@@ -182,7 +181,13 @@ void(*on_retry)(ker::mod::sched::task::Task&,ker::mod::sched::task::Task&){};
 bool enabled{}, fail_attach{}, fail_shm{}, fail_lazy{}, fail_binding_reserve{};
 unsigned child_attaches{}, queries{};
 unsigned pubs{};bool at_final_publication{};void(*on_pub)(){};
-void(*on_pin)(){},(*on_shm)(){},(*on_legacy)(){};
+void(*on_pin)(){},(*on_shm)(){},(*on_legacy)(){},(*on_pub_release)(){};
+unsigned source_yields{}, source_release_after{}, source_wait_epoch{};
+bool source_wait_observing{};
+struct SourceWaitObservation {
+ SourceWaitObservation(){EXPECT_FALSE(source_wait_observing);source_wait_observing=true;}
+ ~SourceWaitObservation(){source_wait_observing=false;}
+};
 void publication_acquire(){++pubs;if(on_pub)on_pub();}
 void pin_acquire(){if(enabled&&on_pin)on_pin();}
 void enter_legacy(){if(enabled&&on_legacy)on_legacy();}
@@ -303,6 +308,8 @@ void host_drain(){EXPECT_TRUE(host_fork_vm::ordinary());for(bool again=true;agai
         ]
         out += [
             "namespace ker::syscall::vmem {\n",
+            self.span("syscalls_impl/vmem/sys_vmem.cpp", "uint64_t g_empty_fork_publication_generation{};", "[[nodiscard]] auto blocking_publication_owner_matches("),
+            d("syscalls_impl/vmem/sys_vmem.cpp", "auto SharedVmemPublicationGuard::try_empty_fork_generation("),
             d("syscalls_impl/vmem/sys_vmem.cpp", "struct FileMmapRange {"),
             """ker::util::SmallVec<FileMmapRange,32>g_file_mmap_ranges;host_fork_vm::RegistryMutex g_file_mmap_ranges_lock;struct NativeMappingEntry{ker::mod::mm::paging::PageTable*root{};NativeMappingEntry*registry_next{};bool registered{};ker::mod::mm::file_mapping::FileMappingLifetime*lifetime{};};NativeMappingEntry*g_native_file_mmap_ranges{};
 """,
@@ -386,9 +393,12 @@ auto get_kernel_pagemap()->PageTable*{return kernel_pagemap;}
         ]
         header = self.sources["platform/mm/virt.hpp"]
         a = header.index(
-            "[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(sched::task::Task&,"
+            "[[nodiscard]] auto deep_copy_current_user_pagemap_prepared("
         )
-        out += [header[a : header.index(";", a) + 1], "}\n"]
+        # Match the real header's pragma-once semantics, including the typed
+        # overload's optional witness, without changing any copied prototype.
+        out += ["#ifndef WOS_HOST_PREPARED_FORK_DECLARATIONS922\n#define WOS_HOST_PREPARED_FORK_DECLARATIONS922\n"
+                + header[a : header.index("#ifdef WOS_SELFTEST", a)] + "\n#endif\n", "}\n"]
         return "\n".join(out)
 
     def compose(
@@ -413,10 +423,21 @@ auto get_kernel_pagemap()->PageTable*{return kernel_pagemap;}
         # Replace the previously explicit *unreachable* prepared-swap port by
         # actual metadata. Existing54 tests still use the null-plan overload.
         support = support[: support.index("// Existing 54 positive vectors")]
-        support = support.replace(
-            "if (!fork_mode) return;",
-            "if (!fork_mode || !host_range::exclusive) return;",
-        )
+        wait_observation = support.index("    if (!fork_mode) return;")
+        cow_observation = support.index("    huge::Snapshot snapshot{};", wait_observation)
+        support = support[:wait_observation] + """    // Observe only the coordinator's actual advisory wait, including its
+    // initial PreemptGuard sample; unrelated ordinary guards stay untouched.
+    if (host_fork_vm::source_wait_observing && !host_range::exclusive && publication_depth == 0 && host_range::interrupts) {
+        EXPECT_TRUE(host_range::interrupts);
+        EXPECT_FALSE(host_range::exclusive);
+        EXPECT_EQ(publication_depth, 0U);
+        EXPECT_EQ(root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);
+        if (host_range::current) EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 0U);
+        ++fork_source_wait_samples;
+        return;
+    }
+    if (!fork_mode || !host_range::exclusive) return;
+""" + support[cow_observation:]
         support = support.replace(
             "void page_free(void* pointer) {",
             "void page_free(void* pointer) {\n    if(host_fork_alloc::free_stack(pointer)||host_fork_public::free_stack(pointer))return;",
@@ -429,6 +450,11 @@ auto get_kernel_pagemap()->PageTable*{return kernel_pagemap;}
 struct HostBindingIndex: file_mapping::FileMappingIndex {
  auto matches_pin_locked(PageTable*r,uint64_t serial,uint64_t address,const file_mapping::FileMappingBinding*b)const noexcept->bool{
  return binding_matches && file_mapping::FileMappingIndex::matches_pin_locked(r,serial,address,b);
+ }
+ // Explicit false-index endpoint for observed-child classification vectors;
+ // ordinary vectors still execute the actual index predicate.
+ auto root_empty_locked(PageTable*r)const noexcept->bool{
+ return host_child_index_empty && file_mapping::FileMappingIndex::root_empty_locked(r);
  }
 }file_mapping_index;
 """
@@ -452,25 +478,25 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
         )
         prelude = prelude.replace(
             "void Mutex::clear_owner() {",
-            "void Mutex::clear_owner() {\n    if(host_fork_vm::enabled) EXPECT_TRUE(host_range::interrupts);",
+            "void Mutex::clear_owner() {\n    if(host_fork_vm::enabled) EXPECT_TRUE(host_range::interrupts);\n    if(host_fork_vm::enabled&&host_fork_vm::on_pub_release)host_fork_vm::on_pub_release();",
         )
         prelude = prelude.replace(
             "auto lock_irqsave() -> uint64_t {\n        EXPECT_EQ(depth, 0U);",
             "auto lock_irqsave() -> uint64_t {\n        if (&depth==&pin_depth) host_fork_vm::pin_acquire();\n        EXPECT_EQ(depth, 0U);",
         )
         # The namespace is declared before the fixture's header includes.
-        declaration = "#include <cstddef>\nnamespace host_fork_alloc {bool refuse(std::size_t,bool);void* null_result();void note_delete(void*);bool free_stack(void*);void guard();}\nnamespace host_fork_vm {extern bool enabled;void publication_acquire();void pin_acquire();}\n"
+        declaration = "#include <cstddef>\nnamespace host_fork_alloc {bool refuse(std::size_t,bool);void* null_result();void note_delete(void*);bool free_stack(void*);void guard();}\nnamespace host_fork_vm {extern bool enabled;extern bool source_wait_observing;extern void(*on_pub_release)();void publication_acquire();void pin_acquire();}\n"
         coordinator_once = self.body(
             "syscalls_impl/process/process.cpp", "auto prepare_fork_vm_snapshot_once("
         )
         # External Host observation port: tag only the real final constructor,
         # then restore immediately. No guard/matches or ownership logic changes.
-        final_guard = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        if (!lazy.matches(actor)"
+        final_guard = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        ker::syscall::vmem::LegacyFileForkPreparation::EmptyMatch empty_legacy_match;\n        if (!lazy.matches(actor)"
         if coordinator_once.count(final_guard) != 1:
             raise RuntimeError("actual final publication observation boundary changed")
         coordinator_once = coordinator_once.replace(
             final_guard,
-            "host_fork_vm::at_final_publication = true;\n        ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        if (!lazy.matches(actor)",
+            "host_fork_vm::at_final_publication = true;\n        ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        ker::syscall::vmem::LegacyFileForkPreparation::EmptyMatch empty_legacy_match;\n        if (!lazy.matches(actor)",
         )
         once_entry = "    using namespace ker::mod;"
         assert coordinator_once.count(once_entry) == 1
@@ -479,6 +505,14 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
         )
         coordinator = self.body(
             "syscalls_impl/process/process.cpp", "auto prepare_fork_vm_snapshot("
+        )
+        source_wait = "int const WAIT = mm::virt::wait_for_fork_source(actor, preparation);"
+        assert coordinator.count(source_wait) == 1
+        coordinator = coordinator.replace(
+            source_wait,
+            "int const WAIT = [&] { host_fork_vm::SourceWaitObservation observe; "
+            "return mm::virt::wait_for_fork_source(actor, preparation); }();",
+            1,
         )
         retry_yield = "ker::mod::sched::kern_yield();"
         assert coordinator.count(retry_yield) == 1
@@ -526,16 +560,389 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
                  .replace("void* operator new[](std::size_t n) { return ::operator new(n); }", "void* operator new[](std::size_t n) { if(host_fork_alloc::refuse(n,true))return host_fork_alloc::null_result(); return ::operator new(n); }", 1)
                  .replace("void* operator new(std::size_t n, const std::nothrow_t&) noexcept {", "void* operator new(std::size_t n, const std::nothrow_t&) noexcept {\n if(host_fork_alloc::refuse(n,false))return nullptr;", 1)
                  .replace("noexcept { return host_fork_vm::take(n); }", "noexcept { if(host_fork_alloc::refuse(n,true))return nullptr; return host_fork_vm::take(n); }", 1),
+                self.copy_refusal_cases(),
                 self.public.path.read_text(),
             ]
         )
 
+    def copy_refusal_cases(self):
+        return r"""
+namespace {
+
+void assert_source_wait_unowned(){
+    EXPECT_TRUE(host_fork_vm::ordinary());
+    ASSERT_NE(host_range::current,nullptr);
+    EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(),0U);
+    EXPECT_EQ(host_range::current->lifetime_refs,1U);
+    EXPECT_EQ(root_readers+cow_depth+pin_depth+backend().preempt_depth,0U);
+    EXPECT_EQ(ker::syscall::vmem::g_shared_vmem_publication_owner.load(),nullptr);
+}
+TEST_F(ForkVmCoordinator, SourceBusyWaitRepreparesAfterSevenOwnerFreeCooperations) {
+    legacy();
+    virt::ForkPrivateChildRoot authority;
+    child_task.pagemap=nullptr;
+    ASSERT_EQ(virt::create_fork_private_child_root(actor,child_task,authority),child);
+    child_task.entry=99;actor.entry=41;
+    host_fork_vm::source_yields=0;fork_source_wait_samples=0;
+    host_fork_vm::on_legacy=+[]{
+        if(host_fork_vm::once_calls==1)virt::user_pagemap_access_gates[0].teardown.store(true);
+    };
+    host_range::on_yield=+[]{
+        assert_source_wait_unowned();
+        ++host_fork_vm::source_yields;
+        if(host_fork_vm::source_yields==1){
+            // Both old preparations are already gone; a fresh attempt must
+            // observe this real source-row change, not reuse its old snapshot.
+            ker::syscall::vmem::SharedVmemPublicationGuard mutation;
+            auto* parent=host_range::current;
+            auto const flags=parent->lazy_vmem_lock.lock_irqsave();
+            parent->lazy_vmem_ranges[0].file_offset+=PAGE;
+            parent->lazy_vmem_lock.unlock_irqrestore(flags);
+            vmem::g_file_mmap_ranges_lock.lock();
+            vmem::g_file_mmap_ranges[0].file_offset+=PAGE;
+            vmem::g_file_mmap_ranges_lock.unlock();
+        }
+        if(host_fork_vm::source_yields==7)virt::user_pagemap_access_gates[0].teardown.store(false);
+    };
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    ForkPoint point{};host_fork_vm::enabled=true;
+    auto const status=ker::syscall::process::detail::prepare_fork_vm_snapshot(
+        actor,child_task,preparation,nullptr,nullptr,&point,nullptr,nullptr,&authority);
+    host_fork_vm::enabled=false;host_fork_vm::on_legacy=nullptr;host_range::on_yield=nullptr;
+    EXPECT_EQ(status,0);EXPECT_EQ(point,ForkPoint::Complete);
+    EXPECT_EQ(host_fork_vm::source_yields,7U);EXPECT_EQ(fork_source_wait_samples,8U);
+    EXPECT_EQ(host_fork_vm::once_calls,2U);EXPECT_EQ(host_fork_vm::retry_yields,0U);
+    EXPECT_EQ(child_task.entry,41U);EXPECT_EQ(child_task.lazy_vmem_ranges.size(),1U);
+    if(!child_task.lazy_vmem_ranges.empty())EXPECT_EQ(child_task.lazy_vmem_ranges[0].file_offset,PAGE);
+    EXPECT_EQ(fork_cow_entries,1U);EXPECT_EQ(fork_exclusives,1U);
+    assert_source_wait_unowned();
+}
+TEST_F(ForkVmCoordinator, SourceBusyDoesNotConsumeOrResetTheThreeRegistryAttempts) {
+    legacy();
+    virt::ForkPrivateChildRoot authority;child_task.pagemap=nullptr;
+    ASSERT_EQ(virt::create_fork_private_child_root(actor,child_task,authority),child);
+    host_fork_vm::source_yields=host_fork_vm::source_wait_epoch=0;
+    host_fork_vm::on_registry_try=+[]{
+        if(host_fork_vm::once_calls==1||host_fork_vm::once_calls==3)host_fork_vm::registry_busy_remaining=1;
+    };
+    host_fork_vm::on_legacy=+[]{
+        if(host_fork_vm::once_calls==2||host_fork_vm::once_calls==4){
+            virt::user_pagemap_access_gates[0].teardown.store(true);
+            host_fork_vm::source_wait_epoch=0;
+            host_fork_vm::source_release_after=host_fork_vm::once_calls==2?3:7;
+        }
+    };
+    host_range::on_yield=+[]{
+        assert_source_wait_unowned();
+        if(!virt::user_pagemap_access_gates[0].teardown.load())return;  // Original registry cooperation.
+        ++host_fork_vm::source_yields;++host_fork_vm::source_wait_epoch;
+        if(host_fork_vm::source_wait_epoch==host_fork_vm::source_release_after)
+            virt::user_pagemap_access_gates[0].teardown.store(false);
+    };
+    ker::mod::sys::SyscallPreparationScope preparation(actor);ForkPoint point{};
+    host_fork_vm::enabled=true;
+    auto const status=ker::syscall::process::detail::prepare_fork_vm_snapshot(
+        actor,child_task,preparation,nullptr,nullptr,&point,nullptr,nullptr,&authority);
+    host_fork_vm::enabled=false;host_fork_vm::on_registry_try=nullptr;host_fork_vm::on_legacy=nullptr;host_range::on_yield=nullptr;
+    EXPECT_EQ(status,0);EXPECT_EQ(point,ForkPoint::Complete);
+    EXPECT_EQ(host_fork_vm::once_calls,5U);EXPECT_EQ(host_fork_vm::retry_yields,2U);
+    EXPECT_EQ(host_fork_vm::source_yields,10U);EXPECT_EQ(fork_cow_entries,1U);
+    assert_source_wait_unowned();
+}
+TEST_F(ForkVmCoordinator, SourceBusyCannotResetTheAccumulatedRegistryExhaustion) {
+    legacy();virt::ForkPrivateChildRoot authority;child_task.pagemap=nullptr;
+    ASSERT_EQ(virt::create_fork_private_child_root(actor,child_task,authority),child);
+    host_fork_vm::source_yields=host_fork_vm::source_wait_epoch=0;
+    host_fork_vm::on_registry_try=+[]{
+        if(host_fork_vm::once_calls==1||host_fork_vm::once_calls==3||host_fork_vm::once_calls==5)
+            host_fork_vm::registry_busy_remaining=1;
+    };
+    host_fork_vm::on_legacy=+[]{
+        if(host_fork_vm::once_calls==2||host_fork_vm::once_calls==4){
+            virt::user_pagemap_access_gates[0].teardown.store(true);host_fork_vm::source_wait_epoch=0;
+        }
+    };
+    host_range::on_yield=+[]{
+        assert_source_wait_unowned();
+        if(!virt::user_pagemap_access_gates[0].teardown.load())return;
+        ++host_fork_vm::source_yields;
+        if(++host_fork_vm::source_wait_epoch==3)virt::user_pagemap_access_gates[0].teardown.store(false);
+    };
+    ker::mod::sys::SyscallPreparationScope preparation(actor);ForkPoint point{};host_fork_vm::enabled=true;
+    auto const status=ker::syscall::process::detail::prepare_fork_vm_snapshot(
+        actor,child_task,preparation,nullptr,nullptr,&point,nullptr,nullptr,&authority);
+    host_fork_vm::enabled=false;host_fork_vm::on_registry_try=nullptr;host_fork_vm::on_legacy=nullptr;host_range::on_yield=nullptr;
+    EXPECT_EQ(status,-EAGAIN);EXPECT_EQ(point,ForkPoint::LegacyMatch);
+    EXPECT_EQ(host_fork_vm::once_calls,5U);EXPECT_EQ(host_fork_vm::retry_yields,2U);
+    EXPECT_EQ(host_fork_vm::source_yields,6U);EXPECT_EQ(fork_cow_entries+fork_exclusives,0U);
+    EXPECT_TRUE(child_task.lazy_vmem_ranges.empty());assert_source_wait_unowned();
+}
+TEST_F(ForkVmCoordinator, LazyConsumeRefusalReleasesActualSourceBeforePublicationUnwinds) {
+    legacy();
+    virt::ForkPrivateChildRoot authority;child_task.pagemap=nullptr;
+    ASSERT_EQ(virt::create_fork_private_child_root(actor,child_task,authority),child);
+    ker::mod::sched::task::LazyVmemRange existing{};existing.start=TEST_VA+20*PAGE;existing.end=existing.start+PAGE;
+    ASSERT_TRUE(child_task.lazy_vmem_ranges.push_back(existing));  // Preexisting metadata causes actual consume refusal.
+    host_fork_vm::on_pub_release=+[]{
+        EXPECT_FALSE(host_range::exclusive);
+        EXPECT_FALSE(virt::user_pagemap_access_gates[0].teardown.load());
+        EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(),0U);
+    };
+    ker::mod::sys::SyscallPreparationScope preparation(actor);ForkPoint point{};
+    host_fork_vm::enabled=true;
+    auto const status=ker::syscall::process::detail::prepare_fork_vm_snapshot(
+        actor,child_task,preparation,nullptr,nullptr,&point,nullptr,nullptr,&authority);
+    host_fork_vm::enabled=false;host_fork_vm::on_pub_release=nullptr;
+    EXPECT_EQ(status,-EAGAIN);EXPECT_EQ(point,ForkPoint::LazyConsume);
+    EXPECT_EQ(host_fork_vm::once_calls,1U);EXPECT_EQ(host_fork_vm::retry_yields,0U);
+    EXPECT_EQ(fork_exclusives,1U);EXPECT_EQ(fork_cow_entries,0U);
+    assert_source_wait_unowned();
+}
+TEST_F(ForkVmCoordinator, SourceWaitContextLossNeverRetriesOrAdoptsChildMetadata) {
+    legacy();
+    virt::ForkPrivateChildRoot authority;child_task.pagemap=nullptr;
+    ASSERT_EQ(virt::create_fork_private_child_root(actor,child_task,authority),child);
+    host_fork_vm::on_legacy=+[]{virt::user_pagemap_access_gates[0].teardown.store(true);};
+    host_range::on_yield=+[]{assert_source_wait_unowned();host_range::current->syscall_account_start_us=0;};
+    ker::mod::sys::SyscallPreparationScope preparation(actor);ForkPoint point{};
+    host_fork_vm::enabled=true;
+    auto const status=ker::syscall::process::detail::prepare_fork_vm_snapshot(
+        actor,child_task,preparation,nullptr,nullptr,&point,nullptr,nullptr,&authority);
+    host_fork_vm::enabled=false;host_fork_vm::on_legacy=nullptr;host_range::on_yield=nullptr;
+    actor.syscall_account_start_us=1;virt::user_pagemap_access_gates[0].teardown.store(false);
+    EXPECT_EQ(status,-EWOULDBLOCK);EXPECT_EQ(point,ForkPoint::SourceAdmission);
+    EXPECT_EQ(host_fork_vm::once_calls,1U);EXPECT_TRUE(child_task.lazy_vmem_ranges.empty());
+    EXPECT_EQ(fork_exclusives+fork_cow_entries,0U);assert_source_wait_unowned();
+}
+TEST_F(ForkVmCoordinator, TypedWrapperInvalidatesOnEveryEarlyExitAndSuccess) {
+    huge::RangeSplitSurvey survey, invalid;
+    huge::PreparedTables tables;
+    ASSERT_EQ(full(survey, tables), huge::Error::None);
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    // The original prepared actor admits a PROCESS executor that is a thread.
+    actor.is_thread=true;
+    for(unsigned which=0;which<4;++which){
+        virt::ForkPrivateChildRoot authority;
+        child_task.pagemap=nullptr;
+        child_task.shares_user_pagemap=false;
+        ASSERT_EQ(virt::create_fork_private_child_root(actor,child_task,authority),child);
+        virt::PreparedAnonymousSwapFork swap;
+        ASSERT_EQ(swap.prepare(actor,child_task,preparation),0);
+        virt::ForkCopyRefusalWitness witness;
+        virt::ForkSourceOwner source_owner;
+        int status;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            HostIrqOff irq;
+            ASSERT_EQ(virt::try_acquire_fork_source(actor,preparation,publication,source_owner),virt::ForkSourceAdmission::Acquired);
+            EXPECT_EQ(actor.usercopy_pagemap_accesses.load(),1U);
+            if(which==0)host_range::queryable=false;
+            if(which==2)actor.usercopy_pagemap_closing=true;
+            status=virt::deep_copy_current_user_pagemap_prepared(actor,child_task,authority,source_owner,preparation,publication,
+                which==1?invalid:survey,tables,nullptr,nullptr,swap,&witness);
+            host_range::queryable=true;
+            actor.usercopy_pagemap_closing=false;
+        }
+        // Closing after an issued source lease refuses the guarded typed borrow;
+        // the longstanding raw TaskLease/-EAGAIN case below stays unchanged.
+        EXPECT_EQ(status,which==0?-EWOULDBLOCK:which==1?-EINVAL:which==2?-EINVAL:0);
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(),0U);
+        EXPECT_EQ(root_readers+cow_depth+pin_depth,0U);
+        EXPECT_FALSE(host_range::exclusive);
+        virt::UnpublishedRootRefusal child_failure;
+        EXPECT_FALSE(virt::consume_fork_private_child_root(actor,child_task,child,authority,&child_failure));
+        EXPECT_EQ(child_failure.site,virt::UnpublishedRootRefusalSite::PrivateAuthority);
+    }
+    actor.is_thread=false;
+}
+TEST_F(ForkVmCoordinator, ObservedPreparedCopyForwardsExactSiteAndClearsSuccess) {
+    huge::RangeSplitSurvey survey, invalid;
+    huge::PreparedTables tables;
+    ASSERT_EQ(full(survey, tables), huge::Error::None);
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    virt::PreparedAnonymousSwapFork swap;
+    ASSERT_EQ(swap.prepare(actor, child_task, preparation), 0);
+    virt::ForkCopyRefusalWitness witness;
+    auto invoke = [&](const huge::RangeSplitSurvey& proof, numa::AllocationContext* placement = nullptr) {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        HostIrqOff irq;
+        auto const status = virt::deep_copy_current_user_pagemap_prepared(
+            actor, child, preparation, publication, proof, tables, placement, nullptr, swap, &witness);
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+        EXPECT_FALSE(host_range::exclusive);
+        EXPECT_EQ(root_readers, 0U);
+        return status;
+    };
+    EXPECT_EQ(invoke(invalid), -EINVAL);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::WrapperInput);
+    EXPECT_EQ(witness.raw_status, -EINVAL);
+    EXPECT_EQ(witness.detail, 2U);
+    actor.usercopy_pagemap_closing = true;
+    EXPECT_EQ(invoke(survey), -EAGAIN);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::TaskLease);
+    EXPECT_EQ(witness.raw_status, -EAGAIN);
+    EXPECT_FALSE(witness.child.valid);
+    actor.usercopy_pagemap_closing = false;
+    auto placement = context(numa::Mode::LOCAL, 0);
+    EXPECT_EQ(invoke(survey, &placement), -EINVAL);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::EagerArguments);
+    EXPECT_EQ(witness.raw_status, -EINVAL);
+    EXPECT_EQ(witness.detail, 0U);
+    word(child, 9) = mm::paging::PAGE_RESERVED;
+    EXPECT_EQ(invoke(survey), -EINVAL);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::ChildRoot);
+    EXPECT_EQ(witness.raw_status, -EINVAL);
+    EXPECT_TRUE(witness.child.valid);
+    EXPECT_EQ(witness.child.site, virt::UnpublishedRootRefusalSite::UserEntryNonzero);
+    EXPECT_EQ(witness.child.user_slot, 9U);
+    EXPECT_EQ(word(child, 9), mm::paging::PAGE_RESERVED);
+    EXPECT_EQ(fork_exclusives + fork_cow_entries, 0U);
+    word(child, 9) = 0;
+    EXPECT_EQ(invoke(survey), 0);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::None);
+    EXPECT_EQ(witness.raw_status, 0);
+    EXPECT_FALSE(witness.child.valid);
+    EXPECT_EQ(witness.child.user_slot, UINT16_MAX);
+}
+TEST_F(ForkVmCoordinator, TypedCoordinatorForwardsExactChildRefusalWithoutCopyRetry) {
+    using Point = ker::syscall::process::detail::ForkVmFailurePoint;
+    legacy();
+    virt::ForkPrivateChildRoot authority;
+    child_task.pagemap = nullptr;
+    ASSERT_EQ(virt::create_fork_private_child_root(actor, child_task, authority), child);
+    constexpr size_t SLOT = 37;
+    child->entries[SLOT].present = 1;  // Contaminate only AFTER actual factory issue.
+    Point point{};
+    virt::ForkCopyRefusalWitness witness;
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    host_fork_vm::enabled = true;
+    auto const status = ker::syscall::process::detail::prepare_fork_vm_snapshot(
+        actor, child_task, preparation, nullptr, nullptr, &point, nullptr, &witness, &authority);
+    host_fork_vm::enabled = false;
+    // Keep this restoration unconditional so assertion mutants still reach the
+    // existing ordinary metadata rollback and physical fixture TearDown.
+    EXPECT_EQ(static_cast<unsigned>(child->entries[SLOT].present), 1U);
+    child->entries[SLOT] = {};
+    EXPECT_EQ(status, -EINVAL);
+    EXPECT_EQ(point, Point::Copy);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::ChildRoot);
+    EXPECT_EQ(witness.raw_status, -EINVAL);
+    EXPECT_TRUE(witness.child.valid);
+    EXPECT_EQ(witness.child.site, virt::UnpublishedRootRefusalSite::UserEntryNonzero);
+    EXPECT_EQ(witness.child.user_slot, SLOT);
+    EXPECT_EQ(host_fork_vm::once_calls, 1U);
+    EXPECT_EQ(host_fork_vm::retry_yields, 0U);
+    EXPECT_EQ(child_task.lazy_vmem_ranges.size(), 1U);  // Real lazy.consume adopted this prefix.
+    EXPECT_TRUE(host_fork_vm::ordinary());
+    EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+    EXPECT_EQ(root_readers + cow_depth + pin_depth, 0U);
+    EXPECT_EQ(fork_exclusives, 1U);
+    EXPECT_EQ(fork_cow_entries, 0U);
+    EXPECT_FALSE(host_range::exclusive);
+    virt::UnpublishedRootRefusal consumed;
+    EXPECT_FALSE(virt::consume_fork_private_child_root(actor, child_task, child, authority, &consumed));
+    EXPECT_EQ(consumed.site, virt::UnpublishedRootRefusalSite::PrivateAuthority);
+}
+TEST_F(ForkVmCoordinator, CoordinatorForwardsChildRefusalAndClearsEveryAttempt) {
+    using Point = ker::syscall::process::detail::ForkVmFailurePoint;
+    virt::ForkCopyRefusalWitness witness;
+    Point point{};
+    auto invoke = [&] {
+        ker::mod::sys::SyscallPreparationScope preparation(actor);
+        host_fork_vm::enabled = true;
+        auto const status = ker::syscall::process::detail::prepare_fork_vm_snapshot(
+            actor, child_task, preparation, nullptr, nullptr, &point, nullptr, &witness);
+        host_fork_vm::enabled = false;
+        EXPECT_TRUE(host_fork_vm::ordinary());
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+        EXPECT_EQ(root_readers, 0U);
+        EXPECT_FALSE(host_range::exclusive);
+        return status;
+    };
+    host_fork_vm::on_legacy = +[] { host_range::reader_busy = true; };
+    EXPECT_EQ(invoke(), -EINVAL);
+    EXPECT_EQ(point, Point::Copy);
+    EXPECT_TRUE(witness.valid);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::ChildRoot);
+    EXPECT_EQ(witness.raw_status, -EINVAL);
+    EXPECT_EQ(witness.child.site, virt::UnpublishedRootRefusalSite::ReaderAdmissionRefused);
+    EXPECT_EQ(witness.child.user_slot, UINT16_MAX);
+    EXPECT_EQ(word(child, 0), 0U);
+    host_range::reader_busy = false;
+    host_fork_vm::on_legacy = nullptr;
+    actor.type = ker::mod::sched::task::TaskType::THREAD;
+    EXPECT_EQ(invoke(), -EWOULDBLOCK);
+    EXPECT_EQ(point, Point::Context);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_FALSE(witness.child.valid);
+    actor.type = ker::mod::sched::task::TaskType::PROCESS;
+    witness.valid = true;
+    witness.site = virt::ForkCopyRefusalSite::ChildRoot;
+    EXPECT_EQ(invoke(), 0);
+    EXPECT_EQ(point, Point::Complete);
+    EXPECT_FALSE(witness.valid);
+    EXPECT_EQ(witness.site, virt::ForkCopyRefusalSite::None);
+}
+}  // namespace
+"""
+
     def controls(self, source):
         vectors = [
             (
+                "coordinator-source-hint-is-not-completion",
+                "if (WAIT != 0) return WAIT; continue;",
+                "if (WAIT != 0) return WAIT; return 0;",
+                "ForkVmCoordinator.SourceBusyWaitRepreparesAfterSevenOwnerFreeCooperations",
+            ),
+            (
+                "coordinator-source-busy-charges-registry",
+                "if (WAIT != 0) return WAIT; continue;",
+                "if (WAIT != 0) return WAIT; ++registry_attempt; continue;",
+                "ForkVmCoordinator.SourceBusyDoesNotConsumeOrResetTheThreeRegistryAttempts",
+            ),
+            (
+                "coordinator-source-busy-resets-registry",
+                "if (WAIT != 0) return WAIT; continue;",
+                "if (WAIT != 0) return WAIT; registry_attempt = 0; continue;",
+                "ForkVmCoordinator.SourceBusyCannotResetTheAccumulatedRegistryExhaustion",
+            ),
+            (
+                "coordinator-lazy-refusal-late-owner-release",
+                "~FinishSourceOwner() { owner.finish(); }",
+                "~FinishSourceOwner() { /* wrong late outer destruction */ }",
+                "ForkVmCoordinator.LazyConsumeRefusalReleasesActualSourceBeforePublicationUnwinds",
+            ),
+            (
+                "coordinator-typed-copy-witness-not-forwarded",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure);",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, nullptr);",
+                "ForkVmCoordinator.TypedCoordinatorForwardsExactChildRefusalWithoutCopyRetry",
+            ),
+            (
+                "coordinator-copy-witness-not-forwarded",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure);",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap, nullptr);",
+                "ForkVmCoordinator.CoordinatorForwardsChildRefusalAndClearsEveryAttempt",
+            ),
+            (
+                "child-reader-refusal-mislabeled",
+                "return refuse(UnpublishedRootRefusalSite::ReaderAdmissionRefused);",
+                "return refuse(UnpublishedRootRefusalSite::InputRoot);",
+                "ManagedFork.ObservedChildReaderRefusalIsNotNonemptyProof",
+            ),
+            (
+                "child-refusal-loses-user-slot",
+                "if (pte_raw(entry_at(root, i)) != 0) empty = refuse(UnpublishedRootRefusalSite::UserEntryNonzero, static_cast<uint16_t>(i));",
+                "if (pte_raw(entry_at(root, i)) != 0) empty = refuse(UnpublishedRootRefusalSite::UserEntryNonzero);",
+                "ManagedFork.ObservedChildIndexPortAndFirstUserSlotHaveDifferentSites",
+            ),
+            (
                 "coordinator-missing-swap",
-                "eager_context, empty_result, swap);",
-                "eager_context, empty_result);",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure);",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result);",
                 "ForkVmCoordinator.SwappedAndBothFailedStatesTransferActualMarkers",
             ),
             (
@@ -570,8 +977,8 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
             ),
             (
                 "coordinator-retry-yield-under-publication",
-                "status = legacy_file.matches(actor, child, preparation, publication, conflict);",
-                "ker::mod::sched::kern_yield();\n        status = legacy_file.matches(actor, child, preparation, publication, conflict);",
+                "status = legacy_file.matches(actor, child, preparation, publication, conflict, &empty_legacy_match);",
+                "ker::mod::sched::kern_yield();\n        status = legacy_file.matches(actor, child, preparation, publication, conflict, &empty_legacy_match);",
                 "ForkVmCoordinator.RegistryBusyRetriesFreshPreparationBeforeOneSuccessfulAdoption",
             ),
             (
@@ -594,7 +1001,7 @@ struct HostBindingIndex: file_mapping::FileMappingIndex {
             + "\nmm::huge::CurrentRangeSplitAdmission nested(actor,preparation,publication);",
         )
         yield "coordinator-nested-reader", nested, "ForkVmCoordinator.CountZeroUsesWholeSurveyAndOneOriginalExclusive"
-        anchor = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        if (!lazy.matches(actor)"
+        anchor = "ker::syscall::vmem::SharedVmemPublicationGuard publication;\n        host_fork_vm::at_final_publication = false;\n        ker::syscall::vmem::LegacyFileForkPreparation::EmptyMatch empty_legacy_match;\n        if (!lazy.matches(actor)"
         assert source.count(anchor) == 1
         bad = source.replace(
             old, "/* Legacy moved too early by compiled control. */"

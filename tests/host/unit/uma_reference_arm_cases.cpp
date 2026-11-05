@@ -517,6 +517,131 @@ void finalized_rows() {
           "original bound cannot exceed witness service deadline");
     check(!arm::witness_consumed(final, earlier, FINALIZER + 1, BOUND), "finalizer caller identity must match");
 }
+void readiness_recovery_rows() {
+    arm::init::StatusSnapshot earlier{};
+    check(uma_arm_host_snapshot(earlier) == 0, "actual snapshot for recovered readiness");
+    uma_arm_host_complete(earlier, ::getpid());
+    auto check_contexts = [](const arm::init::StatusSnapshot& snapshot, bool expected) {
+        check(arm::consumed(snapshot, ::getpid()) == expected, "recovered readiness preserves consuming-controller authority");
+        auto pending = snapshot;
+        uma_arm_host_pending(pending);
+        check(arm::awaiting_exec(pending, ::getpid()) == expected, "recovered readiness preserves pending-witness authority");
+        auto final = snapshot;
+        ++final.published_mono_ns;
+        pid_t const FINALIZER = ::getpid() + 1;
+        uma_arm_host_witness_complete(final, FINALIZER);
+        uint64_t const BOUND = snapshot.services[7].deadline_mono_ns - 1;
+        check(arm::witness_consumed(final, snapshot, FINALIZER, BOUND) == expected,
+              "recovered readiness preserves consuming-witness authority");
+        uma_arm_host_final_pending(final);
+        check(arm::witness_awaiting_exec(final, snapshot, FINALIZER, BOUND) == expected,
+              "recovered readiness preserves pending-finalizer authority");
+    };
+    check_contexts(earlier, true);
+    auto& netd = earlier.services[2];
+    // Captured WOS netd retained EADDRNOTAVAIL after its IPv4 probe recovered.
+    // The successful current READINESS transition, not an initialized raw0,
+    // establishes readiness while the historical diagnostic remains intact.
+    netd.last_error = EADDRNOTAVAIL;
+    --netd.history[0].timestamp_mono_ns;
+    netd.history_count = 2;
+    netd.history[1] = {netd.state_since_mono_ns, arm::init::ServiceState::RUNNING, arm::init::ServiceState::RUNNING,
+                       arm::init::TransitionReason::READINESS, 0};
+    check_contexts(earlier, true);
+    for (unsigned i = 0; i < 23; ++i) {
+        auto bad = earlier;
+        auto& row = bad.services[2];
+        switch (i) {
+            case 0:
+                row.last_error = -EADDRNOTAVAIL;
+                break;
+            case 1:
+                row.state = arm::init::ServiceState::FAILED;
+                break;
+            case 2:
+                row.readiness = arm::init::ReadinessState::NOT_READY;
+                break;
+            case 3:
+                row.history_count = 1;
+                row.history[1] = {};
+                break;
+            case 4:
+                row.history[1].reason = arm::init::TransitionReason::SPAWN;
+                break;
+            case 5:
+                --row.history[1].timestamp_mono_ns;
+                break;
+            case 6:
+                row.history[1].to_state = arm::init::ServiceState::STARTING;
+                break;
+            case 7:
+                row.restart_count = 1;
+                break;
+            case 8:
+                row.last_wait_status = 256;
+                break;
+            case 9:
+                row.generation = 2;
+                break;
+            case 10:
+                row.pid = -1;
+                break;
+            case 11:
+                ++row.pgid;
+                break;
+            case 12:
+                row.flags = 7;
+                break;
+            case 13:
+                row.deadline_mono_ns = 1;
+                break;
+            case 14:
+                row.history[0].reason = arm::init::TransitionReason::TIMEOUT;
+                break;
+            case 15:
+                row.state = arm::init::ServiceState::STARTING;
+                break;
+            case 16:
+                bad.services[6].last_error = EADDRNOTAVAIL;
+                break;
+            case 17:
+                bad.services[7].last_error = EADDRNOTAVAIL;
+                break;
+            case 18:
+                bad.services[8].last_error = EADDRNOTAVAIL;
+                break;
+            case 19:
+                bad.services[1].last_error = EADDRNOTAVAIL;
+                break;
+            case 20:
+                bad.services[5].last_error = EADDRNOTAVAIL;
+                break;
+            case 21:
+                row.history[1].from_state = arm::init::ServiceState::STARTING;
+                break;
+            case 22:
+                row.history[1].from_state = arm::init::ServiceState::FAILED;
+                break;
+        }
+        check_contexts(bad, false);
+    }
+    auto final = earlier;
+    ++final.published_mono_ns;
+    pid_t const FINALIZER = ::getpid() + 1;
+    uma_arm_host_witness_complete(final, FINALIZER);
+    uint64_t const BOUND = earlier.services[7].deadline_mono_ns - 1;
+    for (unsigned index : {6U, 7U, 8U}) {
+        auto bad = final;
+        bad.services[index].last_error = EADDRNOTAVAIL;
+        check(!arm::witness_consumed(bad, earlier, FINALIZER, BOUND), "finalizer rejects an actual work-service error");
+        uma_arm_host_final_pending(bad);
+        check(!arm::witness_awaiting_exec(bad, earlier, FINALIZER, BOUND), "pending finalizer rejects an actual work-service error");
+    }
+    ++final.services[2].last_error;
+    check(!arm::witness_consumed(final, earlier, FINALIZER, BOUND), "finalizer still rejects a changed daemon diagnostic");
+    uma_arm_host_final_pending(final);
+    check(!arm::witness_awaiting_exec(final, earlier, FINALIZER, BOUND), "pending finalizer still requires the identical daemon row");
+}
 void dependency_gate() {
     namespace model = wos::init;
     std::array<char, model::MAX_MANIFEST_BYTES + 1> bytes{};
@@ -644,6 +769,7 @@ auto main(int argc, char** argv) -> int {
     } else if (!std::strcmp(mode, "consumed")) {
         consumed_rows();
         finalized_rows();
+        readiness_recovery_rows();
     } else {
         ::setenv("WOS_UMA_TEST_ROOT", root.c_str(), 1);
         ::setenv("USER", "root", 1);

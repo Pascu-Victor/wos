@@ -478,6 +478,29 @@ auto supervisor() -> int {
     expect_live(host.checks, pthread_attr_init(&attributes) == 0, STARTUP);
     expect_live(host.checks, pthread_attr_setstacksize(&attributes, 256 * 1024) == 0 && pthread_attr_setguardsize(&attributes, PAGE) == 0,
                 STARTUP);
+    // Stage bootstrap on one inherited CPU. A remote SET cannot move a
+    // sole-current worker; keep its runnable parent on that same origin until
+    // every existing checked SET and worker confirmation has completed.
+    int64_t const SUPERVISOR_AFFINITY = get_affinity(state, host.tid);
+    expect_live(host.checks, SUPERVISOR_AFFINITY == static_cast<int64_t>(ONLINE), AFFINITY, WORKERS, SUPERVISOR_AFFINITY, ONLINE);
+    uint64_t bootstrap_cpu = UINT64_MAX;
+    for (;;) {
+        alive(state);
+        uint64_t const SAMPLED_CPU = ker::multiproc::getcurrent_cpu();
+        expect_live(host.checks, SAMPLED_CPU < 8, CPU, WORKERS, static_cast<int64_t>(SAMPLED_CPU), 8);
+        int64_t const RC = raw(Op::SET_AFFINITY, host.tid, uint64_t{1} << SAMPLED_CPU);
+        if (RC == -EBUSY) {
+            (void)ker::multiproc::yield();
+            continue;
+        }
+        expect_live(host.checks, RC == 0, PIN, WORKERS, RC);
+        int64_t const MASK = get_affinity(state, host.tid);
+        expect_live(host.checks,
+                    ker::multiproc::getcurrent_cpu() == SAMPLED_CPU && MASK == static_cast<int64_t>(uint64_t{1} << SAMPLED_CPU), PIN,
+                    WORKERS, MASK, uint64_t{1} << SAMPLED_CPU);
+        bootstrap_cpu = SAMPLED_CPU;
+        break;
+    }
     std::array<Argument, WORKERS> arguments{};
     std::array<pthread_t, WORKERS> threads{};
     for (unsigned index = 0; index < WORKERS; ++index) {
@@ -492,6 +515,10 @@ auto supervisor() -> int {
     }
     uint64_t const SETUP_OWNER = state.published[0].cpu.load(std::memory_order_acquire);
     expect_live(host.checks, SETUP_OWNER < 8, CPU);
+    expect_live(host.checks, SETUP_OWNER == bootstrap_cpu, CPU, WORKERS, static_cast<int64_t>(SETUP_OWNER), bootstrap_cpu);
+    for (unsigned index = 0; index < WORKERS; ++index)
+        expect_live(host.checks, state.published[index].cpu.load(std::memory_order_acquire) == bootstrap_cpu, CPU, index,
+                    static_cast<int64_t>(state.published[index].cpu.load(std::memory_order_acquire)), bootstrap_cpu);
     for (unsigned index = 0; index < WORKERS; ++index) {
         uint64_t const CPU = (SETUP_OWNER + index) % 8;
         uint64_t const TID = state.published[index].tid.load(std::memory_order_acquire);
@@ -513,6 +540,21 @@ auto supervisor() -> int {
             (void)ker::multiproc::yield();
         }
     }
+    // All16 placements have been confirmed by execution at their destination.
+    // Restore the original full mask before later controller thread creation.
+    for (;;) {
+        alive(state);
+        int64_t const RC = raw(Op::SET_AFFINITY, host.tid, ONLINE);
+        if (RC == -EBUSY) {
+            (void)ker::multiproc::yield();
+            continue;
+        }
+        expect_live(host.checks, RC == 0, AFFINITY, WORKERS, RC);
+        break;
+    }
+    int64_t const RESTORED_AFFINITY = get_affinity(state, host.tid);
+    expect_live(host.checks, RESTORED_AFFINITY == SUPERVISOR_AFFINITY, AFFINITY, WORKERS, RESTORED_AFFINITY,
+                static_cast<uint64_t>(SUPERVISOR_AFFINITY));
     state.setup_done.store(true, std::memory_order_release);
     std::array<unsigned, 8> cpu_counts{};
     for (unsigned index = 0; index < WORKERS; ++index) {

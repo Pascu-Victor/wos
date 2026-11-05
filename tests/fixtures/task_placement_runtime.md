@@ -27,13 +27,27 @@ eight-CPU mask. It makes no libc signed-bit63 success claim.
 
 ## Workload and refusal boundaries
 
-Sixteen workers first pin themselves to their actual observed CPU. During a
-finite busy-yield setup, the parent assigns target0-relative destinations
-`(target0_first_cpu + index) % 8` through checked single-bit affinity operations,
-retrying only EBUSY. Each worker must execute on that actual destination and
-successfully pin itself there again before publishing confirmation. This gives
-exactly two workers on each CPU and a live peer on target0's unchanged original
-CPU; setup does not assume round-robin creation survives work stealing.
+Before creating workers, the supervisor requires the full online mask, pins
+itself to its observed CPU through checked SET/GET operations, and verifies that
+all sixteen workers inherit and first pin themselves to that same origin. The
+parent stays pinned while assigning target0-relative destinations
+`(target0_first_cpu + index) % 8` through the original checked single-bit affinity
+operations, retrying only EBUSY. Each worker must execute at its destination and
+successfully pin itself there again before publishing confirmation.
+
+Keeping the parent on the origin provides another runnable task there during
+placement. An isolated current worker can yield back to itself indefinitely;
+checked EBUSY does not promise that such a worker will become movable. The
+inherited origin avoids that setup assumption without changing kernel refusal
+rules or assuming a round-robin creation order. The sixteen original parent
+requests include fourteen cross-CPU moves and two same-origin assignments,
+ending with exactly two workers per CPU.
+
+After all confirmations, the parent restores and verifies the full online mask
+before releasing setup and creating the later controllers. Its two additional
+successful setup policy changes are outside the existing sixteen-request
+counters. Worker pin counts, report layouts, subsequent workload checks and the
+shared absolute sixty-second deadline are unchanged.
 
 Workers then nanosleep in phase0. Target0 announces a two-second nanosleep;
 after10ms and before its announced midpoint the parent requires excluding that

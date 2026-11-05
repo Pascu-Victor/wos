@@ -308,17 +308,50 @@ def require_mapping_mutations_use_shootdown(source: str) -> None:
         fail("prepared metadata must be fully validated before split or COW publication")
     if "intprepared_error=0;" not in exact_prepared:
         fail("the compatible branch must preserve its original ENOMEM fallback")
-    order = ["UserPagemapExclusiveScopesource_usercopy_scope(source);",
+    order = ["if(TYPED&&(private_child==nullptr||authority==nullptr||source_owner==nullptr))",
+             "if(source_owner!=nullptr&&virt::detail::fork_source_owner_root(actor,preparation,publication,*source_owner)!=source)",
+             "UserPagemapExclusiveScopesource_usercopy_scope(source,source_owner);",
+             "if(source_owner!=nullptr&&!source_usercopy_scope.owns(source))returnrefuse(Site::SourceAuthority,-EAGAIN);",
              "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
              "sched::PreemptGuardconstCOW_PREEMPT;",
              "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)",
-             "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);", "returnprepared_error!=0?prepared_error:-ENOMEM;"]
+             "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);",
+             "returnrefuse(Site::CowWalk,prepared_error!=0?prepared_error:-ENOMEM);"]
     cursor = 0
     for token in order:
         found = prepared.find(token, cursor)
         if found < 0:
             fail(f"prepared fork must ACK its split before COW and any failed source prefix before rollback: {token}")
         cursor = found + len(token)
+
+    scope = prepared.index("UserPagemapExclusiveScopesource_usercopy_scope(source,source_owner);")
+    for mutation in ["commit_managed_split_plan_exclusive(", "deep_copy_user_pagemap_cow_held("]:
+        if mutation in prepared[:scope]:
+            fail(f"prepared fork must validate and adopt its source owner before any split or COW: {mutation}")
+
+    scope_start = source.index("class UserPagemapExclusiveScope {")
+    scope_brace = source.index("{", scope_start)
+    scope_class = source[scope_start:find_matching_brace(source, scope_brace) + 1]
+    adopted = "".join(signature_body(scope_class, "UserPagemapExclusiveScope(PageTable* pagemap, ForkSourceOwner* owner)").split())
+    for token in ["if(owner==nullptr){gate_index=begin_user_pagemap_exclusive(pagemap);}",
+                  "elseif(!detail::ForkSourceAccess::transfer(*owner,pagemap,gate_index,lease_actor_)){root_=nullptr;"]:
+        if token not in adopted:
+            fail(f"provided source owner must use validated transfer without a blocking fallback: {token}")
+    if adopted.count("begin_user_pagemap_exclusive(") != 1:
+        fail("only the null-owner raw path may begin a new blocking exclusive")
+
+    transfer = "".join(function_body(source, "detail::ForkSourceAccess::transfer").split())
+    reject = transfer.find("if(expected==nullptr||expected==get_kernel_pagemap()||empty_gate!=USER_PAGEMAP_ACCESS_GATE_NONE||empty_actor!=nullptr||")
+    validate = transfer.find("root(*owner.actor_,*owner.preparation_,*owner.publication_,owner)!=expected)")
+    refuse = transfer.find("returnfalse;", validate)
+    adopt = transfer.find("empty_gate=owner.gate_;")
+    if not (0 <= reject < validate < refuse < adopt):
+        fail("source transfer must reject null or invalid ownership before adopting the existing gate")
+    finish = "".join(signature_body(scope_class, "void finish()").split())
+    release_gate = finish.find("end_user_pagemap_exclusive(gate_index);")
+    release_lease = finish.find("lease_actor_->release_usercopy_pagemap();")
+    if not (0 <= release_gate < release_lease):
+        fail("adopted source exclusive must release its gate before the transferred Task lease")
 
     if "flush_user_mapping_if_current" in source:
         fail("old local-only user mapping flush helper must not remain")

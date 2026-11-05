@@ -18,6 +18,89 @@ import time
 import traceback
 
 
+def check_init_wire_readiness_recovery(codec,check,expect_refusal):
+    """Synthetic complete ABI wires exercise saved witness/finalizer policy."""
+    import copy
+    import struct
+    second=1_000_000_000
+    def service(state,ready,flags,pid,generation,since,history,deadline=0):
+        return dict(state=state,ready=ready,flags=flags,pid=pid,pgid=pid,
+                    generation=generation,restarts=0,wait=0,error=0,since=since,
+                    deadline=deadline,history=history)
+    def transition(stamp,before,after,reason):return(stamp,before,after,reason,0)
+    rows={name:service(3,2,3,pid,1,second,[transition(second,2,3,3)])
+          for name,pid in zip(('journald','netd','httpd','dropbear'),(104,105,107,108))}
+    rows['netd'].update(error=99,since=2*second,
+                       history=[transition(second,2,3,3),transition(2*second,3,3,4)])
+    rows['dropbear-keygen']=service(6,2,0,-1,0,second,[transition(second,8,6,2)])
+    rows['testd']=service(8,1,0,-1,0,second,[transition(second,8,8,2)])
+    rows['uma-reference']=service(6,2,3,-1,1,8*second,[transition(8*second,4,6,5)])
+    rows['uma-reference-exit-witness']=service(3,1,3,701,1,9*second,
+                                              [transition(9*second,2,3,3)],39*second)
+    rows['uma-reference-finalizer']=service(1,1,3,-1,0,second,[transition(second,8,1,2)])
+    def wire(values,sequence,published):
+        data=bytearray(4160)
+        struct.pack_into('<4I2Q2I3Q',data,0,4160,1,1,0,sequence,published,9,0,0,0,0)
+        for i,name in enumerate(codec.SERVICES):
+            row=values[name];offset=64+256*i
+            struct.pack_into('<64s4IqqQQiiQQII2Q',data,offset,name.encode(),
+                             row['state'],row['ready'],row['flags'],0,row['pid'],row['pgid'],
+                             row['generation'],row['restarts'],row['wait'],row['error'],
+                             row['since'],row['deadline'],len(row['history']),0,0,0)
+            for j,item in enumerate(row['history']):struct.pack_into('<Q4I',data,offset+160+24*j,*item)
+        return bytes(data)
+    def finalizer_rows(values):
+        later=copy.deepcopy(values)
+        later['uma-reference-exit-witness']=service(6,2,3,-1,1,11*second,[transition(11*second,4,6,5)])
+        later['uma-reference-finalizer']=service(3,1,3,702,1,12*second,[transition(12*second,2,3,3)],42*second)
+        return later
+    def decode_finalizer(values,prior):
+        return codec.init_wire(wire(values,11,12*second),finalizer=True,prior=prior,original_deadline=38*second)
+    prior=codec.init_wire(wire(rows,10,10*second),final=True)
+    later=finalizer_rows(rows)
+    decoded=decode_finalizer(later,prior)
+    check('wire recovered netd99 preserves historical errno through witness and finalizer',
+          prior['services']['netd']['error']==decoded['services']['netd']['error']==99
+          and prior['observer']==decoded['observer']==701 and decoded['finalizer']==702)
+    for name in ('journald','netd','httpd','dropbear'):
+        changed=copy.deepcopy(rows);row=changed[name]
+        row.update(error=99,history=[transition(row['since'],3,3,4)])
+        accepted=codec.init_wire(wire(changed,10,10*second),final=True)
+        check('wire positive historical probe recovery allowed only ready daemon '+name,
+              decode_finalizer(finalizer_rows(changed),accepted)['services'][name]['error']==99)
+    controls=[
+        ('missing-current-readiness',dict(history=[transition(2*second,2,3,3)])),
+        ('stale-readiness',dict(history=[transition(second,3,3,4),transition(2*second,2,3,3)])),
+        ('negative-error',dict(error=-99)),('not-ready',dict(ready=1)),
+        ('failed-current-state',dict(state=7,ready=3)),('starting-current-state',dict(state=2)),
+        ('failed-wait',dict(wait=256)),('restart',dict(restarts=1)),
+        ('wrong-generation',dict(generation=2)),('wrong-flags',dict(flags=1)),
+        ('missing-pid',dict(pid=-1,pgid=-1)),('wrong-pgid',dict(pgid=999)),
+        ('active-deadline',dict(deadline=20*second)),
+        ('timeout-history',dict(history=[transition(second,3,3,9),transition(2*second,3,3,4)])),
+        ('recovery-to-wrong-state',dict(history=[transition(2*second,3,2,4)])),
+        ('recovery-from-starting',dict(history=[transition(2*second,2,3,4)])),
+        ('recovery-from-failed',dict(history=[transition(2*second,7,3,4)])),
+    ]
+    for label,fields in controls:
+        changed=copy.deepcopy(rows);changed['netd'].update(fields)
+        expect_refusal('wire final rejects recovered-error '+label,
+                       lambda values=changed:codec.init_wire(wire(values,10,10*second),final=True))
+        changed_later=finalizer_rows(changed)
+        expect_refusal('wire finalizer rejects recovered-error '+label,
+                       lambda values=changed_later:decode_finalizer(values,prior))
+    for name in ('uma-reference','uma-reference-exit-witness','uma-reference-finalizer','dropbear-keygen','testd'):
+        changed=copy.deepcopy(rows);changed[name]['error']=99
+        expect_refusal('wire actual control error remains fatal '+name,
+                       lambda values=changed:codec.init_wire(wire(values,10,10*second),final=True))
+        changed_later=copy.deepcopy(later);changed_later[name]['error']=99
+        expect_refusal('wire actual finalizer control error remains fatal '+name,
+                       lambda values=changed_later:decode_finalizer(values,prior))
+    changed_later=copy.deepcopy(later);changed_later['netd']['error']=100
+    expect_refusal('wire finalizer preserves exact prior daemon row including historical errno',
+                   lambda:decode_finalizer(changed_later,prior))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root',type=Path,default=Path(__file__).resolve().parents[3])
@@ -153,6 +236,7 @@ WOS_SUITE_TIMING_DEADLINE_NS={time.monotonic_ns()+30_000_000_000}
             scratch=Path(tempfile.mkdtemp(prefix='scratch-',dir=out))
         finally:signal.pthread_sigmask(signal.SIG_SETMASK,previous)
         env=dict(os.environ,TMPDIR=str(scratch),TMP=str(scratch),TEMP=str(scratch))
+        check_init_wire_readiness_recovery(codec,check,expect_refusal)
         binary=scratch/'stamp'
         common=[args.cxx,'-std=c++23','-O1','-g','-Wall','-Wextra','-Werror','-DWOS_UMA_TIMING_HOST=1','-I',str(header.parent)]
         command('compile-helper',common+[str(fixture),'-o',str(binary)])

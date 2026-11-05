@@ -313,6 +313,14 @@ set_tests_properties(vfs_unlink_progress_runtime_test PROPERTIES
     LABELS "host;unit;runtime" TIMEOUT 60
 )
 
+add_test(NAME vfs_mkdir_progress_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_mkdir_progress_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(vfs_mkdir_progress_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 60
+)
+
 wos_add_unit_test(dmar_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/dmar_test.cpp
 )
@@ -435,6 +443,12 @@ add_test(NAME weighted_fairness_bootstrap_runtime_test
         --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
         --host-cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(weighted_fairness_bootstrap_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+
+add_test(NAME affinity_bootstrap_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/affinity_bootstrap_runtime_test.py
+        --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+        --host-cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(affinity_bootstrap_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
 
 add_test(NAME kernel_direct_map_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_direct_map_runtime_test.py
@@ -1099,6 +1113,13 @@ add_test(
 add_test(
     NAME gc_epoch_progress_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/gc_epoch_progress_test.py
+)
+add_test(NAME process_exit_root_retirement_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/process_exit_root_retirement_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(process_exit_root_retirement_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 120
 )
 add_test(
     NAME userspace_startup_test
@@ -2359,6 +2380,14 @@ add_test(NAME prepared_fork_metadata_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/prepared_fork_metadata_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(prepared_fork_metadata_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+
+foreach(control IN ITEMS empty-reacquires-registry empty-ignores-generation empty-keeps-proof)
+    string(REPLACE "-" "_" control_name "${control}")
+    add_test(NAME prepared_fork_${control_name}_control_test
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/prepared_fork_metadata_runtime_test.py
+            --cxx ${CMAKE_CXX_COMPILER} --mode file --control ${control})
+    set_tests_properties(prepared_fork_${control_name}_control_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+endforeach()
 
 # Python-owned unit programs retain their actual category; source checks are separate.
 set_tests_properties(rootfs_directory_policy_test serial_fifo_test

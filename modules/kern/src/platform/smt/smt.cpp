@@ -1002,6 +1002,8 @@ void init() {
     acpi::numa::initialize_boot_topology({topology_cpus.data(), static_cast<size_t>(g_cpu_count)});
     if (mm::phys::initialize_node_counters_after_topology() != mm::NodeCounterError::NONE)
         dbg::panic_handler("physical node counter binding failed before AP startup");
+    if (!mm::virt::initialize_page_table_pool_after_topology())
+        dbg::panic_handler("page-table pool topology initialization failed before AP startup");
     if (mm::huge::initialize_after_topology() != mm::huge::Error::None) dbg::panic_handler("managed huge capacity initialization failed");
     if (mm::numa::root_reserve::initialize_after_topology() != mm::numa::root_reserve::Error::NONE)
         dbg::panic_handler("emergency root reserve initialization failed");

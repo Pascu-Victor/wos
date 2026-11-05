@@ -8,14 +8,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <platform/mm/paging.hpp>
+#include <platform/sched/resource_model.hpp>
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <platform/mm/paging.hpp>
 
 namespace host {
 inline unsigned checks{}, guard_depth{}, own_readers{}, queries{}, reads{};
 inline unsigned acquired{}, released{}, cooperations{}, entropy_calls{};
+inline unsigned busy_on_query{}, resource_locks{}, observations{};
+inline uint64_t observed_bytes{};
 inline uint64_t entropy_index{};
 inline bool entropy_ok{true};
 inline void* watched_readers{};
@@ -34,8 +37,9 @@ void check(bool condition, const char* name) {
     ++checks;
     if (!condition) fail(name);
 }
-template <typename T> class Atomic {
-  public:
+template <typename T>
+class Atomic {
+   public:
     std::atomic<T> value;
     constexpr Atomic(T initial = {}) : value(initial) {}
     auto load(std::memory_order order = std::memory_order_seq_cst) const -> T {
@@ -59,7 +63,10 @@ template <typename T> class Atomic {
 
 namespace ker::mod::sched {
 struct PreemptGuard {
-    PreemptGuard() { ++host::guard_depth; host::enter_query(); }
+    PreemptGuard() {
+        ++host::guard_depth;
+        host::enter_query();
+    }
     ~PreemptGuard() {
         host::check(host::own_readers == 0, "reader-release");
         --host::guard_depth;
@@ -68,9 +75,9 @@ struct PreemptGuard {
 }  // namespace ker::mod::sched
 
 namespace ker::mod::mm::virt {
+using paging::PAGE_SIZE;
 using paging::PageTable;
 using paging::PageTableEntry;
-using paging::PAGE_SIZE;
 using vaddr_t = uint64_t;
 // ACTUAL_GATE
 auto entry_at(PageTable* table, size_t index) -> PageTableEntry& {
@@ -85,10 +92,71 @@ auto pte_raw(const PageTableEntry& entry) -> uint64_t {
 }
 namespace addr {
 auto get_virt_pointer(uint64_t address) -> void* { return reinterpret_cast<void*>(address); }
-}
+}  // namespace addr
+void service_user_pagemap_gate_wait(uint64_t&) { host::fail("unexpected-raw-wait"); }
 // ACTUAL_ADMISSION
 // ACTUAL_QUERY
+// ACTUAL_COUNT
 }  // namespace ker::mod::mm::virt
+
+// Only Task ownership, the resource lock and usage publication are Host ports.
+// The actual counting, policy state machine and admission bodies execute below.
+namespace ker::mod::sched::task {
+enum class TaskType { PROCESS };
+struct Task {
+    mm::paging::PageTable* pagemap{};
+    TaskType type{TaskType::PROCESS};
+    bool is_thread{}, closing{}, owner_available{true};
+    std::atomic<bool> shares_user_pagemap{false};
+    struct Range {
+        uint64_t start{}, end{};
+    };
+    std::vector<Range> lazy_vmem_ranges;
+    resource::State resources;
+    struct Lock {
+        auto lock_irqsave() -> uint64_t {
+            host::check(!host::guard_depth && !host::own_readers && !host::resource_locks, "as-policy-owner-boundary");
+            ++host::resource_locks;
+            return 1;
+        }
+        void unlock_irqrestore(uint64_t flags) {
+            host::check(flags == 1 && host::resource_locks == 1, "as-policy-lock-release");
+            --host::resource_locks;
+        }
+    } resource_lock;
+    auto try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
+        out = closing ? nullptr : pagemap;
+        return out != nullptr;
+    }
+    void release_usercopy_pagemap() {}
+};
+}  // namespace ker::mod::sched::task
+namespace ker::mod::sched {
+inline task::Task* current_actor{};
+auto get_current_task() -> task::Task* { return current_actor; }
+}  // namespace ker::mod::sched
+namespace ker::mod::sched::resource {
+constexpr uint64_t USER_END = 0x0000800000000000ULL;
+constexpr unsigned AS = static_cast<unsigned>(Id::AS);
+class Owner {
+   public:
+    explicit Owner(task::Task* task) : task_(task->owner_available ? task : nullptr) {}
+    auto get() const -> task::Task* { return task_; }
+
+   private:
+    task::Task* task_;
+};
+void record_address_space_usage(task::Task*, mm::paging::PageTable*, uint64_t bytes) {
+    ++host::observations;
+    host::observed_bytes = bytes;
+}
+// ACTUAL_RESOURCE_TYPES
+// ACTUAL_ACCOUNTING
+// Trace-disabled destructor endpoint; observe() itself is the actual body.
+AddressSpaceObservation::~AddressSpaceObservation() {
+    if (m_subject != nullptr) (void)observe();
+}
+}  // namespace ker::mod::sched::resource
 
 namespace host {
 namespace virt = ker::mod::mm::virt;
@@ -119,7 +187,7 @@ void after_load(void* address) {
 }
 void enter_query() {
     ++queries;
-    if (injection == Injection::SecondQueryBusy && queries == 2) {
+    if ((injection == Injection::SecondQueryBusy && queries == 2) || (busy_on_query && queries == busy_on_query)) {
         virt::user_pagemap_access_gates.at(stripe).teardown.store(true, std::memory_order_release);
     }
 }
@@ -143,9 +211,16 @@ namespace ker::loader::elf {
 using Elf64_Half = uint16_t;
 // ACTUAL_COOPERATION
 // ACTUAL_PROBE
-struct LoadImageExtent { uint64_t min_vaddr{}, max_vaddr{}; };
-struct Header { uint16_t e_type{}, e_phnum{}; };
-struct ProgramHeader { uint32_t p_type{}; uint64_t p_align{}; };
+struct LoadImageExtent {
+    uint64_t min_vaddr{}, max_vaddr{};
+};
+struct Header {
+    uint16_t e_type{}, e_phnum{};
+};
+struct ProgramHeader {
+    uint32_t p_type{};
+    uint64_t p_align{};
+};
 struct ElfFile {
     Header elf_head{};
     uint64_t load_base{};
@@ -206,6 +281,7 @@ void reset(PageTable* next) {
     entropy_index = 0;
     entropy_ok = true;
     injection = Injection::None;
+    busy_on_query = 0;
 }
 void ordinary() { check(!guard_depth && !own_readers, "cooperation-owner-boundary"); }
 struct Cooperation {
@@ -279,8 +355,8 @@ void query_cases() {
     check(virt::query_user_virtual_range(root, BASE, BASE + 4096) == Status::ReaderUnavailable, "raced-capacity-terminal");
     check(acquired == 1 && released == 1 && !own_readers && !reads, "raced-capacity-rollback");
     reset(empty);
-    for (auto [start, end] : std::array<std::pair<uint64_t, uint64_t>, 5>{{{BASE, BASE}, {BASE + 1, BASE + 4096},
-             {BASE, BASE + 4097}, {BASE + 4096, BASE}, {0, 0x800000001000ULL}}}) {
+    for (auto [start, end] : std::array<std::pair<uint64_t, uint64_t>, 5>{
+             {{BASE, BASE}, {BASE + 1, BASE + 4096}, {BASE, BASE + 4097}, {BASE + 4096, BASE}, {0, 0x800000001000ULL}}}) {
         check(virt::query_user_virtual_range(root, start, end) == Status::Invalid, "invalid-bounds");
     }
     check(virt::query_user_virtual_range(nullptr, 0, 4096) == Status::Invalid && !queries, "invalid-null-root");
@@ -295,6 +371,111 @@ void query_cases() {
     put(root, BASE + 4096, ker::mod::mm::paging::PAGE_PRESENT);
     check(virt::query_user_virtual_range(root, BASE + 4096, BASE + 8192) == Status::Occupied, "present-occupied");
 }
+
+void count_cases() {
+    using Count = virt::UserVirtualCountStatus;
+    constexpr uint64_t BASE = layout::MAIN_IMAGE_WINDOW.begin;
+    auto* empty = table();
+    uint64_t bytes = 99;
+    reset(empty);
+    check(virt::query_user_virtual_bytes(root, BASE, BASE + 4096, bytes) == Count::Counted && bytes == 0, "count-empty");
+    reset(empty);
+    auto* foreign = reinterpret_cast<PageTable*>(reinterpret_cast<uintptr_t>(root) + (4096ULL << 12));
+    check(foreign != root && virt::user_pagemap_access_gate_index(foreign) == stripe, "count-foreign-stripe");
+    virt::user_pagemap_access_gates.at(virt::user_pagemap_access_gate_index(foreign)).teardown.store(true);
+    bytes = 99;
+    check(virt::query_user_virtual_bytes(root, BASE, BASE + 4096, bytes) == Count::GateBusy, "count-foreign-busy");
+    check(bytes == 0 && !reads && !acquired && !own_readers && !guard_depth, "count-busy-no-walk");
+    check(!virt::count_user_virtual_bytes(root, BASE, BASE + 4096, bytes), "count-boolean-fail-closed");
+    reset(empty);
+    injection = Injection::Race;
+    check(virt::query_user_virtual_bytes(root, BASE, BASE + 4096, bytes) == Count::GateBusy, "count-raced-busy");
+    check(bytes == 0 && acquired == 1 && released == 1 && !reads && !own_readers, "count-raced-rollback");
+    reset(empty);
+    virt::user_pagemap_access_gates.at(stripe).readers.store(UINT32_MAX);
+    check(virt::query_user_virtual_bytes(root, BASE, BASE + 4096, bytes) == Count::ReaderUnavailable, "count-capacity-terminal");
+    reset(empty);
+    busy().readers.store(UINT32_MAX);
+    check(virt::query_user_virtual_bytes(root, BASE, BASE + 4096, bytes) == Count::ReaderUnavailable, "count-combined-capacity-terminal");
+    reset(empty);
+    injection = Injection::RaceCapacity;
+    check(virt::query_user_virtual_bytes(root, BASE, BASE + 4096, bytes) == Count::ReaderUnavailable, "count-raced-capacity-terminal");
+    check(acquired == 1 && released == 1 && !reads && !own_readers, "count-raced-capacity-rollback");
+    reset(empty);
+    bytes = 99;
+    check(virt::query_user_virtual_bytes(root, BASE, BASE, bytes) == Count::Counted && bytes == 0 && !queries, "count-empty-no-reader");
+    check(virt::query_user_virtual_bytes(root, BASE + 1, BASE + 4096, bytes) == Count::Invalid && !reads, "count-invalid-bounds");
+    auto* malformed = table();
+    malformed->entries[0] = raw(ker::mod::mm::paging::PAGE_PRESENT | (1ULL << 7));
+    reset(malformed);
+    check(virt::query_user_virtual_bytes(root, 0, 4096, bytes) == Count::Invalid && bytes == 0, "count-invalid-walk");
+}
+
+void accounting_cases() {
+    namespace resource = ker::mod::sched::resource;
+    using Admission = resource::MappingAdmission;
+    constexpr uint64_t BASE = layout::MAIN_IMAGE_WINDOW.begin, PAGE = 4096;
+    auto* empty = table();
+    ker::mod::sched::task::Task actor;
+    actor.pagemap = empty;
+    ker::mod::sched::current_actor = &actor;
+    reset(empty);
+    uint64_t admitted = 99;
+    busy();
+    check(resource::try_admit_mapping_count(&actor, root, PAGE, BASE, PAGE, &admitted) == Admission::GateBusy, "as-whole-busy");
+    check(admitted == 0 && !reads && !resource_locks, "as-whole-no-prefix");
+    reset(empty);
+    busy_on_query = 2;
+    admitted = 99;
+    check(resource::try_admit_mapping_count(&actor, root, PAGE, BASE, PAGE, &admitted) == Admission::GateBusy, "as-replaced-busy");
+    check(admitted == 0 && !resource_locks, "as-replaced-no-prefix");
+    reset(empty);
+    actor.lazy_vmem_ranges = {{BASE + PAGE, BASE + 2 * PAGE}};
+    busy_on_query = 2;
+    uint64_t bytes = 99;
+    check(resource::query_address_space_count(actor, root, 0, 0x800000000000ULL, bytes) == virt::UserVirtualCountStatus::GateBusy,
+          "as-late-gap-busy");
+    check(bytes == 0, "as-no-prefix");
+    actor.lazy_vmem_ranges.clear();
+    reset(empty);
+    busy().readers.store(UINT32_MAX);
+    check(resource::try_admit_mapping_count(&actor, root, PAGE, BASE, PAGE, &admitted) == Admission::Denied, "as-capacity-denied");
+    reset(empty);
+    actor.resources.entries[static_cast<unsigned>(resource::Id::AS)].limit.soft = 0;
+    check(resource::try_admit_mapping_count(&actor, root, PAGE, BASE, PAGE, &admitted) == Admission::Denied, "as-policy-denied");
+    check(actor.resources.entries[static_cast<unsigned>(resource::Id::AS)].denied == 1 && admitted == 0, "as-real-policy-reason");
+    actor.resources.entries[static_cast<unsigned>(resource::Id::AS)].limit.soft = UINT64_MAX;
+    reset(empty);
+    {
+        resource::AddressSpaceObservation observation(&actor);
+        busy();
+        check(observation.try_admit_mapping(root, PAGE, BASE, PAGE) == Admission::GateBusy, "as-observation-busy");
+        virt::user_pagemap_access_gates.at(stripe).teardown.store(false);
+        check(observation.try_admit_mapping(root, PAGE, BASE, PAGE) == Admission::Admitted, "as-fresh-admission");
+        observation.commit_mapping();
+        put(root, BASE, ker::mod::mm::paging::PAGE_RESERVED);
+        put(root, BASE + PAGE, ker::mod::mm::paging::PAGE_RESERVED);
+        observed_bytes = UINT64_MAX;
+    }
+    check(observed_bytes == 2 * PAGE, "as-busy-prefix-never-reused");
+    reset(empty);
+    unsigned before_reads = 0;
+    {
+        resource::AddressSpaceObservation observation(&actor);
+        check(observation.try_admit_mapping(root, PAGE, BASE, PAGE) == Admission::Admitted, "as-complete-admission");
+        observation.commit_mapping();
+        before_reads = reads;
+    }
+    check(reads == before_reads && observed_bytes == 2 * PAGE, "as-complete-count-reuse");
+    reset(empty);
+    busy();
+    check(!resource::admit_address_space(&actor, root, PAGE, BASE, PAGE), "as-boolean-fail-closed");
+    actor.lazy_vmem_ranges = {{BASE + 1, BASE + PAGE}};
+    reset(empty);
+    check(resource::try_admit_mapping_count(&actor, root, PAGE, BASE, PAGE, &admitted) == Admission::Denied, "as-invalid-lazy-denied");
+    actor.lazy_vmem_ranges.clear();
+    ker::mod::sched::current_actor = nullptr;
+}
 void selector_cases() {
     reset(table());
     uint64_t base = 123;
@@ -302,22 +483,25 @@ void selector_cases() {
     check(layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 0, 4096, base, scripted, &script), "selector-success");
     check(entropy_calls == 1, "entropy-once");
     check(script.ranges.size() == 2 && script.ranges[0].first == layout::MAIN_IMAGE_WINDOW.begin &&
-              script.ranges[1].first == layout::MAIN_IMAGE_WINDOW.begin + layout::IMAGE_ALIGNMENT &&
-              base == script.ranges[1].first, "occupied-only-cursor");
+              script.ranges[1].first == layout::MAIN_IMAGE_WINDOW.begin + layout::IMAGE_ALIGNMENT && base == script.ranges[1].first,
+          "occupied-only-cursor");
     for (auto status : {Status::GateBusy, Status::ReaderUnavailable, Status::Invalid}) {
         Script terminal{{status}};
         entropy_calls = 0;
         base = 123;
-        check(!layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 0, 4096, base, scripted, &terminal), "selector-refuses-terminal");
+        check(!layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 0, 4096, base, scripted, &terminal),
+              "selector-refuses-terminal");
         check(terminal.ranges.size() == 1 && entropy_calls == 1 && base == 123, "selector-terminal");
     }
     Script occupied{{Status::Occupied}};
-    check(!layout::choose_image_base_with_query(root, layout::ImageRole::INTERPRETER, 0, 4096, base, scripted, &occupied), "occupied-exhausted");
+    check(!layout::choose_image_base_with_query(root, layout::ImageRole::INTERPRETER, 0, 4096, base, scripted, &occupied),
+          "occupied-exhausted");
     check(occupied.ranges.size() == 256, "genuine-collision-limit");
     Script bounded{{Status::Free}};
     unsigned previous = entropy_calls;
-    check(!layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 1, 4096, base, scripted, &bounded) &&
-              !bounded.index && entropy_calls == previous, "selector-invalid-before-entropy");
+    check(!layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 1, 4096, base, scripted, &bounded) && !bounded.index &&
+              entropy_calls == previous,
+          "selector-invalid-before-entropy");
     entropy_ok = false;
     check(!layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 0, 4096, base, scripted, &bounded) && !bounded.index,
           "entropy-failure");
@@ -350,8 +534,9 @@ void probe_cases() {
     elf::ElfLayoutCooperation collision_token(cooperate, &collision);
     elf::ElfRangeProbe collision_probe{&collision_token};
     uint64_t next_base = 0;
-    check(layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 0, 4096, next_base,
-              elf::ElfRangeProbe::query, &collision_probe), "cooperation-then-collision");
+    check(layout::choose_image_base_with_query(root, layout::ImageRole::MAIN, 0, 4096, next_base, elf::ElfRangeProbe::query,
+                                               &collision_probe),
+          "cooperation-then-collision");
     check(next_base == BASE + layout::IMAGE_ALIGNMENT && entropy_calls == 1 && cooperations == 1 && queries == 3,
           "busy-same-candidate-occupied-advances");
     reset(table());
@@ -373,22 +558,23 @@ void probe_cases() {
     busy();
     check(interpreter_image.range_is_free(root, layout::INTERPRETER_WINDOW.begin, 4096), "interpreter-shared-cooperation");
     busy();
-    check(!fixed_metadata.range_is_free(root, 0x700000000000ULL, 4096) && fixed_metadata.error() == -EAGAIN &&
-              cooperations == 2 && queries == 5, "successful-images-exhaust-shared-budget");
+    check(!fixed_metadata.range_is_free(root, 0x700000000000ULL, 4096) && fixed_metadata.error() == -EAGAIN && cooperations == 2 &&
+              queries == 5,
+          "successful-images-exhaust-shared-budget");
     reset(table());
     busy().readers.store(UINT32_MAX);
     Cooperation capacity;
     elf::ElfLayoutCooperation capacity_token(cooperate, &capacity);
     elf::ElfRangeProbe unavailable{&capacity_token};
     check(!unavailable.range_is_free(root, BASE, 4096) && !cooperations && unavailable.status == Status::ReaderUnavailable &&
-              unavailable.error() == 0, "capacity-no-cooperation");
+              unavailable.error() == 0,
+          "capacity-no-cooperation");
     reset(table());
     busy();
     Cooperation decline{Cooperation::Action::Decline};
     elf::ElfLayoutCooperation decline_token(cooperate, &decline);
     elf::ElfRangeProbe refused{&decline_token};
-    check(!refused.range_is_free(root, BASE, 4096) && queries == 1 && cooperations == 1 && refused.error() == -EAGAIN,
-          "declined-context");
+    check(!refused.range_is_free(root, BASE, 4096) && queries == 1 && cooperations == 1 && refused.error() == -EAGAIN, "declined-context");
     reset(table());
     Cooperation recursive{Cooperation::Action::Recursive};
     elf::ElfLayoutCooperation recursive_token(cooperate, &recursive);
@@ -424,13 +610,14 @@ void image_selection_cases() {
     check(!elf::select_image_load_base(fixed, root, options, reserved) && reserved.error() == 0, "fixed-exec-occupied");
     reset(table());
     elf::ElfRangeProbe invalid;
-    check(!invalid.range_is_free(root, UINT64_MAX - 4095, 8192) && invalid.status == Status::Invalid && !queries,
-          "probe-overflow");
+    check(!invalid.range_is_free(root, UINT64_MAX - 4095, 8192) && invalid.status == Status::Invalid && !queries, "probe-overflow");
 }
 }  // namespace host
 
 int main() {
     host::query_cases();
+    host::count_cases();
+    host::accounting_cases();
     host::selector_cases();
     host::probe_cases();
     host::image_selection_cases();

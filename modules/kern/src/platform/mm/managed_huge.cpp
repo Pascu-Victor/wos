@@ -461,7 +461,11 @@ struct detail::RangePreparationDriver {
             fill.stamp = count.stamp;
             fill.start = start;
             fill.end = end;
-            error = pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage,
+            // Empty ordinary forks have no descriptor storage to fill. Keep
+            // the independent final geometry scan with the original stamp.
+            if (count.count != 0 || publication_policy != PublicationPolicy::ForkWait)
+                error =
+                    pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage,
                          witness, fork_chunks, RangePreparePass::Fill, static_cast<uint8_t>(attempt + 1), count.count, publication_policy);
             if (error == Error::None && fill.count != count.count) {
                 error = Error::Again;
@@ -653,10 +657,30 @@ auto deep_copy_current_user_pagemap_prepared_impl(sched::task::Task& actor, Page
                                                   const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
                                                   const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
                                                   numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
-                                                  PreparedAnonymousSwapFork* prepared_swap) noexcept -> int {
-    if (!huge::detail::current_fork_context_valid(actor, preparation, publication)) return -EWOULDBLOCK;
+                                                  PreparedAnonymousSwapFork* prepared_swap, ForkCopyRefusalWitness* refusal = nullptr,
+                                                  sched::task::Task* private_child = nullptr, ForkPrivateChildRoot* authority = nullptr,
+                                                  ForkSourceOwner* source_owner = nullptr) noexcept -> int {
+    if (refusal != nullptr) *refusal = {};
+    auto refuse = [refusal](ForkCopyRefusalSite site, int status, uint32_t detail = 0) {
+        if (refusal != nullptr) *refusal = {.valid = true, .site = site, .raw_status = status, .detail = detail};
+        return status;
+    };
+    if (!huge::detail::current_fork_context_valid(actor, preparation, publication))
+        return refuse(ForkCopyRefusalSite::WrapperContext, -EWOULDBLOCK);
     constexpr uint64_t USER_END = uint64_t{1} << 47;
-    if (child == nullptr || !survey.complete() || survey.start() != 0 || survey.end() != USER_END) return -EINVAL;
+    if (child == nullptr) return refuse(ForkCopyRefusalSite::WrapperInput, -EINVAL, 1);
+    if (!survey.complete()) return refuse(ForkCopyRefusalSite::WrapperInput, -EINVAL, 2);
+    if (survey.start() != 0) return refuse(ForkCopyRefusalSite::WrapperInput, -EINVAL, 3);
+    if (survey.end() != USER_END) return refuse(ForkCopyRefusalSite::WrapperInput, -EINVAL, 4);
+    if (source_owner != nullptr) {
+        // The actual try owner already retains the Task lease. This guarded
+        // borrow grants no new ownership and never reacquires that lease.
+        auto* const SOURCE = detail::fork_source_owner_root(actor, preparation, publication, *source_owner);
+        if (SOURCE == nullptr) return refuse(ForkCopyRefusalSite::SourceAuthority, -EINVAL);
+        return huge::detail::copy_current_user_pagemap_exclusive(actor, SOURCE, child, preparation, publication, survey, tables,
+                                                                 eager_context, empty_result, prepared_swap, refusal, private_child,
+                                                                 authority, source_owner);
+    }
     // Instrumented caller-born storage: Task writes its result into this actual
     // addressable output. Deliberately do not acquire a striped reader here.
     huge::detail::CurrentRangeRootAccess access;
@@ -665,7 +689,10 @@ auto deep_copy_current_user_pagemap_prepared_impl(sched::task::Task& actor, Page
     int result = -EAGAIN;
     if (access.local && access.root != nullptr && access.root == actor.pagemap)
         result = huge::detail::copy_current_user_pagemap_exclusive(actor, access.root, child, preparation, publication, survey, tables,
-                                                                   eager_context, empty_result, prepared_swap);
+                                                                   eager_context, empty_result, prepared_swap, refusal, private_child,
+                                                                   authority);
+    else
+        result = refuse(ForkCopyRefusalSite::TaskLease, result);
     // Record/release even a successful local lease followed by identity refusal.
     huge::detail::release_current_range_root(access);
     return result;
@@ -686,6 +713,32 @@ auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable
                                              PreparedAnonymousSwapFork& swap) noexcept -> int {
     return deep_copy_current_user_pagemap_prepared_impl(actor, child, preparation, publication, survey, tables, eager_context, empty_result,
                                                         &swap);
+}
+auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable* child, const sys::SyscallPreparationScope& preparation,
+                                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                             const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                             numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
+                                             PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal) noexcept -> int {
+    return deep_copy_current_user_pagemap_prepared_impl(actor, child, preparation, publication, survey, tables, eager_context, empty_result,
+                                                        &swap, refusal);
+}
+
+auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, sched::task::Task& child, ForkPrivateChildRoot& authority,
+                                             ForkSourceOwner& source_owner, const sys::SyscallPreparationScope& preparation,
+                                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                             const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                             numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
+                                             PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal) noexcept -> int {
+    struct InvalidateAuthority {
+        ForkPrivateChildRoot& authority;
+        ForkSourceOwner& source_owner;
+        ~InvalidateAuthority() {
+            source_owner.finish();
+            authority.invalidate();
+        }
+    } const INVALIDATE{authority, source_owner};
+    return deep_copy_current_user_pagemap_prepared_impl(actor, child.pagemap, preparation, publication, survey, tables, eager_context,
+                                                        empty_result, &swap, refusal, &child, &authority, &source_owner);
 }
 
 }  // namespace ker::mod::mm::virt

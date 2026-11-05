@@ -68,6 +68,7 @@ class ForkVmCoordinator : public ManagedFork {
     void SetUp() override {
         ManagedFork::SetUp();
         child_task.pid = 2;
+        child_task.shares_user_pagemap = false;
         child_task.pagemap = child;
         actor.pid = 1;
         host_fork_vm::registry_tries = host_fork_vm::registry_fail_try = 0;
@@ -80,7 +81,7 @@ class ForkVmCoordinator : public ManagedFork {
         host_fork_vm::pubs = 0;
         host_fork_vm::at_final_publication = false;
         host_fork_vm::on_pub = nullptr;
-        host_fork_vm::on_pin = host_fork_vm::on_shm = host_fork_vm::on_legacy = nullptr;
+        host_fork_vm::on_pin = host_fork_vm::on_shm = host_fork_vm::on_legacy = host_fork_vm::on_pub_release = nullptr;
         host_fork_vm::fail_after = -1;
         host_fork_vm::metadata_allocations = host_fork_vm::metadata_returns = 0;
         host_fork_vm::binding_reserves = host_fork_vm::binding_returns = 0;
@@ -118,6 +119,10 @@ class ForkVmCoordinator : public ManagedFork {
         host_fork_vm::registry_busy_always = false;
         host_fork_vm::registry_busy_remaining = 0;
         host_fork_vm::enabled = false;
+        host_fork_vm::on_pub_release = nullptr;
+        host_fork_vm::on_legacy = nullptr;
+        host_range::on_yield = nullptr;
+        virt::user_pagemap_access_gates[0].teardown.store(false);
         rollback();
         ker::mod::sched::task::release_lazy_vmem_ranges(actor);
         ASSERT_EQ(vmem::unregister_file_mmap_range(runtime_root, 0, uint64_t{1} << 47), 0);
@@ -153,9 +158,8 @@ class ForkVmCoordinator : public ManagedFork {
              vmem::LegacyFileForkPreparation::MatchConflict* conflict = nullptr) -> int {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
         host_fork_vm::enabled = true;
-        auto status =
-            ker::syscall::process::detail::prepare_fork_vm_snapshot_once(actor, child_task, preparation, placement, output, point,
-                                                                      witness, conflict);
+        auto status = ker::syscall::process::detail::prepare_fork_vm_snapshot_once(actor, child_task, preparation, placement, output, point,
+                                                                                   witness, conflict);
         host_fork_vm::enabled = false;
         EXPECT_TRUE(host_fork_vm::ordinary());
         EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
@@ -166,7 +170,8 @@ class ForkVmCoordinator : public ManagedFork {
     auto run_retry(ker::syscall::process::detail::ForkVmFailurePoint* point = nullptr) -> int {
         ker::mod::sys::SyscallPreparationScope preparation(actor);
         host_fork_vm::enabled = true;
-        auto const STATUS = ker::syscall::process::detail::prepare_fork_vm_snapshot(actor, child_task, preparation, nullptr, nullptr, point);
+        auto const STATUS =
+            ker::syscall::process::detail::prepare_fork_vm_snapshot(actor, child_task, preparation, nullptr, nullptr, point);
         host_fork_vm::enabled = false;
         EXPECT_TRUE(host_fork_vm::ordinary());
         EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
@@ -267,6 +272,67 @@ TEST_F(ForkVmCoordinator, CountZeroUsesWholeSurveyAndOneOriginalExclusive) {
     EXPECT_EQ(child_task.program_header_count, 7U);
     EXPECT_EQ(child_task.mmap_next.load(), 0x78000000U);
     EXPECT_GT(host_fork_vm::pubs, 0U);
+}
+TEST_F(ForkVmCoordinator, EmptyLegacyCertificateIgnoresLateForeignBusyWithoutSkippingCopy) {
+    ordinary(TEST_VA);
+    mm::paging::PageTable foreign{};
+    ASSERT_TRUE(vmem::g_file_mmap_ranges.reserve(90));
+    for (unsigned i = 0; i < 90; ++i) {
+        ASSERT_TRUE(vmem::retain_prepared_legacy_file(&file));
+        vmem::FileMmapRange row{.pagemap = &foreign, .start = TEST_VA + i * PAGE, .length = PAGE, .file = &file};
+        ASSERT_TRUE(vmem::g_file_mmap_ranges.push_back_no_grow(row));
+    }
+    std::array<vmem::FileMmapRange, 90> original;
+    for (unsigned i = 0; i < original.size(); ++i) original[i] = vmem::g_file_mmap_ranges.at(i);
+    auto* const buffer = &vmem::g_file_mmap_ranges.at(32);
+    auto const refs = file.refcount.load();
+    host_fork_vm::on_legacy = +[] { host_fork_vm::registry_busy_always = true; };
+    EXPECT_EQ(run(), 0);
+    host_fork_vm::on_legacy = nullptr;
+    host_fork_vm::registry_busy_always = false;
+    EXPECT_EQ(host_fork_vm::registry_tries, 1U);
+    EXPECT_EQ(fork_exclusives, 1U);
+    EXPECT_EQ(fork_cow_entries, 1U);
+    EXPECT_EQ(&vmem::g_file_mmap_ranges.at(32), buffer);
+    EXPECT_EQ(vmem::g_file_mmap_ranges.size(), 90U);
+    EXPECT_EQ(file.refcount.load(), refs);
+    for (unsigned i = 0; i < original.size(); ++i) EXPECT_TRUE(vmem::legacy_row_equal(vmem::g_file_mmap_ranges.at(i), original[i]));
+    while (!vmem::g_file_mmap_ranges.empty()) {
+        auto* held = vmem::g_file_mmap_ranges.at(vmem::g_file_mmap_ranges.size() - 1).file;
+        vmem::g_file_mmap_ranges.pop_back();
+        vmem::return_prepared_legacy_file(held);
+    }
+}
+TEST_F(ForkVmCoordinator, SaturatedEmptyGenerationUsesOriginalLateBusyRollback) {
+    ordinary(TEST_VA);
+    tmpfs();
+    shared();
+    auto const saved = vmem::g_empty_fork_publication_generation;
+    // Explicit Host fault injection of the actual counter boundary. Production
+    // never resets it; restoring here only isolates independent Host cases.
+    vmem::g_empty_fork_publication_generation = UINT64_MAX;
+    host_fork_vm::on_legacy = +[] { host_fork_vm::registry_busy_always = true; };
+    ker::syscall::process::detail::ForkVmFailurePoint point{};
+    EXPECT_EQ(run(nullptr, nullptr, nullptr, &point), -EAGAIN);
+    host_fork_vm::on_legacy = nullptr;
+    host_fork_vm::registry_busy_always = false;
+    EXPECT_EQ(point, ker::syscall::process::detail::ForkVmFailurePoint::LegacyCommit);
+    EXPECT_EQ(host_fork_vm::registry_tries, 2U);
+    EXPECT_EQ(vmem::g_empty_fork_publication_generation, UINT64_MAX);
+    EXPECT_EQ(child_task.lazy_vmem_ranges.size(), 2U);
+    EXPECT_EQ(shm::g_segments[0].attach_count, 2U);
+    EXPECT_EQ(fork_cow_entries, 1U);
+    vmem::g_empty_fork_publication_generation = saved;
+    rollback();
+    EXPECT_EQ(shm::g_segments[0].attach_count, 1U);
+}
+TEST_F(ForkVmCoordinator, SaturatedEmptyGenerationStillSucceedsThroughOriginalRegistryCommit) {
+    auto const saved = vmem::g_empty_fork_publication_generation;
+    vmem::g_empty_fork_publication_generation = UINT64_MAX;
+    EXPECT_EQ(run(), 0);
+    EXPECT_EQ(host_fork_vm::registry_tries, 2U);
+    EXPECT_EQ(vmem::g_empty_fork_publication_generation, UINT64_MAX);
+    vmem::g_empty_fork_publication_generation = saved;
 }
 TEST_F(ForkVmCoordinator, MixedFileMetadataKeepDistinctOwners) {
     legacy();
@@ -603,9 +669,19 @@ mm::paging::PageTable* retry_root_identity{};
 std::array<uint64_t, 13> retry_child_image{};
 std::array<uint64_t, 512> retry_root_words{};
 auto image_fields(const ForkTask& task) -> std::array<uint64_t, 13> {
-    return {task.entry, task.program_header_addr, task.elf_header_addr, task.image_load_base, task.image_vaddr_start,
-            task.image_vaddr_end, task.program_header_count, task.program_header_ent_size, task.interp_base,
-            task.interp_vaddr_start, task.interp_vaddr_end, task.at_random_addr, task.mmap_next.load()};
+    return {task.entry,
+            task.program_header_addr,
+            task.elf_header_addr,
+            task.image_load_base,
+            task.image_vaddr_start,
+            task.image_vaddr_end,
+            task.program_header_count,
+            task.program_header_ent_size,
+            task.interp_base,
+            task.interp_vaddr_start,
+            task.interp_vaddr_end,
+            task.at_random_addr,
+            task.mmap_next.load()};
 }
 void remember_retry_child(ForkTask& task) {
     retry_child_identity = &task;
@@ -631,8 +707,7 @@ void expect_retry_child_unchanged(ForkTask&, ForkTask& task) {
 }
 auto pending_fork_bindings() -> unsigned {
     unsigned count = 0;
-    for (auto const& ticket : fm::host_tickets)
-        count += ticket.pending && ticket.run == fm::FileMappingBinding::finish;
+    for (auto const& ticket : fm::host_tickets) count += ticket.pending && ticket.run == fm::FileMappingBinding::finish;
     return count;
 }
 

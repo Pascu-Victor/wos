@@ -6,10 +6,12 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/loader/runtime_images.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/kernel_image.hpp>
+#include <platform/mm/numa_balance.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -35,6 +37,77 @@ namespace {
 constexpr uintptr_t PAGE_ALIGNMENT_MASK = 0xFFFULL;
 constexpr uint64_t NON_RAM_TEST_PHYS = (1ULL << 52) - paging::PAGE_SIZE;
 constexpr uint64_t PAGE_FAULT_ERROR_MASK = 0x7FULL;
+
+namespace pool_balance = mm::numa::balance;
+constexpr uint64_t ROOT_POOL_BALANCE_MAX_FRAMES = 8 * 1024 * 1024;
+struct RootPoolNodeBalance {
+    pool_balance::Snapshot before{}, after{};
+    pool_balance::Workspace scratch{};
+};
+constinit RootPoolNodeBalance root_pool_node_balance{};
+
+void prepare_root_pool_node_balance() {
+    // Prepare only caller-owned diagnostic storage before the baseline. Never
+    // put these large buffers on the kernel stack or reset allocator state.
+    auto* bytes = reinterpret_cast<volatile uint8_t*>(&root_pool_node_balance);
+    for (size_t i = 0; i < sizeof(root_pool_node_balance); ++i) bytes[i] = 0;
+}
+
+auto collect_root_pool_node_balance(pool_balance::Snapshot& out) -> bool {
+    auto const result = pool_balance::snapshot(out, root_pool_node_balance.scratch, ROOT_POOL_BALANCE_MAX_FRAMES);
+    return result.valid() && out.complete;
+}
+
+void expect_root_pool_counts_equal(const pool_balance::Counts& before, const pool_balance::Counts& after) {
+    KEXPECT_TRUE(before.cached_free_pages <= before.free_pages && after.cached_free_pages <= after.free_pages);
+    KEXPECT_EQ(after.managed_pages, before.managed_pages);
+    KEXPECT_EQ(after.free_pages, before.free_pages);
+    KEXPECT_EQ(after.allocator_metadata_pages, before.allocator_metadata_pages);
+    KEXPECT_EQ(after.zone_descriptor_pages, before.zone_descriptor_pages);
+    KEXPECT_EQ(after.owner_pages, before.owner_pages);
+    KEXPECT_TRUE(after.kind_pages == before.kind_pages);
+    for (size_t i = 0; i < before.owners.size(); ++i) {
+        KEXPECT_EQ(after.owners[i].pages, before.owners[i].pages);
+        KEXPECT_EQ(after.owners[i].objects, before.owners[i].objects);
+    }
+}
+
+void expect_root_pool_node_balance() {
+    auto const& before = root_pool_node_balance.before;
+    auto const& after = root_pool_node_balance.after;
+    KREQUIRE_TRUE(before.complete && after.complete && before.result.valid() && after.result.valid());
+    KREQUIRE_TRUE(before.node_count > 1 && before.node_count <= before.nodes.size() && after.node_count == before.node_count);
+    KEXPECT_EQ(after.provenance, before.provenance);
+    KEXPECT_EQ(after.zone_count, before.zone_count);
+    KEXPECT_EQ(after.scanned_frames, before.scanned_frames);
+    expect_root_pool_counts_equal(before.scanned, after.scanned);
+    auto const& a = before.global;
+    auto const& b = after.global;
+    KEXPECT_EQ(b.managed_pages, a.managed_pages);
+    KEXPECT_EQ(b.free_pages, a.free_pages);
+    KEXPECT_EQ(b.allocator_metadata_pages, a.allocator_metadata_pages);
+    KEXPECT_EQ(b.zone_descriptor_pages, a.zone_descriptor_pages);
+    KEXPECT_EQ(b.per_cpu_page_cache_reserve_pages, a.per_cpu_page_cache_reserve_pages);
+    KEXPECT_EQ(b.per_cpu_page_cache_reserve_objects, a.per_cpu_page_cache_reserve_objects);
+    KEXPECT_EQ(b.owner_pages, a.owner_pages);
+    KEXPECT_EQ(b.identity_pages, a.identity_pages);
+    KEXPECT_EQ(a.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(b.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(a.untracked_unreclaimable_pages, 0U);
+    KEXPECT_EQ(b.untracked_unreclaimable_pages, 0U);
+    KEXPECT_EQ(b.zone_count, a.zone_count);
+    for (size_t i = 0; i < a.owners.size(); ++i) {
+        KEXPECT_EQ(b.owners[i].pages, a.owners[i].pages);
+        KEXPECT_EQ(b.owners[i].objects, a.owners[i].objects);
+    }
+    for (size_t i = 0; i < a.firmware_reserves.size(); ++i) {
+        KEXPECT_EQ(b.firmware_reserves[i].pages, a.firmware_reserves[i].pages);
+        KEXPECT_EQ(b.firmware_reserves[i].objects, a.firmware_reserves[i].objects);
+    }
+    // The existing census permits a different cached-FREE partition only;
+    // inclusive free, every kind and all41 owner pages/objects stay exact.
+    for (size_t node = 0; node < before.node_count; ++node) expect_root_pool_counts_equal(before.nodes[node], after.nodes[node]);
+}
 
 extern "C" {
 extern char wos_selftest_text_write_target[];      // NOLINT(readability-identifier-naming)
@@ -433,18 +506,65 @@ KTEST(MM, PhysicalOwnerBalanceIsExactAcrossAllocationLifetime) {
 }
 
 KTEST(MM, PagemapPoolReusesZeroedRootPage) {
+    auto const* topology = ker::mod::acpi::numa::boot_topology();
+    KREQUIRE_TRUE(topology != nullptr && topology->node_count != 0);
+    bool const NUMA = topology->node_count > 1;
+    auto allocate_root = [&](virt::SelftestRootFactoryOutput& output) {
+        if (!NUMA) return virt::create_pagemap();
+        virt::SelftestRootFactoryOptions const options{};
+        auto* root = virt::selftest_create_pagemap(options, output);
+        KEXPECT_EQ(output.source, virt::SelftestRootAllocationSource::PHYSICAL_ALLOCATOR);
+        KEXPECT_TRUE(output.ordinary_allocator_called && !output.ordinary_failure_injected && !output.reserve_attempted &&
+                     output.control_registered);
+        return root;
+    };
+    auto release_root = [&](paging::PageTable* root) {
+        if (!NUMA) {
+            virt::release_pagemap(root);
+            return;
+        }
+        virt::SelftestRootReleaseOutput output{};
+        virt::selftest_release_pagemap(root, output);
+        KEXPECT_TRUE(output.owned_facts_valid && output.control_retired);
+        KEXPECT_EQ(output.kind, mm::PageKind::PAGE_TABLE);
+        KEXPECT_EQ(output.references, 1U);
+        KEXPECT_EQ(output.disposition, virt::SelftestRootReturnDisposition::PHYSICAL_RELEASED);
+        KEXPECT_FALSE(output.insertion.inserted);
+        KEXPECT_EQ(output.insertion.completed_sequence, 0U);
+    };
+    if (NUMA) {
+        prepare_root_pool_node_balance();
+        // Exercise ordinary allocation/control storage before taking the one
+        // fixed physical baseline. No full scan runs per root or in a loop.
+        for (unsigned i = 0; i < 2; ++i) {
+            virt::SelftestRootFactoryOutput output{};
+            auto* warm = allocate_root(output);
+            KREQUIRE_NE(warm, nullptr);
+            release_root(warm);
+        }
+        KREQUIRE_TRUE(collect_root_pool_node_balance(root_pool_node_balance.before));
+    }
     virt::PageTablePoolStatsSnapshot before{};
     virt::get_page_table_pool_stats_snapshot(before);
 
-    auto* first = virt::create_pagemap();
+    virt::SelftestRootFactoryOutput first_output{};
+    auto* first = allocate_root(first_output);
     KREQUIRE_NE(first, nullptr);
+    uint64_t const first_serial = virt::selftest_user_root_incarnation(first);
+    KEXPECT_NE(first_serial, 0U);
+    KEXPECT_EQ(phys::page_kind_get(first), mm::PageKind::PAGE_TABLE);
+    KEXPECT_EQ(phys::page_ref_get(first), 1U);
     first->entries.at(7).present = 1;
     first->entries.at(7).writable = 1;
     first->entries.at(7).frame = 0x12345;
-    virt::release_pagemap(first);
+    release_root(first);
 
-    auto* second = virt::create_pagemap();
+    virt::SelftestRootFactoryOutput second_output{};
+    auto* second = allocate_root(second_output);
     KREQUIRE_NE(second, nullptr);
+    KEXPECT_TRUE(virt::selftest_user_root_incarnation(second) > first_serial);
+    KEXPECT_EQ(phys::page_kind_get(second), mm::PageKind::PAGE_TABLE);
+    KEXPECT_EQ(phys::page_ref_get(second), 1U);
 
     paging::PageTableEntry zero_entry{};
     bool table_zero = true;
@@ -478,14 +598,28 @@ KTEST(MM, PagemapPoolReusesZeroedRootPage) {
 
     virt::PageTablePoolStatsSnapshot after{};
     virt::get_page_table_pool_stats_snapshot(after);
-    KEXPECT_TRUE(after.alloc_hits >= before.alloc_hits + 1);
-    KEXPECT_TRUE(after.releases >= before.releases + 1);
+    if (NUMA) {
+        KEXPECT_EQ(before.capacity, 64U);
+        KEXPECT_EQ(after.capacity, before.capacity);
+        KEXPECT_EQ(before.cached_pages, 0U);
+        KEXPECT_EQ(after.cached_pages, 0U);
+        KEXPECT_EQ(after.alloc_hits, before.alloc_hits);
+        KEXPECT_EQ(after.releases, before.releases);
+        KEXPECT_TRUE(after.alloc_misses >= before.alloc_misses + 2);
+    } else {
+        KEXPECT_TRUE(after.alloc_hits >= before.alloc_hits + 1);
+        KEXPECT_TRUE(after.releases >= before.releases + 1);
+    }
 
-    virt::release_pagemap(second);
+    release_root(second);
     phys::PhysicalBalanceSnapshot final_balance{};
     phys::get_physical_balance_snapshot(final_balance);
     KEXPECT_EQ(final_balance.identity_mismatch_pages, 0U);
     KEXPECT_EQ(final_balance.untracked_unreclaimable_pages, 0U);
+    if (NUMA) {
+        KREQUIRE_TRUE(collect_root_pool_node_balance(root_pool_node_balance.after));
+        expect_root_pool_node_balance();
+    }
 }
 
 KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {

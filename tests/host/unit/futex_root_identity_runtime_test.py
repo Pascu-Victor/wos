@@ -78,7 +78,7 @@ PHYS_TAIL = '\nnamespace fixture {\ninline ker::mod::mm::PageAllocator allocator
 
 RAW_PHYS = 'namespace fixture {\nstruct RawPage{ker::mod::mm::PhysicalPageOwner owner;ker::mod::mm::PageKind kind{ker::mod::mm::PageKind::NORMAL};uint32_t refs{1};};\ninline std::mutex raw_lock;inline std::map<void*,RawPage>raw_pages;inline std::vector<ker::mod::mm::paging::PageTable*>root_pool;\ninline void* raw_allocate(ker::mod::mm::PhysicalPageOwner owner){\n check(irq_depth==0,"raw allocator only outside mapping/bucket IRQ lock");\n if(owner==ker::mod::mm::PhysicalPageOwner::USER_ROOT_CONTROL&&fail_metadata.load())return nullptr;\n if(owner==ker::mod::mm::PhysicalPageOwner::PAGE_TABLE&&fail_root.load())return nullptr;\n auto*p=std::aligned_alloc(4096,4096);if(!p)return nullptr;std::memset(p,0,4096);\n {std::lock_guard l(raw_lock);check(!raw_pages.contains(p),"raw allocation not reused while owned");raw_pages.emplace(p,RawPage{owner});}\n if(owner==ker::mod::mm::PhysicalPageOwner::USER_ROOT_CONTROL){++metadata_allocations;if(auto*g=metadata_barrier){g->count_down();g->wait();}}\n return p;\n}\ninline void raw_free(void*p){if(!p)return;check(irq_depth==0,"raw free outside metadata/bucket lock");RawPage metadata{};{std::lock_guard l(raw_lock);auto i=raw_pages.find(p);check(i!=raw_pages.end(),"free exact owned raw allocation");if(i==raw_pages.end())return;metadata=i->second;check(metadata.refs==1,"raw physical page has sole final owner");raw_pages.erase(i);}if(metadata.owner==ker::mod::mm::PhysicalPageOwner::USER_ROOT_CONTROL)++metadata_frees;std::free(p);}\ninline void set_root_metadata(void*p,ker::mod::mm::PageKind kind,uint32_t refs){std::lock_guard l(raw_lock);raw_pages.at(p).kind=kind;raw_pages.at(p).refs=refs;}\nvoid free_pool();\n\n}\nnamespace ker::mod::mm::phys {\ninline auto page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner owner,std::string_view) -> void*{return fixture::raw_allocate(owner);}\ninline void page_free(void*p){fixture::raw_free(p);}\ninline auto page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner o,std::string_view)->void*{return fixture::raw_allocate(o);}\ninline auto page_alloc_full_overwrite_page_with_reclaim(PhysicalPageOwner o,std::string_view)->void*{return fixture::raw_allocate(o);}\ninline auto page_mark_kind(void*p,PageKind k)->bool{std::lock_guard l(fixture::raw_lock);auto i=fixture::raw_pages.find(p);if(i==fixture::raw_pages.end())return false;i->second.kind=k;return true;}\ninline auto page_reassign_owner(void*p,PhysicalPageOwner o)->bool{std::lock_guard l(fixture::raw_lock);auto i=fixture::raw_pages.find(p);if(i==fixture::raw_pages.end())return false;i->second.owner=o;return true;}\ninline auto page_kind_get(void*p)->PageKind{std::lock_guard l(fixture::raw_lock);auto i=fixture::raw_pages.find(p);return i==fixture::raw_pages.end()?PageKind::NORMAL:i->second.kind;}\ninline auto page_ref_get(void*p)->uint32_t{auto i=fixture::index_of(p);if(i<fixture::frames.size())return fixture::allocator.page_refcounts[i];std::lock_guard l(fixture::raw_lock);return fixture::raw_pages.at(p).refs;}\n}'
 
-TASK = '\n#pragma once\n#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\nnamespace ker::mod::sched::task {\nenum class WaitChannelKind { FUTEX };\nstruct Task {\n    uint64_t pid{},cpu{};\n    std::atomic<void*> futex_waiter{};\n    std::atomic<unsigned> task_readers{}, refs{1}, wakes{};\n    mm::paging::PageTable* pagemap{};\n    std::atomic<uint64_t> wake_at_us{};\n    std::atomic<bool> deferred_task_switch{}, channel{}, root_allowed{true};\n    uint64_t timeout_address=0x9000; timespec timeout{}; bool timeout_fault{};\n    uint64_t load_cpu() const { return cpu; }\n    void set_wait_channel(const char*,WaitChannelKind) { channel=true; }\n    void clear_wait_channel() { channel=false; }\n    bool try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) {\n        if(!root_allowed || pagemap==nullptr) return false;\n        ++task_readers; out=pagemap; return true;\n    }\n    void release_usercopy_pagemap() { fixture::check(task_readers.fetch_sub(1)>0,"Task root lease released once"); }\n    void release() { fixture::check(refs.fetch_sub(1)>1,"temporary lookup Task reference released once"); }\n};\n}\nnamespace fixture {\ninline thread_local ker::mod::sched::task::Task* current{};\ninline std::array<std::atomic<ker::mod::sched::task::Task*>,32> tasks{};\n}\n'
+TASK = '\n#pragma once\n#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\nnamespace ker::mod::sched::task {\nenum class WaitChannelKind { FUTEX };\nstruct Task {\n    uint64_t pid{},cpu{};\n    std::atomic<void*> futex_waiter{};\n    std::atomic<unsigned> task_readers{}, refs{1}, wakes{};\n    std::atomic<bool> exit_in_progress{};\n    bool has_exited{};\n    mm::paging::PageTable* pagemap{};\n    std::atomic<uint64_t> wake_at_us{};\n    std::atomic<bool> deferred_task_switch{}, channel{}, root_allowed{true};\n    uint64_t timeout_address=0x9000; timespec timeout{}; bool timeout_fault{};\n    uint64_t load_cpu() const { return cpu; }\n    void set_wait_channel(const char*,WaitChannelKind) { channel=true; }\n    void clear_wait_channel() { channel=false; }\n    bool try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) {\n        if(!root_allowed || pagemap==nullptr) return false;\n        ++task_readers; out=pagemap; return true;\n    }\n    void release_usercopy_pagemap() { fixture::check(task_readers.fetch_sub(1)>0,"Task root lease released once"); }\n    void release() { fixture::check(refs.fetch_sub(1)>1,"temporary lookup Task reference released once"); }\n};\n}\nnamespace fixture {\ninline thread_local ker::mod::sched::task::Task* current{};\ninline std::array<std::atomic<ker::mod::sched::task::Task*>,32> tasks{};\n}\n'
 
 SCHEDULER = "\n#pragma once\n#include <platform/sched/task.hpp>\nnamespace ker::mod::sched {\nenum class EventWakeDeferredSwitch { CANCEL };\ninline bool interrupts_enabled(){return fixture::irq_depth==0;}\ninline auto get_current_task() -> task::Task* { return fixture::current; }\ninline auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {\n    for(auto& slot:fixture::tasks) if(auto* t=slot.load();t!=nullptr && t->pid==pid) { ++t->refs; return t; }\n    return nullptr;\n}\ninline void wake_task_from_event_on_cpu(task::Task* t,uint64_t,EventWakeDeferredSwitch) {\n    ++t->wakes; t->deferred_task_switch=false; t->wake_at_us=0; t->clear_wait_channel();\n}\n}\n"
 
@@ -433,9 +433,12 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     )
     phys_h = kernel_path("platform/mm/phys.hpp").read_text()
     owner_h = kernel_path("platform/mm/page_alloc.hpp").read_text()
+    topology_h = kernel_path("platform/acpi/numa_topology.hpp").read_text()
+    topology_capacity = span(topology_h, "inline constexpr size_t MAX_NODES =", "\n", "actual-topology-capacity-for-initializer")
+    reserve_seams = ROOT_RESERVE_SEAMS.replace("using NodeId=uint16_t;", "using NodeId=uint16_t;\n" + topology_capacity, 1)
     common = (
         COMMON
-        + ROOT_RESERVE_SEAMS
+        + reserve_seams
         + "\nnamespace ker::mod::mm {\n"
         + definition(owner_h, "enum class PhysicalPageOwner", True)
         + "\n"
@@ -465,7 +468,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     vh = kernel_path("platform/mm/virt.hpp").read_text()
     declarations = "\n".join(
         definition(vh, a, True)
-        for a in ["struct UserPagePin {", "struct UserFutexIdentity {", "struct UserRootControlStats {"]
+        for a in ["struct UserPagePin {", "struct UserFutexIdentity {", "struct UserRootControlStats {", "enum class UserPagePinAttempt :"]
     )
     write(
         "platform/mm/virt.hpp",
@@ -474,6 +477,13 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         + """
     auto pin_user_page(PageTable*,vaddr_t,bool,UserPagePin&,bool) -> bool;
     auto pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> bool;
+    auto try_pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> UserPagePinAttempt;
+    // The actual exclusive-scope class also declares an unused private-fork
+    // adoption constructor. These root/frame vectors never supply such owner.
+    class ForkSourceOwner;
+    namespace detail {struct ForkSourceAccess {
+        static auto transfer(ForkSourceOwner&,PageTable*,size_t&,sched::task::Task*&) noexcept -> bool;
+    };}
     auto user_page_pin_still_mapped(const UserPagePin&) -> bool;
     auto user_page_pin_commit_write(const UserPagePin&) -> bool;
     auto capture_user_futex_identity(const UserPagePin&,vaddr_t,UserFutexIdentity&) -> bool;
@@ -490,7 +500,12 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     }\n""",
     )
     write("platform/sched/task.hpp", TASK)
-    write("platform/sched/scheduler.hpp", SCHEDULER)
+    write("platform/sched/scheduler.hpp", SCHEDULER + '''
+namespace ker::mod::sched {
+inline auto can_query_current_task() -> bool {return false;}
+inline void kern_yield() {fixture::check(false,"ordinary retry unsupported in root/frame fixture");}
+}
+''')
     for name in ["platform/sys/spinlock.hpp", "platform/mm/phys.hpp"]:
         write(name, '#pragma once\n#include "fixture-common.hpp"\n')
     write("platform/asm/cpu.hpp", "#pragma once\n")
@@ -601,6 +616,10 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         + "\n}\n"
     )
     public_anchors = [
+        # Compile the actual one-shot API and private policy globals too. These
+        # existing vectors explicitly remain pre-topology ordinary-compatibility
+        # contexts; initialized UMA/NUMA boot policy is exercised by root-route.
+        "auto initialize_page_table_pool_after_topology()",
         "auto create_pagemap()",
         "auto create_pagemap_may_fail()",
         "void release_pagemap(",
@@ -608,6 +627,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         "auto selftest_user_root_incarnation(",
         "auto pin_user_page(",
         "auto pin_user_page_for_task(",
+        "auto try_pin_user_page_for_task(",
         "auto user_page_pin_still_mapped(",
         "auto user_page_pin_commit_write(",
         "auto capture_user_futex_identity(",
@@ -670,6 +690,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         + increment
         + '\n}\n#include "actual-mm.cpp"\n'
         + MAP_SEAMS
+        + 'namespace ker::mod::sys::usercopy {\n// Existing root/frame vectors expose no ordinary executor context.\ninline auto ordinary_usercopy_retry_context(sched::task::Task*) -> bool {return false;}\n}\n'
         + 'namespace ker::mod::sys {\nclass SyscallPreparationScope {\n public:\n  explicit SyscallPreparationScope(sched::task::Task&) {}\n  auto ready() const -> bool { return false; }\n};\n}\nnamespace ker::mod::mm::virt {\ninline auto prepare_current_anonymous_user_page(sched::task::Task&,uint64_t,bool,\n const sys::SyscallPreparationScope&) -> int {\n fixture::check(false,"ordinary preparation unsupported in frame/root-only fixtures"); return -EWOULDBLOCK;\n}\n}\nnamespace ker::mod::sys::usercopy {\nauto copy_from_current_task_partial(sched::task::Task&task,uint64_t address,void*dst,size_t size)->CopyResult {\n bool const ok=copy_from_task(task,address,dst,size);return {ok?size:0,!ok};\n}\n}\n'
         + "\nnamespace ker::mod::sys::usercopy{\n"
         + user_bodies
@@ -710,8 +731,9 @@ def main() -> int:
     }
     try:
         selected = args.futex_source.resolve(strict=True)
-        compiler = Path(args.cxx).resolve(strict=True)
-        if not compiler.is_file() or not os.access(compiler, os.X_OK):
+        # Keep the selected C++ invocation alias while pin() holds its ELF target.
+        compiler = Path(args.cxx).absolute()
+        if not compiler.resolve(strict=True).is_file() or not os.access(compiler, os.X_OK):
             raise ValueError("--cxx must resolve to one executable Host ELF compiler")
         with compiler.open("rb") as executable:
             if executable.read(4) != b"\x7fELF":
@@ -731,6 +753,7 @@ def main() -> int:
                     "platform/mm/paging.hpp",
                     "platform/mm/virt.hpp",
                     "platform/mm/virt.opt.cpp",
+                    "platform/acpi/numa_topology.hpp",
                     "platform/mm/managed_huge_core.hpp",
                     "platform/mm/file_mapping_lifetime.hpp",
                     "platform/mm/file_mapping_lifetime.cpp",

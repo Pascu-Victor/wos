@@ -285,8 +285,22 @@ auto begin_user_pagemap_exclusive(PageTable* root) -> size_t {
     }
     return 0;
 }
+// Finite try endpoint for the composite; the separate4096 profile executes
+// the actual CAS body. No blocking begin occurs on this modeled Busy path.
+auto try_begin_user_pagemap_exclusive(PageTable* root) -> size_t {
+    EXPECT_EQ(root, runtime_root);
+    EXPECT_EQ(cow_depth + pin_depth + backend().preempt_depth, 0U);
+    EXPECT_EQ(publication_depth, 1U);
+    EXPECT_FALSE(host_range::interrupts);
+    if (host_range::reader_busy || host_range::exclusive || root_readers != 0 || user_pagemap_access_gates[0].teardown.load())
+        return USER_PAGEMAP_ACCESS_GATE_NONE;
+    auto const index = begin_user_pagemap_exclusive(root);
+    user_pagemap_access_gates[0].teardown.store(true);
+    return index;
+}
 void end_user_pagemap_exclusive(size_t index) {
     EXPECT_EQ(index, 0U);
+    user_pagemap_access_gates[0].teardown.store(false);
     EXPECT_TRUE(host_range::exclusive);
     host_range::exclusive = false;
 }

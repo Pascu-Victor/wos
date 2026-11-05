@@ -8,7 +8,10 @@ struct Task;
 }
 namespace ker::mod::mm::virt {
 class PreparedAnonymousSwapFork;
-}
+class ForkPrivateChildRoot;
+class ForkSourceOwner;
+struct ForkCopyRefusalWitness;
+}  // namespace ker::mod::mm::virt
 namespace ker::mod::sys {
 class SyscallPreparationScope;
 }
@@ -245,12 +248,20 @@ struct CurrentRangeRootAccess {
 };
 [[nodiscard]] auto acquire_current_range_root(sched::task::Task&, CurrentRangeRootAccess& empty,
                                               RangePrepareSite* failure_site = nullptr) noexcept -> Error;
-// Named ordinary fork acquisition retains the actual PUB and Task lease while
+// Ordinary acquisition retains the actual PUB and Task lease while
 // waiting with IF enabled/depth0. No striped reader/debt epoch crosses a wait.
+[[nodiscard]] auto acquire_current_ordinary_range_root(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                                       const ker::syscall::vmem::SharedVmemPublicationGuard&, CurrentRangeRootAccess& empty,
+                                                       RangePrepareSite* failure_site = nullptr) noexcept -> Error;
+// Recheck the same borrowed authority after the caller enters depth1.
+[[nodiscard]] auto validate_current_ordinary_range_root(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                                        const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                                        const CurrentRangeRootAccess&, RangePrepareSite* failure_site = nullptr) noexcept
+    -> Error;
+// Fork uses the same ordinary acquisition and validation protocol.
 [[nodiscard]] auto acquire_current_fork_range_root(sched::task::Task&, const sys::SyscallPreparationScope&,
                                                    const ker::syscall::vmem::SharedVmemPublicationGuard&, CurrentRangeRootAccess& empty,
                                                    RangePrepareSite* failure_site = nullptr) noexcept -> Error;
-// Recheck the same borrowed authority after the caller enters depth1.
 [[nodiscard]] auto validate_current_fork_range_root(sched::task::Task&, const sys::SyscallPreparationScope&,
                                                     const ker::syscall::vmem::SharedVmemPublicationGuard&, const CurrentRangeRootAccess&,
                                                     RangePrepareSite* failure_site = nullptr) noexcept -> Error;
@@ -278,11 +289,12 @@ void release_mremap_ps_policy(RootKey& owned) noexcept;
                                               const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> bool;
 // Only the instrumented current coordinator lends its actual Task-local lease.
 // This excluded adapter owns the original source exclusive, no normal reader.
-[[nodiscard]] auto copy_current_user_pagemap_exclusive(sched::task::Task&, paging::PageTable* source, paging::PageTable* child,
-                                                       const sys::SyscallPreparationScope&,
-                                                       const ker::syscall::vmem::SharedVmemPublicationGuard&, const RangeSplitSurvey&,
-                                                       PreparedTables&, numa::AllocationContext*, numa::AllocationResult*,
-                                                       virt::PreparedAnonymousSwapFork* = nullptr) noexcept -> int;
+[[nodiscard]] auto copy_current_user_pagemap_exclusive(
+    sched::task::Task&, paging::PageTable* source, paging::PageTable* child, const sys::SyscallPreparationScope&,
+    const ker::syscall::vmem::SharedVmemPublicationGuard&, const RangeSplitSurvey&, PreparedTables&, numa::AllocationContext*,
+    numa::AllocationResult*, virt::PreparedAnonymousSwapFork* = nullptr, virt::ForkCopyRefusalWitness* refusal = nullptr,
+    sched::task::Task* private_child = nullptr, virt::ForkPrivateChildRoot* authority = nullptr,
+    virt::ForkSourceOwner* source_owner = nullptr) noexcept -> int;
 // At most16 cursor steps/48 raw hierarchy loads; owns COW->pin only internally.
 [[nodiscard]] auto survey_range_chunk(paging::PageTable*, RangeSplitCursor&, RangeSurveyMode, SplitPlanStorage*,
                                       RangePrepareSite* failure_site = nullptr) noexcept -> Error;

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Execute actual fork error diagnostics with lock, queue and journal seams."""
+"""Execute actual fork recorders and attempt-entry reset with finite Host ports.
+
+Copy predicate capture is exercised by the managed/fork fixtures. This fixture
+checks copied scalar fidelity and deferred emission, not native MM ownership.
+"""
 import os
 from pathlib import Path
 import re
@@ -12,6 +16,7 @@ from exec_trace_ownership_test import block, function
 ROOT = Path(os.environ.get("WOS_FORK_DIAGNOSTICS_ROOT", Path(__file__).resolve().parents[3]))
 PROCESS_SOURCE = Path(os.environ.get("WOS_FORK_DIAGNOSTICS_SOURCE", ROOT / "modules/kern/src/syscalls_impl/process/process.cpp"))
 MANAGED_HUGE_SOURCE = PROCESS_SOURCE.parents[2] / "platform/mm/managed_huge.hpp"
+VIRT_SOURCE = PROCESS_SOURCE.parents[2] / "platform/mm/virt.hpp"
 STAGES = (
     'pressure-admission', 'kernel-stack', 'task', 'name', 'vfs-rules', 'credentials',
     'pagemap', 'vm-snapshot', 'thread', 'per-cpu', 'fd-table', 'child-publication',
@@ -80,6 +85,15 @@ SchedulerTraceStats get_scheduler_trace_stats(uint64_t cpu) {
 namespace ker::mod::mm::huge {
 GEOMETRY_TYPES
 }
+namespace ker::mod::mm::virt {
+COPY_TYPES
+}
+namespace ker::mod::sys {
+struct SyscallPreparationScope { bool prepared; bool ready() const { return prepared; } };
+}
+namespace ker::syscall::vmem {
+struct LegacyFileForkPreparation { enum class MatchConflict { None, RegistryBusy }; };
+}
 namespace ker::mod::perf { enum class WkiPerfLocalProcOp { FORK }; }
 #define WOS_PERF_CALLSITE() 123ULL
 namespace ker::syscall::process {
@@ -88,7 +102,8 @@ struct process_log {
   assert(!held);
   bool const refusal=std::strstr(format,"fork_refusal_v1")==format;
   bool const geometry=std::strstr(format,"fork_geometry_refusal_v1")==format;
-  if(refusal || geometry){assert(diagnostic_owners==0);if(discard_refusal_log)return;}
+  bool const copy=std::strstr(format,"fork_copy_refusal_v1")==format;
+  if(refusal || geometry || copy){assert(diagnostic_owners==0);if(discard_refusal_log)return;}
   ++logs; calls.emplace_back("journal");
   char data[512]; va_list args; va_start(args,format);
   int length=vsnprintf(data,sizeof(data),format,args); va_end(args);
@@ -98,6 +113,15 @@ struct process_log {
 };
 namespace detail {
 TRANSLATOR
+int actual_attempt_entry(ker::mod::sched::task::Task& actor, bool ready,
+ ForkVmFailurePoint* failure_point, ker::mod::mm::huge::RangePrepareWitness* geometry_failure,
+ ker::mod::mm::virt::ForkCopyRefusalWitness* copy_failure,
+ ker::mod::mm::virt::ForkSourceAdmission* source_admission=nullptr) {
+ ker::mod::sys::SyscallPreparationScope preparation{ready};
+ ker::syscall::vmem::LegacyFileForkPreparation::MatchConflict* conflict=nullptr;
+ACTUAL_ATTEMPT_ENTRY_PREFIX
+ return 0;
+}
 }
 DIAGNOSTIC
 REFUSAL_DIAGNOSTIC
@@ -272,6 +296,93 @@ void geometry_refusal_cases() {
  }
  allow_context=true;diagnostic_preempt=0;
 }
+void copy_refusal_cases() {
+ using namespace ker::mod;
+ using Recorder=ker::syscall::process::ForkRefusalDiagnostic;
+ using Point=ker::syscall::process::detail::ForkVmFailurePoint;
+ using Site=mm::virt::ForkCopyRefusalSite;
+ using ChildSite=mm::virt::UnpublishedRootRefusalSite;
+ using Witness=mm::virt::ForkCopyRefusalWitness;
+ // Copy actual scalar output while its caller-owned lifetime is still present.
+ // Later overwrite/context loss must not change the deferred, owner-free record.
+ for(bool child:{false,true}) {
+  sched::task::Task parent;sched::diagnostic_current=&parent;
+  logs=0;messages.clear();calls.clear();allow_context=true;diagnostic_irq=true;diagnostic_preempt=0;
+  {
+   Recorder diagnostic{parent.pid};DiagnosticOwner owner;
+   {
+    Witness witness{};witness.valid=true;witness.raw_status=-EINVAL;
+    witness.site=child?Site::ChildRoot:Site::SplitCommit;
+    witness.child.valid=child;witness.child.site=child?ChildSite::ReaderAdmissionRefused:ChildSite::None;
+    witness.detail=child?0:static_cast<uint32_t>(mm::huge::Error::Invalid);
+    diagnostic.capture(parent,"vm-snapshot",-EINVAL,-ENOMEM,static_cast<uint32_t>(Point::Copy),1,"coordinator-return",nullptr,&witness);
+    witness={};assert(logs==0);
+   }
+   parent.pid=0;parent.type=sched::task::TaskType::DAEMON;allow_context=false;
+  }
+  assert(logs==2 && messages.size()==2 && diagnostic_owners==0 && !diagnostic_irq);
+  assert((calls==std::vector<std::string>{"journal","journal"}));
+  assert(messages[0]=="fork_refusal_v1 stage=vm-snapshot raw=-22 public=-12 parent=8589934599 point=11 prep=1 if=1 preempt=0 current=1 type=1 state=1 transition=0 accounted=1 context=coordinator-return");
+  assert(messages[1]=="fork_copy_refusal_v1 parent=8589934599 raw=-22 public=-12 point=11 site="+
+   std::to_string(static_cast<unsigned>(child?Site::ChildRoot:Site::SplitCommit))+" child_valid="+(child?"1":"0")+
+   " child_site="+std::to_string(static_cast<unsigned>(child?ChildSite::ReaderAdmissionRefused:ChildSite::None))+
+   " user_slot=65535 detail="+std::to_string(child?0:static_cast<uint32_t>(mm::huge::Error::Invalid)));
+ }
+ // Null, invalid, wrong-phase and mismatched-raw witnesses cannot emit. Every
+ // later negative capture clears an earlier Copy witness before deciding anew.
+ for(unsigned mode=0;mode!=6;++mode) {
+  sched::task::Task parent;sched::diagnostic_current=&parent;
+  logs=0;messages.clear();allow_context=true;diagnostic_irq=true;diagnostic_preempt=0;
+  {
+   Recorder diagnostic{parent.pid};DiagnosticOwner owner;
+   Witness witness{};witness.valid=true;witness.raw_status=-EINVAL;witness.site=Site::ChildRoot;
+   witness.child.valid=true;witness.child.site=ChildSite::UserEntryNonzero;witness.child.user_slot=17;
+   if(mode>=4)diagnostic.capture(parent,"vm-snapshot",-EINVAL,-ENOMEM,11,1,"coordinator-return",nullptr,&witness);
+   if(mode==1 || mode==4)witness.valid=false;
+   if(mode==3)witness.raw_status=-EAGAIN;
+   auto const point=mode==2 || mode==5?Point::LegacyMatch:Point::Copy;
+   diagnostic.capture(parent,"vm-snapshot",-EINVAL,-ENOMEM,static_cast<uint32_t>(point),1,"coordinator-return",nullptr,mode==0?nullptr:&witness);
+   assert(logs==0);allow_context=false;
+  }
+  assert(logs==1 && messages.size()==1 && messages[0].starts_with("fork_refusal_v1 "));
+ }
+ // No context query or log on an unarmed success, even with a valid witness.
+ {
+  sched::task::Task parent;logs=0;messages.clear();allow_context=false;
+  Recorder diagnostic{parent.pid};Witness witness{};witness.valid=true;witness.raw_status=0;
+  diagnostic.capture(parent,"success",0,0,11,1,"coordinator-return",nullptr,&witness);
+ }
+ assert(logs==0 && messages.empty());
+ // Execute only the actual attempt-entry prefix through its earliest context
+ // refusal. Controlled preparation/context ports are not the full coordinator.
+ {
+  sched::task::Task parent;Witness witness{};witness.valid=true;witness.site=Site::CowWalk;
+  witness.raw_status=-EINVAL;witness.child={true,ChildSite::UserEntryNonzero,17};witness.detail=123;
+  mm::huge::RangePrepareWitness geometry{};geometry.valid=true;Point point=Point::Copy;
+  allow_context=false;
+  auto source_admission=mm::virt::ForkSourceAdmission::Busy;
+  assert(ker::syscall::process::detail::actual_attempt_entry(parent,false,&point,&geometry,&witness,&source_admission)==-EWOULDBLOCK);
+  assert(source_admission==mm::virt::ForkSourceAdmission::NotAttempted);
+  assert(!witness.valid && witness.site==Site::None && witness.raw_status==0 && !witness.child.valid &&
+   witness.child.site==ChildSite::None && witness.child.user_slot==UINT16_MAX && witness.detail==0);
+  assert(!geometry.valid && point==Point::Context);
+ }
+ // Every representable field fits its own existing512B journal message.
+ {
+  sched::task::Task parent;parent.pid=UINT64_MAX;sched::diagnostic_current=&parent;
+  logs=0;messages.clear();allow_context=true;diagnostic_irq=true;diagnostic_preempt=UINT32_MAX;
+  {
+   Recorder diagnostic{parent.pid};DiagnosticOwner owner;Witness witness{};
+   witness.valid=true;witness.raw_status=INT32_MIN;witness.site=static_cast<Site>(UINT8_MAX);
+   witness.child={true,static_cast<ChildSite>(UINT8_MAX),UINT16_MAX};witness.detail=UINT32_MAX;
+   diagnostic.capture(parent,"vm-snapshot",INT32_MIN,INT32_MIN,11,UINT32_MAX,"coordinator-return",nullptr,&witness);
+   allow_context=false;
+  }
+  assert(logs==2 && messages.size()==2 && messages[0].size()<512 && messages[1].size()<512);
+  assert(messages[1]=="fork_copy_refusal_v1 parent=18446744073709551615 raw=-2147483648 public=-2147483648 point=11 site=255 child_valid=1 child_site=255 user_slot=65535 detail=4294967295");
+ }
+ allow_context=true;diagnostic_preempt=0;
+}
 int main() {
  using namespace ker::mod; using ker::syscall::process::finish;
  auto& pool=mm::phys::kernel_stack_pool; sched::task::Task parent;
@@ -332,7 +443,8 @@ int main() {
  assert(message.size()<512 && message.ends_with("gc_deferred=18446744073709551615"));
  refusal_cases();
  geometry_refusal_cases();
- puts("PASS actual fork failure getter/helper/finish: 13 stages + 6 dynamic VM cases, errno/bytes, success silence, lock ordering, CPU bounds, 512-byte journal bound");
+ copy_refusal_cases();
+ puts("PASS actual fork failure getter/helper/finish/Copy recorder and attempt-entry reset: 13 stages + 6 dynamic VM cases, errno/bytes, deferred scalar fidelity, success silence, lock ordering, CPU bounds, 512-byte journal bound");
 }
 '''
 
@@ -340,17 +452,19 @@ int main() {
 def validate_dynamic_vm_route(fork):
     """Keep the one explicit dynamic status alongside the exact literal labels."""
     exact = re.sub(r"\s+", "", fork)
-    call = "detail::prepare_fork_vm_snapshot(*parent,*child,preparation,EAGER_COPY?&fork_placement:nullptr,EAGER_COPY?&fork_page:nullptr,&point,&geometry_failure)"
+    call = "detail::prepare_fork_vm_snapshot(*parent,*child,preparation,EAGER_COPY?&fork_placement:nullptr,EAGER_COPY?&fork_page:nullptr,&point,&geometry_failure,&copy_failure,&private_child_authority)"
     result = 'returnfinish_fork(detail::public_fork_vm_error(point,FORK_VM_ERROR),0,"vm-snapshot");'
     assert exact.count("detail::ForkVmFailurePointpoint{};") == 1
     assert exact.count("mm::huge::RangePrepareWitnessgeometry_failure{};") == 1
-    assert exact.count('refusal.capture(*parent,"vm-snapshot",FORK_VM_ERROR,detail::public_fork_vm_error(point,FORK_VM_ERROR),static_cast<uint32_t>(point),preparation.ready()?1U:0U,"coordinator-return",&geometry_failure);') == 1
+    assert exact.count("mm::virt::ForkCopyRefusalWitnesscopy_failure{};") == 1
+    assert exact.count('refusal.capture(*parent,"vm-snapshot",FORK_VM_ERROR,detail::public_fork_vm_error(point,FORK_VM_ERROR),static_cast<uint32_t>(point),preparation.ready()?1U:0U,"coordinator-return",&geometry_failure,&copy_failure);') == 1
     assert exact.count(call) == 1
     assert exact.count(result) == 1
     cursor = 0
     for token in ("sys::SyscallPreparationScopepreparation(*parent);", "detail::ForkVmFailurePointpoint{};",
                   "mm::huge::RangePrepareWitnessgeometry_failure{};",
-                  "intconstFORK_VM_ERROR=" + call, "if(FORK_VM_ERROR!=0)",
+                  "mm::virt::ForkCopyRefusalWitnesscopy_failure{};",
+                  "intconstFORK_VM_ERROR=" + call, "private_child_authority.invalidate();", "if(FORK_VM_ERROR!=0)",
                   "shm_cleanup_for_task(child)", "release_file_mmap_ranges_for_pagemap(child->pagemap)",
                   "release_lazy_vmem_ranges(*child)", "destroy_user_space(child->pagemap", "deletechild;", result):
         position = exact.find(token, cursor)
@@ -381,8 +495,34 @@ def main():
     assert bound is not None
     geometry_types += bound.group(0)
     source = source.replace('GEOMETRY_TYPES', geometry_types)
+    virt = VIRT_SOURCE.read_text()
+    copy_types = ''
+    for name in ('UnpublishedRootRefusalSite', 'ForkCopyRefusalSite', 'ForkSourceAdmission'):
+        copy_types += block(virt, r'^enum class ' + name + ' :') + ';\n'
+    for name in ('UnpublishedRootRefusal', 'ForkCopyRefusalWitness'):
+        copy_types += block(virt, r'^struct ' + name + r' \{') + ';\n'
+    # Keep the actual public POD bounds in the compiled extraction.
+    copy_bounds = [line for line in virt.splitlines() if line.startswith('static_assert(') and
+                   any(name in line for name in ('UnpublishedRootRefusal', 'ForkCopyRefusalWitness'))]
+    assert len(copy_bounds) == 3
+    source = source.replace('COPY_TYPES', copy_types + '\n'.join(copy_bounds))
     translator = block(process, r'^enum class ForkVmFailurePoint :') + ';\n' + function(process, 'public_fork_vm_error')
+    point_bound = 'static_assert(static_cast<uint32_t>(ForkVmFailurePoint::Copy) == 11);'
+    assert process.count(point_bound) == 1
+    translator += '\n' + point_bound
     source = source.replace('TRANSLATOR', translator)
+    once = function(process, 'prepare_fork_vm_snapshot_once')
+    attempt_prefix = once[once.index('{') + 1:once.index('    // Every fallible owner')]
+    reset_copy = 'if (copy_failure != nullptr) *copy_failure = {};'
+    assert attempt_prefix.count(reset_copy) == 1
+    once_exact = re.sub(r'\s+', '', once)
+    assert once_exact.count('MatchConflict*conflict=nullptr,ker::mod::mm::virt::ForkCopyRefusalWitness*copy_failure=nullptr,ker::mod::mm::virt::ForkPrivateChildRoot*private_child_authority=nullptr,ker::mod::mm::virt::ForkSourceAdmission*source_admission=nullptr)') == 1
+    assert once_exact.count('eager_context,empty_result,swap,copy_failure);') == 2
+    assert 'if(private_child_authority!=nullptr)' in once_exact
+    assert 'actor,child,*private_child_authority,source_owner,preparation' in once_exact
+    wrapper = re.sub(r'\s+', '', function(process, 'prepare_fork_vm_snapshot'))
+    assert wrapper.count('prepare_fork_vm_snapshot_once(actor,child,preparation,eager_context,empty_result,&point,geometry_failure,&conflict,copy_failure,private_child_authority,&source_admission)') == 1
+    source = source.replace('ACTUAL_ATTEMPT_ENTRY_PREFIX', attempt_prefix)
     recorder = block(process, r'^struct ForkRefusalDiagnostic \{') + ';'
     source = source.replace('REFUSAL_DIAGNOSTIC', recorder)
     source = source.replace('DIAGNOSTIC', function(process, 'note_fork_failure'))
@@ -398,14 +538,26 @@ def main():
         early = capture_body[:-1] + destructor[destructor.index('{') + 1:-1] + '}'
         geometry_emit = block(destructor, r'^        if \(geometry.valid\)')
         early_geometry = capture_body[:-1] + geometry_emit + '}'
+        copy_emit = block(destructor, r'^        if \(copy.valid\)')
+        early_copy = capture_body[:-1] + copy_emit + '}'
+        copy_site = 'static_cast<unsigned>(copy.site)'
+        copy_phase = 'vm_point == 11'
+        copy_status = ' && copy_failure->raw_status == raw'
         site = 'static_cast<unsigned>(geometry.site)'
         assert source.count(site) == 1 and source.count(geometry_emit) == 1
+        assert source.count(copy_emit) == source.count(copy_site) == source.count(copy_phase) == source.count(copy_status) == source.count(reset_copy) == 1
         variants = {'actual': source,
                     'suppress-refusal': source.replace(destructor, destructor[:destructor.index('{')] + '{}', 1),
                     'early-refusal': source.replace(capture_body, early, 1),
                     'suppress-geometry': source.replace(geometry_emit, '', 1),
                     'mislabel-geometry': source.replace(site, 'static_cast<unsigned>(ker::mod::mm::huge::RangePrepareSite::Unreported)', 1),
-                    'early-geometry': source.replace(capture_body, early_geometry, 1)}
+                    'early-geometry': source.replace(capture_body, early_geometry, 1),
+                    'suppress-copy': source.replace(copy_emit, '', 1),
+                    'mislabel-copy': source.replace(copy_site, 'static_cast<unsigned>(ker::mod::mm::virt::ForkCopyRefusalSite::None)', 1),
+                    'early-copy': source.replace(capture_body, early_copy, 1),
+                    'capture-noncopy': source.replace(copy_phase, 'true', 1),
+                    'accept-stale-copy-status': source.replace(copy_status, '', 1),
+                    'retain-prior-attempt-copy': source.replace(reset_copy, '(void)copy_failure;', 1)}
         for label, content in variants.items():
             if label != 'actual': assert content != source
             cpp, binary = temp / (label + '.cpp'), temp / label

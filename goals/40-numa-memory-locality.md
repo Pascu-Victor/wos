@@ -23,6 +23,17 @@ distances cannot establish physical remote-memory latency. Large-page mapping
 and TLB-sensitive measurements remain separate requirements. All other
 acceptance criteria retain their scope.
 
+User-directed performance acceptance, 2026-11-05: the owner explicitly directed
+"mark the current campain as sufficient in performance" after deciding that
+chasing the remaining roughly 0.3 percentage-point margin was not worthwhile.
+Criterion 10's performance requirement is accepted by that decision; no further
+optimization or ten-pair campaign is required for this execution. Preserve the
+original numeric results and failed campaign records. This decision does not
+turn C107's 94.6961-percent fork/COW result into a 95-percent pass, establish a
+new ten-pair result for the current kernel, or claim the intermittent timeout
+fixed. Scheduler fairness, task affinity and the other correctness requirements
+retain their scope.
+
 The user authorizes agent-run WOS qualification through `bin/wos-cluster
 --no-setup` and isolated `bin/wos-ktest --no-setup`; root setup is unnecessary.
 Keep one disposable topology, a 20 GiB disposable-storage budget and at least

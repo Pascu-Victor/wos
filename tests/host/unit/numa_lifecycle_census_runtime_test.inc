@@ -13,6 +13,26 @@
 #include <vector>
 namespace fixture {
 unsigned checks{}, lock_depth{}, copy_pins{}, provider_calls{}, copies{}, progress{}, tail_events{};
+enum class ReturnStage { ENTRY, COLLECT, COPYOUT, NONE };
+enum class ReturnFault {
+    NONE,
+    NOT_YIELD,
+    CHANNEL,
+    KIND,
+    VOLUNTARY,
+    PROXY_ID,
+    WANTS_BLOCK,
+    TRANSITION,
+    CREDENTIAL,
+    ROOT_SERIAL,
+    RESOURCE,
+    PROXY_TASK,
+    NULL_ROOT
+};
+ReturnStage return_stage{ReturnStage::NONE};
+ReturnFault return_fault{ReturnFault::NONE};
+unsigned return_physical_at{}, return_injections{}, successful_copyouts{};
+void inject_return_state(ReturnStage stage);
 const void* tail_target{};
 void observe_tail(unsigned phase);
 void after_native_unlock();
@@ -130,6 +150,7 @@ struct Credentials {
 namespace ker::mod::sched::task {
 enum class TaskType { PROCESS, DAEMON };
 enum class TaskState { ACTIVE, DEAD };
+/* @WAIT_CHANNEL_KIND@ */
 struct Task {
     uint64_t pid{50}, syscall_account_start_us{1};
     char* name{};
@@ -144,7 +165,12 @@ struct Task {
         }
     }
     TaskType type{TaskType::PROCESS};
-    bool is_thread{}, wki_proxy_task{}, deferred_task_switch{}, wants_block{};
+    bool is_thread{}, wki_proxy_task{}, deferred_task_switch{}, yield_switch{}, wants_block{};
+    void* wait_channel{};
+    WaitChannelKind wait_channel_kind{WaitChannelKind::NONE};
+    std::atomic<bool> voluntary_block{};
+    uint64_t wki_proxy_task_id{};
+    auto is_voluntary_blocked() const -> bool { return voluntary_block.load(std::memory_order_acquire); }
     std::atomic<TaskState> state{TaskState::ACTIVE};
     std::atomic<bool> scheduler_transition_active{}, shares_user_pagemap{};
     std::atomic<uint64_t> resource_thread_owners{}, resource_cpu_threads{};
@@ -206,6 +232,54 @@ ker::vfs::SelftestFdCensus descriptors{};
 ker::mod::mm::file_mapping::LifetimeRetirementSnapshot executor{};
 ker::test::numa_lifecycle::NativeDebtSnapshot native{};
 ker::test::numa_lifecycle::RegistrySnapshot registry{};
+void inject_return_state(ReturnStage stage) {
+    if (return_stage != stage || (stage == ReturnStage::COLLECT && physical_calls != return_physical_at)) return;
+    check(lock_depth == 0 && copy_pins == 0 && current != nullptr);
+    return_stage = ReturnStage::NONE;
+    ++return_injections;
+    auto& a = *current;
+    a.deferred_task_switch = a.yield_switch = true;
+    switch (return_fault) {
+        case ReturnFault::NONE:
+            break;
+        case ReturnFault::NOT_YIELD:
+            a.yield_switch = false;
+            break;
+        case ReturnFault::CHANNEL:
+            a.wait_channel = reinterpret_cast<void*>(1);
+            break;
+        case ReturnFault::KIND:
+            a.wait_channel_kind = ker::mod::sched::task::WaitChannelKind::GENERIC;
+            break;
+        case ReturnFault::VOLUNTARY:
+            a.voluntary_block.store(true);
+            break;
+        case ReturnFault::PROXY_ID:
+            a.wki_proxy_task_id = 1;
+            break;
+        case ReturnFault::WANTS_BLOCK:
+            a.wants_block = true;
+            break;
+        case ReturnFault::TRANSITION:
+            a.scheduler_transition_active.store(true);
+            break;
+        case ReturnFault::CREDENTIAL:
+            privileged = false;
+            break;
+        case ReturnFault::ROOT_SERIAL:
+            ++root_serial;
+            break;
+        case ReturnFault::RESOURCE:
+            a.resource_exec_admission_closed = true;
+            break;
+        case ReturnFault::PROXY_TASK:
+            a.wki_proxy_task = true;
+            break;
+        case ReturnFault::NULL_ROOT:
+            a.pagemap = nullptr;
+            break;
+    }
+}
 }  // namespace fixture
 namespace ker::test::lifecycle60 {
 constexpr size_t CENSUS_CPUS = 8;
@@ -532,6 +606,8 @@ auto copy_to_task_mapped(ker::mod::sched::task::Task&, uint64_t address, const v
     ++fixture::copy_pins;
     std::memcpy(reinterpret_cast<void*>(address), in, bytes);
     --fixture::copy_pins;
+    ++fixture::successful_copyouts;
+    fixture::inject_return_state(fixture::ReturnStage::COPYOUT);
     return true;
 }
 auto copy_to_task(ker::mod::sched::task::Task&, uint64_t, const void*, size_t) {
@@ -630,7 +706,9 @@ auto selftest_snapshot_with_mm(Snapshot& out, Workspace& work, ker::test::numa_l
     fixture::outside();
     mm = fixture::mm;
     capture.before = capture.after = {mm.version_end, mm.inflight, mm.valid != 0};
-    return snapshot(out, work, max);
+    auto result = snapshot(out, work, max);
+    fixture::inject_return_state(fixture::ReturnStage::COLLECT);
+    return result;
 }
 }  // namespace ker::mod::mm::numa::balance
 /* @HANDLER@ */
@@ -660,6 +738,9 @@ ker::mod::sched::task::Task actor;
 Report output;
 Request request;
 void reset() {
+    return_stage = ReturnStage::NONE;
+    return_fault = ReturnFault::NONE;
+    return_physical_at = return_injections = successful_copyouts = 0;
     reclaim_results = {};
     reclaim_effects = {};
     reclaim_calls.clear();
@@ -705,6 +786,12 @@ void reset() {
     actor.resource_exec_admission_closed = false;
     actor.owned_unpublished_process.store(nullptr);
     actor.scheduler_transition_active.store(false);
+    actor.deferred_task_switch = actor.yield_switch = actor.wants_block = actor.wki_proxy_task = false;
+    actor.wait_channel = nullptr;
+    actor.wait_channel_kind = ker::mod::sched::task::WaitChannelKind::NONE;
+    actor.voluntary_block.store(false);
+    actor.wki_proxy_task_id = 0;
+    actor.pagemap = &actor.root;
     actor.pending_wki_submissions = nullptr;
     storage = {};
     storage.sequence = 1;
@@ -770,6 +857,92 @@ void begin() {
     ++now;
     accept(Phase::BEGIN);
     ++now;
+}
+void arm_return_state(ReturnStage stage, ReturnFault fault) {
+    return_stage = stage;
+    return_fault = fault;
+    return_physical_at = physical_calls + 2;
+    if (stage == ReturnStage::ENTRY) inject_return_state(stage);
+}
+void return_yield_cases() {
+    for (auto stage : {ReturnStage::ENTRY, ReturnStage::COLLECT, ReturnStage::COPYOUT}) {
+        for (auto phase : {Phase::PREPARE, Phase::BEGIN, Phase::END}) {
+            reset();
+            if (phase == Phase::BEGIN) accept(Phase::PREPARE);
+            if (phase == Phase::END) begin();
+            unsigned const before_physical = physical_calls, before_copyouts = successful_copyouts;
+            arm_return_state(stage, ReturnFault::NONE);
+            auto const accepted = call(phase);
+            if (accepted != 0 || output.header.outcome != static_cast<uint64_t>(Outcome::ACCEPT) || output.header.coverage != 255) {
+                std::fprintf(stderr, "channel-free return-yield acceptance oracle failed stage=%u phase=%u result=%lld\n",
+                             static_cast<unsigned>(stage), static_cast<unsigned>(phase), static_cast<long long>(accepted));
+                check(false);
+            }
+            check(return_injections == 1 && return_stage == ReturnStage::NONE);
+            check(actor.deferred_task_switch && actor.yield_switch && actor.wait_channel == nullptr);
+            check(actor.wait_channel_kind == ker::mod::sched::task::WaitChannelKind::NONE && !actor.is_voluntary_blocked() &&
+                  actor.wki_proxy_task_id == 0);
+            check(physical_calls == before_physical + 2 && successful_copyouts == before_copyouts + 1);
+            check(output.header.reason == static_cast<uint64_t>(Reason::NONE) && output.mm.valid == 1);
+            check(ker::test::lifecycle60::complete(plain.owner_a) && ker::test::lifecycle60::complete(plain.owner_b));
+            check(plain.owner_a.executor_cookie == session.cookie && plain.owner_b.executor_cookie == session.cookie);
+            check(output.totals.task_blocks == storage.task.live_blocks && output.totals.file_blocks == storage.file.live_blocks);
+            check((session.flags & SESSION_POISONED) == 0 && (session.flags & SESSION_PREPARED));
+            check(phase != Phase::BEGIN || (session.flags & SESSION_BASELINE));
+            check(phase != Phase::END || (session.flags & SESSION_ENDED));
+            check(lock_depth == 0 && copy_pins == 0);
+        }
+        for (auto fault : {ReturnFault::NOT_YIELD, ReturnFault::CHANNEL, ReturnFault::KIND, ReturnFault::VOLUNTARY, ReturnFault::PROXY_ID,
+                           ReturnFault::WANTS_BLOCK, ReturnFault::TRANSITION, ReturnFault::CREDENTIAL, ReturnFault::ROOT_SERIAL,
+                           ReturnFault::RESOURCE, ReturnFault::PROXY_TASK, ReturnFault::NULL_ROOT}) {
+            reset();
+            begin();
+            auto const before_flags = session.flags;
+            unsigned const before_physical = physical_calls, before_copyouts = successful_copyouts;
+            output = {};
+            arm_return_state(stage, fault);
+            auto const refused = call(Phase::END);
+            if (refused != -EPERM) {
+                std::fprintf(stderr, "blocked deferred refusal oracle failed stage=%u fault=%u result=%lld\n", static_cast<unsigned>(stage),
+                             static_cast<unsigned>(fault), static_cast<long long>(refused));
+                check(false);
+            }
+            check(return_injections == 1 && actor.deferred_task_switch && actor.yield_switch == (fault != ReturnFault::NOT_YIELD));
+            check((session.flags & SESSION_ENDED) == 0 && lock_depth == 0 && copy_pins == 0);
+            if (stage == ReturnStage::ENTRY && fault != ReturnFault::ROOT_SERIAL) {
+                check(successful_copyouts == before_copyouts && physical_calls == before_physical && session.flags == before_flags);
+                check(output.header.bytes == 0);
+            } else {
+                check(successful_copyouts == before_copyouts + 1 && (session.flags & SESSION_POISONED));
+                check(physical_calls == before_physical + (stage == ReturnStage::ENTRY ? 0 : 2));
+                if (stage == ReturnStage::COPYOUT) {
+                    // The report was copied before identity refusal; the syscall result still rejects it.
+                    check(output.header.outcome == static_cast<uint64_t>(Outcome::ACCEPT) && output.header.coverage == 255);
+                } else {
+                    check(output.header.outcome == static_cast<uint64_t>(Outcome::REFUSE) && output.header.coverage == 0 &&
+                          output.header.reason == static_cast<uint64_t>(Reason::ROOT_CHANGED));
+                }
+            }
+        }
+    }
+    // A permitted return-yield never substitutes for owner, physical, baseline or deadline proofs.
+    for (unsigned axis = 0; axis < 4; ++axis) {
+        reset();
+        begin();
+        arm_return_state(ReturnStage::ENTRY, ReturnFault::NONE);
+        if (axis == 0) mounts.complete = false;
+        if (axis == 1) physical_churn = true;
+        if (axis == 2) ++storage.file.live_blocks;
+        if (axis == 3) now = session.deadline;
+        check(call(Phase::END) == 0 && output.header.coverage == 0);
+        check(output.header.outcome == static_cast<uint64_t>(axis == 3 ? Outcome::REFUSE : Outcome::WAIT));
+        check(output.header.reason == static_cast<uint64_t>(axis == 0   ? Reason::OWNER_CHURN
+                                                            : axis == 1 ? Reason::PHYSICAL
+                                                            : axis == 2 ? Reason::BASELINE_DEBT
+                                                                        : Reason::DEADLINE));
+        check(actor.deferred_task_switch && actor.yield_switch && (session.flags & SESSION_ENDED) == 0);
+    }
+    reset();
 }
 // Finite provider data exercises the COMPLETE actual handler below. Real
 // PageAllocator/scanner transfers are covered separately by coherent-census.
@@ -1008,6 +1181,7 @@ int main() {
     check(physical_calls == 6);
     check(lock_depth == 0 && copy_pins == 0);
     endpoint_attempt_cases();
+    return_yield_cases();
     mremap_policy_presence_census_case();
     physical_cache_partition_cases();
     reset();

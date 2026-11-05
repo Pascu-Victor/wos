@@ -99,11 +99,14 @@ class StableUserPage {
 };
 
 [[nodiscard]] auto range_valid(uint64_t user_addr, size_t size) -> bool;
+// The caller retains task's lifetime. Faulting access may yield on root-gate
+// contention only at an ordinary syscall frontier without other foreign/raw
+// pins or MM/publication/backend/access guards. Other contexts never wait.
 [[nodiscard]] auto pin_task_user_page(sched::task::Task& task, uint64_t user_addr, bool require_writable, bool fault_in,
                                       StableUserPage& out) -> bool;
 // Opt in only at audited ordinary syscall pre-owner frontiers. The short
-// preparation scope ends before the old pin; nonordinary/foreign callers keep
-// the old generic behavior. No caller MM/publication/backend/access guard.
+// preparation scope ends before generic pinning and its separate busy retry.
+// No caller MM/publication/backend/access guard.
 [[nodiscard]] auto pin_current_task_user_page(sched::task::Task& task, uint64_t user_addr, bool require_writable, StableUserPage& out)
     -> bool;
 [[nodiscard]] auto copy_from_current_task_partial(sched::task::Task& task, uint64_t user_addr, void* dst, size_t size) -> CopyResult;

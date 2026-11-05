@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -105,7 +106,7 @@ def require_common_usercopy_helper(header: str, source: str) -> None:
 
     for snippet in [
         "__builtin_add_overflow",
-        "mm::virt::pin_user_page_for_task(&task, pagemap, user_addr, require_writable, fault_in, out.m_pin)",
+        "mm::virt::try_pin_user_page_for_task(&task, pagemap, user_addr, require_writable, fault_in, out.m_pin)",
         "pin_task_user_page(task, page, true, true, pin)",
         "pin_task_user_page(task, CUR, true, fault_in, pin)",
         "pin_task_user_page(task, CUR, false, fault_in, pin)",
@@ -199,7 +200,7 @@ def require_mapping_stable_pin_contract() -> None:
     pin_attempt = function_body(virt_cpp, "try_pin_current_user_page_mapping")
     acquire = "acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)"
     attempt = "try_pin_current_user_page_mapping(pagemap, vaddr, require_writable, access_gate_index, out)"
-    early = "task != nullptr && require_writable && fault_in && task->pagemap == pagemap"
+    early = "task != nullptr && fault_in && task->pagemap == pagemap"
     ready = "bool const READY = task == nullptr"
     if acquire not in pin_common or pin_common.count(attempt) != 2 or early not in pin_common or ready not in pin_common:
         fail("VM user-page pin must retain the root gate through its actual early and fallback attempts")
@@ -402,11 +403,26 @@ def require_mapping_stable_pin_contract() -> None:
         fail("prepared metadata must be fully validated before split or COW publication")
     if "intprepared_error=0;" not in exact_prepared:
         fail("the compatible branch must preserve its original ENOMEM fallback")
-    order = ["survey.start()!=0||survey.end()!=USER_END",
-             "UserPagemapExclusiveScopesource_usercopy_scope(source);",
+    order = ["if(source==nullptr)returnrefuse(Site::CopyInput,-EINVAL,1);",
+             "if(child==nullptr)returnrefuse(Site::CopyInput,-EINVAL,2);",
+             "if(source==child)returnrefuse(Site::CopyInput,-EINVAL,3);",
+             "if(source!=actor.pagemap)returnrefuse(Site::CopyInput,-EINVAL,4);",
+             "if(source==virt::kernel_pagemap)returnrefuse(Site::CopyInput,-EINVAL,5);",
+             "if(child==virt::kernel_pagemap)returnrefuse(Site::CopyInput,-EINVAL,6);",
+             "if(!survey.complete())returnrefuse(Site::CopyInput,-EINVAL,7);",
+             "if(survey.start()!=0)returnrefuse(Site::CopyInput,-EINVAL,8);",
+             "if(survey.end()!=USER_END)returnrefuse(Site::CopyInput,-EINVAL,9);",
+             "if(survey.stamp().root.address_bits!=reinterpret_cast<uint64_t>(source))returnrefuse(Site::CopyInput,-EINVAL,10);",
+             "if(survey.stamp().root.incarnation==0)returnrefuse(Site::CopyInput,-EINVAL,11);",
+             "if(TYPED&&(private_child==nullptr||authority==nullptr||source_owner==nullptr))",
+             "consume_fork_private_child_root(actor,*private_child,child,*authority,refusal!=nullptr?&child_refusal:nullptr)",
+             "unpublished_user_root_empty_observed(child,refusal!=nullptr?&child_refusal:nullptr)",
+             "UserPagemapExclusiveScopesource_usercopy_scope(source,source_owner);",
              "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
              "sched::PreemptGuardconstCOW_PREEMPT;",
-             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)"]
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)",
+             "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);",
+             "returnrefuse(Site::CowWalk,prepared_error!=0?prepared_error:-ENOMEM);"]
     cursor = 0
     for token in order:
         found = prepared.find(token, cursor)
@@ -425,6 +441,8 @@ def require_mapping_stable_pin_contract() -> None:
     release = entry.find("release_current_range_root(access);")
     if min(lease, copy, release) < 0 or not lease < copy < release:
         fail("prepared fork must retain and release its real Task-local lease around the exclusive coordinator")
+    if "eager_context,empty_result,prepared_swap,refusal,private_child,authority)" not in entry:
+        fail("prepared fork must forward its optional scalar witness with the original borrowed owners")
 
     for snippet in [
         "usercopy_pagemap_accesses",
@@ -442,8 +460,7 @@ def require_mapping_stable_pin_contract() -> None:
         if snippet not in task_cpp:
             fail(f"Task pagemap quiescence is incomplete: {snippet}")
 
-    if "detach_pagemap_after_usercopy_quiescence()" not in exit_cpp:
-        fail("process exit must detach its pagemap after quiescing usercopy")
+    require_exit_gc_pagemap_handoff(exit_cpp, scheduler_cpp, task_cpp)
     if "replace_pagemap_after_usercopy_quiescence(image.pagemap)" not in exec_cpp:
         fail("exec must publish its new pagemap after quiescing usercopy")
     if "quiesce_usercopy_pagemap()" not in scheduler_cpp:
@@ -471,6 +488,75 @@ def require_mapping_stable_pin_contract() -> None:
     ]:
         if snippet not in ktest:
             fail(f"mapping-stable usercopy KTEST coverage is missing: {snippet}")
+
+
+def require_exit_gc_pagemap_handoff(exit_cpp: str, scheduler_cpp: str, task_cpp: str) -> None:
+    def compact(body: str) -> str:
+        return "".join(re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", body).split())
+
+    def ordered(body: str, tokens: list[str], reason: str) -> None:
+        cursor = 0
+        for token in tokens:
+            position = body.find(token, cursor)
+            if position < 0:
+                fail(f"{reason}: {token}")
+            cursor = position + len(token)
+
+    leave = compact(function_body(exit_cpp, "leave_exiting_user_address_space"))
+    expected = ("if(task==nullptr||task->type!=ker::mod::sched::task::TaskType::PROCESS||"
+                "task->is_thread||task->pagemap==nullptr){return;}"
+                "ker::mod::mm::virt::switch_to_kernel_pagemap();")
+    if leave != expected:
+        fail("exit handoff must only validate the task and switch hardware root while retaining Task.pagemap for GC")
+    exit_body = compact(function_body(exit_cpp, "wos_proc_exit_with_wait_status"))
+    for forbidden in ("detach_pagemap_after_usercopy_quiescence(", "destroy_user_space(", "release_pagemap(",
+                      "current_task->pagemap="):
+        if forbidden in exit_body:
+            fail("exiting executor must not detach or synchronously reclaim its retained root")
+    ordered(exit_body, ["current_task->exit_in_progress=true;", "current_task->exit_status=wait_status;",
+                       "child_events::prepare_process_exit(*current_task);", "ker::vfs::vfs_close(",
+                       "shm_cleanup_for_task(current_task);", "current_task->quiesce_usercopy_pagemap();",
+                       "release_lazy_vmem_ranges(*current_task);", "release_file_mmap_ranges_for_pagemap(current_task->pagemap);",
+                       'asmvolatile("cli":::"memory");',
+                       "transition_state(ker::mod::sched::task::TaskState::ACTIVE,ker::mod::sched::task::TaskState::EXITING)",
+                       "current_task->has_exited=true;", "current_task->exit_notify_ready.store(true,std::memory_order_release);",
+                       "child_events::publish_exit(*current_task)", "leave_exiting_user_address_space(current_task);",
+                       "current_task->death_epoch.store(ker::mod::sched::EpochManager::current_epoch(),std::memory_order_release);",
+                       "current_task->state.store(ker::mod::sched::task::TaskState::DEAD,std::memory_order_release);",
+                       "jump_to_next_task_no_save();"],
+            "exit must finish blocking cleanup and stable wait status before EXITING, root handoff and DEAD publication")
+    detach = compact(function_body(task_cpp, "Task::detach_pagemap_after_usercopy_quiescence"))
+    ordered(detach, ["quiesce_usercopy_pagemap();", "auto*detached=pagemap;", "pagemap=nullptr;", "returndetached;"],
+            "GC root detach must first close and drain real Task-local borrows")
+    selection = compact(function_body(scheduler_cpp, "detach_next_reclaimable_task_locked"))
+    ordered(selection, ["if(cur->state.load(std::memory_order_acquire)!=task::TaskState::DEAD)",
+                        "DEATH_EPOCH=cur->death_epoch.load(std::memory_order_acquire);",
+                        "if(!EpochManager::is_safe_to_reclaim(DEATH_EPOCH))",
+                        "run_queues->that_cpu(check_cpu)->current_task==cur", "if(still_in_use)",
+                        "cur->has_exited&&!cur->is_thread&&ker::syscall::process::child_events::is_waitable_zombie(*cur)",
+                        "should_free_pagemap=!gc_task_has_pagemap_sibling_locked(cur);"],
+            "GC must retain DEAD/epoch/current-CPU and shared-publisher gates before zombie resource handoff")
+    siblings = compact(function_body(scheduler_cpp, "gc_task_has_pagemap_sibling_locked"))
+    for token in ("cur->shares_user_pagemap.load(std::memory_order_acquire)", "task_has_registered_pagemap_sibling(cur)",
+                  "run_queues->that_cpu(scan_cpu)->dead_list.head", "dl!=cur&&dl->pagemap==cur->pagemap"):
+        if token not in siblings:
+            fail("GC must account for registered and queued shared-root publishers")
+    if "TaskState::ACTIVE" in siblings:
+        fail("GC shared-root retention must not exclude EXITING/DEAD publishers")
+    for name in ("cleanup_waitable_zombie_resources", "cleanup_detached_gc_task"):
+        body = compact(function_body(scheduler_cpp, name))
+        ordered(body, ["detach_pagemap_after_usercopy_quiescence();", "if(detached.should_free_pagemap){",
+                       "release_file_mmap_ranges_for_pagemap(pagemap);", "destroy_user_space(pagemap,", "release_pagemap(pagemap,"],
+                "GC synchronous fallback must retain final-publisher, quiescence and complete retirement ordering")
+    queued = compact(function_body(scheduler_cpp, "queue_detached_gc_task_cleanup"))
+    ordered(queued, ["!detached.should_free_pagemap", "cur->quiesce_usercopy_pagemap();",
+                     "release_file_mmap_ranges_for_pagemap(cur->pagemap);", "create_destroy_user_space_budget_state(cur->pagemap,"],
+            "budgeted GC must close readers and file owners before admitting full root retirement")
+    deferred = compact(function_body(scheduler_cpp, "process_deferred_gc_cleanup_slice"))
+    ordered(deferred, ["if(!mm::virt::destroy_user_space_budgeted(", "returnfalse;",
+                       "destroy_user_space_budget_state_destroy(item->pagemap_state);", "release_pagemap(cur->pagemap,",
+                       "cur->pagemap=nullptr;"],
+            "budgeted GC must complete retirement before releasing or clearing the retained root")
 
 
 def require_process_syscalls_use_usercopy(source: str) -> None:
@@ -828,10 +914,146 @@ def require_thread_publication_uses_preflighted_mapped_usercopy() -> None:
         fail("CLONE_VM must preflight the child TCB before mapped-only publication")
 
 
+
+def require_fork_private_child_factory_authority() -> None:
+    """Private922 route is factory-born; retain the original generic try route."""
+    source = VIRT_CPP.read_text()
+    header = VIRT_HPP.read_text()
+    process = PROCESS_CPP.read_text()
+    managed = (ROOT / "modules/kern/src/platform/mm/managed_huge.cpp").read_text()
+    a = header.index("class ForkPrivateChildRoot {")
+    b = find_matching_brace(header, header.index("{", a))
+    token = "".join(header[a:b + 1].split())
+    for spelling in ("ForkPrivateChildRoot(constForkPrivateChildRoot&)=delete;",
+                     "ForkPrivateChildRoot(ForkPrivateChildRoot&&)=delete;",
+                     "operator=(constForkPrivateChildRoot&)->ForkPrivateChildRoot&=delete;",
+                     "operator=(ForkPrivateChildRoot&&)->ForkPrivateChildRoot&=delete;",
+                     "private:", "enumclassState:uint8_t{Virgin,Issued,Consumed}"):
+        if spelling not in token:
+            fail("private child authority must preserve its opaque noncopy/nonmove state: " + spelling)
+    invalidate = "".join(function_body(header, "invalidate").split())
+    if any(word in invalidate for word in ("->", "page_free", "release(", "lock", "yield", "new")):
+        fail("token invalidation must be terminal scalar-only and nonowning")
+    factory = "".join(function_body(source, "create_fork_private_child_root").split())
+    cursor = 0
+    for spelling in ("State::Virgin", "child.pagemap!=nullptr", "fork_private_child_constructor_valid(creator,child)",
+                     "create_user_root_common(false)", "child.pagemap=root;", "copy_kernel_mappings(&child)",
+                     "find_user_root_control_locked(root)", "authority.root_serial_=serial", "State::Issued"):
+        at = factory.find(spelling, cursor)
+        if at < 0:
+            fail("fresh child allocation/kernel-copy/serial/issue sequence changed: " + spelling)
+        cursor = at + len(spelling)
+    consume = "".join(function_body(source, "consume_fork_private_child_root").split())
+    cursor = 0
+    for spelling in ("authority.invalidate();", "!ISSUED", "ROOT!=expected", "child.pagemap!=ROOT",
+                     "fork_private_child_constructor_valid(creator,child)", "is_current_pagemap(ROOT)",
+                     "page_kind_get(ROOT)", "page_ref_get(ROOT)", "user_mapping_pin_lock.lock_irqsave()",
+                     "find_user_root_control_locked(ROOT)", "control->serial==0", "control->serial!=SERIAL",
+                     "file_mapping_index.root_empty_locked(ROOT)", "i<256", "pte_raw(entry_at(ROOT,i))",
+                     "user_mapping_pin_lock.unlock_irqrestore(FLAGS)"):
+        at = consume.find(spelling, cursor)
+        if at < 0:
+            fail("terminal typed validation lost original structural gate/order: " + spelling)
+        cursor = at + len(spelling)
+    if any(word in consume for word in ("acquire_user_pagemap_access(", "UserPagemapExclusiveScope", "new", "yield")):
+        fail("typed child consume must not acquire a child stripe or allocate/wait")
+    guard = "".join(function_body(source, "fork_private_child_constructor_valid").split())
+    for spelling in ("sched::get_current_task()==&creator", "creator.type==sched::task::TaskType::PROCESS",
+                     "!child.is_thread", "child.thread==nullptr", "!child.scheduler_published.load(",
+                     "child.child_membership_state.load(", "ChildMembershipState::UNLINKED", "!child.child_publication_established",
+                     "child.child_parent==nullptr", "child.child_sibling_prev==nullptr", "child.child_sibling_next==nullptr",
+                     "!child.shares_user_pagemap.load(", "!child.usercopy_pagemap_closing.load(",
+                     "child.usercopy_pagemap_accesses.load(", "!child.gc_queued.load(", "ACTIVE_REGISTRY_INDEX_INVALID",
+                     "Task::sched_queue::NONE", "child.heap_index==-1", "child.sched_next==nullptr", "child.ref_count.load("):
+        if spelling not in guard:
+            fail("actual private constructor-state guard missing: " + spelling)
+    if "creator.is_thread" in guard:
+        fail("a threaded PROCESS creator remains supported by the original fork API")
+    wrapper = re.search(r"auto deep_copy_current_user_pagemap_prepared\(sched::task::Task& actor,\s*sched::task::Task& child,", managed)
+    if wrapper is None:
+        fail("typed Task+factory authority wrapper is missing")
+    end = find_matching_brace(managed, managed.index("{", wrapper.start()))
+    typed = "".join(managed[wrapper.start():end + 1].split())
+    if "~InvalidateAuthority(){source_owner.finish();authority.invalidate();}" not in typed or "constINVALIDATE{authority,source_owner};" not in typed:
+        fail("every early typed wrapper return must terminally invalidate its caller-owned token")
+    if "&swap,refusal,&child,&authority,&source_owner)" not in typed:
+        fail("typed wrapper must forward the exact child and issued authority with original metadata owners")
+    fork = "".join(function_body(process, "wos_proc_fork").split())
+    cursor = 0
+    for spelling in ("ForkPrivateChildRootprivate_child_authority;", "create_fork_private_child_root(*parent,*child,private_child_authority)",
+                     "SyscallPreparationScopepreparation(*parent)", "&copy_failure,&private_child_authority)",
+                     "private_child_authority.invalidate();", "if(FORK_VM_ERROR!=0)", "destroy_user_space(child->pagemap",
+                     "child_events::begin_publication(*parent,*child)"):
+        at = fork.find(spelling, cursor)
+        if at < 0:
+            fail("factory authority must end before rollback and first child publication: " + spelling)
+        cursor = at + len(spelling)
+
+
+
+def require_fork_source_owner_progress() -> None:
+    source = VIRT_CPP.read_text()
+    managed = (ROOT / "modules/kern/src/platform/mm/managed_huge.cpp").read_text()
+    process = PROCESS_CPP.read_text()
+    compact = lambda text: "".join(text.split())
+    acquire = compact(function_body(source, "try_acquire_fork_source"))
+    for spelling in ("returnForkSourceAdmission::OwnerUsed;", "actor.try_acquire_usercopy_pagemap(owner.root_)",
+                     "owner.actor_=&actor", "try_begin_user_pagemap_exclusive(owner.root_)", "State::Held"):
+        if spelling not in acquire: fail("actual try source-owner predicate missing: " + spelling)
+    if any(word in acquire for word in ("begin_user_pagemap_exclusive(owner.root_)", "kern_yield(", "new")):
+        # The nonblocking try symbol contains the blocking symbol as a suffix.
+        blocking = acquire.replace("try_begin_user_pagemap_exclusive(owner.root_)", "")
+        if "begin_user_pagemap_exclusive(" in blocking or "kern_yield(" in blocking or "new" in blocking:
+            fail("source admission must remain one nonwaiting nonallocating try")
+    finish = compact(function_body(source, "ForkSourceOwner::finish"))
+    if not finish.index("end_user_pagemap_exclusive(gate_)") < finish.index("actor_->release_usercopy_pagemap()"):
+        fail("source owner must release exclusive before its Task lease")
+    root = compact(function_body(source, "detail::ForkSourceAccess::root"))
+    if ".readers.load(" in root:
+        fail("an issued source owner must not reject a transient speculative reader count")
+    transfer = compact(function_body(source, "detail::ForkSourceAccess::transfer"))
+    if "expected==nullptr" not in transfer or "owner.state_=ForkSourceOwner::State::Consumed;" not in transfer:
+        fail("private adoption must reject null expected and terminally transfer actual ownership")
+    wait = compact(function_body(source, "wait_for_fork_source"))
+    cursor = 0
+    for spelling in ("PreemptGuardconstPREEMPT;", "PageTable*root=nullptr;", "actor.try_acquire_usercopy_pagemap(root)",
+                     "gate.teardown.load(", "gate.readers.load(", "actor.release_usercopy_pagemap();",
+                     "if(status!=0)returnstatus;", "if(!busy)return0;", "sched::kern_yield();"):
+        at = wait.find(spelling, cursor)
+        if at < 0: fail("short source wait must release its lease/guard before cooperation: " + spelling)
+        cursor = at + len(spelling)
+    if any(word in wait for word in ("SharedVmemPublicationGuard", "UserPagemapExclusiveScope", "acquire_user_pagemap_access(", "new")):
+        fail("source wait may not retain publication/root owner or allocate")
+    entry = compact(function_body(managed, "deep_copy_current_user_pagemap_prepared_impl"))
+    borrow = entry.find("detail::fork_source_owner_root(actor,preparation,publication,*source_owner)")
+    old_lease = entry.find("access.local=actor.try_acquire_usercopy_pagemap(access.root)")
+    if min(borrow,old_lease)<0 or not borrow<old_lease:
+        fail("typed route must borrow actual source owner before the unchanged raw lease path")
+    branch = entry[entry.index("if(source_owner!=nullptr)"):old_lease]
+    if "try_acquire_usercopy_pagemap(" in branch:
+        fail("typed route cannot reacquire a second Task lease")
+    once = compact(function_body(process, "prepare_fork_vm_snapshot_once"))
+    cursor = 0
+    for spelling in ("ForkSourceOwnersource_owner;", "SharedVmemPublicationGuardpublication;", "LegacyIntervallegacy_context(preparation);",
+                     "~FinishSourceOwner(){owner.finish();}", "try_acquire_fork_source(actor,preparation,publication,source_owner)",
+                     "child.entry=actor.entry", "lazy.consume(child)", "*private_child_authority,source_owner,preparation"):
+        at = once.find(spelling,cursor)
+        if at<0: fail("source try/release must precede every child adoption: " + spelling)
+        cursor = at+len(spelling)
+    outer = compact(function_body(process, "prepare_fork_vm_snapshot"))
+    branch_start=outer.index("if(STATUS==-EAGAIN&&point==ForkVmFailurePoint::SourceAdmission&&source_admission==mm::virt::ForkSourceAdmission::Busy)")
+    registry=outer.index("registry_attempt+1==REGISTRY_ATTEMPTS")
+    busy=outer[branch_start:registry]
+    if "wait_for_fork_source(actor,preparation)" not in busy or "continue;" not in busy or "registry_attempt" in busy:
+        fail("only exact source Busy may wait/reprepare, without consuming/resetting registry retries")
+
+
 def main() -> None:
     require_common_usercopy_helper(USERCOPY_HPP.read_text(), USERCOPY_CPP.read_text())
     require_current_preparation_is_before_the_legacy_pin(USERCOPY_CPP.read_text())
     require_mapping_stable_pin_contract()
+    require_fork_private_child_factory_authority()
+    require_fork_source_owner_progress()
     require_process_syscalls_use_usercopy(PROCESS_CPP.read_text())
     require_waitpid_outputs_are_preflighted(WAITPID_CPP.read_text())
     require_deferred_waiters_use_usercopy()

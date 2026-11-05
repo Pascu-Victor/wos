@@ -168,6 +168,8 @@ struct Task {
     mm::paging::PageTable* pagemap{};
     std::atomic<uint64_t> wake_at_us{};
     std::atomic<bool> deferred_task_switch{}, channel{}, root_allowed{true};
+    std::atomic<bool> exit_in_progress{};
+    bool has_exited{};
     uint64_t timeout_address=0x9000; timespec timeout{}; bool timeout_fault{};
     uint64_t load_cpu() const { return cpu; }
     void set_wait_channel(const char*,WaitChannelKind) { channel=true; }
@@ -598,12 +600,14 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     virt = (KERN / "platform/mm/virt.hpp").read_text()
     user_pin, row = capture(virt, "struct UserPagePin {", declaration=True); actual.append(row)
     futex_identity, row = capture(virt, "struct UserFutexIdentity {", declaration=True); actual.append(row)
+    pin_attempt, row = capture(virt, "enum class UserPagePinAttempt :", declaration=True); actual.append(row)
     write("platform/mm/virt.hpp", '#pragma once\n#include "fixture-common.hpp"\n'
           'namespace ker::mod::mm::file_mapping { class FileMappingBinding; }\n'
           'namespace ker::mod::sched::task { struct Task; }\n'
           'namespace ker::mod::mm::virt { using PageTable=paging::PageTable; inline constexpr uint64_t PADDR_INVALID=UINT64_MAX;\n'
-          + user_pin + '\n' + futex_identity + '\n'
+          + user_pin + '\n' + futex_identity + '\n' + pin_attempt + '\n'
           'auto pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> bool;\n'
+          'auto try_pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> UserPagePinAttempt;\n'
           'auto user_page_pin_still_mapped(const UserPagePin&) -> bool;\n'
           'auto user_page_pin_commit_write(const UserPagePin&) -> bool;\n'
           'auto capture_user_futex_identity(const UserPagePin&,vaddr_t,UserFutexIdentity&) -> bool;\n'
@@ -613,7 +617,13 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
           'inline auto prepare_tmpfs_read_shared_page(sched::task::Task&,uint64_t,bool) -> PublicReadPrepareResult { return PublicReadPrepareResult::NOT_TRACKED; }\n'
           'void unpin_user_page(UserPagePin&); }\n')
     write("platform/sched/task.hpp", TASK)
-    write("platform/sched/scheduler.hpp", SCHEDULER)
+    write("platform/sched/scheduler.hpp", SCHEDULER + '''
+namespace ker::mod::sched {
+inline auto can_query_current_task() -> bool {return false;}
+inline auto interrupts_enabled() -> bool {return false;}
+inline void kern_yield() {fixture::check(false,"ordinary retry unsupported in frame-only fixture");}
+}
+''')
     write("platform/sys/spinlock.hpp", '#pragma once\n#include "fixture-common.hpp"\n')
     write("platform/mm/paging.hpp", '#pragma once\n#include "fixture-common.hpp"\n')
     write("platform/mm/phys.hpp", '#pragma once\n#include "fixture-common.hpp"\n')
@@ -653,6 +663,21 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     increment, row = capture(phys_cpp, "auto page_ref_try_inc(void* page, PageLookupHint* hint)"); actual.append(row)
     text = '#include "fixture-common.hpp"\n#include <platform/sys/usercopy.hpp>\n#include <platform/sched/scheduler.hpp>\n'
     text += 'namespace ker::mod::mm::phys {\n' + increment + '\n}\n' + PIN_SEAMS
+    text += '''
+namespace ker::mod::mm::virt {
+// Existing finite frame-pin endpoint has no striped Busy state. It neither
+// models nor qualifies ordinary usercopy retry or native MM admission.
+inline auto try_pin_user_page_for_task(sched::task::Task* task,PageTable* root,vaddr_t address,
+                                     bool writable,bool fault,UserPagePin& out) -> UserPagePinAttempt {
+ return pin_user_page_for_task(task,root,address,writable,fault,out)
+     ? UserPagePinAttempt::Pinned : UserPagePinAttempt::Failed;
+}
+}
+namespace ker::mod::sys::usercopy {
+// These retained frame-only fixtures expose no ordinary executor context.
+inline auto ordinary_usercopy_retry_context(sched::task::Task*) -> bool {return false;}
+}
+'''
     text += 'namespace ker::mod::sys {\nclass SyscallPreparationScope {\n public:\n  explicit SyscallPreparationScope(sched::task::Task&) {}\n  auto ready() const -> bool { return false; }\n};\n}\nnamespace ker::mod::mm::virt {\ninline auto prepare_current_anonymous_user_page(sched::task::Task&,uint64_t,bool,\n const sys::SyscallPreparationScope&) -> int {\n fixture::check(false,"ordinary preparation unsupported in frame/root-only fixtures"); return -EWOULDBLOCK;\n}\n}\nnamespace ker::mod::sys::usercopy {\nauto copy_from_current_task_partial(sched::task::Task&task,uint64_t address,void*dst,size_t size)->CopyResult {\n bool const ok=copy_from_task(task,address,dst,size);return {ok?size:0,!ok};\n}\n}\n'
     text += '\nnamespace ker::mod::sys::usercopy {\n' + '\n\n'.join(bodies) + '\n}\n'
     text += '#include "actual-futex.cpp"\n' + CASES
@@ -793,7 +818,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--futex-source", type=Path, default=SOURCE)
     parser.add_argument("--only", choices=["all", *VECTORS], default="all")
-    parser.add_argument("--cxx", default=os.environ.get("CXX", os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")))
+    # CXX may select the freestanding WOS toolchain without Host C++ headers.
+    parser.add_argument("--cxx", default=os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++"))
     args = parser.parse_args()
     started = time.monotonic()
     deadline = started + 60
@@ -805,7 +831,8 @@ def main() -> int:
               "native_runtime_qualified": False, "compiler_external_dependencies_after_only": True}
     try:
         selected = args.futex_source.resolve(strict=True)
-        compiler = Path(args.cxx).resolve(strict=True)
+        compiler_command = Path(args.cxx).absolute()
+        compiler = compiler_command.resolve(strict=True)
         if not compiler.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError("--cxx must resolve to one executable Host ELF compiler")
         with compiler.open("rb") as executable:
@@ -826,7 +853,9 @@ def main() -> int:
         staged_before = [pin(path) for path in staged]
         result["actual_staged_sources_before"] = staged_before
         source, binary, depfile = scratch / "harness.cpp", scratch / "futex-frame-test", scratch / "dependencies.d"
-        argv = [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
+        # Clang selects C++ link-driver semantics from the invoked name.
+        # Hold the resolved ELF above, but preserve a configured clang++ link.
+        argv = [str(compiler_command), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer", "-MD", "-MF", str(depfile), "-I", str(scratch / "include"),
                 str(source), "-o", str(binary)]
         vectors = VECTORS if args.only == "all" else [args.only]

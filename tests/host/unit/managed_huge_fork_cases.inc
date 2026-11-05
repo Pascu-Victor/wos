@@ -14,6 +14,9 @@ class ManagedFork : public ManagedRange {
         fork_fail_table_at = SIZE_MAX;
         fork_table_attempts = 0;
         fork_events.clear();
+        virt::host_child_control_missing = false;
+        virt::host_child_index_empty = true;
+        virt::host_child_control.serial = 23;
     }
     void TearDown() override {
         fork_mode = false;
@@ -50,7 +53,103 @@ class ManagedFork : public ManagedRange {
         std::memset(bytes, 0x63, PAGE);
         word(cursor, virt::index_of(va, 1)) = pa | 7;
     }
+    void child_refusal(mm::paging::PageTable* root, virt::UnpublishedRootRefusalSite site, uint16_t slot = UINT16_MAX) {
+        // Actual predicate body, finite Host reader/control/index/PMM ports.
+        // This checks classification, not a real hashed-stripe CAS or owner.
+        std::array<uint64_t, 256> before{};
+        for (size_t i = 0; i < before.size(); ++i) before[i] = word(child, i);
+        auto const refs = model.live_refs();
+        virt::UnpublishedRootRefusal witness{true, virt::UnpublishedRootRefusalSite::UserEntryNonzero, 7};
+        bool const old_mode = fork_mode;
+        fork_mode = true;
+        EXPECT_FALSE(virt::unpublished_user_root_empty_observed(root, &witness));
+        fork_mode = old_mode;
+        EXPECT_TRUE(witness.valid);
+        EXPECT_EQ(witness.site, site);
+        EXPECT_EQ(witness.user_slot, slot);
+        EXPECT_EQ(root_readers + cow_depth + pin_depth, 0U);
+        EXPECT_FALSE(host_range::exclusive);
+        EXPECT_EQ(model.live_refs(), refs);
+        for (size_t i = 0; i < before.size(); ++i) EXPECT_EQ(word(child, i), before[i]);
+    }
 };
+TEST_F(ManagedFork, ObservedChildInputAndSuccessResetStaleWitness) {
+    using Site = virt::UnpublishedRootRefusalSite;
+    child_refusal(nullptr, Site::InputRoot);
+    child_refusal(runtime_root, Site::InputRoot);
+    virt::kernel_pagemap = child;
+    child_refusal(child, Site::InputRoot);
+    virt::kernel_pagemap = nullptr;
+    fork_mode = true;
+    virt::UnpublishedRootRefusal witness{true, Site::UserEntryNonzero, 7};
+    EXPECT_TRUE(virt::unpublished_user_root_empty_observed(child, &witness));
+    EXPECT_FALSE(witness.valid);
+    EXPECT_EQ(witness.site, Site::None);
+    EXPECT_EQ(witness.user_slot, UINT16_MAX);
+    EXPECT_TRUE(virt::unpublished_user_root_empty(child));
+    EXPECT_EQ(root_readers + cow_depth + pin_depth, 0U);
+    fork_mode = false;
+}
+TEST_F(ManagedFork, ObservedChildReaderRefusalIsNotNonemptyProof) {
+    host_range::reader_busy = true;
+    child_refusal(child, virt::UnpublishedRootRefusalSite::ReaderAdmissionRefused);
+    host_range::reader_busy = false;
+    EXPECT_EQ(word(child, 0), 0U);
+    word(child, 17) = mm::paging::PAGE_RESERVED;
+    child_refusal(child, virt::UnpublishedRootRefusalSite::UserEntryNonzero, 17);
+    word(child, 17) = 0;
+}
+TEST_F(ManagedFork, ObservedChildPageKindRefusalPrecedesDereference) {
+    auto* bytes = model.allocate(model.topology.memory[0].base + 8 * LARGE, 1, PAGE, Initialization::FULL_OVERWRITE);
+    ASSERT_NE(bytes, nullptr);
+    auto* root = reinterpret_cast<mm::paging::PageTable*>(bytes);
+    fork_child = root;
+    child_refusal(root, virt::UnpublishedRootRefusalSite::PageKind);
+    fork_child = child;
+    // This standalone order-0 fixture has no managed-leaf cap. Use the same
+    // ordinary cleanup selector as ManagedRange::TearDown, then restore it.
+    bool const charge_checks = std::exchange(huge_check_free, false);
+    EXPECT_EQ(mm::phys::page_ref_dec(bytes), 0U);
+    huge_check_free = charge_checks;
+}
+TEST_F(ManagedFork, ObservedChildReferenceRefusalKeepsOriginalOwner) {
+    auto* bytes = model.allocate(model.topology.memory[0].base + 8 * LARGE, 1, PAGE, Initialization::FULL_OVERWRITE);
+    ASSERT_NE(bytes, nullptr);
+    auto* root = reinterpret_cast<mm::paging::PageTable*>(bytes);
+    fork_child = root;
+    invalid_kind = true;  // Existing PMM kind port reports PAGE_TABLE here.
+    EXPECT_TRUE(mm::phys::page_ref_try_inc(bytes, nullptr));
+    child_refusal(root, virt::UnpublishedRootRefusalSite::ReferenceCount);
+    EXPECT_EQ(mm::phys::page_ref_get(bytes), 2U);
+    invalid_kind = false;
+    fork_child = child;
+    // Drop both ordinary fixture references through the real refcount port;
+    // the managed-leaf capacity hook applies to different owned backing.
+    bool const charge_checks = std::exchange(huge_check_free, false);
+    EXPECT_EQ(mm::phys::page_ref_dec(bytes), 1U);
+    EXPECT_EQ(mm::phys::page_ref_dec(bytes), 0U);
+    huge_check_free = charge_checks;
+}
+TEST_F(ManagedFork, ObservedChildDistinguishesMissingControlAndZeroSerial) {
+    virt::host_child_control_missing = true;
+    child_refusal(child, virt::UnpublishedRootRefusalSite::MissingControl);
+    virt::host_child_control_missing = false;
+    virt::host_child_control.serial = 0;
+    child_refusal(child, virt::UnpublishedRootRefusalSite::ZeroSerial);
+    virt::host_child_control.serial = 23;
+}
+TEST_F(ManagedFork, ObservedChildIndexPortAndFirstUserSlotHaveDifferentSites) {
+    word(child, 19) = mm::paging::PAGE_RESERVED;
+    word(child, 3) = mm::paging::PAGE_RESERVED;
+    virt::host_child_index_empty = false;
+    child_refusal(child, virt::UnpublishedRootRefusalSite::FileIndexNonempty);
+    virt::host_child_index_empty = true;
+    child_refusal(child, virt::UnpublishedRootRefusalSite::UserEntryNonzero, 3);
+    fork_mode = true;
+    EXPECT_FALSE(virt::unpublished_user_root_empty(child));
+    fork_mode = false;
+    word(child, 3) = word(child, 19) = 0;
+}
 TEST_F(ManagedFork, FullZeroProofCopiesWithOneExclusiveAndNoReader) {
     huge::RangeSplitSurvey survey;
     huge::PreparedTables tables;

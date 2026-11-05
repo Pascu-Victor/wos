@@ -1,18 +1,16 @@
 # Separate placement diagnostic clone
 
-Current validation: the standalone builder compiled this diagnostic clone
-against the WOS sysroot on 2026-10-15. No runtime success is claimed. The
-source-writing milestone and its immutable evidence references follow.
+This variant adds bounded diagnostic observations to the public placement
+workload below, including the same inherited-origin setup. Build each changed
+source revision into a fresh, uniquely named ELF and bind its exact source and
+binary receipts; earlier compilation or runtime evidence does not qualify a
+changed artifact.
 
-This new source clones the original workload below with declared diagnostic
-observations. It has not been compiled or run. The original fixture CPP, builder,
-README, compiled witness03, kernel/libc and current618 source capture remain
-unchanged. Compile only this clone to a new unique ELF path using
+Compile with
 `python3 tests/fixtures/build_task_placement_capture_runtime.py --output PATH`.
-The future runner must install this new ELF as its main placement service and
-keep the independent init-exit witness at the original immutable witness03 ELF.
-The inherited witness mode below is byte-preserved, but is outside this clone's
-runtime admission and must not replace that independently pinned executable.
+A diagnostic runner must pin its main executable and independent init-exit
+witness separately. The inherited witness mode remains outside this clone's
+runtime admission and cannot replace that independently pinned executable.
 
 Original workload contract, with its existing success formats and limits:
 
@@ -45,13 +43,27 @@ eight-CPU mask. It makes no libc signed-bit63 success claim.
 
 ## Workload and refusal boundaries
 
-Sixteen workers first pin themselves to their actual observed CPU. During a
-finite busy-yield setup, the parent assigns target0-relative destinations
-`(target0_first_cpu + index) % 8` through checked single-bit affinity operations,
-retrying only EBUSY. Each worker must execute on that actual destination and
-successfully pin itself there again before publishing confirmation. This gives
-exactly two workers on each CPU and a live peer on target0's unchanged original
-CPU; setup does not assume round-robin creation survives work stealing.
+Before creating workers, the supervisor requires the full online mask, pins
+itself to its observed CPU through checked SET/GET operations, and verifies that
+all sixteen workers inherit and first pin themselves to that same origin. The
+parent stays pinned while assigning target0-relative destinations
+`(target0_first_cpu + index) % 8` through the original checked single-bit affinity
+operations, retrying only EBUSY. Each worker must execute at its destination and
+successfully pin itself there again before publishing confirmation.
+
+Keeping the parent on the origin provides another runnable task there during
+placement. An isolated current worker can yield back to itself indefinitely;
+checked EBUSY does not promise that such a worker will become movable. The
+inherited origin avoids that setup assumption without changing kernel refusal
+rules or assuming a round-robin creation order. The sixteen original parent
+requests include fourteen cross-CPU moves and two same-origin assignments,
+ending with exactly two workers per CPU.
+
+After all confirmations, the parent restores and verifies the full online mask
+before releasing setup and creating the later controllers. Its two additional
+successful setup policy changes are outside the existing sixteen-request
+counters. Worker pin counts, report layouts, subsequent workload checks and the
+shared absolute sixty-second deadline are unchanged.
 
 Workers then nanosleep in phase0. Target0 announces a two-second nanosleep;
 after10ms and before its announced midpoint the parent requires excluding that

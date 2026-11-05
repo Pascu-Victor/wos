@@ -91,6 +91,7 @@ class PendingOperation {
 
    private:
     friend struct PendingBuffer;
+    friend auto has_pending_local_effect(const Task& executor) noexcept -> bool;
     Task* executor_{};
     PendingOperation* next_{};
     Task* target_{};
@@ -147,6 +148,13 @@ void PendingOperation::cancel() {
 
 void cleanup_operations(ker::mod::sched::task::Task& executor) {
     while (executor.pending_ptrace_operations != nullptr) executor.pending_ptrace_operations->cancel();
+}
+
+auto has_pending_local_effect(const ker::mod::sched::task::Task& executor) noexcept -> bool {
+    for (auto const* operation = executor.pending_ptrace_operations; operation != nullptr; operation = operation->next_) {
+        if (operation->local_effect_ != nullptr) return true;
+    }
+    return false;
 }
 
 namespace {

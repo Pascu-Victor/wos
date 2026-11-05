@@ -8,6 +8,7 @@ struct Task;
 }
 
 namespace ker::mod::sched::resource {
+enum class MappingAdmission : uint8_t { Admitted, GateBusy, Denied };
 // Count the union of lazy metadata and lower-half PTEs. The subject is the
 // current task or an exclusively owned unpublished task. Its metadata is
 // serialized by SharedVmemPublicationGuard (or private construction).
@@ -31,6 +32,10 @@ class AddressSpaceObservation {
     // guard. Every refusal, partial mapping, or ineligible root is recounted.
     [[nodiscard]] auto admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start = 0, uint64_t replaced_size = 0)
         -> bool;
+    // A Busy attempt owns no count or policy admission. The caller must drop
+    // publication/lifetime owners and recount after any ordinary cooperation.
+    [[nodiscard]] auto try_admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start = 0,
+                                         uint64_t replaced_size = 0) -> MappingAdmission;
     void commit_mapping();
 
    private:

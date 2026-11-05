@@ -6,6 +6,14 @@ and telemetry are documented in `docs/unified_memory_reclaim.md`. Sections
 below that describe allocator-to-scheduler direct calls are retained as design
 history and are superseded by that contract.
 
+The synchronous exit-time pagemap release described below is historical too.
+Current non-thread `PROCESS` exit switches the CPU to the kernel root and keeps
+`Task::pagemap` attached for scheduler-GC retirement under the existing epoch,
+current-task, shared-root and lifetime guards. A waitable zombie may retain its
+resources until that retirement completes. Usercopy's eligible ordinary retry
+releases transient pins and the Task pagemap lease before yielding. See
+[address-space admission and retirement](numa_qualification.md#address-space-admission-and-retirement).
+
 Date: 2026-06-08
 
 ## Coordination

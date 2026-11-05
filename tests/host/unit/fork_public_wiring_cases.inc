@@ -184,7 +184,8 @@ TEST(PublicForkError, CompletePhaseStatusTable) {
                         {FailurePoint::ShmCommit, boolean},
                         {FailurePoint::LegacyCommit, boolean},
                         {FailurePoint::Complete, invalid},
-                        {static_cast<FailurePoint>(16), invalid},
+                        {FailurePoint::SourceAdmission, boolean},
+                        {static_cast<FailurePoint>(17), invalid},
                         {static_cast<FailurePoint>(255), invalid}};
     for (auto const& row : rows)
         for (size_t i = 0; i < std::size(statuses); ++i)
@@ -207,6 +208,7 @@ class PublicForkWiring : public ForkVmCoordinator {
     auto make_child() -> Task* {
         auto* task = new Task;
         task->pid = 2;
+        task->shares_user_pagemap = false;
         task->pagemap = child;
         task->name = new char[8]{};
         task->lazy_vmem_lock.tag = 2;

@@ -39,6 +39,7 @@ if not ephemeral:
 T = Path(tempfile.mkdtemp(prefix='scratch-', dir=OUT))
 start = time.monotonic()
 groups, commands, errors, before, after = [], [], [], [], []
+runtime_summary = None
 def pin(path):
     path = Path(path).resolve()
     st = path.stat()
@@ -91,7 +92,7 @@ try:
     user = user_path.read_text()
     vfs = vfs_path.read_text()
     futex = futex_path.read_text()
-    anchors = ['auto copy_chunk(', 'auto copy_to_task_common(', 'StableUserPage::~StableUserPage()',
+    anchors = ['auto copy_chunk(', 'auto ordinary_usercopy_retry_context(', 'auto copy_to_task_common(', 'StableUserPage::~StableUserPage()',
                'auto StableUserPage::valid(', 'auto StableUserPage::kernel_address(',
                'auto StableUserPage::still_mapped(', 'auto StableUserPage::commit_write(',
                'void StableUserPage::reset(', 'auto pin_task_user_page(', 'auto pin_current_task_user_page(',
@@ -99,12 +100,33 @@ try:
                'auto copy_from_task_common(', 'auto copy_from_current_task_partial(',
                'auto copy_to_current_task_partial(', 'auto copy_from_task_partial(']
     actual = '\n\n'.join(definition(user, a) for a in anchors)
+    flags_read = 'asm volatile("pushfq; pop %0" : "=r"(flags)::"memory");'
+    assert actual.count(flags_read) == 1, 'one actual advisory retry FLAGS read'
+    actual = 'constexpr uint64_t RFLAGS_AC = uint64_t{1} << 18U;\n' + actual.replace(
+        flags_read, 'flags = fixture::ac ? RFLAGS_AC : 0;')
+    preparation_path = source('platform/sys/syscall_preparation.hpp')
+    preparation = definition(preparation_path.read_text(), 'class SyscallPreparationScope {') + ';'
+    # Keep the production context/IF protocol. Only privileged IF instructions
+    # and a scope-lifetime observer are Host ports, not a replacement policy.
+    assert preparation.count('asm volatile("cli" ::: "memory");') == 2
+    assert preparation.count('asm volatile("sti" ::: "memory");') == 2
+    preparation = preparation.replace('asm volatile("cli" ::: "memory");', 'fixture::irq = false;')
+    preparation = preparation.replace('asm volatile("sti" ::: "memory");', 'fixture::irq = true;')
+    preparation = preparation.replace('class SyscallPreparationScope {',
+                                      'class SyscallPreparationScope {\n    fixture::ScopeObservation host_observation_;', 1)
+    attempt_type = definition(source('platform/mm/virt.hpp').read_text(), 'enum class UserPagePinAttempt :') + ';'
+    ptrace_path = source('platform/debug/ptrace.cpp')
+    # The earlier friend declaration shares the name; select the namespace
+    # definition explicitly rather than walking into its following data member.
+    pending_effect = definition(ptrace_path.read_text(), '\nauto has_pending_local_effect(')
     vfs_names = ['clamp_io_count', 'user_io_read_bounce_size_for', 'vfs_read_user_bounced',
                  'vfs_write_user_bounced', 'vfs_pwrite_user_bounced']
     actual_vfs = '\n\n'.join(definition(vfs, 'auto ' + n + '(') for n in vfs_names)
     template = D / 'anonymous_current_usercopy_cases.inc'
     text = template.read_text()
     for token, replacement in [('ACTUAL_USERCOPY', actual), ('ACTUAL_VFS', actual_vfs),
+                               ('ACTUAL_PREPARATION', preparation), ('ACTUAL_PIN_ATTEMPT_TYPE', attempt_type),
+                               ('ACTUAL_PENDING_EFFECT_QUERY', pending_effect),
                                ('ACTUAL_TIMEOUT', definition(futex, 'auto relative_timeout_us('))]:
         assert text.count(token) == 1, token
         text = text.replace(token, replacement)
@@ -128,20 +150,38 @@ try:
     run('dependencies', base + ['-M', '-MF', dep, '-MT', 'out', normal])
     deps = {Path(x).resolve() for x in shlex.split(dep.read_text().replace('\\\n', ' ').split(':', 1)[1]) if not str(Path(x).resolve()).startswith(str(T))}
     deps.update([user_path, vfs_path, futex_path, hpp, source('platform/mm/virt.hpp'),
-                 source('platform/mm/virt.opt.cpp'), K / 'platform/sys/syscall_preparation.hpp',
+                 source('platform/mm/virt.opt.cpp'), preparation_path, ptrace_path, source('platform/debug/ptrace.hpp'),
                  template, Path(__file__), DB, R / 'tests/host/unit/file_mmap_registry_runtime_test.py'])
     before = [pin(p) for p in sorted(deps)]
     run('compile-actual', base + [normal, '-o', T / 'actual'])
     run('execute-actual', [T / 'actual'])
-    assert 'PASS actual current-copy/VFS/timeout checks=' in (OUT / 'execute-actual.log').read_text()
+    runtime_summary = (OUT / 'execute-actual.log').read_text().strip()
+    assert runtime_summary.startswith('PASS actual current-copy/VFS/timeout checks=')
+    assert 'resident_vectors=4 fallback_vectors=6 exit_vectors=4 reused_exit_vectors=2' in runtime_summary
     mutations = [
         ('lost-reused-reset', '    out.reset();\n    if (!range_valid(user_addr, 1)) return false;',
          '    if (!range_valid(user_addr, 1)) return false;', 'preparation has IF and no caller owners'),
         ('lost-current-copy', 'copy_from_task_common(task, user_addr, dst, size, true, true)',
-         'copy_from_task_common(task, user_addr, dst, size, true, false)', 'current partial read prepares each page'),
-        ('lost-write-commit', 'if (!pin.commit_write())', 'if (false)', 'write prefix dirty accounting'),
+         'copy_from_task_common(task, user_addr, dst, size, true, false)', 'resident hit skips preparation and faulting admission'),
+        ('lost-write-commit', 'if (!pin.commit_write())', 'if (false)', 'resident current write copies and commits without preparation'),
         ('lost-read-preflight', 'if (!ker::mod::sys::usercopy::ensure_current_task_writable(task, USER_BASE + total, TO_READ))',
          'if (false)', 'read preflight before backend consumption'),
+        ('busy-retains-task-lease', '            out.reset();\n        }  // No root pointer, Task lease, reader or frame pin reaches scheduling.',
+         '        }  // Wrong: unsuccessful Task lease survives scheduling.', 'preparation has IF and no caller owners'),
+        ('busy-treated-terminal', 'attempt != mm::virt::UserPagePinAttempt::Busy || !fault_in',
+         'true', 'resident Busy keeps owner-free ordinary fallback'),
+        ('busy-retry-mapped-only', 'attempt != mm::virt::UserPagePinAttempt::Busy || !fault_in',
+         'attempt != mm::virt::UserPagePinAttempt::Busy', 'initial mapped Busy returns before preparation and existing faulting retry'),
+        ('busy-skips-return-context', 'sched::get_return_task() == executor &&',
+         '', 'unsafe executor refuses Busy without scheduling'),
+        ('busy-ignores-retained-effect', '!debug::ptrace::has_pending_local_effect(*executor) &&',
+         '', 'nested retained ptrace effect forbids advisory handoff'),
+        ('resident-fast-attempt-removed', 'pin_task_user_page(task, user_addr, require_writable, false, out)',
+         'false', 'resident current read copies without preparation'),
+        ('resident-ignores-exit-in-progress', '!task.exit_in_progress.load(std::memory_order_acquire) &&',
+         '', 'exiting current resident actor refuses before fast pin'),
+        ('resident-ignores-has-exited', '!task.has_exited &&',
+         '', 'exiting current resident actor refuses before fast pin'),
     ]
     for label, old, new, expected in mutations:
         assert text.count(old) == 1, (label, text.count(old))
@@ -180,10 +220,11 @@ finally:
         result = dict(qualification='PASS_ACTUAL_CURRENT_USERCOPY_HOST_PORTS' if not errors else 'FAIL_PRIVATE_CURRENT_USERCOPY_HOST',
                       commands=commands, errors=errors, input_before=before, input_after=after,
                       source_held=bool(before) and before == after, scratch_removed=removed,
+                      runtime_summary=runtime_summary,
                       preserved_scratch=preserved, owned_groups_pending=groups[:], seconds=time.monotonic() - start,
-                      scope='Actual usercopy/VFS/timeout bodies. Privileged Scope/Task/PTE/pin/backend are finite Host ports; actual preparer/service/factory is qualified separately, no scheduled page-in claim.')
+                      scope='Actual usercopy/VFS/timeout bodies and actual SyscallPreparationScope context/IF protocol. Privileged IF/FLAGS, scheduler, Task lease, PTE/pin/backend are finite Host ports; lower typed admission and actual preparer/service/factory are qualified separately. No native scheduler, TLB, scheduled page-in or C97 causal-repair claim.')
         (OUT / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
-        print(json.dumps({k: result[k] for k in ['qualification', 'errors', 'source_held', 'scratch_removed', 'seconds']}))
+        print(json.dumps({k: result[k] for k in ['qualification', 'errors', 'source_held', 'scratch_removed', 'runtime_summary', 'seconds']}))
     finally:
         for s, h in handlers.items():
             signal.signal(s, h)

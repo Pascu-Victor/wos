@@ -22,6 +22,7 @@ allocator = (ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp").read_text()
 allocator_header = (ROOT / "modules/kern/src/platform/mm/numa_alloc.hpp").read_text()
 demand_virt = (ROOT / "modules/kern/src/platform/mm/virt.opt.cpp").read_text()
 virt_header = (ROOT / "modules/kern/src/platform/mm/virt.hpp").read_text()
+resource_header = (ROOT / "modules/kern/src/platform/sched/resource_as.hpp").read_text()
 code = r'''
 #define WOS_KASAN 1
 #include <algorithm>
@@ -46,7 +47,7 @@ namespace model {
 bool expected_stack_size(size_t);
 std::vector<int> locks;
 alignas(4096) std::array<uint8_t,4096> bytes;
-bool eager=false,cacheable=true,lazy_enabled=false,fail_capture=false,fail_admit=false;int pub=0,reservations=0,released_reservations=0,rolled_back=0,registered=0,register_error=0,capture_calls=0;
+bool eager=false,cacheable=true,lazy_enabled=false,fail_capture=false,fail_admit=false;int pub=0,reservations=0,released_reservations=0,rolled_back=0,registered=0,register_error=0,capture_calls=0,admissions=0;
 bool live=false,unpoisoned=false,fail_alloc=false,fail_read=false,share=true,fail_cache=false;
 uint64_t observed_nodes=0,observed_index=0;unsigned observed_mode=0;uint16_t observed_local=0;
 int attempts=0,reclaim_calls=0,zero_calls=0,cr3_writes=0,unpoison_calls=0,drops=0,reads=0,caches=0,installs=0,tlbs=0;
@@ -54,7 +55,7 @@ uint64_t mapping=0,current_cr3=0x111,expected_flags=0,read_offset=0;
 size_t read_size=0;
 std::function<void()> allocation_hook,read_hook;
 void expect_zero(){assert(live&&unpoisoned);for(auto b:bytes)assert(b==0);}
-void reset(){assert(locks.empty()&&pub==0);eager=lazy_enabled=fail_capture=fail_admit=false;cacheable=true;reservations=released_reservations=rolled_back=registered=register_error=capture_calls=0;live=unpoisoned=fail_alloc=fail_read=fail_cache=false;share=true;
+void reset(){assert(locks.empty()&&pub==0);eager=lazy_enabled=fail_capture=fail_admit=false;cacheable=true;reservations=released_reservations=rolled_back=registered=register_error=capture_calls=admissions=0;live=unpoisoned=fail_alloc=fail_read=fail_cache=false;share=true;
  attempts=reclaim_calls=zero_calls=cr3_writes=unpoison_calls=drops=reads=caches=installs=tlbs=0;
  mapping=expected_flags=read_offset=read_size=0;current_cr3=0x111;allocation_hook=read_hook={};bytes.fill(0xa5);}
 uint8_t data(uint64_t offset){return static_cast<uint8_t>((offset*37+19)%251+1);}
@@ -98,12 +99,18 @@ class SyscallPreparationScope {
  auto operator=(const SyscallPreparationScope&)->SyscallPreparationScope& = delete;
 };
 }
-namespace sched::resource{struct AddressSpaceObservation{template<class T>explicit AddressSpaceObservation(T*){}
- bool admit_mapping(void*,uint64_t,uint64_t=0,uint64_t=0){return !model::fail_admit;}void commit_mapping(){}};}
+namespace sched::resource{
+RESOURCE_MAPPING_ADMISSION
+struct AddressSpaceObservation{template<class T>explicit AddressSpaceObservation(T*){}
+ bool admit_mapping(void*root,uint64_t added,uint64_t replaced_start=0,uint64_t replaced_size=0){
+  assert(model::pub==1&&model::locks.empty()&&root==reinterpret_cast<void*>(1)&&added==4096&&replaced_start==0&&replaced_size==0);
+  ++model::admissions;return !model::fail_admit;}
+ MappingAdmission try_admit_mapping(void*,uint64_t,uint64_t=0,uint64_t=0){std::abort();}
+ void commit_mapping(){}};}
 namespace security{int authorize_file_mapping(unsigned,bool,bool,bool){return 0;}}
 namespace mm {
 enum class PhysicalPageOwner{USER_PRIVATE_MAPPING,USER_FILE_MAPPING};
-namespace paging{constexpr uint64_t PAGE_SIZE=4096;struct PageFault{unsigned writable=0;};}
+namespace paging{using PageTable=void;constexpr uint64_t PAGE_SIZE=4096;struct PageFault{unsigned writable=0;};}
 namespace addr{auto get_phys_pointer(uint64_t p)->void*{return reinterpret_cast<void*>(p);}}
 namespace kasan{
 bool is_enabled(){return true;}bool in_shadow_fault(){return false;}
@@ -219,9 +226,14 @@ class PreparedRangeDemotion {
 auto demote_prepared_range_locked(ker::mod::sched::task::Task&,uint64_t,uint64_t,const SharedVmemPublicationGuard&,PreparedRangeDemotion&)->int{std::abort();}
 class PublicRangeMutation {
  public:
+PUBLIC_MUTATION_BOUNDS
  PublicRangeMutation(ker::mod::sched::task::Task&,const ker::mod::sys::SyscallPreparationScope* preparation,uint64_t,uint64_t){
   if(preparation!=nullptr)std::abort();
  }
+// WHOLE actual admission method; Legacy delegates to the controlled bool
+// policy above. Entering the excluded Public typed/retry route must abort.
+PUBLIC_MUTATION_ADMISSION
+ auto prepare_accounting(const ker::mod::sys::SyscallPreparationScope&)->int{std::abort();}
  auto inspect(const SharedVmemPublicationGuard&)->MutationAttempt{std::abort();}
  auto demote(const SharedVmemPublicationGuard&)->int{std::abort();}
  auto prepare_next(MutationStage)->int{std::abort();}
@@ -344,6 +356,8 @@ int run(){
   uint64_t result=ker::syscall::vmem::file_allocate(&t,0,4096,3,1,5,83);
   bool success=mode<4;assert(result==(success?0x10000ULL:static_cast<uint64_t>(mode==4?-EINVAL:mode==5||mode==7?-ENOMEM:mode==6?-EFAULT:-EIO)));
   assert(file.refs==1&&pub==0&&capture_calls==(mode==1?0:1));
+  assert(admissions==(mode==4?0:1));
+  if(mode==7)assert(reservations==0&&attempts==0&&caches==0&&reads==0);
   if(mode==1)assert(attempts==0&&mapping==0&&reservations==1);
   if(mode==0||mode==3){assert(observed_nodes==10&&observed_mode==2&&observed_local==3&&observed_index==16);check_data(83,1000);assert(installs==1&&drops==0);}
   if(mode==2)assert(caches==1&&attempts==0&&mapping);
@@ -374,6 +388,11 @@ code = extend_raw_fixture(code, 'model::Lock user_mapping_pin_lock{3};')
 mutation_source = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
 mutation_types = '\n'.join(block(mutation_source, rf'^(?:enum class|struct) {name}[^;{{]*\{{') + ';'
                            for name in ('MutationRoute', 'MutationStage', 'MutationAttempt'))
+mutation_record = block(mutation_source, r'^class PublicRangeMutation \{')
+mutation_bounds = '\n'.join(line for line in mutation_record.splitlines()
+                            if line.strip().startswith('static constexpr unsigned MAX_'))
+assert mutation_bounds.count('static constexpr') == 2
+mutation_admission = block(mutation_record, r'^\s*\[\[nodiscard\]\] auto admit_mapping\(')
 file_allocate_body = function(vmem, 'file_allocate')
 if 'SyscallPreparationScope' in file_allocate_body[:file_allocate_body.index('{')]:
     # Preserve actual default-Legacy delegation; never rewrite the main body.
@@ -386,6 +405,9 @@ replacements = {
     'INSTALL': function(virt, 'install_lazy_file_page_if_current'),
     'FILE_ALLOCATE': file_allocate_body,
     'LEGACY_MUTATION_TYPES': mutation_types,
+    'PUBLIC_MUTATION_BOUNDS': mutation_bounds,
+    'PUBLIC_MUTATION_ADMISSION': mutation_admission,
+    'RESOURCE_MAPPING_ADMISSION': block(resource_header, r'^enum class MappingAdmission[^;{]*\{') + ';',
     'FILE_MATERIALIZE': function(vmem, 'materialize_lazy_file_page_impl'),
     'FAULT': actual_fault,
     'NUMA_DECLARATIONS': numa_declarations,

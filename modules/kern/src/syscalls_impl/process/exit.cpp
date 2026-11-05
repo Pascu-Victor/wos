@@ -62,26 +62,17 @@ void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::
                                      aux, callsite);
 }
 
-void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
+void leave_exiting_user_address_space(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->type != ker::mod::sched::task::TaskType::PROCESS || task->is_thread || task->pagemap == nullptr) {
         return;
     }
-    if (ker::mod::sched::task_has_live_pagemap_sibling(task)) {
-        return;
-    }
 
-    // The task has already transitioned out of ACTIVE, so it will not return to
-    // userspace. Switch this CPU away from the exiting address space, then make
-    // the Task stop publishing the pagemap before destroying the user half.
-    // Waitpid-visible zombie state stays in the Task; scheduler GC still reclaims
-    // the thread object, kernel stack, and scratch area after the epoch guard.
+    // This task can no longer return to userspace. Stop this CPU publishing its
+    // root, but retain the Task's binding for the existing GC owner. GC waits
+    // for the death epoch and current-CPU/shared-publisher guards, including
+    // resource cleanup for waitable zombies. Draining a striped reader here
+    // with IF masked can wait for a reader suspended on this same CPU.
     ker::mod::mm::virt::switch_to_kernel_pagemap();
-    auto* pagemap = task->detach_pagemap_after_usercopy_quiescence();
-    if (pagemap == nullptr) {
-        return;
-    }
-    ker::mod::mm::virt::destroy_user_space(pagemap, task->pid, task->name, "process-exit");
-    ker::mod::mm::virt::release_pagemap(pagemap, task->pid);
 }
 
 void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
@@ -408,10 +399,10 @@ namespace {
     // closed and status/accounting are stable, but it also must not depend on
     // later memory cleanup making progress under heavy build load.
 
-    // A waitable zombie keeps only status/accounting/PID metadata. It must not
-    // pin the exiting process's user address space while waiting for the parent
-    // to reap it, especially under fork/COW storms.
-    release_exiting_user_address_space(current_task);
+    // Leave the hardware user root now. GC sheds the address space and stack
+    // after the final handoff/epoch, even when a waitable zombie retains its
+    // Task/status record. Do not wait for root readers in this EXITING tail.
+    leave_exiting_user_address_space(current_task);
 
     // Thread destruction deferred to gcExpiredTasks()
 

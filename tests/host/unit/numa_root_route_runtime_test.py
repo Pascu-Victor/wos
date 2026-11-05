@@ -37,8 +37,10 @@ if not isinstance(overlay, dict) or not set(overlay) <= set(RELATIVE):
     parser.error("overlay contains an unapproved source path")
 if any(not isinstance(v, str) or not Path(v).is_absolute() for v in overlay.values()):
     parser.error("overlay files must be absolute paths")
-cxx = Path(shutil.which(args.cxx) or args.cxx).resolve(strict=True)
-if not cxx.is_file():
+# Preserve the C++ driver alias in argv; clang++ may resolve to a C-mode ELF.
+# pin() still resolves and holds the actual executable content and identity.
+cxx = Path(shutil.which(args.cxx) or args.cxx).absolute()
+if not cxx.resolve(strict=True).is_file():
     parser.error("native compiler must be an existing file")
 E = args.evidence_dir.resolve() if args.evidence_dir else None
 if E:
@@ -184,6 +186,7 @@ try:
     source, h, f = cpp.read_text(), header.read_text(), fixture.read_text()
     types = definition(h, "struct PageTablePoolStatsSnapshot", ";") + "\n" + h[h.index("enum class SelftestRootAllocationSource"):h.index("struct SelftestRootCensus")]
     pool_types = source[source.index("constexpr size_t PAGE_TABLE_POOL_CAPACITY"):source.index("constexpr size_t OWNED_FRAME_TABLE_CAPACITY")]
+    initializer = definition(source, "auto initialize_page_table_pool_after_topology()")
     pool = "\n\n".join(definition(source, marker) for marker in ["auto page_table_pool_proof_begin_locked()", "auto page_table_pool_proof_end(", "void selftest_observe_page_table_pool(", "void get_page_table_pool_stats_snapshot(", "void zero_page_table_for_pool(", "auto try_alloc_page_table_from_pool(",
                  "auto try_release_page_table_to_pool(", "auto alloc_zeroed_page_table("])
     roots = definition(source, "class CurrentRootSemanticOperation", ";") + "\n"
@@ -199,7 +202,7 @@ try:
     generated = generated.replace("// WOS_TEST_INSERT_ACTUAL_PHYSICAL_TYPES", physical_types)
     generated = generated.replace("// WOS_TEST_INSERT_ACTUAL_CONSERVATION_PREDICATES", predicates)
     generated = generated.replace("// WOS_TEST_INSERT_CONSERVATION_CASES", (HERE / "numa_root_conservation_cases.inc").read_text())
-    for marker, value in [("// WOS_TEST_INSERT_ACTUAL_OUTPUT_TYPES", types), ("// WOS_TEST_INSERT_ACTUAL_POOL_TYPES", pool_types), ("// WOS_TEST_INSERT_ACTUAL_POOL_FUNCTIONS", pool),
+    for marker, value in [("// WOS_TEST_INSERT_ACTUAL_OUTPUT_TYPES", types), ("// WOS_TEST_INSERT_ACTUAL_POOL_TYPES", pool_types), ("// WOS_TEST_INSERT_ACTUAL_POOL_FUNCTIONS", pool), ("// WOS_TEST_INSERT_ACTUAL_POOL_INITIALIZER", initializer),
                           ("// WOS_TEST_INSERT_ACTUAL_ROOT_FUNCTIONS", roots), ("// WOS_TEST_INSERT_ACTUAL_DIAGNOSTIC_TYPES", diagnostic)]:
         if generated.count(marker) != 1: raise RuntimeError("fixture marker")
         generated = generated.replace(marker, value)
@@ -231,10 +234,41 @@ try:
     ]:
         if generated.count(needle) != 1: raise RuntimeError("genuine new mutation boundary " + label)
         path = T / (label + ".cpp"); path.write_text(generated.replace(needle, replacement)); extra_mutants.append((label,path,1))
+    # Restore actual old cache behavior, rather than claiming that pop-only
+    # removal can affect a valid empty cache whose adoption remains disabled.
+    pop_guard = """    if (!page_table_pool_enabled.load(std::memory_order_acquire)) {
+        page_table_pool_alloc_misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+"""
+    adoption_guard = """    if (!page_table_pool_enabled.load(std::memory_order_acquire)) {
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+"""
+    if generated.count(pop_guard) != 1 or generated.count(adoption_guard) != 1:
+        raise RuntimeError("actual NUMA cache-policy mutation boundaries")
+    numa_mutants = []
+    for label, text in [
+        ("old-global-mixed-cache", generated.replace(pop_guard, "").replace(adoption_guard, "")),
+        ("adopt-on-disabled-numa", generated.replace(adoption_guard, "")),
+    ]:
+        path = T / (label + ".cpp")
+        path.write_text(text)
+        numa_mutants.append((label, path))
     for label, src, expected in [("actual", main, 0), ("mislabel", mutant1, 1), ("bypass", mutant2, 1), *extra_mutants]:
         binary = T / label
         run("compile-" + label, flags + [src, "-pthread", "-o", binary])
-        run("run-" + label, [binary], expected)
+        run("run-" + label, [binary, "uma"], expected)
+        if label == "actual":
+            for mode in ("numa", "unpublished", "zero-nodes", "too-many-nodes", "nonempty", "inflight", "invalid-proof"):
+                run("run-actual-" + mode, [binary, mode])
+    for label, src in numa_mutants:
+        binary = T / label
+        run("compile-" + label, flags + [src, "-pthread", "-o", binary])
+        run("run-" + label, [binary, "numa"], 1)
+        if "FAIL NUMA per-node free/kind/all-owner rows close after each root lifecycle" not in commands[-1]["output"]:
+            raise RuntimeError("NUMA cache mutant must fail the actual physical-return oracle")
     emitted_after = [pin(p) for p in deps]
     inputs_after = [pin(p) for p in chosen]
     if emitted_before != emitted_after or inputs_before != inputs_after:
@@ -279,7 +313,7 @@ finally:
             emitted_before=emitted_before, emitted_after=emitted_after, seconds=time.monotonic() - started,
             scratch_removed=clean, scratch_allocated_bytes_removed=size, pending_groups=list(active),
             preserved_scratch=str(T) if not clean else None,
-            scope="Actual root/pool/factory/return bodies; explicit physical, emergency, control registry, CPU/CR3 and lock Host endpoints. No PMM pressure, native, SMP or causal attribution.")
+            scope="Actual one-shot topology initializer/root/pool/factory/return bodies; fresh UMA and multi-node processes with 1000 cycles per node and strict explicit physical ownership/kind/free conservation; explicit physical, emergency, control registry, CPU/CR3 and lock Host endpoints. No PMM pressure, native, SMP or causal attribution.")
         if E:
             (E / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps({k: result[k] for k in ("qualification", "errors", "seconds", "scratch_removed")}))

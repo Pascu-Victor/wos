@@ -2,9 +2,18 @@
 // exclusive class, actual survey/split, coordinator and full copier are extracted.
 namespace {
 size_t fork_fail_table_at = SIZE_MAX, fork_table_attempts{};
+unsigned fork_source_wait_samples{};
 void before_fork_preempt() {
     if (host_range::expect_fork_wait && root_readers != 0 && host_range::on_range_preempt) host_range::on_range_preempt();
     if (!fork_mode) return;
+    // New actual advisory sampling enters PreemptGuard before its short Task
+    // lease. Keep old COW-entry checks unchanged whenever PUB is retained.
+    if (!host_range::exclusive && publication_depth == 0 && host_range::interrupts) {
+        EXPECT_EQ(root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);
+        if (host_range::current) EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(), 0U);
+        ++fork_source_wait_samples;
+        return;
+    }
     huge::Snapshot snapshot{};
     huge_core.snapshot(snapshot);
     EXPECT_TRUE(host_range::exclusive);

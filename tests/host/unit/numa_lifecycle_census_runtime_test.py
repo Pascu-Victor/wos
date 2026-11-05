@@ -102,6 +102,7 @@ def generate(root, source_root):
         declaration("test/compartment_lifecycle_census.hpp", name) for name in ["CensusCpuScalars", "CensusScalars"]
     )
     scope = clean(text("test/numa_lifecycle_census.hpp"))
+    wait_kind = capture(text("platform/sched/task.hpp"), "enum class WaitChannelKind :", True)
     owner = clean(text("test/lifecycle_owner_census.hpp"))
     body = clean(text("test/numa_lifecycle_census.cpp"))
     fd_readers = "\n".join(
@@ -168,6 +169,7 @@ def generate(root, source_root):
         ("@DECLARATIONS@", "\n".join(declarations)),
         ("@SCALARS@", scalars),
         ("@SCOPE@", scope),
+        ("@WAIT_CHANNEL_KIND@", wait_kind),
         ("@OWNER@", owner),
         ("@HANDLER@", body),
         ("@FD_READERS@", fd_readers),
@@ -237,6 +239,7 @@ def main():
         "vfs/fd_reservation.cpp",
         "platform/sched/resource_process.cpp",
         "platform/sched/task.cpp",
+        "platform/sched/task.hpp",
         "platform/mm/unpublished_mapping_retirement.hpp",
         "platform/mm/file_mapping_lifetime.hpp",
         "syscalls_impl/vmem/sys_vmem.cpp",
@@ -289,6 +292,9 @@ def main():
         generated = source.read_text()
         registry_function = capture(generated, "auto same_registry_rows(")
         endpoint_function = capture(generated, "auto prepare_endpoint(")
+        return_yield_function = capture(generated, "auto channel_free_return_yield(")
+        return_yield_guard = "(actor.deferred_task_switch && !channel_free_return_yield(actor))"
+        assert generated.count(return_yield_guard) == 1
         mm_function = capture(generated, "auto same_mm_debt(")
         tail_before = "    adjust_native_return_tail(true);"
         assert generated.count(tail_before) == 2
@@ -302,6 +308,10 @@ def main():
         assert generated.count(baseline_physical) == 1
         variants = {
             "actual": generated,
+            "old-blanket-deferred": generated.replace(return_yield_guard, "actor.deferred_task_switch", 1),
+            "overbroad-deferred-permit": generated.replace(
+                return_yield_function, return_yield_function[:return_yield_function.index("{")] + "{ return true; }", 1
+            ),
             "old-baseline-cache-partition": generated.replace(
                 baseline_physical, "same_physical(plain.physical_baseline, plain.physical_b)", 1
             ),
@@ -364,6 +374,12 @@ def main():
                 if phase == "run" and name == "old-baseline-cache-partition":
                     if "physical ownership partition acceptance oracle failed" not in log.read_text():
                         raise ValueError("old baseline control missed the physical partition acceptance oracle")
+                if phase == "run" and name == "old-blanket-deferred":
+                    if "channel-free return-yield acceptance oracle failed" not in log.read_text():
+                        raise ValueError("old blanket control missed the return-yield acceptance oracle")
+                if phase == "run" and name == "overbroad-deferred-permit":
+                    if "blocked deferred refusal oracle failed" not in log.read_text():
+                        raise ValueError("overbroad control missed the blocked-deferred refusal oracle")
         result["pass"] = True
     except BaseException as error:
         result["errors"].append(f"{type(error).__name__}: {error}")

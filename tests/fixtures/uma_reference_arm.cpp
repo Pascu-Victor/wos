@@ -324,6 +324,21 @@ auto running(const init::StatusSnapshot& s, pid_t controller, uint64_t& deadline
     return true;
 }
 namespace {
+auto recovered_readiness_error(const init::ServiceStatus& service) -> bool {
+    // Init retains a failed probe's diagnostic after successful readiness.
+    // Only a current ready daemon with that transition can prove recovery.
+    if (service.last_error <= 0 || service.state != init::ServiceState::RUNNING || service.readiness != init::ReadinessState::READY ||
+        (std::strcmp(service.service, "journald") && std::strcmp(service.service, "netd") && std::strcmp(service.service, "httpd") &&
+         std::strcmp(service.service, "dropbear")))
+        return false;
+    for (size_t i = 0; i < service.history_count; ++i) {
+        auto const& transition = service.history[i];
+        if (transition.reason == init::TransitionReason::READINESS && transition.from_state == init::ServiceState::RUNNING &&
+            transition.to_state == init::ServiceState::RUNNING && transition.timestamp_mono_ns == service.state_since_mono_ns)
+            return true;
+    }
+    return false;
+}
 auto completed_context(const init::StatusSnapshot& s, pid_t observer, bool pending_exec) -> bool {
     init::ServiceStatus row{};
     // Witness and its dependent finalizer are unfinished oneshots. This stage
@@ -348,7 +363,7 @@ auto completed_context(const init::StatusSnapshot& s, pid_t observer, bool pendi
     if (!exited) return false;
     for (size_t i = 0; i < s.service_count; ++i) {
         auto const& service = s.services[i];
-        if (service.restart_count || service.last_wait_status || service.last_error) return false;
+        if (service.restart_count || service.last_wait_status || (service.last_error && !recovered_readiness_error(service))) return false;
         for (size_t j = 0; j < service.history_count; ++j) {
             auto const reason = service.history[j].reason;
             if (reason == init::TransitionReason::RESTART || reason == init::TransitionReason::STOP_REQUEST ||
@@ -421,7 +436,7 @@ auto witnessed_context(const init::StatusSnapshot& s, const init::StatusSnapshot
         return false;
     for (size_t i = 0; i < s.service_count; ++i) {
         auto const& service = s.services[i];
-        if (service.restart_count || service.last_wait_status || service.last_error) return false;
+        if (service.restart_count || service.last_wait_status || (service.last_error && !recovered_readiness_error(service))) return false;
         for (size_t j = 0; j < service.history_count; ++j) {
             auto reason = service.history[j].reason;
             if (reason == init::TransitionReason::RESTART || reason == init::TransitionReason::STOP_REQUEST ||

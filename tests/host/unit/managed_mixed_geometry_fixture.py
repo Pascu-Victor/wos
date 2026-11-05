@@ -33,7 +33,8 @@ class Builder(AnonymousBuilder):
         text = path.read_text()
         anchor = " std::atomic<void*> native_file_mapping_retirement{};"
         assert text.count(anchor) == 1
-        path.write_text(text.replace(anchor, anchor + "\n std::atomic<bool> shares_user_pagemap{true};", 1))
+        assert text.count("shares_user_pagemap{false}") == 1
+        path.write_text(text.replace("shares_user_pagemap{false}", "shares_user_pagemap{true}", 1))
 
     def mixed_additions(self):
         d = self.body
@@ -461,18 +462,19 @@ void map_same_page_range(PageTable*root,vaddr_t address,paddr_t physical,uint64_
 namespace ker::mod::sched::resource {
 // Decision endpoint only: actual policy/accounting walks are not modeled.
 // The actual observation methods below retain attempt/commit/recount ordering.
-auto admit_mapping_count(task::Task* subject,mm::paging::PageTable* root,uint64_t added,
- uint64_t replaced_start,uint64_t replaced_size,uint64_t* admitted_bytes)->bool {
+auto try_admit_mapping_count(task::Task* subject,mm::paging::PageTable* root,uint64_t added,
+ uint64_t replaced_start,uint64_t replaced_size,uint64_t* admitted_bytes)->MappingAdmission {
  host_mixed::ordinary_boundary();EXPECT_EQ(subject,host_range::current);EXPECT_EQ(root,runtime_root);
  EXPECT_GT(added,0U);EXPECT_EQ(added%PAGE,0U);
  EXPECT_TRUE(replaced_size==0||(replaced_start%PAGE==0&&replaced_size==added));
  ++host_fixed::admissions;
- if(!host_fixed::admit)return false;
+ if(!host_fixed::admit)return MappingAdmission::Denied;
  if(admitted_bytes)*admitted_bytes=added;
- return true;
+ return MappingAdmission::Admitted;
 }
 using ker::mod::sched::get_current_task;
 ''', d("platform/sched/resource_as.cpp", "auto can_reuse_mapping_count("),
+               d("platform/sched/resource_as.cpp", "auto AddressSpaceObservation::try_admit_mapping("),
                d("platform/sched/resource_as.cpp", "auto AddressSpaceObservation::admit_mapping("),
                d("platform/sched/resource_as.cpp", "void AddressSpaceObservation::commit_mapping()"), r'''
 }
@@ -503,7 +505,10 @@ auto anon_zero_cow_enabled()->bool{return host_fixed::zero_cow;}
         old = "auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);"
         assert actual.count(old) == 1
         # Numerical HHDM input only. Preserve the real guard and refusal.
-        out.append(actual.replace(old, "auto pm_addr = host_fixed::hhdm_address(task->pagemap);", 1))
+        # Host optimization endpoint only: retain the whole production body and
+        # sanitizers while bounding compilation of the large retry lambda.
+        out.append("[[gnu::noinline]]\n#ifdef __clang__\n[[clang::optnone]]\n#endif\n" +
+                   actual.replace(old, "auto pm_addr = host_fixed::hhdm_address(task->pagemap);", 1))
         out.append(d("syscalls_impl/vmem/sys_vmem.cpp", "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t {"))
         out.extend(["namespace detail {\n", d("syscalls_impl/vmem/sys_vmem.cpp", "auto replace_current_anonymous_fixed("), "}\n}\n"])
         return "\n".join(out)
@@ -560,10 +565,10 @@ return allocate(first, pages, alignment, initialization);'''
             ("fixed-skips-demotion", "int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);", "int const DEMOTION = 0;", "CrossLeafReplacementDemotesAllBeforeUnmap"),
             ("fixed-keeps-reader", "release_fixed_mmap_range_locked(task, vaddr, size);", "ker::mod::mm::huge::detail::CurrentRangeRootAccess extra; (void)ker::mod::mm::huge::detail::acquire_current_range_root(*task,extra); release_fixed_mmap_range_locked(task,vaddr,size); ker::mod::mm::huge::detail::release_current_range_root(extra);", "PrivateReadUsesSamePublicationAfterReaderDestruction"),
             ("fixed-reacquires-publication", "release_fixed_mmap_range_locked(task, vaddr, size);", "publication_guard.~SharedVmemPublicationGuard(); ::new(&publication_guard) SharedVmemPublicationGuard; release_fixed_mmap_range_locked(task,vaddr,size);", "PrivateReadUsesSamePublicationAfterReaderDestruction"),
-            ("fixed-bypasses-as-refusal", "if (!observation.admit_mapping(task->pagemap, size, hint, size)) {", "if (false) {", "AsRefusalKeepsManagedLeafAndMetadataExact"),
+            ("fixed-bypasses-as-refusal", "if (ADMITTED.stage != MutationStage::Complete || ADMITTED.result != 0) return ADMITTED;", "/* omitted fixed AS refusal */", "AsRefusalKeepsManagedLeafAndMetadataExact"),
         ]
         for label, old, new, test in vectors:
-            assert actual.count(old) == 1, label
+            assert actual.count(old) == (2 if label == "fixed-bypasses-as-refusal" else 1), label
             assert source.count(actual.strip()) == 1, label
             yield label, source.replace(actual.strip(), actual.replace(old, new, 1).strip(), 1), "ManagedAnonymousFixed." + test
 
@@ -672,7 +677,10 @@ auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task&,ker::vfs::File&,c
             "auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset,",
             "auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset)\n",
         ):
-            out.append(d("syscalls_impl/vmem/sys_vmem.cpp", anchor))
+            actual = d("syscalls_impl/vmem/sys_vmem.cpp", anchor)
+            if anchor.startswith("auto file_allocate(") and "PreparedRangeDemotion" not in anchor and anchor.endswith("offset,"):
+                actual = "[[gnu::noinline]]\n#ifdef __clang__\n[[clang::optnone]]\n#endif\n" + actual
+            out.append(actual)
         out.extend(["namespace detail {\n", d("syscalls_impl/vmem/sys_vmem.cpp", "auto replace_current_file_fixed("), "}\n}\n"])
         return "\n".join(out)
 
@@ -724,10 +732,11 @@ namespace host_file {extern bool active;void final_close(ker::vfs::File*);}
             ("file-fixed-skips-demotion", "int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);", "int const DEMOTION = 0;", "CrossLeafReadReplacesOnlyRequestedFrames"),
             ("file-fixed-keeps-reader", "release_fixed_mmap_range_locked(task, vaddr, size);", "ker::mod::mm::huge::detail::CurrentRangeRootAccess extra; (void)ker::mod::mm::huge::detail::acquire_current_range_root(*task,extra); release_fixed_mmap_range_locked(task,vaddr,size); ker::mod::mm::huge::detail::release_current_range_root(extra);", "ReadAndFinalOuterCloseUseOrdinaryContinuousPublication"),
             ("file-fixed-reacquires-publication", "release_fixed_mmap_range_locked(task, vaddr, size);", "publication_guard.~SharedVmemPublicationGuard(); ::new(&publication_guard) SharedVmemPublicationGuard; release_fixed_mmap_range_locked(task,vaddr,size);", "ReadAndFinalOuterCloseUseOrdinaryContinuousPublication"),
-            ("file-fixed-bypasses-as", "if (!observation.admit_mapping(task->pagemap, size, hint, size)) {", "if (false) {", "AsDenialKeepsOldLeafAndDoesNotReadBacking"),
+            ("file-fixed-bypasses-as", "if (ADMITTED.stage != MutationStage::Complete || ADMITTED.result != 0) return ADMITTED;", "/* omitted fixed AS refusal */", "AsDenialKeepsOldLeafAndDoesNotReadBacking"),
         ]
         for label, old, new, test in vectors:
-            assert actual.count(old) == source.count(actual.strip()) == 1, label
+            assert actual.count(old) == (2 if label == "file-fixed-bypasses-as" else 1), label
+            assert source.count(actual.strip()) == 1, label
             yield label, source.replace(actual.strip(), actual.replace(old, new, 1).strip(), 1), "ManagedFileFixed." + test
 
 
@@ -740,12 +749,81 @@ class PublicMutationBuilder(FileFixedBuilder):
 
     def __init__(self, kernel_file, support, definition):
         super().__init__(kernel_file, support, definition)
+        self._definition = definition
         self.public_cases = support / "managed_public_mutation_cases.inc"
         count = self.public_cases.read_text().count("TEST_F(ManagedPublicMutation,")
-        if not 0 < count <= 16:
-            raise ValueError("public mutation profile must add1..16 actual cases")
-        self.inputs.extend([self.public_cases, kernel_file("abi/numa.h")])
+        if not 0 < count <= 32:
+            raise ValueError("public mutation profile must add1..32 actual cases")
+        self.inputs.extend([self.public_cases, kernel_file("abi/numa.h"), kernel_file("platform/sched/resource_model.hpp"),
+                            kernel_file("abi/resource.hpp")])
         self.test_count += count
+
+    def extend_context(self, overlay):
+        super().extend_context(overlay)
+        path = overlay / "platform/sched/task.hpp"
+        text = path.read_text().replace("#include <atomic>", "#include <atomic>\n#include <platform/sched/resource_model.hpp>", 1)
+        anchor = "bool has_run{}, is_thread{}; Task* owner{};"
+        assert text.count(anchor) == 1, "one composed Task owner declaration"
+        path.write_text(text.replace(anchor, anchor + r'''
+ bool resource_owner_available{true};
+ resource::State resources{};
+ struct ResourceLock {bool held{};auto lock_irqsave()->uint64_t;void unlock_irqrestore(uint64_t);} resource_lock;
+''', 1))
+
+    def accounting_additions(self):
+        """Whole real count/policy functions; Task owner/lock are explicit Host ports.
+
+        Existing cases retain their finite admission endpoint. Only new cases
+        opt in through its typed dispatch to the actual admission body below.
+        The striped atomic transport remains the existing one-collision model.
+        """
+        d = self.body
+        status = self.sources["platform/mm/virt.hpp"]
+        enum = status[status.index("enum class UserVirtualCountStatus"):].split(";", 1)[0] + ";"
+        return "\n".join([r'''
+namespace host_accounting {
+bool enabled{};
+unsigned pte_reads{}, reader_cas{}, policy_locks{};
+void (*on_reader_cas)(){};
+}
+namespace ker::mod::sched::task {
+auto Task::ResourceLock::lock_irqsave()->uint64_t {
+ EXPECT_FALSE(held);EXPECT_EQ(root_readers+backend().preempt_depth,0U);
+ EXPECT_EQ(publication_depth,1U);held=true;++host_accounting::policy_locks;return 0;
+}
+void Task::ResourceLock::unlock_irqrestore(uint64_t){EXPECT_TRUE(held);held=false;}
+}
+namespace ker::mod::mm::virt {
+''', enum, r'''
+namespace counting132 {
+auto entry_at(PageTable*table,size_t index)->PageTableEntry& {
+ ++host_accounting::pte_reads;
+ return ker::mod::mm::virt::entry_at(table,index);
+}
+''', "template<bool StopAtFirst=false>\n" + d("platform/mm/virt.opt.cpp", "auto count_virtual_bytes_in_table("),
+            "}\nusing counting132::count_virtual_bytes_in_table;\n",
+            d("platform/mm/virt.opt.cpp", "auto query_user_virtual_bytes("), r'''
+}
+namespace ker::mod::sched::resource::accounting132 {
+constexpr uint64_t USER_END=0x0000800000000000ULL;
+// Process-owner lifetime and resource locking are finite endpoints. The exact
+// State::admit_address_space and all actual full/replaced counts run unchanged.
+class Owner {
+ task::Task* task_;
+ public:explicit Owner(task::Task* subject):task_(subject->resource_owner_available?subject:nullptr){}
+ auto get()const->task::Task*{return task_;}
+};
+''', d("platform/sched/resource_as.cpp", "auto query_address_space_count("),
+            d("platform/sched/resource_as.cpp", "auto try_admit_mapping_count("), r'''
+}
+namespace host_accounting {
+auto admit(ker::mod::sched::task::Task*subject,ker::mod::mm::paging::PageTable*root,
+ uint64_t added,uint64_t start,uint64_t removed,uint64_t*bytes)->ker::mod::sched::resource::MappingAdmission {
+ host_public::admission_boundary();++host_fixed::admissions;
+ return ker::mod::sched::resource::accounting132::try_admit_mapping_count(subject,root,added,start,removed,bytes);
+}
+}
+'''])
 
     def compose(self, *arguments):
         source = super().compose(*arguments)
@@ -755,7 +833,57 @@ class PublicMutationBuilder(FileFixedBuilder):
         old = "host_mixed::ordinary_boundary();EXPECT_EQ(subject,host_range::current);EXPECT_EQ(root,runtime_root);"
         assert source.count(old) == 1
         source = source.replace(old, "host_public::admission_boundary();EXPECT_EQ(subject,host_range::current);EXPECT_EQ(root,runtime_root);", 1)
-        declarations = "namespace host_public {extern bool active;void admission_boundary();}\n"
+        declarations = r'''
+#include <cstdint>
+namespace ker::mod::mm::paging {struct PageTable;}
+namespace ker::mod::sched::task {struct Task;}
+namespace ker::mod::sched::resource {enum class MappingAdmission:uint8_t;}
+namespace host_public {extern bool active, actual_reader_admission;void admission_boundary();}
+namespace host_accounting {
+extern bool enabled;extern unsigned pte_reads,reader_cas;extern void(*on_reader_cas)();
+auto admit(ker::mod::sched::task::Task*,ker::mod::mm::paging::PageTable*,uint64_t,uint64_t,uint64_t,uint64_t*)
+ ->ker::mod::sched::resource::MappingAdmission;
+}
+'''
+        endpoint = self._definition(source, "auto try_admit_mapping_count(")
+        opening = endpoint.index("{") + 1
+        routed = endpoint[:opening] + "\n if(host_accounting::enabled)return host_accounting::admit(subject,root,added,replaced_start,replaced_size,admitted_bytes);\n" + endpoint[opening:]
+        source = source.replace(endpoint, routed, 1)
+        cas = "        root_readers = desired;"
+        assert source.count(cas) == 1
+        source = source.replace(cas, cas + "\n        if(host_accounting::enabled){++host_accounting::reader_cas;if(host_accounting::on_reader_cas)host_accounting::on_reader_cas();}", 1)
+        # Existing legacy profiles retain their finite reader port. Only the
+        # new contention cases opt into the whole extracted production CAS /
+        # teardown / saturation protocol already present in this composition.
+        old_reader = self._definition(source, "auto acquire_user_pagemap_access(")
+        opening = old_reader.index("{") + 1
+        routed = old_reader[:opening] + "\n    if (host_public::actual_reader_admission) {\n" + \
+            "        if (root != runtime_root) return false;\n" + \
+            "        return admit_user_pagemap_reader(root, index, [](bool) { return false; });\n    }\n" + old_reader[opening:]
+        assert source.count(old_reader) == 1
+        source = source.replace(old_reader, routed, 1)
+        # A public contention callback checks only the settled safe-yield
+        # invariants. Whether a reviewed ordinary policy retains PUB/Task
+        # leases is deliberately not decided by this regression.
+        yield_body = self._definition(source, "void kern_yield()")
+        yield_open = yield_body.index("{") + 1
+        yielded = yield_body[:yield_open] + "\n    if (host_public::actual_reader_admission) {\n" + \
+            "        EXPECT_EQ(root_readers + cow_depth + pin_depth + backend().preempt_depth, 0U);\n" + \
+            "        EXPECT_TRUE(host_range::interrupts); ++host_range::yields;\n" + \
+            "        if (host_range::on_yield) host_range::on_yield(); return;\n    }\n" + yield_body[yield_open:]
+        source = source.replace(yield_body, yielded, 1)
+        total = "EXPECT_EQ(host_fork_vm::pubs,expected_pubs);"
+        assert source.count(total) == 1
+        source = source.replace(total, "if(expected_pubs != UINT_MAX) " + total, 1)
+        # The actual hash proves the two roots really collide. The maintained
+        # Host storage remains one explicit colliding-stripe endpoint, not a
+        # claim that all 4096 production gates or native teardown execute.
+        gate_source = self.sources["platform/mm/virt.opt.cpp"]
+        gate_count = next(line for line in gate_source.splitlines()
+                          if line.startswith("constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT ="))
+        actual_hash = self.body("platform/mm/virt.opt.cpp", "[[nodiscard]] auto user_pagemap_access_gate_index(")
+        hash_endpoint = "\nnamespace host_public_hash {using PageTable=ker::mod::mm::paging::PageTable;\n" + \
+            gate_count + "\n" + actual_hash + "\n}\n"
         # These endpoints are deliberately rejecting. The actual dispatchers
         # below retain all cases and their original malformed-argument checks.
         ports = r'''
@@ -782,7 +910,7 @@ auto set_memory_policy_for_task(ker::mod::sched::task::Task&,uint64_t,uint64_t,u
             "auto sys_vmem(uint64_t op,", "auto sys_vmem_map("))
         boundary = r'''
 namespace host_public {
-bool active{};
+bool active{}, actual_reader_admission{};
 void admission_boundary(){
  if(!active){host_mixed::ordinary_boundary();return;}
  EXPECT_TRUE(host_range::interrupts);EXPECT_EQ(publication_depth,1U);
@@ -791,7 +919,7 @@ void admission_boundary(){
 }
 }
 '''
-        return declarations + source + boundary + self.huge_constructor_additions() + ports + callers + "\n}\n" + self.public_cases.read_text()
+        return declarations + source + boundary + self.accounting_additions() + self.huge_constructor_additions() + ports + callers + "\n}\n" + hash_endpoint + self.public_cases.read_text()
 
     def huge_constructor_additions(self):
         source = self.sources["syscalls_impl/vmem/sys_vmem.cpp"]
@@ -832,6 +960,18 @@ void admission_boundary(){
         assert actual.count(old) == 1 and source.count(actual) == 1
         bad = actual.replace(old, old + "\npublication_guard.~SharedVmemPublicationGuard(); ::new(&publication_guard) SharedVmemPublicationGuard;", 1)
         yield "public-reopens-final-publication", source.replace(actual, bad, 1), "ManagedPublicMutation.RawFreeDemotesBeforeUnmapUnderFinalPublication"
+        actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "class PublicRangeMutation {")
+        old = "if (STATUS == MappingAdmission::GateBusy) return MutationStage::NeedAccounting;"
+        assert actual.count(old) == source.count(actual) == 1
+        bad = actual.replace(old, "if (STATUS == MappingAdmission::GateBusy) return static_cast<uint64_t>(-ENOMEM);", 1)
+        yield "public-accounting-busy-becomes-enomem", source.replace(actual, bad, 1), "ManagedPublicMutation.AccountingInitialBusyNeverWalksOrMutatesBeforeOwnerFreeCooperation"
+        actual = self.body("platform/sched/resource_as.cpp", "auto try_admit_mapping_count(")
+        old = "uint64_t current = 0;"
+        first = "auto const CURRENT = query_address_space_count(*subject, root, 0, USER_END, current);"
+        assert actual.count(old) == actual.count(first) == source.count(actual) == 1
+        bad = actual.replace(old, "static uint64_t stale_current = 0; uint64_t current = stale_current;", 1)
+        bad = bad.replace(first, "auto const CURRENT = current ? mm::virt::UserVirtualCountStatus::Counted : query_address_space_count(*subject, root, 0, USER_END, current); stale_current = current;", 1)
+        yield "public-accounting-reuses-stale-whole-count", source.replace(actual, bad, 1), "ManagedPublicMutation.AccountingReplacedBusyDiscardsTheEarlierWholeCount"
 
 class PublicHugeMapBuilder(PublicMutationBuilder):
     """Actual358 constructor and real batch provider; finite context/AS/ACK ports."""
@@ -885,7 +1025,7 @@ class PublicHugeMapBuilder(PublicMutationBuilder):
         source = replace(source, "void admission_boundary(){", "void admission_boundary(){\n if(host_public_huge::active){host_public_huge::admit_boundary();return;}")
         source = replace(source, "auto observe_mapping_count(task::Task& subject,mm::paging::PageTable*,uint64_t)->bool{",
                          "auto observe_mapping_count(task::Task& subject,mm::paging::PageTable*,uint64_t)->bool{\n if(host_public_huge::active){host_public_huge::observe_boundary(subject);return true;}")
-        source = replace(source, "if(!host_fixed::admit)return false;", "if(host_public_huge::active){if(!host_public_huge::admit())return false;}else if(!host_fixed::admit)return false;")
+        source = replace(source, "if(!host_fixed::admit)return MappingAdmission::Denied;", "if(host_public_huge::active){if(!host_public_huge::admit())return MappingAdmission::Denied;}else if(!host_fixed::admit)return MappingAdmission::Denied;")
         adapter = self.batch.adapter
         call = "return virt::publish_managed_huge_batch_owned(root, publication, batch);"
         assert adapter.count(call) == 1

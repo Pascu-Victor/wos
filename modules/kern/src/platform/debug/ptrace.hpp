@@ -16,6 +16,8 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
 auto ptrace_as(ker::mod::sched::task::Task& tracer, abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t data) -> uint64_t;
 // Current-executor cleanup before process/thread stack or image reclamation.
 void cleanup_operations(ker::mod::sched::task::Task& executor);
+// Current-executor-only inspection; never schedule while traversing its owned operations.
+[[nodiscard]] auto has_pending_local_effect(const ker::mod::sched::task::Task& executor) noexcept -> bool;
 auto report_user_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, abi::ptrace::stop_reason reason, uint32_t signal,
                       uint64_t address) -> bool;
 auto report_user_exception_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, uint32_t signal, uint64_t address,
