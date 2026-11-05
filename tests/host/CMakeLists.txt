@@ -25,6 +25,9 @@ wos_add_unit_test(pci_boot_resource_test
 wos_add_unit_test(pci_msix_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_msix_test.cpp
 )
+wos_add_unit_test(power_shutdown_targets_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/power_shutdown_targets_test.cpp
+)
 wos_add_unit_test(pci_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/pci.cpp

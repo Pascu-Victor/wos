@@ -16,6 +16,8 @@
 #include <platform/ktime/process_timer.hpp>
 #include <platform/ktime/timer_queue.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/power/power.hpp>
+#include <platform/sched/process_signal_targets.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/security/terminal.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -634,22 +636,22 @@ inline auto active_task_slot(uint32_t index) -> task::Task*& {
 auto is_kernel_thread_shutdown_target(task::Task* task, task::Task* current) -> bool {
     return task != nullptr && task != current && task != file_retirement_executor_task.load(std::memory_order_acquire) &&
            task->type == task::TaskType::DAEMON && task->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
-           !task->has_exited && task->kthread_entry != nullptr && task->context.syscall_kernel_stack != 0;
+           task->kthread_entry != nullptr && task->context.syscall_kernel_stack != 0;
 }
 
 auto count_kernel_thread_shutdown_targets(task::Task* current) -> size_t {
+    // Keep EXITING cleanup and compacting removals inside one conservative
+    // census. No lifetime reference, signal publication or wake is needed.
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    auto const* const EXECUTOR = file_retirement_executor_task.load(std::memory_order_acquire);
     size_t remaining = 0;
-    uint32_t const COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; ++i) {
-        auto* task = get_active_task_at_safe(i);
-        if (task == nullptr) {
-            continue;
-        }
-        if (is_kernel_thread_shutdown_target(task, current)) {
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        auto const* subject = active_task_slot(i);
+        if (subject != nullptr && subject != current && subject != EXECUTOR && subject->type == task::TaskType::DAEMON &&
+            subject->state.load(std::memory_order_acquire) != task::TaskState::DEAD)
             ++remaining;
-        }
-        task->release();
     }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
     return remaining;
 }
 
@@ -677,6 +679,13 @@ auto active_list_insert(task::Task* t) -> bool {
         global_task_registry_lock.unlock_irqrestore(FLAGS);
         dbg::panic_handler("scheduler: corrupt cached active registry index during insert");
         hcf();
+    }
+    // Pair fresh publication with each shutdown census under this same lock.
+    // Existing registered wakes above and providers before worker stop stay legal.
+    if (!fresh_admission_allowed(t->type == task::TaskType::PROCESS, t->type == task::TaskType::DAEMON, power::shutdown_in_progress(),
+                                 kernel_thread_shutdown_requested.load(std::memory_order_acquire))) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return false;
     }
     if (active_task_count < MAX_ACTIVE_TASKS) {
         uint32_t const INDEX = active_task_count++;
@@ -750,6 +759,11 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
         global_task_registry_lock.unlock_irqrestore(FLAGS);
         dbg::panic_handler("scheduler: fresh task already present in active registry");
         hcf();
+    }
+    if (!fresh_admission_allowed(task->type == task::TaskType::PROCESS, task->type == task::TaskType::DAEMON, power::shutdown_in_progress(),
+                                 kernel_thread_shutdown_requested.load(std::memory_order_acquire))) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return false;
     }
 
     bool duplicate_task = false;
@@ -7799,9 +7813,32 @@ auto signal_terminal_process_group(security::TerminalIdentity terminal, uint64_t
     return matched;
 }
 
-auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig) -> size_t {
+auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig, bool terminal_shutdown) -> size_t {
     if (sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
         return 0;
+    }
+    auto eligible = [=](const task::Task& subject) {
+        auto const STATE = subject.state.load(std::memory_order_acquire);
+        return visible_process_signal_target({.pid = subject.pid,
+                                              .process_pid = task::process_pid(subject),
+                                              .active = STATE == task::TaskState::ACTIVE,
+                                              .exiting = sig == 0 && STATE == task::TaskState::EXITING,
+                                              .process = subject.type == task::TaskType::PROCESS,
+                                              .visible = terminal_shutdown || task::process_visible(subject)},
+                                             excluded_pid, excluded_owner_pid, terminal_shutdown);
+    };
+    if (sig == 0) {
+        // Removal compacts the registry by moving its last task into the hole.
+        // An unlocked index walk can skip that still-live consumer and report
+        // false quiescence. Counting performs no publication or wake operation.
+        uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+        size_t matched = 0;
+        for (uint32_t i = 0; i < active_task_count; ++i) {
+            auto const* subject = active_task_slot(i);
+            if (subject != nullptr && eligible(*subject)) ++matched;
+        }
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return matched;
     }
     uint64_t const MASK = sig > 0 ? (1ULL << (sig - 1)) : 0;
     size_t matched = 0;
@@ -7811,10 +7848,7 @@ auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_ow
         if (t == nullptr) {
             continue;
         }
-        bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
-        uint64_t const PROCESS_PID = task::process_pid(*t);
-        bool const EXCLUDED = t->pid == excluded_pid || PROCESS_PID == excluded_owner_pid || PROCESS_PID == 1;
-        if (ALIVE && t->type == task::TaskType::PROCESS && task::process_visible(*t) && !EXCLUDED) {
+        if (eligible(*t)) {
             ++matched;
             if (sig != 0) {
                 t->signal_generate_pending_mask(MASK);

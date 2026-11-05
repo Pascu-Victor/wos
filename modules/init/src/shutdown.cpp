@@ -287,7 +287,7 @@ auto shutdown_reboot_cmd(ShutdownAction action) -> int {
 void shutdown_perform(ShutdownAction action) {
     init_log::info("shutdown: stopping services");
     stop_services_for_shutdown();
-    init_log::info("shutdown: preparing kernel threads");
+    init_log::info("shutdown: preparing power transition");
     int64_t const PREPARE_RET = prepare_kernel_shutdown();
     if (PREPARE_RET != 0) {
         init_log::warn("shutdown: kernel prepare returned %lld", static_cast<long long>(PREPARE_RET));

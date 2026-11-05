@@ -32,9 +32,12 @@ enum class ShutdownPhase : uint64_t {
 
 [[nodiscard]] auto shutdown_in_progress() -> bool;
 [[nodiscard]] auto shutdown_phase() -> ShutdownPhase;
+// Returning admission phase only. Existing userspace retains fault/I/O/GC
+// providers; their retirement belongs to the nonreturning finalizer.
 [[nodiscard]] auto prepare_shutdown() -> int;
 // Normal task entry without preemption-disabled ownership or a pending handoff.
 // IF may be clear; an accepted non-returning finalizer enables completion IRQs.
+// A thread or process with sibling CPU executors refuses before acceptance.
 [[nodiscard]] auto begin_reboot_command(uint64_t cmd) -> int;
 #ifdef WOS_SELFTEST
 // Borrow an unpublished diagnostic subject; share ordinary authorization and

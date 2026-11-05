@@ -17,6 +17,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/lifetime_retirement_executor.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/compartment_host.hpp>
@@ -33,6 +34,8 @@ constexpr int WOS_SIGTERM = 15;
 constexpr uint64_t TERM_WAIT_US = 2'000'000;
 constexpr uint64_t KILL_WAIT_US = 1'000'000;
 constexpr uint64_t KERNEL_THREAD_WAIT_US = 2'000'000;
+constexpr uint64_t FILE_RETIREMENT_WAIT_US = 5'000'000;
+constexpr uint64_t FILE_RETIREMENT_JOIN_SLICE_US = 100'000;
 
 std::atomic<ShutdownPhase> g_phase{ShutdownPhase::IDLE};
 std::atomic<ShutdownAction> g_action{ShutdownAction::NONE};
@@ -60,7 +63,7 @@ auto command_to_action(uint64_t cmd, ShutdownAction& action) -> int {
 auto current_process_pid(const sched::task::Task* task) -> uint64_t { return task != nullptr ? sched::task::process_pid(*task) : 0; }
 
 auto count_shutdown_targets(uint64_t excluded_pid, uint64_t excluded_owner_pid) -> size_t {
-    return sched::signal_visible_processes_except(excluded_pid, excluded_owner_pid, 0);
+    return sched::signal_visible_processes_except(excluded_pid, excluded_owner_pid, 0, true);
 }
 
 auto authorize_current_power(const sched::task::Task* subject) -> int {
@@ -76,17 +79,19 @@ auto authorize_current_power(const sched::task::Task* subject) -> int {
     return 0;
 }
 
-void quiesce_kernel_threads(uint64_t timeout_us) {
+auto quiesce_kernel_threads(uint64_t timeout_us) -> bool {
     auto const RESULT = sched::request_kernel_threads_shutdown(timeout_us);
     if (RESULT.requested != 0) {
         log::info("shutdown requested stop for %lu kernel threads", static_cast<unsigned long>(RESULT.requested));
     }
     if (RESULT.remaining != 0) {
-        log::warn("shutdown continuing with %lu kernel threads still active", static_cast<unsigned long>(RESULT.remaining));
+        log::error("shutdown has %lu kernel threads still active; dependent teardown refused",
+                   static_cast<unsigned long>(RESULT.remaining));
     }
+    return RESULT.remaining == 0;
 }
 
-auto drain_file_retirement_before_provider_stop() -> int {
+auto drain_file_retirement_before_provider_stop(uint64_t join_timeout_us) -> int {
     using mm::file_mapping::LifetimeRetirementExecutor;
     auto const BEFORE = LifetimeRetirementExecutor::snapshot();
     if (!BEFORE.initialized) return 0;  // Existing pre-scheduler diagnostic path.
@@ -103,7 +108,7 @@ auto drain_file_retirement_before_provider_stop() -> int {
         return -EWOULDBLOCK;
     bool const IRQ_ENABLED = sched::interrupts_enabled();
     if (!IRQ_ENABLED) asm volatile("sti" ::: "memory");
-    auto const DRAIN = LifetimeRetirementExecutor::finish_shutdown(100'000);
+    auto const DRAIN = LifetimeRetirementExecutor::finish_shutdown(join_timeout_us);
     if (!IRQ_ENABLED) asm volatile("cli" ::: "memory");
     if (!DRAIN.joined) return DRAIN.result == -ETIMEDOUT || DRAIN.result == -EAGAIN ? -EBUSY : DRAIN.result;
     if (DRAIN.snapshot.protocol_errors != 0) return -EPROTO;
@@ -128,34 +133,52 @@ void clear_current_finalizer_sched_state() {
 
 void wait_for_shutdown_progress() { sched::kern_yield(); }
 
-void wait_for_process_quiescence(uint64_t excluded_pid, uint64_t excluded_owner_pid, uint64_t timeout_us) {
+auto wait_for_process_quiescence(uint64_t excluded_pid, uint64_t excluded_owner_pid, uint64_t timeout_us) -> bool {
     uint64_t const START = ker::mod::time::get_us();
     while (count_shutdown_targets(excluded_pid, excluded_owner_pid) != 0) {
         if (ker::mod::time::get_us() - START >= timeout_us) {
-            return;
+            return false;
         }
         wait_for_shutdown_progress();
     }
+    return true;
 }
 
-void teardown_processes() {
+auto teardown_processes() -> bool {
     auto* current = sched::get_current_task();
     uint64_t const EXCLUDED_PID = current != nullptr ? current->pid : 0;
     uint64_t const EXCLUDED_OWNER_PID = current_process_pid(current);
 
     g_phase.store(ShutdownPhase::PROCESS_TEARDOWN, std::memory_order_release);
-    size_t const TERM_COUNT = sched::signal_visible_processes_except(EXCLUDED_PID, EXCLUDED_OWNER_PID, WOS_SIGTERM);
+    size_t const TERM_COUNT = sched::signal_visible_processes_except(EXCLUDED_PID, EXCLUDED_OWNER_PID, WOS_SIGTERM, true);
     log::info("shutdown SIGTERM sent to %lu processes", static_cast<unsigned long>(TERM_COUNT));
-    wait_for_process_quiescence(EXCLUDED_PID, EXCLUDED_OWNER_PID, TERM_WAIT_US);
+    if (wait_for_process_quiescence(EXCLUDED_PID, EXCLUDED_OWNER_PID, TERM_WAIT_US)) return true;
 
     size_t const REMAINING = count_shutdown_targets(EXCLUDED_PID, EXCLUDED_OWNER_PID);
     if (REMAINING == 0) {
-        return;
+        return true;
     }
 
-    size_t const KILL_COUNT = sched::signal_visible_processes_except(EXCLUDED_PID, EXCLUDED_OWNER_PID, WOS_SIGKILL);
+    size_t const KILL_COUNT = sched::signal_visible_processes_except(EXCLUDED_PID, EXCLUDED_OWNER_PID, WOS_SIGKILL, true);
     log::warn("shutdown SIGKILL sent to %lu remaining processes", static_cast<unsigned long>(KILL_COUNT));
-    wait_for_process_quiescence(EXCLUDED_PID, EXCLUDED_OWNER_PID, KILL_WAIT_US);
+    return wait_for_process_quiescence(EXCLUDED_PID, EXCLUDED_OWNER_PID, KILL_WAIT_US);
+}
+
+auto wait_for_file_retirement() -> int {
+    uint64_t const START = ker::mod::time::get_us();
+    for (;;) {
+        uint64_t const ELAPSED = ker::mod::time::get_us() - START;
+        if (ELAPSED >= FILE_RETIREMENT_WAIT_US) return -ETIMEDOUT;
+        uint64_t const REMAINING = FILE_RETIREMENT_WAIT_US - ELAPSED;
+        int const RESULT = drain_file_retirement_before_provider_stop(
+            REMAINING < FILE_RETIREMENT_JOIN_SLICE_US ? REMAINING : FILE_RETIREMENT_JOIN_SLICE_US);
+        clear_current_finalizer_sched_state();
+        if (RESULT != -EBUSY) return RESULT;
+        // Exit and asynchronous GC may still own a native root or a prepared
+        // callback. Keep every provider running until those owners return.
+        wait_for_shutdown_progress();
+        clear_current_finalizer_sched_state();
+    }
 }
 
 auto current_root_path() -> const char* {
@@ -202,9 +225,13 @@ void io_delay_loop() {
 }
 
 [[noreturn]] void run_finalizer(ShutdownAction action) {
-    if (drain_file_retirement_before_provider_stop() != 0)
-        dbg::panic_handler("shutdown finalizer entered before native File retirement completed");
+    auto const FINALIZER_HOLD = sched::hold_kernel_shutdown();
     g_phase.store(ShutdownPhase::FINALIZING, std::memory_order_release);
+    auto* const CURRENT = sched::get_current_task();
+    if (CURRENT == nullptr || CURRENT->is_thread || !sched::resource::close_idle_thread_cpu_admission(*CURRENT)) {
+        dbg::panic_handler("shutdown finalizer could not seal sole caller CPU admission; providers retained");
+        halt_forever();
+    }
     log::info("system shutdown finalizer starting action=%lu", static_cast<unsigned long>(action));
 
     // The power syscall enters with IF clear. Admission has established an
@@ -212,11 +239,33 @@ void io_delay_loop() {
     // never returns, and its completion/retirement waits require IRQ progress.
     asm volatile("sti" ::: "memory");
 
-    quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);
+    bool const CONSUMERS_DRAINED = teardown_processes();
     clear_current_finalizer_sched_state();
+    if (!CONSUMERS_DRAINED) {
+        dbg::panic_handler("shutdown userspace consumers remain; providers retained");
+        halt_forever();
+    }
+    int const FILE_DRAIN = wait_for_file_retirement();
+    clear_current_finalizer_sched_state();
+    if (FILE_DRAIN != 0) {
+        log::error("shutdown native File retirement returned %d; providers retained", FILE_DRAIN);
+        dbg::panic_handler("shutdown native File retirement did not join; providers retained");
+        halt_forever();
+    }
+    // An already admitted construction may have published after the first
+    // census. Admission is now closed and native retirement has joined, so
+    // refuse any late consumer before requesting provider shutdown.
+    if (count_shutdown_targets(CURRENT->pid, current_process_pid(CURRENT)) != 0) {
+        dbg::panic_handler("shutdown late userspace consumers remain; providers retained");
+        halt_forever();
+    }
 
-    teardown_processes();
+    bool const KERNEL_THREADS_DRAINED = quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);
     clear_current_finalizer_sched_state();
+    if (!KERNEL_THREADS_DRAINED) {
+        dbg::panic_handler("shutdown kernel workers remain; WKI/VFS/devices retained");
+        halt_forever();
+    }
 
     ker::net::wki::wki_shutdown();
     clear_current_finalizer_sched_state();
@@ -287,9 +336,6 @@ auto prepare_shutdown(sched::task::Task* subject) -> int {
     if (AUTHORITY_RET != 0) {
         return AUTHORITY_RET;
     }
-    int const FILE_DRAIN = drain_file_retirement_before_provider_stop();
-    if (FILE_DRAIN != 0) return FILE_DRAIN;
-
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);
     for (;;) {
         if (phase == ShutdownPhase::IDLE) {
@@ -306,7 +352,9 @@ auto prepare_shutdown(sched::task::Task* subject) -> int {
         return -EBUSY;
     }
 
-    quiesce_kernel_threads(0);
+    // This operation returns to PID1 while journald and PID1 itself may still
+    // fault or perform I/O. PREPARING closes new consumer creation, while all
+    // fault, retirement and completion providers stay available until REBOOT.
     return 0;
 }
 
@@ -334,8 +382,10 @@ auto begin_reboot_command(sched::task::Task* subject, uint64_t cmd, bool current
         CURRENT->scheduler_transition_active.load(std::memory_order_acquire) || CURRENT->deferred_task_switch || CURRENT->wants_block) {
         return -EWOULDBLOCK;
     }
-    int const FILE_DRAIN = drain_file_retirement_before_provider_stop();
-    if (FILE_DRAIN != 0) return FILE_DRAIN;
+    // Excluding an owning process from TERM/KILL is safe only for a sole CPU
+    // executor. The accepted nonreturning finalizer seals admission under the
+    // resource lock; an already in-flight sibling binding then fails closed.
+    if (CURRENT->is_thread || CURRENT->resource_cpu_threads.load(std::memory_order_acquire) != 0) return -EBUSY;
 
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);
     for (;;) {

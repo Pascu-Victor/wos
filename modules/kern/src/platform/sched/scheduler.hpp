@@ -533,7 +533,10 @@ void revoke_terminal_attachment(security::TerminalIdentity terminal, uint64_t se
 auto signal_terminal_process_group(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t pgid,
                                    session::Origin group_origin, int sig)
     -> size_t;  // Signals stay within the originating terminal allocation
-auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig) -> size_t;
+// Terminal power shutdown includes init, threads and proxies through EXITING;
+// other callers retain visible ACTIVE process leaders only. A zero signal
+// counts eligible consumers under one registry snapshot without publishing.
+auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig, bool terminal_shutdown = false) -> size_t;
 void wake_task_for_signal(task::Task* task);  // Make a signaled blocked task runnable so signal delivery can occur
 [[nodiscard]] auto kernel_threads_shutdown_requested() -> bool;
 void maybe_exit_current_kernel_thread_for_shutdown();

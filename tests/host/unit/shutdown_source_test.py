@@ -206,7 +206,7 @@ def test_init_owns_scheduled_shutdown_and_service_sync_order() -> None:
         perform_body,
         [
             'init_log::info("shutdown: stopping services")',
-            'init_log::info("shutdown: preparing kernel threads")',
+            'init_log::info("shutdown: preparing power transition")',
             'init_log::info("shutdown: syncing filesystems before journald stop")',
             'init_log::info("shutdown: final userspace sync")',
         ],
@@ -216,6 +216,8 @@ def test_init_owns_scheduled_shutdown_and_service_sync_order() -> None:
     require_order(perform_body, "prepare_kernel_shutdown()", "ker::abi::vfs::sync_vfs()", "kernel prepare before first sync")
     require_order(perform_body, "ker::abi::vfs::sync_vfs()", "stop_journald_for_shutdown()", "journald survives first sync")
     require_order(perform_body, "stop_journald_for_shutdown()", "reboot(CMD)", "journald stopped before finalizer")
+    forbid_tokens(perform_body, ['"shutdown: preparing kernel threads"'],
+                  "returning power preparation must not claim to stop provider threads")
 
     require_tokens(
         services_source,
@@ -265,13 +267,10 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
             "quiesce_kernel_threads",
             "sched::request_kernel_threads_shutdown(timeout_us)",
             "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)",
-            "quiesce_kernel_threads(0)",
             "return -EBUSY;",
             "return -EPERM;",
             "RB_ENABLE_CAD",
             "RB_DISABLE_CAD",
-            "signal_visible_processes_except(EXCLUDED_PID, EXCLUDED_OWNER_PID, WOS_SIGTERM)",
-            "signal_visible_processes_except(EXCLUDED_PID, EXCLUDED_OWNER_PID, WOS_SIGKILL)",
             "clear_current_finalizer_sched_state",
             "current->deferred_task_switch = false;",
             "current->yield_switch = false;",
@@ -298,9 +297,13 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     require_tokens(mlibc_power, ["static inline int64_t prepare_shutdown()", "ops::PREPARE"], "mlibc power prepare wrapper")
     forbid_tokens(source, ['log::warn("system shutdown finalizer starting action=%lu"'], "normal finalizer start is not a warning")
     for first, second, context in [
-        ("quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);", "teardown_processes();", "kernel threads quiesce before process teardown"),
-        ("teardown_processes();", "ker::vfs::vfs_shutdown_sync();", "process teardown before vfs sync"),
-        ("teardown_processes();", "ker::net::wki::wki_shutdown();", "process teardown before WKI shutdown"),
+        ("ShutdownPhase::FINALIZING", "teardown_processes()", "finalizer closes public admission before consumer stop"),
+        ("teardown_processes()", "wait_for_file_retirement()", "userspace retires while FILE providers remain alive"),
+        ("wait_for_file_retirement()", "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)",
+         "native GC and retirement executor join before generic provider stop"),
+        ("quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)", "ker::net::wki::wki_shutdown();", "worker stop before WKI shutdown"),
+        ("teardown_processes()", "ker::vfs::vfs_shutdown_sync();", "process teardown before vfs sync"),
+        ("teardown_processes()", "ker::net::wki::wki_shutdown();", "process teardown before WKI shutdown"),
         ("ker::net::wki::wki_shutdown();", "ker::vfs::vfs_shutdown_sync();", "WKI shutdown before vfs sync"),
         ("ker::net::wki::wki_shutdown();", "ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "WKI shutdown before root unmount"),
         ("ker::vfs::vfs_shutdown_sync();", "ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "sync before root unmount"),
@@ -328,15 +331,101 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
                    "locked and pending-handoff power entry must fail before changing phase")
     require_order(entry, "return -EWOULDBLOCK;", "compare_exchange_weak(phase, ShutdownPhase::FINALIZING",
                   "unsafe power entry cannot claim finalizer ownership")
+    require_order(entry, "CURRENT->is_thread", "compare_exchange_weak(phase, ShutdownPhase::FINALIZING",
+                  "worker-process or sibling execution refuses before finalizer acceptance")
     require_order(entry, "compare_exchange_weak(phase, ShutdownPhase::FINALIZING", "run_finalizer(action)",
                   "accepted ownership precedes the non-returning finalizer")
-    require_order(run_body, 'asm volatile("sti" ::: "memory")', "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)",
-                  "completion IRQs are enabled before bounded finalizer waits")
+    forbid_tokens(entry, ["drain_file_retirement_before_provider_stop(", "wait_for_file_retirement(", "quiesce_kernel_threads("],
+                  "returning admission cannot retire providers before the accepted finalizer stops consumers")
+    require_order(run_body, 'asm volatile("sti" ::: "memory")', "teardown_processes()",
+                  "completion IRQs are enabled while consumers and their providers drain")
+    require_order(run_body, "close_idle_thread_cpu_admission(*CURRENT)", "teardown_processes()",
+                  "accepted finalizer seals its sole caller before excluding that process")
+    for guard, boundary in [("if (!CONSUMERS_DRAINED)", "wait_for_file_retirement()"),
+                            ("if (FILE_DRAIN != 0)", "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)"),
+                            ("if (count_shutdown_targets(", "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)"),
+                            ("if (!KERNEL_THREADS_DRAINED)", "ker::net::wki::wki_shutdown();")]:
+        require_order(run_body, guard, boundary, "failed consumer/retirement proof precedes provider stop")
+        failure = run_body[run_body.index(guard):run_body.index(boundary)]
+        require_tokens(failure, ["panic_handler(", "halt_forever();"],
+                       "unproved quiescence fails closed before required providers or storage retire")
+    require_order(run_body, "wait_for_file_retirement()", "if (count_shutdown_targets(",
+                  "consumer census is revalidated after native publication closes and retirement joins")
+    require_tokens(function_body(source, "quiesce_kernel_threads"), ["return RESULT.remaining == 0;"],
+                   "kernel-worker survivors prevent dependent subsystem teardown")
 
     sched_init_body = function_body(init_wrappers, "sched_init")
     require_tokens(sched_init_body, ['cmdline_has_token(get_kernel_cmdline(), "--selftest")', "mod::power::selftest_poweroff();"], "KTEST selftest poweroff call")
     require_order(sched_init_body, 'ker::test::run_all(cmdline_has_token(get_kernel_cmdline(), "--ahci-test-retire-only"));', "mod::power::selftest_poweroff();", "KTEST powers off only after the selftest runner returns")
     require_order(sched_init_body, "mod::power::selftest_poweroff();", "hcf();", "KTEST hcf remains fallback after poweroff")
+
+
+def test_returning_prepare_preserves_providers_and_file_retirement_admission() -> None:
+    source = POWER_CPP.read_text()
+    prepare = function_body(source, "prepare_shutdown")
+    require_tokens(prepare, ["authorize_current_power(subject)", "return AUTHORITY_RET;",
+                             "compare_exchange_weak(phase, ShutdownPhase::PREPARING", "return 0;"],
+                   "PREPARE authorizes and publishes the public admission phase")
+    require_order(prepare, "authorize_current_power(subject)", "compare_exchange_weak(phase, ShutdownPhase::PREPARING",
+                  "unauthorized prepare has no shutdown effects")
+    forbid_tokens(prepare, ["quiesce_kernel_threads(", "request_kernel_threads_shutdown(",
+                            "drain_file_retirement_before_provider_stop(", "wait_for_file_retirement(", "close_native_file_mapping_admission(",
+                            "close_new_reservations(", "finish_shutdown(", "poll_shutdown("],
+                  "returning PREPARE preserves cold-page fault, File retirement, GC and completion providers")
+    forbid_tokens(source, ["quiesce_kernel_threads(0)"],
+                  "zero-wait global stop still destroys lazy-fault admission and is not preparation")
+
+    drain = function_body(source, "drain_file_retirement_before_provider_stop")
+    require_tokens(drain, ["close_native_file_mapping_admission()", "close_new_reservations()",
+                           "native_unpublished_retirements_pending()", "LifetimeRetirementExecutor::snapshot()",
+                           "LifetimeRetirementExecutor::finish_shutdown(join_timeout_us)"],
+                   "finalizer closes native admission and joins its exact retirement executor")
+    require_order(drain, "close_native_file_mapping_admission()", "LifetimeRetirementExecutor::finish_shutdown(",
+                  "native publication closes before executor join")
+    forbid_tokens(drain, ["request_kernel_threads_shutdown(", "quiesce_kernel_threads("],
+                  "retirement cannot stop its own required providers")
+    wait = function_body(source, "wait_for_file_retirement")
+    require_tokens(wait, ["FILE_RETIREMENT_WAIT_US", "FILE_RETIREMENT_JOIN_SLICE_US", "return -ETIMEDOUT;",
+                          "drain_file_retirement_before_provider_stop(", "if (RESULT != -EBUSY) return RESULT;",
+                          "wait_for_shutdown_progress()"],
+                   "bounded retries preserve provider progress for asynchronous GC and native File tails")
+    require_order(wait, "if (ELAPSED >= FILE_RETIREMENT_WAIT_US)", "drain_file_retirement_before_provider_stop(",
+                  "each retirement join is admitted within the overall deadline")
+
+
+def test_terminal_power_finalizer_counts_all_executors_without_changing_legacy_broadcast_policy() -> None:
+    power = POWER_CPP.read_text()
+    scheduler_hpp = SCHEDULER_HPP.read_text()
+    broadcast = function_body(SCHEDULER_CPP.read_text(), "signal_visible_processes_except")
+    declaration = re.search(r"signal_visible_processes_except\([^;]+;", scheduler_hpp, re.DOTALL)
+    if declaration is None or re.search(r"bool\s+terminal_shutdown\s*=\s*false", declaration.group()) is None:
+        fail("ordinary broadcast callers must preserve legacy visibility and PID1 exclusion")
+    for signal in ("0", "WOS_SIGTERM", "WOS_SIGKILL"):
+        if re.search(r"signal_visible_processes_except\(\s*(?:excluded_pid|EXCLUDED_PID)\s*,\s*"
+                     r"(?:excluded_owner_pid|EXCLUDED_OWNER_PID)\s*,\s*" + signal + r"\s*,\s*true\s*\)", power) is None:
+            fail(f"terminal power shutdown count/signal {signal} must include every other process executor")
+    # Registry removal moves its last task into the removed slot. A count that
+    # unlocks between numeric indices can skip a live consumer and claim zero.
+    require_tokens(broadcast, ["if (sig == 0)", "global_task_registry_lock.lock_irqsave()", "active_task_slot(i)"],
+                   "zero-target shutdown proof scans a stable dense registry")
+    require_order(broadcast, "global_task_registry_lock.lock_irqsave()", "active_task_slot(i)",
+                  "quiescence count prevents compaction while scanning consumers")
+    require_order(broadcast, "active_task_slot(i)", "global_task_registry_lock.unlock_irqrestore(FLAGS)",
+                  "quiescence scan completes before releasing the registry gate")
+    if re.search(r"\.visible\s*=\s*terminal_shutdown\s*\|\|\s*task::process_visible\(subject\)", broadcast) is None:
+        fail("terminal census must bypass mutable legacy proxy visibility")
+    exiting = re.search(r"\.exiting\s*=\s*([^,}]+)", broadcast)
+    if exiting is None or re.search(r"\bsig\s*==\s*0\b", exiting.group(1)) is None:
+        fail("EXITING consumers remain in the zero census but must not receive new TERM/KILL publication or wakes")
+    forbid_tokens(broadcast, ["subject.has_exited", "t->has_exited"],
+                  "terminal consumer lifetime uses the atomic task state instead of mutable plain exit flags")
+    scheduler = SCHEDULER_CPP.read_text()
+    for name in ("active_list_insert", "register_fresh_task_visibility"):
+        publication = function_body(scheduler, name)
+        require_order(publication, "global_task_registry_lock.lock_irqsave()", "power::shutdown_in_progress()",
+                      "new process publication shares the shutdown census registry gate")
+        require_order(publication, "power::shutdown_in_progress()", "active_task_count++",
+                      "shutdown closes fresh process admission before registry insertion")
 
 
 def test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific() -> None:
@@ -512,6 +601,8 @@ def main() -> None:
     test_rootfs_aliases_install_power_commands()
     test_init_owns_scheduled_shutdown_and_service_sync_order()
     test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action()
+    test_returning_prepare_preserves_providers_and_file_retirement_admission()
+    test_terminal_power_finalizer_counts_all_executors_without_changing_legacy_broadcast_policy()
     test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific()
     test_drained_workers_exit_explicitly_without_suppressing_unexpected_returns()
     test_shutdown_unmount_is_exact_deepest_first_and_root_last()

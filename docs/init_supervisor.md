@@ -396,12 +396,25 @@ oneshots are already quiesced or are stopped within their own bounds.
 
 The model emits a non-journal completion barrier only after every non-journal
 generation is genuinely quiesced or has reached the explicit bounded
-`FAILED`/abandoned outcome described above. PID 1 then prepares kernel workers
-and syncs filesystems while journald is still available. The journal phase
-begins explicitly after that barrier. Journald receives the same bounded
+`FAILED`/abandoned outcome described above. PID 1 then enters the kernel's
+`PREPARING` admission phase and syncs filesystems while journald is still
+available. Preparation returns without stopping demand paging, I/O, GC or File
+retirement providers. The journal phase begins explicitly after that barrier.
+Journald receives the same bounded
 TERM/KILL/quiesce-or-abandon treatment; journald is last. A final userspace
 sync and the requested reboot, poweroff, or halt follow. Automatic restarts and
 dependency starts remain suppressed throughout shutdown.
+
+The nonreturning kernel finalizer seals the sole caller's CPU admission and
+retires remaining userspace consumers before draining native File/GC work and
+joining its retirement executor. Generic workers stop afterward, followed by
+WKI, final filesystem sync/unmount, device retirement and platform shutdown.
+Fresh process/worker publication is fenced under the same registry lock as its
+quiescence census. Terminal counting includes EXITING processes, threads and
+WKI proxies until DEAD. Local pending signals do not prove remote cancellation;
+an unresponsive proxy or any unproven consumer/worker/retirement deadline fails
+closed before provider or device teardown. Direct finalizer entry refuses a
+thread or a process with sibling CPU executors before acceptance.
 
 Use the graceful command path for testing:
 
