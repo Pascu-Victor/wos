@@ -277,6 +277,8 @@ bool tlb_ack{};
 fm::FileMappingBinding* expected_binding{};
 void binding_return(void*, fm::LifetimeRetirementTicket&) noexcept {
     check(tlb_ack && virt::current_root_stamp().inflight != 0, "detached index obligation spans actual TLB-ref release");
+    check(expected_binding != nullptr && expected_binding->retirement_state() == fm::BindingRetirementState::TLB_COMPLETE,
+          "actual ACK state publishes before destructive binding return endpoint");
     ++binding_returns;
     delete std::exchange(expected_binding, nullptr);  // Destructive publication endpoint; no post-call dereference allowed.
 }

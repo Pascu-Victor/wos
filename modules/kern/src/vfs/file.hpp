@@ -9,6 +9,7 @@
 #include <new>
 #endif
 #include <cstdint>
+#include <dev/device_mapping_client.hpp>
 #include <memory>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -172,6 +173,11 @@ struct File {
     // Hint for filesystem backends that this file is currently being serviced
     // through vfs_pread(), so sequential prefetch/read-ahead should be avoided.
     std::atomic<uint32_t> positional_read_depth{0};
+
+    // One client per shared open description, immutable after publication.
+    // Independent of backend private_data (including the devfs prefix ABI).
+    // The backend close runs before this owner is reset and mount_owner drops.
+    ker::dev::mapping::ClientRef device_client;
 };
 
 }  // namespace ker::vfs

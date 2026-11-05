@@ -80,6 +80,7 @@ inline auto get_current_task() -> ker::mod::sched::task::Task* { return ker::mod
 
 ker::mod::sys::Mutex g_shared_vmem_publication_lock;
 constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};
+constinit std::atomic<const ker::mod::sched::task::Task*> g_shared_vmem_publication_executor{nullptr};
 // Protected by blocking PUB; used only when issuing an empty fork proof.
 uint64_t g_empty_fork_publication_generation{};
 
@@ -4925,15 +4926,24 @@ auto selftest_file_writeback_policy() -> bool {
 
 SharedVmemPublicationGuard::SharedVmemPublicationGuard() {
     g_shared_vmem_publication_lock.lock();
+    g_shared_vmem_publication_executor.store(ker::mod::sched::can_query_current_task() ? get_current_task() : nullptr,
+                                             std::memory_order_release);
     g_shared_vmem_publication_owner.store(this, std::memory_order_release);
 }
 
 SharedVmemPublicationGuard::~SharedVmemPublicationGuard() {
     g_shared_vmem_publication_owner.store(nullptr, std::memory_order_release);
+    g_shared_vmem_publication_executor.store(nullptr, std::memory_order_release);
     g_shared_vmem_publication_lock.unlock();
 }
 
 auto SharedVmemPublicationGuard::acquired() const noexcept -> bool { return blocking_publication_owner_matches(this); }
+
+auto SharedVmemPublicationGuard::acquired_by_current_executor() const noexcept -> bool {
+    if (!acquired() || !ker::mod::sched::can_query_current_task()) return false;
+    auto* const CURRENT = get_current_task();
+    return CURRENT != nullptr && g_shared_vmem_publication_executor.load(std::memory_order_acquire) == CURRENT;
+}
 
 auto SharedVmemPublicationGuard::try_empty_fork_generation() const noexcept -> uint64_t {
     if (!acquired()) return 0;

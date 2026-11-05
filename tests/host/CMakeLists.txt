@@ -60,6 +60,18 @@ wos_add_unit_test(cache_pte_test
 wos_add_unit_test(cache_policy_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/cache_policy_test.cpp
 )
+wos_add_unit_test(file_binding_snapshot_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_test.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim/retirement_port.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/file_mapping_lifetime.cpp
+)
+target_include_directories(file_binding_snapshot_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim)
+set_tests_properties(file_binding_snapshot_test PROPERTIES TIMEOUT 30)
+wos_add_unit_test(device_mapping_client_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_client_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/device_mapping_client.cpp
+)
+set_tests_properties(device_mapping_client_test PROPERTIES TIMEOUT 30)
 wos_add_unit_test(pci_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/pci.cpp
@@ -292,6 +304,13 @@ add_test(NAME file_mmap_registry_runtime_test
 )
 set_tests_properties(file_mmap_registry_runtime_test PROPERTIES
     LABELS "host;unit;runtime;integration" TIMEOUT 130
+)
+add_test(NAME binding_root_lease_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/binding_root_lease_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(binding_root_lease_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 120
 )
 add_test(NAME tmpfs_page_ownership_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_page_ownership_runtime_test.py

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -14,6 +15,9 @@ class TmpfsDemandSharedBacking;
 }  // namespace ker::vfs::tmpfs
 namespace ker::mod::mm::paging {
 struct PageTable;
+}
+namespace ker::mod::mm::virt {
+class BindingRootMutationLease;
 }
 
 namespace ker::mod::mm::file_mapping {
@@ -160,6 +164,11 @@ class FileMappingLifetime {
 
 class FileMappingIndex;
 class FileMappingTlbRetirement;
+class FileBindingSnapshot;
+
+// Translation retirement only. COMPLETE does not imply pins/installers or
+// destructive binding/family/File callbacks have returned.
+enum class BindingRetirementState : uint8_t { EMPTY, PREPARED, INDEXED, TLB_PENDING, TLB_COMPLETE };
 
 // A stable immutable interval incarnation. A retained binding prevents pointer
 // ABA even when another mapping uses the same root, VA and physical frame.
@@ -179,6 +188,8 @@ class FileMappingBinding {
     [[nodiscard]] auto owner_counts() const noexcept -> BindingOwnerCounts;
     [[nodiscard]] auto owners_match(const BindingOwnerCounts& expected) const noexcept -> bool;
     [[nodiscard]] auto observe_return(RetirementCompletion& empty) noexcept -> bool;
+    // Caller already owns/protects this binding. This does not acquire a ref.
+    [[nodiscard]] auto retirement_state() const noexcept -> BindingRetirementState;
     [[nodiscard]] auto file() const noexcept -> ker::vfs::File* { return lifetime_->file(); }
     [[nodiscard]] auto lifetime() const noexcept -> FileMappingLifetime* { return lifetime_; }
     [[nodiscard]] auto root() const noexcept -> paging::PageTable* { return root_; }
@@ -193,7 +204,8 @@ class FileMappingBinding {
    private:
     friend class FileMappingIndex;
     friend class FileMappingTlbRetirement;
-    enum class IndexState : uint8_t { PREPARED, INDEXED, DETACHED };
+    enum class IndexState : uint8_t { PREPARED, INDEXED, DETACHED, COMPLETE };
+    static_assert(std::atomic<IndexState>::is_always_lock_free);
     explicit FileMappingBinding(FileMappingLifetime& lifetime) noexcept;
     ~FileMappingBinding() = default;
     static auto finish(void* argument) noexcept -> int;
@@ -207,7 +219,32 @@ class FileMappingBinding {
     uint64_t file_offset_{};
     FileMappingBinding* index_next_{};   // Actual user_mapping_pin_lock only.
     FileMappingBinding* retire_next_{};  // Exclusive retirement batch after detach.
-    IndexState index_state_{IndexState::PREPARED};
+    std::atomic<IndexState> index_state_{IndexState::PREPARED};
+};
+
+// One exact SNAPSHOT role, captured by the actual index while its lock is held.
+// It owns binding/family storage, never the root named by that binding. A wrapper
+// is externally serialized; distinct wrappers can observe retirement concurrently.
+// Reset/destruction must occur outside MM/publication/IRQ guards. No raw adoption.
+class FileBindingSnapshot {
+   public:
+    FileBindingSnapshot() noexcept = default;
+    FileBindingSnapshot(FileBindingSnapshot&& other) noexcept;
+    auto operator=(FileBindingSnapshot&& other) noexcept -> FileBindingSnapshot&;
+    FileBindingSnapshot(const FileBindingSnapshot&) = delete;
+    auto operator=(const FileBindingSnapshot&) -> FileBindingSnapshot& = delete;
+    ~FileBindingSnapshot();
+    [[nodiscard]] auto empty() const noexcept -> bool { return binding_ == nullptr; }
+    [[nodiscard]] auto retirement_state() const noexcept -> BindingRetirementState;
+    void reset() noexcept;
+
+   private:
+    friend class FileMappingIndex;
+    friend class ker::mod::mm::virt::BindingRootMutationLease;
+    FileMappingBinding* binding_{};
+    // A live root lease borrows this exact wrapper; moving or dropping it then
+    // is a caller bug and traps before an owner can be lost.
+    mutable bool borrowed_{};
 };
 
 // Owns exact INDEX refs transferred as TLB refs, without a new acquisition.
@@ -260,9 +297,15 @@ class FileMappingIndex {
     // SNAPSHOT outside the actual pin lock, including when exact is false.
     [[nodiscard]] auto overlap_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t start, uint64_t end,
                                       FileMappingBinding*& owned, bool& exact) noexcept -> bool;
+    [[nodiscard]] auto overlap_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t start, uint64_t end,
+                                      FileBindingSnapshot& owned, bool& exact) noexcept -> bool;
     // Preallocate outside lock. Refusal preserves the actual acquired prefix;
     // caller releases its SNAPSHOT owners after unlocking, including on failure.
     [[nodiscard]] auto snapshot_root_locked(paging::PageTable* root, uint64_t root_incarnation, FileMappingBinding** output,
+                                            size_t capacity, size_t& owned_count) noexcept -> bool;
+    // Every output slot must start empty. Refusal preserves the acquired prefix;
+    // caller resets that prefix only after releasing the actual index lock.
+    [[nodiscard]] auto snapshot_root_locked(paging::PageTable* root, uint64_t root_incarnation, FileBindingSnapshot* output,
                                             size_t capacity, size_t& owned_count) noexcept -> bool;
 
    private:

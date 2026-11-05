@@ -31,6 +31,9 @@ struct AllocationResult;
 namespace ker::mod::sys {
 class SyscallPreparationScope;
 }
+namespace ker::mod::mm::file_mapping {
+class FileBindingSnapshot;
+}
 namespace ker::syscall::vmem {
 class SharedVmemPublicationGuard;
 }
@@ -319,6 +322,53 @@ namespace detail {
 [[nodiscard]] auto fork_source_owner_root(sched::task::Task&, const sys::SyscallPreparationScope&,
                                           const ker::syscall::vmem::SharedVmemPublicationGuard&, ForkSourceOwner&) noexcept -> PageTable*;
 }  // namespace detail
+
+enum class BindingRootAdmission : uint8_t { NotAttempted, Acquired, Busy, StaleRoot, NotIndexed, Invalid, Context, OwnerUsed };
+
+// One try-only, serial-checked exclusive root lease from an actual binding
+// SNAPSHOT. No Task/root allocator reference or raw-root authority is acquired.
+// The snapshot is borrowed until finish; resetting/moving it while borrowed is
+// a protocol error. Declare it outside this lease's continuously held PUB.
+class BindingRootMutationLease {
+   public:
+    BindingRootMutationLease() noexcept = default;
+    ~BindingRootMutationLease() { finish(); }
+    BindingRootMutationLease(const BindingRootMutationLease&) = delete;
+    auto operator=(const BindingRootMutationLease&) -> BindingRootMutationLease& = delete;
+    BindingRootMutationLease(BindingRootMutationLease&&) = delete;
+    auto operator=(BindingRootMutationLease&&) -> BindingRootMutationLease& = delete;
+    [[nodiscard]] auto acquired() const noexcept -> bool;
+    void finish() noexcept;
+
+   private:
+    friend auto try_acquire_binding_root(const file_mapping::FileBindingSnapshot&, const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                         BindingRootMutationLease&) noexcept -> BindingRootAdmission;
+    [[nodiscard]] auto acquire(const file_mapping::FileBindingSnapshot&, const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept
+        -> BindingRootAdmission;
+    enum class State : uint8_t { Virgin, Held, Consumed };
+    State state_{State::Virgin};
+    const file_mapping::FileBindingSnapshot* snapshot_{};
+    file_mapping::FileMappingBinding* binding_{};  // Borrowed from the sealed snapshot.
+    const ker::syscall::vmem::SharedVmemPublicationGuard* publication_{};
+    PageTable* root_{};  // Dereference authority never escapes through a getter.
+    uint64_t serial_{};
+    size_t gate_{static_cast<size_t>(-1)};
+};
+static_assert(!std::is_copy_constructible_v<BindingRootMutationLease> && !std::is_move_constructible_v<BindingRootMutationLease>);
+
+// Ordinary ACTIVE executor, IF on/preempt0 and no existing root/pin/backend
+// guards. A DAEMON holds real shutdown ownership; the retirement worker is
+// excluded. Refusal consumes this attempt but owns no gate and keeps snapshot.
+[[nodiscard]] auto try_acquire_binding_root(const file_mapping::FileBindingSnapshot&, const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                            BindingRootMutationLease&) noexcept -> BindingRootAdmission;
+#ifdef WOS_SELFTEST
+// Caller actually/exclusively owns the original never-published Task/root.
+// Scalar validation is additional refusal, not a way to mint that ownership.
+// Captures only the real index under its pin lock; no root page is dereferenced.
+[[nodiscard]] auto selftest_capture_binding_snapshot(sched::task::Task& subject, uint64_t start, uint64_t end,
+                                                     const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                                     file_mapping::FileBindingSnapshot& empty, bool& exact) noexcept -> bool;
+#endif
 // Ordinary preparation only: the caller owns a stable, exclusively unpublished
 // root and its retirement record. Failure may leave root-owned empty upper
 // tables; no leaf is published. Do not hold publication/lazy/cow/MM guards.

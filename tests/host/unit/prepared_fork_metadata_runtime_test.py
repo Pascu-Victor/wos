@@ -78,12 +78,15 @@ def generate(root: Path, scratch: Path, mode: str, helper) -> list:
             raise ValueError("actual lazy PUB generation declaration")
         guard = ["namespace ker::syscall::vmem {", body(header, "class SharedVmemPublicationGuard {", True),
             "struct PublicationMutex {void lock(){fixture::check(!fixture::pub,\"single PUB owner\");++fixture::pub;}void unlock(){fixture::check(fixture::pub==1,\"PUB unlock\");--fixture::pub;}}; PublicationMutex g_shared_vmem_publication_lock;",
-            "constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};",
+            body(source, "inline auto get_current_task("),
+            body(source, "constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner", True),
+            body(source, "constinit std::atomic<const ker::mod::sched::task::Task*> g_shared_vmem_publication_executor", True),
             "namespace {" + counter[0] + "}",
             body(source, "[[nodiscard]] auto blocking_publication_owner_matches("),
             body(source, "SharedVmemPublicationGuard::SharedVmemPublicationGuard("),
             body(source, "SharedVmemPublicationGuard::~SharedVmemPublicationGuard("),
             body(source, "auto SharedVmemPublicationGuard::acquired("),
+            body(source, "auto SharedVmemPublicationGuard::acquired_by_current_executor("),
             body(source, "auto SharedVmemPublicationGuard::try_empty_fork_generation("), "}"]
         common = common[:guard_start] + "\n".join(guard) + common[guard_end:]
         chunks[0] = common

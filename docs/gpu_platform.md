@@ -141,6 +141,42 @@ reads, lazy publication or MAP_FIXED replacement. Device files cannot silently
 become copied or zero-filled anonymous pages. Regular-file mappings continue
 through their existing retained File and fault paths.
 
+## Retained endpoint and mapping ownership
+
+`dev/device_mapping_client` owns a character endpoint's Device wrapper, copied
+operation table, name and context. Its checked move-only references retain that
+storage across namespace replacement and unlink. Callback code is built into the
+kernel; this API does not support unloading it. Typed endpoints use generic
+client creation and reject legacy open callbacks that could redirect the wrapper.
+Legacy endpoints keep their existing callbacks and devfs prefix layout.
+
+Each typed open attaches one client to the shared `File`, independently of
+backend private data. It copies the admitted credentials and explicit mount/open
+ceilings; it owns no Task or File back-reference. Dup and inherited descriptors
+share that File/client. Backend close runs while the client is live; client
+release precedes mount-owner release. Typed publication replaces an existing
+inode with a fresh node, preserving the old File's identity and metadata.
+Unlinked metadata references continue to retain their endpoint. Endpoint
+admission closure refuses new clients and preserves existing ones; it does not
+claim mapping revocation. Dynamic endpoints stay out of the borrowed Device
+registry until typed lookup ownership exists there.
+
+`FileBindingSnapshot` owns an exact binding SNAPSHOT role captured by the real
+mapping index. Its root address is identity only. `BindingRootMutationLease`
+requires that sealed owner and the current executor's actual publication guard,
+tries the permanent root gate, and validates the registered serial and exact
+indexed binding before root access. It acquires no Task or root-frame reference.
+Attempts are one-shot; busy callers must drop guards before retrying. A borrowed
+snapshot cannot move or reset until its lease finishes.
+
+Owned retirement observations distinguish INDEXED, TLB_PENDING and TLB_COMPLETE.
+Only the existing post-invalidation batch return publishes COMPLETE. This does
+not prove pins/installers ended, destructive File callbacks returned, or a device
+stopped DMA. Existing shootdown waits are not made bounded by try-only root
+admission. These internal owners prepare the device mapping transaction; user
+device mmap still refuses until partial unmap, fork, protection and actual
+multi-root revocation are implemented together.
+
 ## Remaining platform work
 
 These records permit one initial MSI-X activation per function and retain boot

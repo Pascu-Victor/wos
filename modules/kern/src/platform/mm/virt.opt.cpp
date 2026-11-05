@@ -27,6 +27,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/cache_bits.hpp>
 #include <platform/mm/cache_policy.hpp>
+#include <platform/mm/lifetime_retirement_executor.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/numa_root_reserve.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -40,6 +41,7 @@
 #include "platform/sched/task.hpp"
 #include "platform/sys/spinlock.hpp"
 #include "platform/sys/syscall_preparation.hpp"
+#include "platform/sys/usercopy.hpp"
 
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
@@ -62,10 +64,6 @@
 #include "util/hcf.hpp"
 #include "vfs/fs/tmpfs.hpp"
 #include "vfs/vfs.hpp"
-
-#ifdef WOS_SELFTEST
-#include "platform/sys/usercopy.hpp"
-#endif
 
 extern "C" {
 extern char __kernel_image_start[];                   // NOLINT(readability-identifier-naming)
@@ -7838,6 +7836,110 @@ auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*& prepared
     user_mapping_pin_lock.unlock_irqrestore(FLAGS);
     return ATTACHED;
 }
+
+namespace {
+auto binding_root_context() noexcept -> bool {
+    if (!phys::can_wait_for_reclaim() || sys::usercopy::access_window_active() ||
+        file_mapping::LifetimeRetirementExecutor::is_current_worker())
+        return false;
+    auto* const CURRENT = sched::get_current_task();
+    if (CURRENT == nullptr || CURRENT->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        CURRENT->exit_in_progress.load(std::memory_order_acquire) || CURRENT->usercopy_pagemap_closing.load(std::memory_order_acquire))
+        return false;
+    if (CURRENT->type == sched::task::TaskType::DAEMON) return CURRENT->kernel_shutdown_ownership.held();
+    return CURRENT->type == sched::task::TaskType::PROCESS && CURRENT->syscall_account_start_us != 0;
+}
+}  // namespace
+
+auto BindingRootMutationLease::acquired() const noexcept -> bool {
+    return state_ == State::Held && gate_ != USER_PAGEMAP_ACCESS_GATE_NONE && snapshot_ != nullptr && snapshot_->borrowed_ &&
+           snapshot_->binding_ == binding_ && publication_ != nullptr && publication_->acquired_by_current_executor();
+}
+
+void BindingRootMutationLease::finish() noexcept {
+    if (state_ == State::Held) {
+        if (!acquired()) __builtin_trap();
+        snapshot_->borrowed_ = false;
+        end_user_pagemap_exclusive(gate_);
+    }
+    state_ = State::Consumed;
+    gate_ = USER_PAGEMAP_ACCESS_GATE_NONE;
+    snapshot_ = nullptr;
+    binding_ = nullptr;
+    publication_ = nullptr;
+    root_ = nullptr;
+    serial_ = 0;
+}
+
+auto BindingRootMutationLease::acquire(const file_mapping::FileBindingSnapshot& snapshot,
+                                       const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> BindingRootAdmission {
+    if (state_ != State::Virgin) return BindingRootAdmission::OwnerUsed;
+    state_ = State::Consumed;  // Every attempt is one-shot, including refusal.
+    if (!publication.acquired_by_current_executor() || !binding_root_context()) return BindingRootAdmission::Context;
+    if (snapshot.empty() || snapshot.borrowed_) return BindingRootAdmission::Invalid;
+    auto* const BINDING = snapshot.binding_;
+    auto* const ROOT = BINDING->root();
+    uint64_t const SERIAL = BINDING->root_incarnation();
+    if (ROOT == nullptr || ROOT == kernel_pagemap || SERIAL == 0 || BINDING->start() >= BINDING->end())
+        return BindingRootAdmission::Invalid;
+
+    // Only pointer bits select permanent gate/control storage. The root may
+    // already be freed/reused; do not probe it before serial/index validation.
+    size_t const GATE = try_begin_user_pagemap_exclusive(ROOT);
+    if (GATE == USER_PAGEMAP_ACCESS_GATE_NONE) return BindingRootAdmission::Busy;
+    BindingRootAdmission result = BindingRootAdmission::StaleRoot;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto const* CONTROL = find_user_root_control_locked(ROOT);
+    if (CONTROL != nullptr && CONTROL->serial == SERIAL) {
+        result = file_mapping_index.matches_pin_locked(ROOT, SERIAL, BINDING->start(), BINDING) ? BindingRootAdmission::Acquired
+                                                                                                : BindingRootAdmission::NotIndexed;
+    }
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    if (result != BindingRootAdmission::Acquired) {
+        end_user_pagemap_exclusive(GATE);
+        return result;
+    }
+    // No fallible operation or callback follows this bidirectional borrow.
+    snapshot.borrowed_ = true;
+    snapshot_ = &snapshot;
+    binding_ = BINDING;
+    publication_ = &publication;
+    root_ = ROOT;
+    serial_ = SERIAL;
+    gate_ = GATE;
+    state_ = State::Held;
+    return result;
+}
+
+auto try_acquire_binding_root(const file_mapping::FileBindingSnapshot& snapshot,
+                              const ker::syscall::vmem::SharedVmemPublicationGuard& publication, BindingRootMutationLease& owner) noexcept
+    -> BindingRootAdmission {
+    return owner.acquire(snapshot, publication);
+}
+
+#ifdef WOS_SELFTEST
+auto selftest_capture_binding_snapshot(sched::task::Task& subject, uint64_t start, uint64_t end,
+                                       const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                       file_mapping::FileBindingSnapshot& empty, bool& exact) noexcept -> bool {
+    if (!publication.acquired_by_current_executor() || !binding_root_context() || !empty.empty() || &subject == sched::get_current_task() ||
+        subject.type != sched::task::TaskType::PROCESS || subject.is_thread ||
+        subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        subject.scheduler_published.load(std::memory_order_acquire) || subject.gc_queued.load(std::memory_order_acquire) ||
+        subject.ref_count.load(std::memory_order_acquire) != 1 ||
+        subject.active_registry_index != sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID || subject.heap_index != -1 ||
+        subject.sched_queue != decltype(subject.sched_queue)::NONE || subject.sched_list_owner.load(std::memory_order_acquire) != nullptr ||
+        subject.usercopy_pagemap_closing.load(std::memory_order_acquire) ||
+        subject.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr || subject.pagemap == nullptr ||
+        subject.pagemap == kernel_pagemap)
+        return false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto const* CONTROL = find_user_root_control_locked(subject.pagemap);
+    bool const CAPTURED =
+        CONTROL != nullptr && file_mapping_index.overlap_locked(subject.pagemap, CONTROL->serial, start, end, empty, exact);
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return CAPTURED;
+}
+#endif
 
 auto snapshot_file_mapping_bindings(PageTable* root, file_mapping::FileMappingBinding** output, size_t capacity, size_t& owned_count)
     -> bool {

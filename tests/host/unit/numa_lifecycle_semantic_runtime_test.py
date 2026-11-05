@@ -201,7 +201,8 @@ def generate(root, source_root, scratch, capture, variant):
     index_declarations += (
         definition(index_header, "struct BindingOwnerCounts", True) + "\n"
     )
-    index_declarations += "class RetirementCompletion; class FileMappingIndex; class FileMappingTlbRetirement;\n"
+    index_declarations += definition(index_header, "enum class BindingRetirementState", True) + "\n"
+    index_declarations += "class RetirementCompletion; class FileMappingIndex; class FileMappingTlbRetirement; class FileBindingSnapshot;\n"
     binding = definition(index_header, "class FileMappingBinding {", True).replace(
         "   private:", "   public:"
     )
@@ -232,6 +233,7 @@ def generate(root, source_root, scratch, capture, variant):
         ("void FileMappingBinding::release(", False),
         ("auto FileMappingBinding::reclassify(", False),
         ("auto FileMappingBinding::configure_unpublished(", False),
+        ("auto FileMappingBinding::retirement_state(", False),
         ("FileMappingTlbRetirement::~FileMappingTlbRetirement()", False),
         ("void FileMappingTlbRetirement::append(", False),
         ("void FileMappingTlbRetirement::release_after_completed_tlb()", False),

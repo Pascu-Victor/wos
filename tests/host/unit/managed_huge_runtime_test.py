@@ -600,13 +600,16 @@ struct Task {
     cpp = sources["syscalls_impl/vmem/sys_vmem.cpp"].read_text()
     constructors = (
         "namespace ker::syscall::vmem {\n"
-        + "constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};\n"
+        + definition(cpp, "inline auto get_current_task(") + "\n"
+        + definition(cpp, "constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner") + "\n"
+        + definition(cpp, "constinit std::atomic<const ker::mod::sched::task::Task*> g_shared_vmem_publication_executor") + "\n"
         + definition(cpp, "[[nodiscard]] auto blocking_publication_owner_matches(") + "\n"
         + "\n".join(
             definition(cpp, anchor)
             for anchor in (
                 "SharedVmemPublicationGuard::SharedVmemPublicationGuard()",
                 "auto SharedVmemPublicationGuard::acquired()",
+                "auto SharedVmemPublicationGuard::acquired_by_current_executor()",
                 "SharedVmemPublicationGuard::~SharedVmemPublicationGuard()",
                 "SharedVmemPublicationTryGuard::SharedVmemPublicationTryGuard()",
                 "SharedVmemPublicationTryGuard::~SharedVmemPublicationTryGuard()",

@@ -3790,6 +3790,7 @@ auto finish_file_close(File* f, bool close_may_change_metadata, int close_result
     }
     vfs_file_clear_path(f);
     f->private_data = nullptr;
+    f->device_client.reset();
     MountPoint* const MOUNT_OWNER = f->mount_owner;
     f->mount_owner = nullptr;
     release_mount_from_open_file(MOUNT_OWNER);
@@ -8634,7 +8635,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     switch (mount->fs_type) {
         case FSType::DEVFS:
             f = ker::vfs::devfs::devfs_open_path(CREDENTIALS, fs_relative_path, backend_flags, mode, &backend_open_result,
-                                                 OPEN_REQUIRE_DIRECTORY, task_is_opener ? task : nullptr);
+                                                 OPEN_REQUIRE_DIRECTORY, task_is_opener ? task : nullptr, &OPEN_POLICY);
             if (f != nullptr) {
                 f->fops = ker::vfs::devfs::get_devfs_fops();
                 f->fs_type = FSType::DEVFS;
@@ -31977,7 +31978,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     switch (mount->fs_type) {
         case FSType::DEVFS:
             f = ker::vfs::devfs::devfs_open_path(CREDENTIALS, fs_relative_path, backend_flags, mode, &backend_open_result,
-                                                 OPEN_REQUIRE_DIRECTORY, apply_task_policy ? CALLER : nullptr);
+                                                 OPEN_REQUIRE_DIRECTORY, apply_task_policy ? CALLER : nullptr, &OPEN_POLICY);
             if (f != nullptr) {
                 f->fops = ker::vfs::devfs::get_devfs_fops();
                 f->fs_type = FSType::DEVFS;

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <platform/security/credentials.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <string_view>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
@@ -31,6 +32,11 @@ struct DevFSNode {
     std::array<char, DEVFS_NAME_MAX> name{};
     DevFSNodeType type = DevFSNodeType::DIRECTORY;
     ker::dev::Device* device = nullptr;
+    // Typed local endpoints own their wrapper/ops/context. Acquisition and
+    // replacement serialize with namespace + metadata guards. Detached typed
+    // inodes retain the binding through all open/path refs; last put occurs
+    // after tree/IRQ guards drop.
+    ker::dev::mapping::EndpointRef mapping_endpoint;
     // Metadata readers may outlive the PTY endpoint containing Device.
     bool is_block_device = false;
     // Cached at generic publication while Device is owned by its caller. This
@@ -69,8 +75,8 @@ struct DevFSNode {
     Timespec ctime{};
 };
 
-// Pins node metadata for the reference's lifetime. Local and PTY references
-// retain metadata, not their borrowed Device pointers.
+// Pins node metadata for the reference's lifetime. Legacy local/PTY Device
+// pointers remain borrowed; a typed inode owns its endpoint binding as well.
 class DevFSNodeRef {
    public:
     DevFSNodeRef() = default;
@@ -119,12 +125,18 @@ auto get_devfs_fops() -> FileOperations*;
 // Open a file in devfs. Caller retains opener through this synchronous call;
 // null carries no process-specific authority and never selects the current task.
 auto devfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int mode, int* result_out = nullptr,
-                     bool require_directory = false, ker::mod::sched::task::Task* opener = nullptr) -> File*;
+                     bool require_directory = false, ker::mod::sched::task::Task* opener = nullptr,
+                     const MountPolicy* admitted_policy = nullptr) -> File*;
 // Inspect symlink metadata without invoking a device open callback.
 auto devfs_readlink_path(const char* path, char* buf, size_t bufsize) -> ssize_t;
 
 // Initialize devfs (creates root node, populates device entries)
 void devfs_init();
+
+// Publish an owned CHAR endpoint at one ordinary root name. No borrowed global
+// device-registry publication or PTS/WKI redirect contract is implied.
+auto devfs_add_mapping_endpoint(std::string_view name, const ker::dev::mapping::EndpointRef& endpoint,
+                                const ker::mod::security::Snapshot* creator = nullptr) -> DevFSNode*;
 
 // Generic mutation helpers reject the /wki subtree (null/false); use its
 // dedicated resource APIs to preserve namespace locking and reclamation.

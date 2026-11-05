@@ -50,6 +50,9 @@ class SharedVmemPublicationGuard {
     auto operator=(SharedVmemPublicationGuard&&) -> SharedVmemPublicationGuard& = delete;
     // Borrows this live guard's exact singleton publication identity; no object bytes are read.
     [[nodiscard]] auto acquired() const noexcept -> bool;
+    // Additionally requires the scheduled executor that acquired this mutex.
+    // Early boot/null-executor scopes do not qualify. No Task ref is acquired.
+    [[nodiscard]] auto acquired_by_current_executor() const noexcept -> bool;
 
    private:
     friend class LegacyFileForkPreparation;

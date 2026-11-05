@@ -353,13 +353,29 @@ auto FileMappingBinding::observe_return(RetirementCompletion& empty) noexcept ->
     return PORT->observe_return(PORT->context, *ticket_, finish, this, empty);
 }
 
+auto FileMappingBinding::retirement_state() const noexcept -> BindingRetirementState {
+    switch (index_state_.load(std::memory_order_acquire)) {
+        case IndexState::PREPARED:
+            return BindingRetirementState::PREPARED;
+        case IndexState::INDEXED:
+            return BindingRetirementState::INDEXED;
+        case IndexState::DETACHED:
+            return BindingRetirementState::TLB_PENDING;
+        case IndexState::COMPLETE:
+            return BindingRetirementState::TLB_COMPLETE;
+    }
+    __builtin_trap();
+}
+
 auto FileMappingBinding::finish(void* argument) noexcept -> int {
     auto* binding = static_cast<FileMappingBinding*>(argument);
     FileMappingLifetime* lifetime = nullptr;
     {
         OwnerCountGuard const GUARD;
-        if (binding->owners_.total != 0 || !counts_valid(binding->owners_) || binding->index_state_ == IndexState::INDEXED ||
-            binding->index_next_ != nullptr || binding->retire_next_ != nullptr)
+        auto const STATE = binding->index_state_.load(std::memory_order_acquire);
+        if (binding->owners_.total != 0 || !counts_valid(binding->owners_) ||
+            (STATE != IndexState::PREPARED && STATE != IndexState::COMPLETE) || binding->index_next_ != nullptr ||
+            binding->retire_next_ != nullptr)
             __builtin_trap();
         lifetime = std::exchange(binding->lifetime_, nullptr);
         if (lifetime == nullptr) __builtin_trap();
@@ -370,6 +386,31 @@ auto FileMappingBinding::finish(void* argument) noexcept -> int {
 #endif
     lifetime->release(FamilyOwner::BINDING);  // Separate pre-reserved callback.
     return 0;
+}
+
+FileBindingSnapshot::FileBindingSnapshot(FileBindingSnapshot&& other) noexcept {
+    if (other.borrowed_) __builtin_trap();
+    binding_ = std::exchange(other.binding_, nullptr);
+}
+
+auto FileBindingSnapshot::operator=(FileBindingSnapshot&& other) noexcept -> FileBindingSnapshot& {
+    if (this == &other) return *this;
+    if (borrowed_ || other.borrowed_) __builtin_trap();
+    reset();
+    binding_ = std::exchange(other.binding_, nullptr);
+    return *this;
+}
+
+FileBindingSnapshot::~FileBindingSnapshot() { reset(); }
+
+auto FileBindingSnapshot::retirement_state() const noexcept -> BindingRetirementState {
+    return binding_ == nullptr ? BindingRetirementState::EMPTY : binding_->retirement_state();
+}
+
+void FileBindingSnapshot::reset() noexcept {
+    if (borrowed_) __builtin_trap();
+    auto* const BINDING = std::exchange(binding_, nullptr);
+    if (BINDING != nullptr) BINDING->release(BindingOwner::SNAPSHOT);
 }
 
 FileMappingTlbRetirement::~FileMappingTlbRetirement() {
@@ -391,6 +432,10 @@ void FileMappingTlbRetirement::release_after_completed_tlb() noexcept {
         head_ = CURRENT->retire_next_;
         CURRENT->retire_next_ = nullptr;
         if (head_ == nullptr) tail_ = nullptr;
+        // Publish the actual caller-completed TLB boundary independently of
+        // remaining pins/snapshots and eventual destructive callback return.
+        if (CURRENT->index_state_.load(std::memory_order_acquire) != FileMappingBinding::IndexState::DETACHED) __builtin_trap();
+        CURRENT->index_state_.store(FileMappingBinding::IndexState::COMPLETE, std::memory_order_release);
         CURRENT->release(BindingOwner::TLB);
 #ifdef WOS_SELFTEST
         virt::selftest_current_root_detached_binding_returned();
@@ -440,7 +485,7 @@ auto FileMappingIndex::attach_locked(FileMappingBinding*& prepared, uint64_t roo
 #endif
     auto* const BINDING = std::exchange(prepared, nullptr);
     BINDING->index_next_ = heads_[SLOT];
-    BINDING->index_state_ = FileMappingBinding::IndexState::INDEXED;
+    BINDING->index_state_.store(FileMappingBinding::IndexState::INDEXED, std::memory_order_release);
     heads_[SLOT] = BINDING;
 #ifdef WOS_SELFTEST
     virt::selftest_current_root_change_end(semantic_owned);
@@ -467,7 +512,7 @@ auto FileMappingIndex::detach_locked(FileMappingBinding& binding, FileMappingTlb
     // The exclusive retirement batch consumes it after actual TLB-ref return.
     *link = binding.index_next_;
     binding.index_next_ = nullptr;
-    binding.index_state_ = FileMappingBinding::IndexState::DETACHED;
+    binding.index_state_.store(FileMappingBinding::IndexState::DETACHED, std::memory_order_release);
     retirement.append(binding);
     return true;
 }
@@ -488,7 +533,7 @@ auto FileMappingIndex::detach_root_locked(paging::PageTable* root, uint64_t root
         if (!CURRENT->reclassify(BindingOwner::INDEX, BindingOwner::TLB)) __builtin_trap();
         *link = CURRENT->index_next_;
         CURRENT->index_next_ = nullptr;
-        CURRENT->index_state_ = FileMappingBinding::IndexState::DETACHED;
+        CURRENT->index_state_.store(FileMappingBinding::IndexState::DETACHED, std::memory_order_release);
         retirement.append(*CURRENT);
     }
     return true;
@@ -553,6 +598,15 @@ auto FileMappingIndex::overlap_locked(paging::PageTable* root, uint64_t root_inc
     return true;
 }
 
+auto FileMappingIndex::overlap_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t start, uint64_t end,
+                                      FileBindingSnapshot& owned, bool& exact) noexcept -> bool {
+    if (!owned.empty() || owned.borrowed_) return false;
+    FileMappingBinding* binding = nullptr;
+    if (!overlap_locked(root, root_incarnation, start, end, binding, exact)) return false;
+    owned.binding_ = binding;
+    return true;
+}
+
 auto FileMappingIndex::snapshot_root_locked(paging::PageTable* root, uint64_t root_incarnation, FileMappingBinding** output,
                                             size_t capacity, size_t& owned_count) noexcept -> bool {
     if (owned_count != 0) __builtin_trap();
@@ -561,6 +615,23 @@ auto FileMappingIndex::snapshot_root_locked(paging::PageTable* root, uint64_t ro
         if (current->root_ != root) continue;
         if (owned_count == capacity || !current->try_acquire(BindingOwner::SNAPSHOT)) return false;
         output[owned_count++] = current;
+    }
+    return true;
+}
+
+auto FileMappingIndex::snapshot_root_locked(paging::PageTable* root, uint64_t root_incarnation, FileBindingSnapshot* output,
+                                            size_t capacity, size_t& owned_count) noexcept -> bool {
+    if (owned_count != 0) __builtin_trap();
+    if ((output == nullptr && capacity != 0) || root_incarnation == 0 || !root_matches_locked(root, root_incarnation)) return false;
+    // Validate all destinations before acquiring any reference. Never replace
+    // an occupied wrapper or release its old owner under the index lock.
+    for (size_t i = 0; i < capacity; ++i) {
+        if (!output[i].empty() || output[i].borrowed_) return false;
+    }
+    for (auto* current = heads_[bucket(root)]; current != nullptr; current = current->index_next_) {
+        if (current->root_ != root) continue;
+        if (owned_count == capacity || !current->try_acquire(BindingOwner::SNAPSHOT)) return false;
+        output[owned_count++].binding_ = current;
     }
     return true;
 }

@@ -40,6 +40,11 @@
 // readability-suspicious-call-argument)
 namespace ker::vfs::devfs {
 
+// The owned wrapper is deliberately not exposed to the borrowed Device registry.
+struct MappingEndpointAccess {
+    static auto device(ker::dev::mapping::Endpoint& endpoint) -> ker::dev::Device* { return &endpoint.device_; }
+};
+
 namespace {
 
 constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
@@ -181,11 +186,21 @@ auto is_local_devfs_path(const char* path) -> bool {
 
 void local_release_node_ref(DevFSNode* node) {
     if (node->local_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        // Device ownership belongs to the endpoint provider, not this metadata.
+        // Legacy Device remains borrowed; a typed inode's binding member owns
+        // its endpoint until this ordinary final metadata release.
         delete[] node->children;
         delete node;
     }
 }
+
+// Declare before namespace guards. A detached inode can own a typed endpoint;
+// its namespace reference and final context destructor retire after unlock.
+struct RetiredLocalNode {
+    DevFSNode* node{};
+    ~RetiredLocalNode() {
+        if (node != nullptr) local_release_node_ref(node);
+    }
+};
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
@@ -391,6 +406,24 @@ void remove_child(DevFSNode* parent, DevFSNode* child) {
             return;
         }
     }
+}
+
+auto replace_child(DevFSNode* parent, DevFSNode* previous, DevFSNode* replacement) -> bool {
+    if (parent == nullptr || previous == nullptr || replacement == nullptr) return false;
+    bool replaced = false;
+    {
+        RootChildrenGuard const ROOT_GUARD(parent);
+        for (size_t index = 0; index < parent->children_count; ++index) {
+            if (parent->children[index] != previous) continue;
+            parent->children[index] = replacement;
+            replacement->parent = parent;
+            previous->parent = nullptr;
+            replaced = true;
+            break;
+        }
+    }
+    if (replaced) touch_node_modified(parent);
+    return replaced;
 }
 
 auto create_node(const char* name, DevFSNodeType type) -> DevFSNode* {
@@ -975,7 +1008,7 @@ auto devfs_utimens_lookup(const char* path, const DevFSNodeRef& retained, const 
 }
 
 auto devfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int /*mode*/, int* result_out,
-                     bool require_directory, ker::mod::sched::task::Task* opener) -> File* {
+                     bool require_directory, ker::mod::sched::task::Task* opener, const MountPolicy* admitted_policy) -> File* {
     auto fail = [result_out](int error) -> File* {
         if (result_out != nullptr) *result_out = error;
         return nullptr;
@@ -1012,6 +1045,7 @@ auto devfs_open_path(const ker::mod::security::Snapshot& credentials, const char
     // A /dev/pts node embeds its Device in the owning PtyPair. Keep namespace
     // removal from dropping the tree-owned pair reference until the device
     // open callback has published its endpoint reference.
+    ker::dev::mapping::EndpointRef selected_endpoint;
     OptionalPtsLock const PTS_GUARD(PTS_PATH);
     DevFSNode* node = nullptr;
     DevFSNodeType selected_type = DevFSNodeType::DIRECTORY;
@@ -1035,6 +1069,14 @@ auto devfs_open_path(const ker::mod::security::Snapshot& credentials, const char
             if (policy == 0) {
                 selected_type = node->type;
                 devfs_file->device = node->device;
+                if (node->mapping_endpoint) {
+                    if (admitted_policy == nullptr || selected_type != DevFSNodeType::DEVICE)
+                        policy = -EINVAL;
+                    else if (!node->mapping_endpoint.clone_into(selected_endpoint))
+                        policy = -EOVERFLOW;
+                    else if (!selected_endpoint.get()->accepting_clients())
+                        policy = -ENODEV;
+                }
             }
             if (policy == 0 && WKI_PATH) {
                 node->wki_open_refs++;
@@ -1067,6 +1109,20 @@ auto devfs_open_path(const ker::mod::security::Snapshot& credentials, const char
     file->refcount = 1;
     file->open_flags = flags;
     file->fd_flags = 0;
+    if (admitted_policy != nullptr) file->mount_policy = *admitted_policy;
+
+    if (selected_endpoint) {
+        int const CLIENT_RESULT = ker::dev::mapping::Client::open(
+            selected_endpoint, credentials,
+            {.open_flags = static_cast<unsigned>(flags), .read_only = admitted_policy->read_only, .nosuid = admitted_policy->nosuid},
+            file->device_client);
+        if (CLIENT_RESULT != 0) {
+            if (devfs_file->owns_local_node_ref) local_release_node_ref(node);
+            delete devfs_file;
+            delete file;
+            return fail(CLIENT_RESULT);
+        }
+    }
 
     if (selected_type == DevFSNodeType::DIRECTORY) {
         file->is_directory = true;
@@ -1231,7 +1287,8 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
 
 namespace {
 // Caller holds the namespace guard appropriate for name.
-auto add_device_node_locked(const char* name, ker::dev::Device* dev, const ker::mod::security::Snapshot* creator) -> DevFSNode* {
+auto add_device_node_locked(const char* name, ker::dev::Device* dev, const ker::mod::security::Snapshot* creator,
+                            DevFSNode** retired = nullptr, ker::dev::mapping::EndpointRef* incoming = nullptr) -> DevFSNode* {
     // If the name contains '/', walk to the parent directory first.
     // e.g. "pts/0" => find (or create) the "pts" dir, then add node "0" there.
     const char* slash = nullptr;
@@ -1265,6 +1322,38 @@ auto add_device_node_locked(const char* name, ker::dev::Device* dev, const ker::
         if (creator != nullptr) {
             return nullptr;
         }
+        bool retained_inode = incoming != nullptr;
+        bool childless = false;
+        {
+            MetadataGuard const GUARD(*existing);
+            retained_inode = retained_inode || static_cast<bool>(existing->mapping_endpoint);
+            childless = existing->children_count == 0;
+        }
+        if (retained_inode) {
+            // A typed inode is never retargeted while old File/path refs exist.
+            // Allocate before the bounded root-child commit; retire outside all
+            // guards through the caller's namespace-reference owner.
+            if (retired == nullptr || *retired != nullptr || !childless) return nullptr;
+            auto* replacement = create_node(leaf_name, DevFSNodeType::DEVICE);
+            if (replacement == nullptr) return nullptr;
+            replacement->device = dev;
+            replacement->is_block_device = dev != nullptr && dev->type == ker::dev::DeviceType::BLOCK;
+            replacement->block_provider = ker::dev::block_device_find_by_wrapper(dev);
+            if (incoming != nullptr) replacement->mapping_endpoint = std::move(*incoming);
+            {
+                MetadataGuard const GUARD(*replacement);
+                if (replacement->children_count != 0) {
+                    *retired = replacement;
+                    return nullptr;
+                }
+            }
+            if (!replace_child(parent, existing, replacement)) {
+                *retired = replacement;
+                return nullptr;
+            }
+            *retired = existing;
+            return replacement;
+        }
         MetadataGuard const GUARD(*existing);
         existing->type = DevFSNodeType::DEVICE;
         existing->device = dev;
@@ -1281,6 +1370,7 @@ auto add_device_node_locked(const char* name, ker::dev::Device* dev, const ker::
         return nullptr;
     }
     node->device = dev;
+    if (incoming != nullptr) node->mapping_endpoint = std::move(*incoming);
     node->is_block_device = dev != nullptr && dev->type == ker::dev::DeviceType::BLOCK;
     node->block_provider = ker::dev::block_device_find_by_wrapper(dev);
     if (creator != nullptr) {
@@ -1289,6 +1379,10 @@ auto add_device_node_locked(const char* name, ker::dev::Device* dev, const ker::
         node->mode = 0600;
     }
     add_child(parent, node);
+    if (node->parent == nullptr && retired != nullptr) {
+        *retired = node;
+        return nullptr;
+    }
     return node;
 }
 
@@ -1299,16 +1393,37 @@ auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::de
     if (is_wki_devfs_path(name.data())) {
         return nullptr;
     }
+    RetiredLocalNode retired;
     OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(name.data()));
     OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(name.data()));
     OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(name.data()));
-    return add_device_node_locked(name.data(), dev, creator);
+    return add_device_node_locked(name.data(), dev, creator, &retired.node);
+}
+
+auto devfs_add_mapping_endpoint(std::string_view name, const ker::dev::mapping::EndpointRef& endpoint,
+                                const ker::mod::security::Snapshot* creator) -> DevFSNode* {
+    if (!endpoint || !endpoint.get()->accepting_clients() || name.empty() || name.size() >= DEVFS_NAME_MAX || name == "." || name == ".." ||
+        name == "pts" || name == "wki" || name == "nodes")
+        return nullptr;
+    std::array<char, DEVFS_NAME_MAX> local_name{};
+    for (size_t index = 0; index < name.size(); ++index) {
+        char const character = name[index];
+        if (character == '/' || character == '\0' || static_cast<unsigned char>(character) < 0x20U) return nullptr;
+        local_name.at(index) = character;
+    }
+    ker::dev::mapping::EndpointRef incoming;
+    RetiredLocalNode retired;
+    if (!endpoint.clone_into(incoming)) return nullptr;
+    OptionalLocalLock const LOCAL_GUARD(true);
+    if (!endpoint.get()->accepting_clients()) return nullptr;
+    return add_device_node_locked(local_name.data(), MappingEndpointAccess::device(*endpoint.get()), creator, &retired.node, &incoming);
 }
 
 auto devfs_remove_node(const char* path) -> bool {
     if (is_wki_devfs_path(path)) {
         return false;
     }
+    RetiredLocalNode retired;
     OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(path));
     bool const PTS_PATH = is_pts_devfs_path(path);
     OptionalPtsLock const PTS_GUARD(PTS_PATH);
@@ -1324,7 +1439,9 @@ auto devfs_remove_node(const char* path) -> bool {
     }
 
     remove_child(node->parent, node);
-    if (PTS_PATH) {
+    if (node->mapping_endpoint) {
+        retired.node = node;
+    } else if (PTS_PATH) {
         pts_release_node_ref(node);
     } else {
         local_release_node_ref(node);
