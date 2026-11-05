@@ -15,6 +15,7 @@
 #include <dev/console.hpp>
 #include <dev/device.hpp>
 #include <dev/e1000e/e1000e.hpp>
+#include <dev/firmware/boot_source.hpp>
 #include <dev/iommu/discovery.hpp>
 #include <dev/iommu/domains.hpp>
 #include <dev/ivshmem/ivshmem_net.hpp>
@@ -52,6 +53,9 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
+#ifdef WOS_SELFTEST
+#include <test/firmware_runtime_ktest.hpp>
+#endif
 
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "util/hcf.hpp"
@@ -330,15 +334,21 @@ void sse_init() {
 void ntp_init() { mod::ntp::init(); }
 
 void initramfs_init() {
+    // Capture before TMPFS unpacking. Reserved firmware modules NEVER enter
+    // the general unpacker, including rejected versions/duplicates/archives.
+    dev::firmware::capture_boot_source();
+    ker::mod::dbg::logger<"firmware">::info("boot source status=%u", static_cast<unsigned>(dev::firmware::source_status()));
     // Unpack CPIO initramfs from Limine modules into tmpfs root
     auto& module_request = get_kernel_module_request();
-    if (module_request.response == nullptr) {
+    if (module_request.response == nullptr || module_request.response->module_count > 32 || module_request.response->modules == nullptr) {
         return;
     }
 
     for (size_t i = 0; i < module_request.response->module_count; i++) {
-        auto* mod_data = static_cast<uint8_t*>(module_request.response->modules[i]->address);
-        size_t const MOD_SIZE = module_request.response->modules[i]->size;
+        auto* const MODULE = module_request.response->modules[i];
+        if (MODULE == nullptr || dev::firmware::module_kind(MODULE) != dev::firmware::ModuleKind::ordinary) continue;
+        auto* mod_data = static_cast<uint8_t*>(MODULE->address);
+        size_t const MOD_SIZE = MODULE->size;
         // Check for CPIO newc magic "070701"
         if (MOD_SIZE >= 6 && mod_data[0] == '0' && mod_data[1] == '7' && mod_data[2] == '0' && mod_data[3] == '7' && mod_data[4] == '0' &&
             mod_data[5] == '1') {
@@ -361,6 +371,11 @@ void sched_init() {
     bool const NUMA_PRESSURE = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-pressure");
     bool const NUMA_CENSUS = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-lifecycle-census");
     bool const ANONYMOUS_USERCOPY = cmdline_has_token(get_kernel_cmdline(), "--selftest-anonymous-usercopy");
+    bool const FIRMWARE = cmdline_has_token(get_kernel_cmdline(), "--selftest-firmware");
+    if (FIRMWARE &&
+        (ANONYMOUS_USERCOPY || NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
+         cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") || cmdline_has_token(get_kernel_cmdline(), "--napi-irq-test")))
+        mod::dbg::panic_handler("conflicting scheduled firmware diagnostic boot modes");
     if (ANONYMOUS_USERCOPY && (NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
                                cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") ||
                                cmdline_has_token(get_kernel_cmdline(), "vmem.anon_swap=on")))
@@ -402,14 +417,15 @@ void sched_init() {
         hcf();
     }
 
-    modules.count = module_request.response->module_count;
-
-    for (size_t i = 0; i < modules.count; i++) {
-        mod::dbg::log("Module: %s", module_request.response->modules[i]->path);
-        modules.modules[i].entry = module_request.response->modules[i]->address;
-        modules.modules[i].size = module_request.response->modules[i]->size;
-        modules.modules[i].cmdline = module_request.response->modules[i]->path;
-        modules.modules[i].name = module_request.response->modules[i]->path;
+    for (size_t i = 0; i < module_request.response->module_count; i++) {
+        auto* const MODULE = module_request.response->modules[i];
+        if (MODULE == nullptr || dev::firmware::module_kind(MODULE) != dev::firmware::ModuleKind::ordinary) continue;
+        auto& output = modules.modules[modules.count++];
+        mod::dbg::log("Module: %s", MODULE->path);
+        output.entry = MODULE->address;
+        output.size = MODULE->size;
+        output.cmdline = MODULE->path;
+        output.name = MODULE->path;
     }
 
     // Start other CPUs and enter scheduler loop (never returns)
@@ -417,6 +433,10 @@ void sched_init() {
 }
 
 void kernel_start() {
+#ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-firmware") && !ker::test::start_firmware_runtime_selftest())
+        mod::dbg::panic_handler("unable to post scheduled firmware selftest");
+#endif
 #ifdef WOS_SELFTEST
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-pressure") && !ker::test::start_numa_pressure_runtime_selftest())
         mod::dbg::panic_handler("unable to post scheduled NUMA pressure selftest");

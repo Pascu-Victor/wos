@@ -54,6 +54,65 @@ retained. CPU steering preserves the owned vector and callback lifetime; an
 already-issued IRQ may reach its old CPU. Batch placement can have partial
 changes when an IRQ update fails, and reports the error without claiming rollback.
 
+## Immutable firmware service
+
+`dev/firmware` provides a kernel-only service for named raw blobs. Set
+`WOS_FIRMWARE_ARCHIVE=/absolute/path/firmware.cpio` when packaging to add a
+separate newc module tagged `wos-firmware-v1`. Entries use
+`lib/firmware/<canonical-relative-name>`. Both image backends and stock/generated
+Limine menus support it; the boot manifest includes its hash. Ordinary boots
+need no firmware archive. Compressed archives/blobs are not decompressed.
+
+Serialized boot capture validates exactly one tagged source before reading its
+payload: checked HHDM conversion, complete page-rounded kernel/module reservation
+without conflicting memory descriptors, actual supervisor read-only/NX physical
+translations, CR0.WP and no kernel-image physical alias. It retains only immutable
+payload/index views. Reserved firmware modules never reach the writable TMPFS
+unpacker or fallback executable handover, even when capture fails. This does not
+harden the general initramfs unpacker or change its trusted-bootloader contract.
+
+The bounded allocation-free scanner validates the entire archive, including
+unused records and the trailer, before publishing an index. It rejects malformed
+metadata, canonical aliases, firmware links and nonzero padding. Limits are
+512MiB/source, 256MiB/blob, 4096 records including the trailer, 512 indexed files,
+512-byte archive paths and 256-byte relative names including NUL, and 511 trailing
+zero bytes. Duplicate detection uses bounded quadratic header/name work at boot;
+it neither rereads nor hashes every prior payload.
+
+A trusted kernel `Policy` pins canonical name, exact/max length, SHA256 and a
+revision matched by the caller. Revision identifies the catalog's hash-bound
+bytes; it is not a vendor-format parser. A manifest accompanying untrusted bytes
+cannot supply policy authority. The service reuses the existing allocation-free
+SHA256 implementation without changing WKI protocols.
+
+Use a stack-owned `firmware::Scope` in ordinary task context, outside IRQ/fault,
+spin, VM, IOMMU and driver locks. `request(policy, revision, view)` returns checked
+immutable bytes or an explicit error while leaving failed output unchanged.
+Concurrent identical policies share one generation/object and verification;
+conflicting live policies fail. `release(view)` rejects foreign, stale and
+duplicate leases. Destruction drains all remaining leases. Views are borrowed;
+copying one does not acquire ownership, and use ends when its lease is released.
+
+Scopes cannot move or cross tasks. Each holds cooperative task shutdown ownership
+through its whole lifetime, including mutex waits and scheduling. Explicit task
+exit with a live Scope is forbidden; unsafe/cross-task destruction is fatal.
+Unsafe requests/releases/snapshots refuse before the sleeping mutex. Hashing
+occurs under that task mutex and performs no I/O, callbacks or allocation. The
+cache has 64 metadata slots, 1024 references/object and 64 leases/scope. Last
+release evicts metadata; generation exhaustion fails without wrap. Source bytes
+remain reserved until shutdown. Firmware possession grants no DMA/device access.
+
+`scripts/test/make_firmware_fixture.py OUTPUT` creates only redistributable WOS
+test bytes for the isolated `--selftest-firmware` scheduled test. The fixture's
+policy is independently compiled into the test kernel. This is service evidence,
+not qualification of any AMD/NVIDIA firmware catalog, processor or GPU driver.
+
+The scheduled diagnostic requests normal PID 1 poweroff after all firmware
+owners return. Shutdown preparation must preserve demand paging, I/O, GC and
+File retirement providers while it returns to userspace. Provider retirement
+belongs after consumer quiescence in the nonreturning finalizer; firmware hashes
+or a successful lifetime test cannot substitute for that ordering.
+
 ## Remaining platform work
 
 These records permit one initial MSI-X activation per function and retain boot
@@ -68,7 +127,7 @@ not-DRIVER_OK device state before handler publication. Large apertures still map
 in proportion to their 4 KiB page count; bounded/on-demand mapping remains open.
 
 The fixed 64-device capacity is shared by PCI, ECAM and IOMMU ownership metadata;
-changing only enumeration is unsafe. Firmware verification/caching, device-backed
+changing only enumeration is unsafe. Vendor firmware catalogs and device-backed
 mmap, WC architecture policy, charged revocable user-page pins, GPU-scale SG,
 AMD-Vi and interrupt remapping also remain open. Existing Intel DMA strict mode
 does not provide MSI isolation. Reuse the current MM binding/root/TLB lifetime
@@ -98,3 +157,14 @@ the corrected fresh boot records BME inhibition and passes all 16 IRQ cases.
 The failed original run and exact cleanup evidence remain preserved. CPU
 steering on real hardware, firmware handoff and physical GPU qualification
 remain separate requirements.
+
+Firmware host tests exercise the production scanner/cache, actual Scope service
+with explicit host task/mutex ports, boot-source qualification helpers and both
+image packaging backends. The scheduled firmware VM uses actual tasks, mutex,
+verified source and shutdown ownership: two requests share one object/hash,
+negative policies retain no objects, and 1,000 release cycles return to baseline.
+Its early normal PID 1 poweroff exposed premature provider retirement; the
+corrected production path shuts down journald, XFS and device DMA cleanly.
+The ordinary KTEST boot also rejects a corrupt final archive padding byte without
+publishing its otherwise valid first blob. These checks pass on synthetic WOS
+test bytes; vendor firmware/device qualification is still required.

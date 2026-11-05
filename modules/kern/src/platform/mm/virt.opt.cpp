@@ -6471,10 +6471,12 @@ struct MappingPermissions {
     bool present{};
     bool writable{};
     bool executable{};
+    bool user{};
+    paddr_t physical = PADDR_INVALID;
 };
 
 auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
-    MappingPermissions result{.present = true, .writable = true, .executable = true};
+    MappingPermissions result{.present = true, .writable = true, .executable = true, .user = true};
     PageTable* table = root;
     for (int level = 4; level >= 1; --level) {
         if (table == nullptr) {
@@ -6486,9 +6488,16 @@ auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
         }
         result.writable = result.writable && entry.writable != 0;
         result.executable = result.executable && entry.no_execute == 0;
+        result.user = result.user && entry.user != 0;
         if (level == 1 || (entry.pagesize != 0 && (level == 3 || level == 2))) {
+            uint64_t const MASK = level == 3 ? LARGE_PAGE_1G_BYTES - 1 : level == 2 ? LARGE_PAGE_2M_BYTES - 1 : paging::PAGE_SIZE - 1;
+            // Bit 12 is PAT in a large leaf; other low frame bits are reserved.
+            uint64_t const FRAME = entry.frame << paging::PAGE_SHIFT;
+            if (level != 1 && (FRAME & MASK & ~uint64_t{4096}) != 0) return {};
+            result.physical = (FRAME & ~MASK) + (vaddr & MASK);
             return result;
         }
+        if (entry.pagesize != 0) return {};  // A PML4 entry cannot be a large leaf.
         table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
     }
     return {};
@@ -6633,6 +6642,47 @@ void init_tlb_shootdown() {
 }
 
 bool active_pagemap_is(PageTable* pagemap) { return is_current_pagemap(pagemap); }
+
+auto boot_range_readable(vaddr_t address, uint64_t bytes) -> bool {
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    if (!is_current_pagemap(kernel_pagemap) || HHDM < 0xffff800000000000ULL || (HHDM & (paging::PAGE_SIZE - 1)) != 0 || address < HHDM ||
+        bytes == 0 || bytes > 512ULL * 1024 * 1024 || bytes > UINT64_MAX - address)
+        return false;
+    uint64_t const LAST = address + bytes - 1;
+    for (uint64_t page = page_align_down(address);; page += paging::PAGE_SIZE) {
+        auto const PERMISSIONS = mapping_permissions(kernel_pagemap, page);
+        if (!PERMISSIONS.present || PERMISSIONS.user || PERMISSIONS.physical != page - HHDM) return false;
+        if (LAST - page < paging::PAGE_SIZE) return true;
+    }
+}
+
+auto boot_module_range_immutable(vaddr_t address, paddr_t physical, uint64_t bytes) -> bool {
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    if (!boot_range_readable(address, bytes) || kernel_address_response == nullptr || !kernel_nx_supported || !cpu::nx_enabled() ||
+        !cpu::write_protect_enabled() || address - HHDM != physical || bytes > UINT64_MAX - physical ||
+        physical + bytes > UINT64_MAX - (paging::PAGE_SIZE - 1))
+        return false;
+    uint64_t const START = page_align_down(physical), END = page_align_up(physical + bytes);
+    uint64_t const IMAGE_START = reinterpret_cast<uint64_t>(__kernel_image_start), IMAGE_END = reinterpret_cast<uint64_t>(__kernel_end);
+    uint64_t const IMAGE_PHYSICAL = kernel_address_response->physical_base;
+    if (IMAGE_START >= IMAGE_END || IMAGE_END - IMAGE_START > UINT64_MAX - IMAGE_PHYSICAL ||
+        (START < IMAGE_PHYSICAL + (IMAGE_END - IMAGE_START) && IMAGE_PHYSICAL < END))
+        return false;
+    cpu::CpuidContext info{};
+    info.function = static_cast<int>(0x80000000U);
+    cpu::cpuid(&info);
+    if (static_cast<uint32_t>(info.eax) < 0x80000008U) return false;
+    info.function = static_cast<int>(0x80000008U);
+    cpu::cpuid(&info);
+    uint8_t const PHYSICAL_BITS = info.eax & 255U;
+    if (PHYSICAL_BITS < 32 || PHYSICAL_BITS > 52 || END > (uint64_t{1} << PHYSICAL_BITS)) return false;
+    for (uint64_t page = START; page < END; page += paging::PAGE_SIZE) {
+        auto const PERMISSIONS = mapping_permissions(kernel_pagemap, HHDM + page);
+        if (!PERMISSIONS.present || PERMISSIONS.user || PERMISSIONS.writable || PERMISSIONS.executable || PERMISSIONS.physical != page)
+            return false;
+    }
+    return true;
+}
 
 bool user_page_mapped_now(PageTable* pagemap, vaddr_t vaddr) { return user_page_mapped_now_impl(pagemap, vaddr); }
 

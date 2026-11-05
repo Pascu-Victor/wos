@@ -497,6 +497,13 @@ void init_tlb_shootdown();
 void note_tlb_shootdown_cpu_online();
 void init_pagemap();
 [[nodiscard]] auto audit_kernel_protections() -> KernelProtectionAudit;
+// Serialized boot only, with the kernel root active; at most 512MiB per query.
+// Read-only observations;
+// neither changes mappings nor acquires user-page ownership. The second query
+// requires every covered HHDM page to map the expected reserved physical bytes
+// supervisor/read-only/NX with CR0.WP, outside the kernel image's aliases.
+[[nodiscard]] auto boot_range_readable(vaddr_t address, uint64_t bytes) -> bool;
+[[nodiscard]] auto boot_module_range_immutable(vaddr_t address, paddr_t physical, uint64_t bytes) -> bool;
 // Final supervisor mappings use these after init_pagemap() has established the
 // CPU feature policy. The base page_types constants remain NX-free so the
 // unsupported-CPU fallback never installs a reserved PTE bit.

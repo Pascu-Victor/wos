@@ -25,6 +25,31 @@ wos_add_unit_test(pci_boot_resource_test
 wos_add_unit_test(pci_msix_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_msix_test.cpp
 )
+wos_add_unit_test(firmware_archive_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/firmware_archive_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/firmware/archive.cpp
+)
+wos_add_unit_test(firmware_cache_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/firmware_cache_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/firmware/archive.cpp
+                 ${WOS_KERN_SRC}/dev/firmware/cache.cpp
+                 ${WOS_KERN_SRC}/net/wki/auth_crypto.cpp
+)
+wos_add_unit_test(firmware_scope_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/firmware_scope_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/firmware/firmware.cpp
+                 ${WOS_KERN_SRC}/dev/firmware/archive.cpp
+                 ${WOS_KERN_SRC}/dev/firmware/cache.cpp
+                 ${WOS_KERN_SRC}/net/wki/auth_crypto.cpp
+)
+target_include_directories(firmware_scope_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/firmware_scope_shim)
+set_tests_properties(firmware_scope_test PROPERTIES TIMEOUT 30)
+wos_add_unit_test(firmware_boot_source_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/firmware_boot_source_test.cpp
+)
+add_test(NAME firmware_packaging_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/firmware_packaging_test.py)
+set_tests_properties(firmware_packaging_test PROPERTIES LABELS "host;unit;integration" TIMEOUT 60)
 wos_add_unit_test(power_shutdown_targets_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/power_shutdown_targets_test.cpp
 )

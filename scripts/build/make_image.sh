@@ -12,6 +12,7 @@ KERNEL_BINARY="$BUILD_DIR/modules/kern/wos"
 INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
 BOOTLOADER="${WOS_BOOTLOADER:-/usr/share/limine/BOOTX64.EFI}"
 BOOT_IMAGE_MANIFEST="${WOS_BOOT_IMAGE_MANIFEST:-$BUILD_DIR/boot_image.manifest}"
+FIRMWARE_COPY="${WOS_FIRMWARE_ARCHIVE:-}"
 BOOT_PART_START_SECTOR=2048
 BOOT_PART_END_SECTOR=1845247
 BOOT_PART_GUID="${WOS_BOOT_PARTUUID:-11044da0-352d-480a-9ef3-f995f3ac3f8b}"
@@ -61,6 +62,33 @@ else
     BOOT_IMAGE_MANIFEST_PATH="$CWD/$BOOT_IMAGE_MANIFEST"
 fi
 
+# Optional immutable module, deliberately separate from writable initramfs.
+# The kernel's trusted policy catalog still determines which bytes are usable.
+FIRMWARE_UPLOAD=""
+if [ -n "$FIRMWARE_COPY" ]; then
+    if [ ! -f "$FIRMWARE_COPY" ] || [[ "$FIRMWARE_COPY" == *$'\n'* || "$FIRMWARE_COPY" == *$'\r'* ]]; then
+        echo "error: WOS_FIRMWARE_ARCHIVE must name a regular archive file" >&2
+        exit 2
+    fi
+    # NUL-delimited read preserves trailing newlines in a symlink target so the
+    # separator check cannot silently select a different, similarly named file.
+    if ! IFS= read -r -d '' FIRMWARE_COPY < <(realpath -z -- "$FIRMWARE_COPY"); then
+        echo "error: cannot resolve WOS_FIRMWARE_ARCHIVE" >&2
+        exit 2
+    fi
+    if [[ "$FIRMWARE_COPY" == *$'\n'* || "$FIRMWARE_COPY" == *$'\r'* || "$FIRMWARE_COPY" == *$'\t'* ]]; then
+        echo "error: WOS_FIRMWARE_ARCHIVE resolved path contains a record separator" >&2
+        exit 2
+    fi
+    if [ ! -f "$FIRMWARE_COPY" ] || [ "$(stat -c %s -- "$FIRMWARE_COPY")" -gt 536870912 ]; then
+        echo "error: WOS_FIRMWARE_ARCHIVE exceeds the 512MiB service limit or is not a regular file" >&2
+        exit 2
+    fi
+    firmware_escaped="${FIRMWARE_COPY//\\/\\\\}"
+    firmware_escaped="${firmware_escaped//\"/\\\"}"
+    FIRMWARE_UPLOAD="upload \"$firmware_escaped\" /firmware.cpio"
+fi
+
 LIMINE_CONF="$CWD/modules/kern/limine.conf"
 if [ "${WOS_KERNEL_CMDLINE+x}" ]; then
     KERNEL_KASLR="${WOS_KERNEL_KASLR:-yes}"
@@ -84,6 +112,19 @@ timeout: 0
     module_path: boot():/initramfs.cpio
     cmdline: $WOS_KERNEL_CMDLINE
 _EOF_
+    LIMINE_CONF="$TMP_LIMINE_CONF"
+fi
+
+if [ -n "$FIRMWARE_COPY" ]; then
+    # Append the marker immediately after its module_path: Limine associates
+    # module_string with the preceding module. Cover stock and generated menus.
+    firmware_conf="$(mktemp)"
+    awk '{ print; if ($0 ~ /^[[:space:]]*module_path: boot\(\):\/initramfs\.cpio[[:space:]]*$/) {
+        print "    module_path: boot():/firmware.cpio";
+        print "    module_string: wos-firmware-v1";
+    }}' "$LIMINE_CONF" > "$firmware_conf"
+    test -z "$TMP_LIMINE_CONF" || rm -f "$TMP_LIMINE_CONF"
+    TMP_LIMINE_CONF="$firmware_conf"
     LIMINE_CONF="$TMP_LIMINE_CONF"
 fi
 
@@ -120,6 +161,7 @@ upload $KERNEL_COPY /wos
 upload $LIMINE_CONF /limine/limine.conf
 upload $BOOTLOADER /EFI/BOOT/BOOTX64.EFI
 upload $INITRAMFS_COPY /initramfs.cpio
+$FIRMWARE_UPLOAD
 umount /
 _EOF_
 }
@@ -169,6 +211,9 @@ create_boot_disk_fast() {
         mcopy -o -i "$BOOT_FAT" "$LIMINE_CONF" ::/limine/limine.conf
         mcopy -o -i "$BOOT_FAT" "$BOOTLOADER" ::/EFI/BOOT/BOOTX64.EFI
         mcopy -o -i "$BOOT_FAT" "$INITRAMFS_COPY" ::/initramfs.cpio
+        if [ -n "$FIRMWARE_COPY" ]; then
+            mcopy -o -i "$BOOT_FAT" "$FIRMWARE_COPY" ::/firmware.cpio
+        fi
     fi
     dd if="$BOOT_FAT" of="$BOOT_RAW" bs="$SECTOR_SIZE" seek="$BOOT_PART_START_SECTOR" conv=notrunc status=none
 
@@ -183,6 +228,7 @@ create_boot_disk_fast() {
 boot_manifest_file_entry() {
     local label="$1"
     local path="$2"
+    local identity="${3:-$path}"
     local hash
     local size
 
@@ -191,9 +237,9 @@ boot_manifest_file_entry() {
         return 1
     fi
 
-    hash=$(sha256sum -b "$path" | awk '{print $1}')
+    hash=$(sha256sum < "$path" | awk '{print $1}')
     size=$(stat -c %s "$path")
-    printf 'file\t%s\t%s\t%s\t%s\n' "$label" "$size" "$hash" "$path"
+    printf 'file\t%s\t%s\t%s\t%s\n' "$label" "$size" "$hash" "$identity"
 }
 
 write_boot_payload_manifest() {
@@ -203,9 +249,14 @@ write_boot_payload_manifest() {
         printf 'version\t2\n'
         printf 'partition\t%s\t%s\t%s\t%s\t%s\t%s\n' "$BOOT_PART_START_SECTOR" "$BOOT_PART_END_SECTOR" "$BOOT_PART_GUID" "$BOOT_DISK_GUID" "$BOOT_FAT_SERIAL" "$SECTOR_SIZE"
         boot_manifest_file_entry kernel "$KERNEL_COPY"
-        boot_manifest_file_entry limine "$LIMINE_CONF"
+        # Temporary generated configs have stable logical identity; their bytes
+        # determine cache validity, never mktemp's random filename.
+        boot_manifest_file_entry limine "$LIMINE_CONF" /limine/limine.conf
         boot_manifest_file_entry bootloader "$BOOTLOADER"
         boot_manifest_file_entry initramfs "$INITRAMFS_COPY"
+        if [ -n "$FIRMWARE_COPY" ]; then
+            boot_manifest_file_entry firmware "$FIRMWARE_COPY"
+        fi
     } > "$manifest"
 }
 
