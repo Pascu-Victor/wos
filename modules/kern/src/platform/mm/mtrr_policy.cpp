@@ -236,4 +236,10 @@ auto effective_uc_pat_type(Vendor vendor, MemoryType mtrr) -> MemoryType {
     if (!legal_type(mtrr) || !known_vendor(vendor)) return MemoryType::cd;
     return vendor == Vendor::intel || mtrr == MemoryType::uc ? MemoryType::uc : MemoryType::cd;
 }
+
+auto effective_wc_pat_type(Vendor vendor, MemoryType mtrr) -> MemoryType {
+    // Intel Table14-7 and AMD Table7-11 compose PAT.WC with every legal
+    // ordinary MTRR type to WC. Capability and mode need separate checks.
+    return legal_type(mtrr) && known_vendor(vendor) ? MemoryType::wc : MemoryType::cd;
+}
 }  // namespace ker::mod::mm::cache_arch

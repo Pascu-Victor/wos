@@ -90,6 +90,8 @@ struct Report {
     uint64_t cache_withheld{};
     mmio_cache::Status service_error{mmio_cache::Status::ready};
     std::array<CpuReport, CPU_CAPACITY> cpus{};
+    // Copied inherited selector only; no permission to publish a cache alias.
+    uint8_t pat_index{mmio_cache::QualifiedUcRange::PAT_INDEX};
 };
 
 struct ServiceObservation {
@@ -112,7 +114,9 @@ struct PoolStats {
 // actual KernelShutdownHold, IF enabled/preempt0, outside MM/PCI/driver locks.
 // Failure leaves prepare inputs unchanged. No hardware work occurs in prepare.
 // Successful prepare returns ready; successful publication returns pending.
+// Each overload retains its genuine policy type through every CPU action.
 [[nodiscard]] auto prepare(mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& empty_output) -> Status;
+[[nodiscard]] auto prepare(mmio_cache::QualifiedWcRange&& range, Kind kind, Ticket& empty_output) -> Status;
 [[nodiscard]] auto publish(Ticket& ticket) -> Status;
 [[nodiscard]] auto observe(const Ticket& ticket) -> Report;
 // Only an explicit wait may advance translations into the cache round.

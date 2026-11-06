@@ -437,21 +437,35 @@ modes return named refusals. The source/layout provenance is
 [AMD APM 3.46](https://docs.amd.com/api/khub/documents/LNBl5evreogi0r25VIFF2g/content),
 and the scoped [Family17h OSRR 3.03](https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/56255_OSRR.pdf).
 
-Only the actual captured cohort can mint a private `QualifiedUcRange` for exact
-page-rounded bounds. Partial/mismatched cohorts cannot seal; duplicate capture
-and detected hardware drift invalidate admission permanently. Local validation
-streams the observed registers and restores incoming IRQ state. It does not
-refresh the snapshots. Snapshot consistency assumes conforming firmware/VMM
-behavior, including meaningful optional-register observations.
+Only the actual captured cohort can mint private `QualifiedUcRange` and
+`QualifiedWcRange` owners for exact page-rounded bounds. The types cannot convert
+or substitute for one another. Partial/mismatched cohorts cannot seal; duplicate
+capture and detected hardware drift invalidate admission permanently. Local
+validation streams the observed registers and restores incoming IRQ state. It
+does not refresh the snapshots. Snapshot consistency assumes conforming
+firmware/VMM behavior, including meaningful optional-register observations.
+
+WC qualification requires inherited PAT entry 5 to encode WC, enabled MTRRs and
+MTRRCAP.WC on every captured CPU. It checks every ordinary MTRR, protected-memory
+and AMD routing boundary. The legal ordinary UC/WC/WT/WP/WB MTRR rows compose to
+WC with PAT.WC; undefined overlap and unsupported modes still refuse. The
+initial WC profile leaves globally disabled MTRRs unqualified. A WC-only
+refusal does not invalidate an otherwise valid UC cohort; real register or CPU
+identity drift retains the existing shared invalidation. The composition rules
+are in [Intel SDM Table 14-7](https://cdrdv2-public.intel.com/929359/253668-093-sdm-vol-3a.pdf)
+and [AMD APM Table 7-11](https://docs.amd.com/api/khub/documents/LNBl5evreogi0r25VIFF2g/content).
 
 The opt-in UC register mapper combines these CPU tokens with independently
 issued PCI ownership, absent aliases and the actual completed all-CPU barrier.
-CPU tokens alone grant none of those other authorities. WC, active encrypted
-mappings and physical GPU qualification remain Goal41 work.
+CPU tokens alone grant none of those other authorities. WC aperture publication,
+active encrypted mappings and physical GPU qualification remain Goal41 work.
 
 `platform/mm/cpu_maintenance` provides a separate scheduled CPU-maintenance
-rendezvous. A private move-only ticket retains a genuine qualified UC range in
-one of 16 permanent slots. All configured CPUs, including the controller's CPU,
+rendezvous. A private move-only ticket retains exactly one genuine qualified UC
+or WC range in one of 16 permanent slots. Typed prepare overloads preserve that
+policy through publication, every CPU action, timeout, abandonment and release.
+The copied report's PAT index describes the retained type and grants no mapping
+permission. All configured CPUs, including the controller's CPU,
 must have independently reached the scheduler-ready boundary. Parked early
 diagnostic APs supply no readiness. Each CPU validates
 its current hardware state and reloads its actual current CR3. Only an explicit
@@ -474,7 +488,16 @@ and mutation exclusion across maintenance. Scheduled CPU actions with existing
 mappings alone do not prove a safe cache-type transition. The private bootstrap
 and accepted-finalizer Controllers provide the scoped integration described
 above; legacy synchronous shootdowns keep their existing behavior. Physical
-GPU qualification remains separate.
+GPU qualification remains separate. WC device access additionally needs an
+immutable aperture-role issuer and issuing-CPU write drain before a doorbell,
+reader release or hardware quiescence; post-quiescence withdrawal cannot supply
+that earlier proof.
+
+The selftest-only `--selftest-cache-wc` mode requires both existing
+`--selftest-cache-policy` and `--selftest-cache-rendezvous` flags. It exercises
+real WC policy and typed CPU requests, including same-ticket retries, without
+mapping or dereferencing the candidate physical range. These CPU observations
+do not qualify physical GPU or WC device access.
 
 Bootstrap preserves each framebuffer page's incoming PAT selector when replacing
 Limine's page tables. It verifies the inherited supervisor translation and
@@ -569,6 +592,11 @@ slices and the real TLB barrier. A typed fork attaches child bindings after its
 genuine empty-child proof and before copying shared leaves. Raw copiers refuse
 device sources. The existing counted remap suspension also excludes new device
 publication while generic relocation copies its source.
+
+Fork-plan matching requires the genuine syscall preparation scope and publication
+guard. Its allocation-free root/index check permits a reschedule deferred until
+syscall return while preserving try-only root admission and exact generation and
+binding checks. Generic device operations retain their reclaim-context limits.
 
 Each family owns the exact File, Object generation and immutable object-relative
 window/protection ceiling. Objects own no File, Client, Task or root. Reverse

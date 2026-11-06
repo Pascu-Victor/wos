@@ -36,11 +36,32 @@ class QualifiedUcRange {
     QualifiedUcRange(uint64_t physical, uint64_t bytes, uint64_t incarnation);
 
    public:
+    static constexpr uint8_t PAT_INDEX = 3;
     QualifiedUcRange() = default;
     QualifiedUcRange(const QualifiedUcRange&) = delete;
     auto operator=(const QualifiedUcRange&) -> QualifiedUcRange& = delete;
     QualifiedUcRange(QualifiedUcRange&& other) noexcept;
     auto operator=(QualifiedUcRange&& other) noexcept -> QualifiedUcRange&;
+    [[nodiscard]] auto empty() const -> bool { return incarnation_ == 0; }
+    [[nodiscard]] auto physical() const -> uint64_t { return physical_; }
+    [[nodiscard]] auto bytes() const -> uint64_t { return bytes_; }
+    [[nodiscard]] auto incarnation() const -> uint64_t { return incarnation_; }
+};
+
+class QualifiedWcRange {
+    uint64_t physical_{};
+    uint64_t bytes_{};
+    uint64_t incarnation_{};
+    friend class detail::Runtime;
+    QualifiedWcRange(uint64_t physical, uint64_t bytes, uint64_t incarnation);
+
+   public:
+    static constexpr uint8_t PAT_INDEX = 5;
+    QualifiedWcRange() = default;
+    QualifiedWcRange(const QualifiedWcRange&) = delete;
+    auto operator=(const QualifiedWcRange&) -> QualifiedWcRange& = delete;
+    QualifiedWcRange(QualifiedWcRange&& other) noexcept;
+    auto operator=(QualifiedWcRange&& other) noexcept -> QualifiedWcRange&;
     [[nodiscard]] auto empty() const -> bool { return incarnation_ == 0; }
     [[nodiscard]] auto physical() const -> uint64_t { return physical_; }
     [[nodiscard]] auto bytes() const -> uint64_t { return bytes_; }
@@ -61,6 +82,12 @@ class QualifiedUcRange {
 // outside MM/PCI/IRQ locks; concurrent preparation returns busy without waiting.
 [[nodiscard]] auto qualify_uc_range(uint64_t physical, uint64_t page_rounded_bytes, QualifiedUcRange& empty_output) -> Status;
 [[nodiscard]] auto revalidate_current_cpu(const QualifiedUcRange& range) -> Status;
+
+// Distinct WC policy evidence for inherited selector5. The token grants no
+// mapping, physical ownership, alias, producer-fence or device authority.
+// Preparation and current-CPU validation use the same contexts as UC above.
+[[nodiscard]] auto qualify_wc_range(uint64_t physical, uint64_t page_rounded_bytes, QualifiedWcRange& empty_output) -> Status;
+[[nodiscard]] auto revalidate_current_cpu(const QualifiedWcRange& range) -> Status;
 [[nodiscard]] auto status_name(Status status) -> const char*;
 
 }  // namespace ker::mod::mm::mmio_cache

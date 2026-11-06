@@ -166,4 +166,34 @@ auto qualify_cpu_uc(const CpuPolicy& policy, uint64_t begin, uint64_t bytes) -> 
     return Status::ready;
 }
 
+auto qualify_cpu_wc(const CpuPolicy& policy, uint64_t begin, uint64_t bytes) -> Status {
+    if (bytes == 0 || ((begin | bytes) & (cache_arch::PAGE_BYTES - 1)) != 0 || begin >= policy.mtrr.address_ceiling ||
+        bytes > policy.mtrr.address_ceiling - begin)
+        return Status::invalid_geometry;
+    auto const shape = policy_shape(policy);
+    if (shape != Status::ready) return shape;
+    // Disabled MTRRs are outside this WC profile. An enabled ordinary UC
+    // range is a distinct case and may compose with the inherited PAT.WC.
+    if (!policy.mtrr.enabled) return Status::unsupported_mode;
+    if (!policy.mtrr.wc_supported) return Status::unsupported_capability;
+    if (((policy.pat >> 40) & 255U) != 1) return Status::not_strict_wc;
+    uint64_t const end = begin + bytes;
+    cache_arch::Boundaries boundaries{};
+    auto result = append_cpu_boundaries(policy, begin, end, boundaries);
+    if (result != Status::ready) return result;
+    for (size_t i = 0; i + 1 < boundaries.count; ++i) {
+        uint64_t const physical = boundaries.values[i];
+        if (excluded(policy, physical)) return Status::protected_range;
+        if (policy.mtrr.vendor == cache_arch::Vendor::amd) {
+            result = amd_io_at(policy.amd, physical);
+            if (result != Status::ready) return result;
+        }
+        MemoryType type{};
+        result = ordinary_type(policy, physical, type);
+        if (result != Status::ready) return result;
+        if (cache_arch::effective_wc_pat_type(policy.mtrr.vendor, type) != MemoryType::wc) return Status::not_strict_wc;
+    }
+    return Status::ready;
+}
+
 }  // namespace ker::mod::mm::mmio_cache::detail

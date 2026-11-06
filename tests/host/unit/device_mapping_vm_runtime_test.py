@@ -20,7 +20,7 @@ import tempfile
 import time
 
 sys.dont_write_bytecode = True
-from file_mmap_registry_runtime_test import command, pin, subreaper
+from file_mmap_registry_runtime_test import command, dependency_pins, pin, subreaper
 from native_lazy_file_fault_runtime_test import definition
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'modules/kern/src').is_dir())
@@ -41,6 +41,11 @@ def generate(scratch: Path, control: str) -> list[dict]:
         if virt.count(old) != 1:
             raise ValueError('counterexample source anchor changed: ' + control)
         virt = virt.replace(old, new)
+    if control == 'restore-fork-reclaim-check':
+        body, _ = definition(virt, 'auto device_fork_match_context(')
+        old = 'return preparation.ready()'
+        if body.count(old) != 1: raise ValueError('fork-only reclaim control anchor changed')
+        virt = virt.replace(body, body.replace(old, 'return phys::can_wait_for_reclaim() && preparation.ready()', 1), 1)
     plan_source = (KERN / 'platform/mm/device_mapping_vm.cpp').read_text()
     if control == 'no-sort':
         plan_source, changed = re.subn(r'    std::sort\(s\.old\.get\(\),[\s\S]*?\}\);\n', '', plan_source)
@@ -62,6 +67,12 @@ def generate(scratch: Path, control: str) -> list[dict]:
         body = source[a:source.index(end, a)]
         actual.append(dict(anchor=begin, bytes=len(body.encode()), sha256=hashlib.sha256(body.encode()).hexdigest()))
         return body
+
+    physical = (KERN / 'platform/mm/phys.opt.cpp').read_text()
+    physical_context = '#include <vm_fixture.hpp>\nnamespace ker::mod::mm::phys {\nnamespace {\n'
+    physical_context += take(physical, 'auto can_wait_for_reclaim_impl() -> bool {')
+    physical_context += '\n}\n' + take(physical, 'auto can_wait_for_reclaim() -> bool {') + '\n}\n'
+    (scratch / 'phys-context.cpp').write_text(physical_context)
 
     include = scratch / 'include'
 
@@ -175,7 +186,9 @@ void flush_pagemap_after_update(PageTable* root,uint64_t,bool) {
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cxx', default='/usr/bin/clang++')
-    parser.add_argument('--control', choices=('current', 'no-sort', 'ignore-lazy', 'ignore-mremap-policy', 'ignore-fork-count'),
+    parser.add_argument('--evidence-dir', type=Path)
+    parser.add_argument('--control', choices=('current', 'no-sort', 'ignore-lazy', 'ignore-mremap-policy', 'ignore-fork-count',
+                                             'restore-fork-reclaim-check'),
                         default='current')
     args = parser.parse_args()
     deadline = time.monotonic() + 90
@@ -195,7 +208,8 @@ def main() -> int:
                  'platform/mm/file_mapping_lifetime.cpp', 'platform/mm/file_mapping_lifetime.hpp',
                  'platform/mm/paging.opt.cpp', 'platform/mm/paging.hpp', 'platform/mm/managed_huge.hpp',
                  'dev/device_mapping_object.cpp', 'dev/device_mapping_object.hpp',
-                 'syscalls_impl/vmem/sys_vmem.cpp', 'syscalls_impl/vmem/sys_vmem.hpp', 'platform/sys/syscall_preparation.hpp')
+                 'syscalls_impl/vmem/sys_vmem.cpp', 'syscalls_impl/vmem/sys_vmem.hpp', 'platform/sys/syscall_preparation.hpp',
+                 'platform/mm/phys.opt.cpp')
         watched = [KERN / p for p in paths] + [Path(__file__).resolve(), compiler,
             UNIT / 'mmio_disabled_virt_ports.inc',
             UNIT / 'device_mapping_vm_common.inc', UNIT / 'device_mapping_vm_ports.inc', UNIT / 'device_mapping_vm_cases.inc',
@@ -206,23 +220,48 @@ def main() -> int:
         result['actual_definitions'] = generate(scratch, args.control)
         result['compiled_plan_source'] = pin(scratch / 'plans.cpp')
         binary = scratch / 'vm'
-        argv = [str(compiler_driver), '-include', str(UNIT / 'mmio_disabled_virt_ports.inc'),
+        flags = [str(compiler_driver), '-include', str(UNIT / 'mmio_disabled_virt_ports.inc'),
                 '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
                 '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer',
                 '-I', str(scratch / 'include'), '-I', str(OBJECT_SHIM), '-I', str(ROOT / 'tests/host/kern_shim'),
-                '-I', str(KERN), '-I', str(ROOT / 'modules'), str(scratch / 'vm.cpp'), str(scratch / 'ports.cpp'),
-                str(scratch / 'retirement.cpp'), str(scratch / 'plans.cpp'),
-                str(KERN / 'platform/mm/device_mapping_revoke.cpp'), str(KERN / 'platform/mm/file_mapping_lifetime.cpp'),
-                str(KERN / 'platform/mm/paging.opt.cpp'), str(KERN / 'dev/device_mapping_object.cpp'), '-o', str(binary)]
-        row = command(argv, scratch / 'compile.log', scratch, deadline, groups)
+                '-I', str(KERN), '-I', str(ROOT / 'modules')]
+        units = [scratch / name for name in ('vm.cpp', 'ports.cpp', 'phys-context.cpp', 'retirement.cpp', 'plans.cpp')]
+        units += [KERN / name for name in ('platform/mm/device_mapping_revoke.cpp', 'platform/mm/file_mapping_lifetime.cpp',
+                                          'platform/mm/paging.opt.cpp', 'dev/device_mapping_object.cpp')]
+        dependencies = {}
+        for i, source in enumerate(units):
+            dep = scratch / f'{i}-discover.d'
+            row = command(flags + ['-M', '-MF', str(dep), '-MT', str(i), str(source)],
+                          scratch / f'{i}-discover.log', scratch, deadline, groups)
+            result['commands'].append(row)
+            if row['exit'] != 0: raise ValueError(f'dependency discovery failed: {source.name}')
+            for item in dependency_pins(dep): dependencies[item['path']] = Path(item['path'])
+        if [pin(p) for p in watched] != before: raise ValueError('source changed during discovery')
+        watched = sorted(set(watched) | set(dependencies.values()))
+        before = [pin(p) for p in watched]
+        result['compiled_input_pins'] = before
+        objects = []
+        for i, source in enumerate(units):
+            obj, dep = scratch / f'{i}.o', scratch / f'{i}-actual.d'
+            row = command(flags + ['-MD', '-MF', str(dep), '-c', str(source), '-o', str(obj)],
+                          scratch / f'{i}-compile.log', scratch, deadline, groups)
+            result['commands'].append(row)
+            if row['exit'] != 0: raise ValueError(f'actual source compile failed: {source.name}')
+            if any(item['path'] not in dependencies for item in dependency_pins(dep)):
+                raise ValueError(f'undeclared compiled input: {source.name}')
+            objects.append(obj)
+        row = command([str(compiler_driver), '-pthread', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                       *map(str, objects), '-o', str(binary)], scratch / 'link.log', scratch, deadline, groups)
         result['commands'].append(row)
-        if row['exit'] != 0:
-            print((scratch / 'compile.log').read_text(errors='replace')[-32768:])
-            raise ValueError('actual VM/Object/family source did not compile')
+        if row['exit'] != 0: raise ValueError('actual VM/Object/family source did not link')
+        result['binary'] = pin(binary)
         row = command([str(binary)], scratch / 'run.log', scratch, deadline, groups)
         result['commands'].append(row)
+        result['run_exit'] = row['exit']
         log = (scratch / 'run.log').read_text(errors='replace')
         print(log[-32768:], end='')
+        if re.search(r'AddressSanitizer|runtime error:|UndefinedBehaviorSanitizer', log):
+            raise ValueError('sanitizer failure is not a qualified device/fork oracle')
         if args.control == 'current':
             if row['exit'] != 0 or not re.search(r'^PASS device_mapping_vm cases=\d+ assertions=\d+ failures=0 host_metadata_ports=1$', log, re.M):
                 raise ValueError('actual VM ownership/transaction oracle failed')
@@ -232,32 +271,58 @@ def main() -> int:
                 'ignore-lazy': 'FAIL sparse device+lazy remove refuses before effects',
                 'ignore-mremap-policy': 'FAIL actual mremap suspension excludes late device admission',
                 'ignore-fork-count': 'FAIL new actual device binding invalidates complete fork plan',
+                'restore-fork-reclaim-check': 'FAIL allocation-free empty fork match permits deferred syscall reschedule',
             }[args.control]
             if row['exit'] not in (-6, 3) or marker not in log.splitlines():
                 raise ValueError('compiled counterexample did not fail its intended connected oracle')
             if args.control == 'ignore-fork-count' and not re.search(
-                    r'^FAIL device_mapping_vm cases=5 assertions=\d+ failures=[1-9]\d* host_metadata_ports=1$', log, re.M):
+                    r'^FAIL device_mapping_vm cases=8 assertions=\d+ failures=[1-9]\d* host_metadata_ports=1$', log, re.M):
                 raise ValueError('fork counterexample did not complete all unchanged scenario groups')
+            if args.control == 'restore-fork-reclaim-check':
+                exact = {'FAIL allocation-free empty fork match permits deferred syscall reschedule',
+                         'FAIL allocation-free nonempty fork match permits deferred syscall reschedule'}
+                failures = {line for line in log.splitlines() if line.startswith('FAIL ') and ' device_mapping_vm ' not in line}
+                if row['exit'] != 3 or failures != exact or not re.search(
+                        r'^FAIL device_mapping_vm cases=8 assertions=\d+ failures=2 host_metadata_ports=1$', log, re.M):
+                    raise ValueError('restored old check did not produce only its exact two deferred-match failures')
             result['negative_control_observed'] = True
         result['pass_'] = True
     except (OSError, ValueError, TimeoutError, KeyboardInterrupt) as error:
         result['error'] = f'{type(error).__name__}: {error}'
     finally:
+        if before:
+            after = [pin(p) for p in watched]
+            result['changed_sources'] = [old['path'] for old, new in zip(before, after) if old != new]
+            result['sources_held'] = not result['changed_sources']
+            result['compiled_inputs_held'] = result['sources_held'] and 'compiled_input_pins' in result
+            result['pass_'] &= result['sources_held']
+        if args.evidence_dir is not None:
+            try:
+                args.evidence_dir.mkdir(parents=True, exist_ok=True)
+                if scratch is not None:
+                    for log in scratch.glob('*.log'):
+                        target = args.evidence_dir / log.name
+                        if target.exists(): raise ValueError(f'evidence exists: {target}')
+                        shutil.copyfile(log, target)
+            except (OSError, ValueError) as error:
+                result['pass_'] = False
+                result['evidence_error'] = str(error)
         if scratch is not None and not groups:
             shutil.rmtree(scratch)
             result['scratch_removed'] = not scratch.exists()
         if groups:
             result['pass_'] = False
             result['cleanup_error'] = f'owned groups {groups}; scratch preserved'
-        if before:
-            after = [pin(p) for p in watched]
-            result['changed_sources'] = [old['path'] for old, new in zip(before, after) if old != new]
-            result['sources_held'] = not result['changed_sources']
-            result['pass_'] &= result['sources_held']
         if time.monotonic() > deadline:
             result['pass_'] = False
             result['error'] = 'whole90-second deadline exceeded'
-        print(json.dumps(result))
+        if args.evidence_dir is not None:
+            target = args.evidence_dir / 'result.json'
+            if target.exists():
+                result['pass_'] = False
+                result['evidence_error'] = f'evidence exists: {target}'
+            else: target.write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps({key: value for key, value in result.items() if key not in ('commands', 'compiled_input_pins')}))
     return 0 if result['pass_'] else 1
 
 

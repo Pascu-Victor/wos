@@ -42,6 +42,7 @@ struct World {
     mapping::ObjectRef object;
     Task actor, second;
     World(uint64_t pages = 140, uint64_t rights = RW) {
+        current = &actor;  // Actual reclaim eligibility requires the ordinary caller before allocation.
         require(table_pages() == 0 && object_fixture::live_pages() == 0 && object_fixture::reserved() == 0,
                 "previous finite physical/callback owners drained");
         require(mapping::QuotaAccount::create({pages, 1, pages}, quota) == 0, "actual resident quota");
@@ -223,9 +224,9 @@ void multiroot_export_and_fork_plan() {
     {
         vm::PreparedFork fork;
         require(fork.prepare_current(world.actor, prep) == 0 && !fork.empty(), "actual eager binding-only fork preparation");
-        { Pub pub; expect(fork.matches_current(world.actor, pub), "actual prepared fork exact match"); }
+        { Pub pub; expect(fork.matches_current(world.actor, prep, pub), "actual prepared fork exact match"); }
         require(world.map(BASE + 8 * PAGE, 8 * PAGE, 1) == 0, "later sibling-style device admission");
-        { Pub pub; expect(!fork.matches_current(world.actor, pub), "new actual device binding invalidates complete fork plan"); }
+        { Pub pub; expect(!fork.matches_current(world.actor, prep, pub), "new actual device binding invalidates complete fork plan"); }
     }
     object_fixture::drain();
     current = &world.second;
@@ -247,7 +248,120 @@ void multiroot_export_and_fork_plan() {
     expect(vm::revoke_cpu_mappings(world.object) == 0 && world.object.get()->state() == mapping::ObjectState::revoked,
            "real export drop and callbacks allow final revoked state");
 }
+
+void deferred_fork_read_match() {
+    ++cases;
+    for (bool populated : {false, true}) {
+        World world(12);
+        if (populated) require(world.map(BASE, 0, 2) == 0, "real nonempty device plan before deferred reschedule");
+        Prep preparation(world.actor);
+        vm::PreparedFork fork;
+        require(fork.prepare_current(world.actor, preparation) == 0, "real device fork preparation before deferred hint");
+        auto const pages_before = object_fixture::live_pages();
+        auto const tables_before = table_pages();
+        auto const flushes_before = flushes;
+        auto const allocations_before = table_attempts;
+        auto const yields_before = yields;
+        auto const leaf_before = raw(world.actor.pagemap, BASE);
+        bool matched = false;
+        {
+            Pub publication;
+            world.actor.deferred_task_switch = true;
+            expect(!phys::can_wait_for_reclaim(), "actual reclaim predicate refuses the deferred syscall return hint");
+            matched = fork.matches_current(world.actor, preparation, publication);
+            expect(matched, populated ? "allocation-free nonempty fork match permits deferred syscall reschedule"
+                                      : "allocation-free empty fork match permits deferred syscall reschedule");
+            expect(world.actor.deferred_task_switch, "read-only fork match never clears the deferred reschedule hint");
+            bool overlap = false;
+            expect(vm::current_device_overlap(world.actor, BASE, BASE + PAGE, publication, overlap) == -EWOULDBLOCK,
+                   "generic device overlap keeps the original reclaim context restriction");
+            world.actor.deferred_task_switch = false;
+        }
+        world.actor.deferred_task_switch = true;
+        expect(vm::revoke_cpu_mappings(world.object) == -EWOULDBLOCK && world.object.get()->state() == mapping::ObjectState::live,
+               "generic device revoke refuses deferred context before closing its actual Object");
+        world.actor.deferred_task_switch = false;
+        expect(world.actor.usercopy_pagemap_accesses.load() == 0 &&
+                   virt::user_pagemap_access_gates[virt::user_pagemap_access_gate_index(world.actor.pagemap)].readers.load() == 0,
+               "deferred match and generic refusals return every actual Task and striped-reader lease");
+        expect(object_fixture::live_pages() == pages_before && table_pages() == tables_before && flushes == flushes_before &&
+                   table_attempts == allocations_before && yields == yields_before && raw(world.actor.pagemap, BASE) == leaf_before,
+               "read-only deferred matching has no page, PTE, table, TLB or yield effect");
+        std::printf("FORK_CONTEXT_HOST populated=%u deferred=1 reclaim=0 matched=%u no_effects=1\n", populated ? 1U : 0U,
+                    matched ? 1U : 0U);
+    }
 }
+
+void fork_match_context_and_gate_refusals() {
+    ++cases;
+    World world(8);
+    require(world.map(BASE, 0, 2) == 0, "real device binding for fork refusal checks");
+    Prep preparation(world.actor);
+    vm::PreparedFork fork;
+    require(fork.prepare_current(world.actor, preparation) == 0, "real fork plan before context/gate changes");
+    auto const before = raw(world.actor.pagemap, BASE);
+    auto const yield_count = yields;
+    auto attempt = [&] {
+        Pub pub;
+        return fork.matches_current(world.actor, preparation, pub);
+    };
+    require(attempt(), "normal current fork matcher remains valid");
+    world.actor.deferred_task_switch = true;
+    world.actor.wants_block = true;
+    expect(!attempt(), "real blocking intent is not a deferred return hint");
+    world.actor.wants_block = false;
+    access_window = true;
+    expect(!attempt(), "fork match still refuses an active usercopy window");
+    access_window = false;
+    world.actor.usercopy_pagemap_closing.store(true);
+    expect(!attempt(), "closing current root cannot grant a fork match");
+    world.actor.usercopy_pagemap_closing.store(false);
+    auto& gate = virt::user_pagemap_access_gates[virt::user_pagemap_access_gate_index(world.actor.pagemap)];
+    gate.teardown.store(true);
+    expect(!attempt() && gate.teardown.load() && gate.readers.load() == 0,
+           "try-only fork reader refuses a held stripe without clearing the foreign exclusive owner");
+    gate.teardown.store(false);
+    gate.readers.store(UINT32_MAX);
+    expect(!attempt() && gate.readers.load() == UINT32_MAX, "saturated fork reader never wraps its real counter");
+    gate.readers.store(0);
+    ++virt::controls[0].serial;
+    expect(!attempt(), "fork plan cannot match a replacement root serial");
+    --virt::controls[0].serial;
+    world.actor.deferred_task_switch = false;
+    world.actor.syscall_account_start_us = 0;
+    Prep invalid(world.actor);
+    world.actor.syscall_account_start_us = 1;
+    {
+        Pub pub;
+        expect(!fork.matches_current(world.actor, invalid, pub), "fork match requires the actual ready preparation scope");
+    }
+    expect(attempt(), "same unchanged plan recovers after temporary context and gate refusal");
+    expect(yields == yield_count && raw(world.actor.pagemap, BASE) == before && world.actor.usercopy_pagemap_accesses.load() == 0 &&
+               gate.readers.load() == 0,
+           "all fork refusals preserve the exact leaf and leave no lease or yield effect");
+}
+
+void fork_match_empty_and_replaced_bindings() {
+    ++cases;
+    World world(8);
+    Prep preparation(world.actor);
+    vm::PreparedFork empty;
+    require(empty.prepare_current(world.actor, preparation) == 0 && empty.empty(), "actual empty device fork plan");
+    require(world.map(BASE, 0, 2) == 0, "real new binding after zero-device preparation");
+    {
+        Pub pub;
+        expect(!empty.matches_current(world.actor, preparation, pub), "empty fork plan cannot skip complete new-device coverage");
+    }
+    vm::PreparedFork original;
+    require(original.prepare_current(world.actor, preparation) == 0, "actual nonempty device plan before same-count replacement");
+    require(world.change(BASE, BASE + 2 * PAGE, vm::Change::Protect, 1) == 0, "actual binding replacement with unchanged device count");
+    {
+        Pub pub;
+        expect(!original.matches_current(world.actor, preparation, pub),
+               "same-count replacement cannot masquerade as old binding identity");
+    }
+}
+}  // namespace vm_fixture
 
 int main() {
     using namespace vm_fixture;
@@ -256,6 +370,9 @@ int main() {
     admission_and_failures();
     read_only_and_stale_plan();
     multiroot_export_and_fork_plan();
+    deferred_fork_read_match();
+    fork_match_context_and_gate_refusals();
+    fork_match_empty_and_replaced_bindings();
     expect(object_fixture::irq_depth == 0 && object_fixture::lock_depth == 0 && object_fixture::mutex_depth == 0 &&
                object_fixture::pub_depth == 0 && object_fixture::reserved() == 0,
            "terminal finite context/queue baseline");

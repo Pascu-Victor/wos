@@ -102,6 +102,117 @@ TEST(MmioCacheModel, IntelAndAmdComposeStrictUcAccordingToTheirActualRules) {
     }
 }
 
+TEST(MmioCacheModel, WcSupportsAllEnabledOrdinaryRowsOnBothVendors) {
+    for (auto type : {arch::MemoryType::uc, arch::MemoryType::wc, arch::MemoryType::wt, arch::MemoryType::wp, arch::MemoryType::wb}) {
+        EXPECT_EQ(model::qualify_cpu_wc(intel(raw(arch::Vendor::intel, type)), BAR, 2 * MIB), Status::ready);
+        EXPECT_EQ(model::qualify_cpu_wc(amd(raw(arch::Vendor::amd, type)), BAR, 2 * MIB), Status::ready);
+    }
+}
+
+TEST(MmioCacheModel, WcRequiresEnabledMtrrsAndCapabilityWithoutChangingUc) {
+    for (auto vendor : {arch::Vendor::intel, arch::Vendor::amd}) {
+        for (bool enabled : {false, true}) {
+            auto source = raw(vendor, arch::MemoryType::uc, 36, enabled);
+            auto const policy = vendor == arch::Vendor::intel ? intel(source) : amd(source);
+            EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), enabled ? Status::ready : Status::unsupported_mode);
+            EXPECT_EQ(model::qualify_cpu_uc(policy, BAR, PAGE), Status::ready);
+        }
+        auto source = raw(vendor);
+        source.capability &= ~uint64_t{0x400};
+        auto const policy = vendor == arch::Vendor::intel ? intel(source) : amd(source);
+        EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), Status::unsupported_capability);
+        EXPECT_EQ(model::qualify_cpu_uc(policy, BAR, PAGE), Status::ready);
+    }
+}
+
+TEST(MmioCacheModel, WcUsesExactSelectorFiveAndRejectsEveryOtherLegalPatType) {
+    auto policy = intel(raw());
+    for (uint8_t type : {uint8_t{0}, uint8_t{1}, uint8_t{4}, uint8_t{5}, uint8_t{6}, uint8_t{7}}) {
+        policy.pat = pat_entry(PAT, 5, type);
+        EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), type == 1 ? Status::ready : Status::not_strict_wc);
+        EXPECT_EQ(model::qualify_cpu_uc(policy, BAR, PAGE), Status::ready);
+    }
+    policy.pat = pat_entry(pat_entry(PAT, 5, 6), 7, 1);
+    EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), Status::not_strict_wc);
+    for (unsigned slot = 0; slot < 8; ++slot) {
+        policy.pat = pat_entry(PAT, slot, 2);
+        EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), Status::invalid_type);
+        policy.pat = pat_entry(PAT, slot, 0x81);
+        EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), Status::invalid_reserved);
+    }
+}
+
+TEST(MmioCacheModel, WcWalksEveryInteriorMtrrBoundaryAndRejectsUndefinedOverlap) {
+    auto source = raw();
+    variable(source, 0, 4 * MIB, 2 * MIB, arch::MemoryType::wc);
+    variable(source, 1, 5 * MIB, MIB, arch::MemoryType::wt);
+    auto const policy = intel(source);
+    EXPECT_EQ(model::qualify_cpu_wc(policy, 3 * MIB, MIB), Status::ready);
+    EXPECT_EQ(model::qualify_cpu_wc(policy, 6 * MIB, MIB), Status::ready);
+    EXPECT_EQ(model::qualify_cpu_wc(policy, 3 * MIB, 4 * MIB), Status::undefined_overlap);
+    source.variable[0].base = 4 * MIB | static_cast<uint64_t>(arch::MemoryType::wb);
+    EXPECT_EQ(model::qualify_cpu_wc(intel(source), 3 * MIB, 4 * MIB), Status::ready);
+    source.capability |= 0x100;
+    source.default_type |= 0x400;
+    source.observed_fixed = true;
+    source.fixed.fill(0x0605040106050401ULL);
+    EXPECT_EQ(model::qualify_cpu_wc(intel(source), PAGE, MIB - PAGE), Status::ready);
+}
+
+TEST(MmioCacheModel, WcCannotAdmitProtectedInteriorEvenWhenOrdinaryCompositionSucceeds) {
+    auto source = raw();
+    source.capability |= SMRR | SEAMRR;
+    model::IntelProtectedInput protection{};
+    smrr(protection, 2 * MIB, MIB);
+    seamrr(protection, 512 * MIB, 32 * MIB);
+    auto const policy = intel(source, protection);
+    for (auto interval : {std::array<uint64_t, 2>{2 * MIB, MIB}, {512 * MIB, 32 * MIB}}) {
+        EXPECT_EQ(model::qualify_cpu_wc(policy, interval[0] - PAGE, PAGE), Status::ready);
+        EXPECT_EQ(model::qualify_cpu_wc(policy, interval[0] + interval[1], PAGE), Status::ready);
+        EXPECT_EQ(model::qualify_cpu_wc(policy, interval[0] - PAGE, interval[1] + 2 * PAGE), Status::protected_range);
+    }
+    auto amd_protected = amd_protection();
+    amd_protected.smm_base = reg(512 * MIB);
+    amd_protected.smm_mask = reg((((uint64_t{1} << 36) - 1) & ~(2 * MIB - 1)) | 3U);
+    auto const other = amd(raw(arch::Vendor::amd), amd_input(true), amd_protected);
+    EXPECT_EQ(model::qualify_cpu_wc(other, 0xa0000, PAGE), Status::protected_range);
+    EXPECT_EQ(model::qualify_cpu_wc(other, 512 * MIB, PAGE), Status::protected_range);
+    EXPECT_EQ(model::qualify_cpu_wc(other, BAR, PAGE), Status::ready);
+}
+
+TEST(MmioCacheModel, WcPreservesAmdRoutingAndWholeSpanDestinationBoundaries) {
+    auto const policy = amd(raw(arch::Vendor::amd), amd_input(true));
+    EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, PAGE), Status::ready);
+    EXPECT_EQ(model::qualify_cpu_wc(policy, 32 * GIB, PAGE), Status::ready);
+    EXPECT_EQ(model::qualify_cpu_wc(policy, BAR, 20 * GIB - BAR), Status::routed_to_memory);
+    EXPECT_EQ(model::qualify_cpu_wc(amd(raw(arch::Vendor::amd)), 0, PAGE), Status::fixed_routing_unqualified);
+    for (auto destinations : {std::array<bool, 2>{true, false}, {false, true}, {true, true}}) {
+        auto extension = amd_input();
+        extension.syscfg = reg(uint64_t{1} << 20);
+        iorr(extension, 0, BAR, 2 * MIB, destinations[0], destinations[1]);
+        auto const routed = amd(raw(arch::Vendor::amd), extension);
+        EXPECT_EQ(model::qualify_cpu_wc(routed, BAR - PAGE, PAGE), Status::ready);
+        EXPECT_EQ(model::qualify_cpu_wc(routed, BAR + 2 * MIB, PAGE), Status::ready);
+        EXPECT_EQ(model::qualify_cpu_wc(routed, BAR - PAGE, 2 * MIB + 2 * PAGE), Status::routing_override_unqualified);
+    }
+}
+
+TEST(MmioCacheModel, WcChecksExactPageGeometryAndExclusiveAddressCeiling) {
+    for (uint8_t bits : {uint8_t{32}, uint8_t{36}, uint8_t{48}, uint8_t{52}}) {
+        auto const policy = intel(raw(arch::Vendor::intel, arch::MemoryType::uc, bits));
+        uint64_t const end = policy.mtrr.address_ceiling;
+        EXPECT_EQ(model::qualify_cpu_wc(policy, end - PAGE, PAGE), Status::ready);
+        for (auto interval : {std::array<uint64_t, 2>{BAR, 0},
+                              {BAR + 1, PAGE},
+                              {BAR, PAGE + 1},
+                              {end, PAGE},
+                              {end - PAGE, 2 * PAGE},
+                              {UINT64_MAX - PAGE + 1, PAGE},
+                              {PAGE, UINT64_MAX - PAGE + 1}})
+            EXPECT_EQ(model::qualify_cpu_wc(policy, interval[0], interval[1]), Status::invalid_geometry);
+    }
+}
+
 TEST(MmioCacheModel, CompleteSpanCannotSkipAnInteriorAmdCdInterval) {
     auto source = raw(arch::Vendor::amd);
     variable(source, 0, 4 * MIB, 2 * MIB, arch::MemoryType::wb);

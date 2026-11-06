@@ -255,9 +255,9 @@ auto PreparedFork::prepare_current(sched::task::Task& actor, const sys::SyscallP
     }
     return 0;
 }
-auto PreparedFork::matches_current(sched::task::Task& actor, const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept
-    -> bool {
-    return detail::VmAccess::match_fork(*this, actor, publication);
+auto PreparedFork::matches_current(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                                   const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> bool {
+    return detail::VmAccess::match_fork(*this, actor, preparation, publication);
 }
 auto PreparedFork::attach_before_copy(sched::task::Task& actor, sched::task::Task& child, paging::PageTable* root,
                                       const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> int {

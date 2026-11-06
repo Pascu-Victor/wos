@@ -25,9 +25,6 @@ auto references(void* page) -> uint32_t {
 void set_references(void* page, uint32_t value) { check(frames.contains(page)); frames.at(page).references = value; }
 }
 namespace ker::mod::mm::phys {
-auto can_wait_for_reclaim() -> bool {
-    return object_fixture::ordinary && object_fixture::irq_depth == 0 && object_fixture::lock_depth == 0;
-}
 auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_view) -> void* {
     using namespace object_fixture;
     check(can_wait_for_reclaim() && owner == PhysicalPageOwner::USER_SHARED_MEMORY && size == 4096);

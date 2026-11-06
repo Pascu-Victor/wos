@@ -87,5 +87,6 @@ struct Boundaries {
 [[nodiscard]] auto append_mtrr_boundaries(const MtrrPolicy& policy, uint64_t begin, uint64_t end, Boundaries& output) -> Status;
 [[nodiscard]] auto equivalent_mtrr_types(const MtrrPolicy& left, const MtrrPolicy& right) -> Status;
 [[nodiscard]] auto effective_uc_pat_type(Vendor vendor, MemoryType mtrr) -> MemoryType;
+[[nodiscard]] auto effective_wc_pat_type(Vendor vendor, MemoryType mtrr) -> MemoryType;
 
 }  // namespace ker::mod::mm::cache_arch

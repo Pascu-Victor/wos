@@ -66,6 +66,33 @@ struct Round {
     std::array<std::atomic<uint64_t>, CPU_CAPACITY> cr3{};
 };
 
+// Only overloads consuming genuine private-issued owners can select a policy.
+// The immutable payload survives every published timeout and handler tail.
+class QualifiedRange {
+    mmio_cache::QualifiedUcRange uc_{};
+    mmio_cache::QualifiedWcRange wc_{};
+
+   public:
+    [[nodiscard]] auto empty() const noexcept -> bool { return uc_.empty() && wc_.empty(); }
+    [[nodiscard]] auto valid() const noexcept -> bool { return uc_.empty() != wc_.empty(); }
+    void adopt(mmio_cache::QualifiedUcRange&& range) noexcept { uc_ = std::move(range); }
+    void adopt(mmio_cache::QualifiedWcRange&& range) noexcept { wc_ = std::move(range); }
+    void clear() noexcept {
+        uc_ = mmio_cache::QualifiedUcRange{};
+        wc_ = mmio_cache::QualifiedWcRange{};
+    }
+    [[nodiscard]] auto physical() const noexcept -> uint64_t { return wc_.empty() ? uc_.physical() : wc_.physical(); }
+    [[nodiscard]] auto bytes() const noexcept -> uint64_t { return wc_.empty() ? uc_.bytes() : wc_.bytes(); }
+    [[nodiscard]] auto incarnation() const noexcept -> uint64_t { return wc_.empty() ? uc_.incarnation() : wc_.incarnation(); }
+    [[nodiscard]] auto pat_index() const noexcept -> uint8_t {
+        return wc_.empty() ? mmio_cache::QualifiedUcRange::PAT_INDEX : mmio_cache::QualifiedWcRange::PAT_INDEX;
+    }
+    [[nodiscard]] auto revalidate() const -> CacheStatus {
+        if (!valid()) return CacheStatus::invalid_configuration;
+        return wc_.empty() ? mmio_cache::revalidate_current_cpu(uc_) : mmio_cache::revalidate_current_cpu(wc_);
+    }
+};
+
 struct Slot {
     std::atomic<bool> used{};
     std::atomic<uint64_t> gate{CLOSED};
@@ -76,7 +103,7 @@ struct Slot {
     uint64_t id{};
     Kind kind{Kind::translations};
     bool private_request{};
-    mmio_cache::QualifiedUcRange range{};
+    QualifiedRange range{};
     uint64_t targets{};
     std::array<uint32_t, CPU_CAPACITY> target_apic{};
     std::array<Round, 2> rounds{};
@@ -159,7 +186,7 @@ class Runtime {
     }
 
     void clear(Slot& slot, Ticket& ticket) {
-        slot.range = mmio_cache::QualifiedUcRange{};
+        slot.range.clear();
         slot.id = 0;
         slot.targets = 0;
         slot.phase.store(Phase::empty, std::memory_order_release);
@@ -220,7 +247,7 @@ class Runtime {
         uint64_t empty = 0;
         if (!row.claimed[logical].compare_exchange_strong(empty, id, std::memory_order_acq_rel, std::memory_order_acquire)) return;
         row.apic[logical].store(apic, std::memory_order_relaxed);
-        auto const result = mmio_cache::revalidate_current_cpu(slot.range);
+        auto const result = slot.range.revalidate();
         if (result != CacheStatus::ready) {
             row.status[logical].store(result, std::memory_order_release);
             return;
@@ -253,6 +280,7 @@ class Runtime {
         value.physical = slot->range.physical();
         value.bytes = slot->range.bytes();
         value.cohort_incarnation = slot->range.incarnation();
+        value.pat_index = slot->range.pat_index();
         value.targets = slot->targets;
         value.timed_out_ever = slot->timed_out.load(std::memory_order_acquire);
         value.abandoned = slot->abandoned.load(std::memory_order_acquire);
@@ -418,7 +446,8 @@ class Runtime {
         return Status::not_ready;
     }
 
-    auto prepare(mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output, const ControllerCall& call) -> Status {
+    template <typename Range>
+    auto prepare(Range&& range, Kind kind, Ticket& output, const ControllerCall& call) -> Status {
         if (!call.ready()) return Status::invalid_context;
         if (!output.empty()) return Status::output_not_empty;
         if (kind != Kind::translations && kind != Kind::translations_then_cache) return Status::invalid_kind;
@@ -441,6 +470,10 @@ class Runtime {
         }
         if (chosen == POOL_CAPACITY) return Status::capacity;
         auto& slot = slots_[chosen];
+        if (!slot.range.empty()) {
+            slot.used.store(false, std::memory_order_release);
+            return Status::failed_retained;
+        }
         uint64_t id = next_id_.load(std::memory_order_acquire);
         if (id == 0 || id >= REQUEST_ID_LIMIT) {
             slot.used.store(false, std::memory_order_release);
@@ -471,7 +504,7 @@ class Runtime {
             slot.defer[i].store(0, std::memory_order_relaxed);
             slot.withheld[i].store(0, std::memory_order_relaxed);
         }
-        slot.range = std::move(range);
+        slot.range.adopt(std::move(range));
         slot.phase.store(Phase::prepared, std::memory_order_release);
         output = Ticket(chosen, id);
         return Status::ready;
@@ -482,6 +515,7 @@ class Runtime {
         auto* slot = find(ticket);
         if (slot == nullptr) return Status::invalid_ticket;
         if (slot->phase.load(std::memory_order_acquire) != Phase::prepared) return Status::invalid_ticket;
+        if (!slot->range.valid()) return Status::not_ready;
         auto const state = service_observation();
         if (state.status != Status::ready) return state.status;
         auto const protection = private_readiness(state.expected_mask, call);
@@ -674,6 +708,10 @@ auto prepare(mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output) ->
     detail::ControllerCall call;
     return detail::runtime.prepare(std::move(range), kind, output, call);
 }
+auto prepare(mmio_cache::QualifiedWcRange&& range, Kind kind, Ticket& output) -> Status {
+    detail::ControllerCall call;
+    return detail::runtime.prepare(std::move(range), kind, output, call);
+}
 auto publish(Ticket& ticket) -> Status {
     detail::ControllerCall call;
     return detail::runtime.publish(ticket, call);
@@ -720,6 +758,10 @@ auto await_ready(const Controller& controller, uint64_t deadline) -> Status {
     return runtime.await_ready(deadline, call);
 }
 auto prepare(const Controller& controller, mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output) -> Status {
+    ControllerCall call(controller);
+    return runtime.prepare(std::move(range), kind, output, call);
+}
+auto prepare(const Controller& controller, mmio_cache::QualifiedWcRange&& range, Kind kind, Ticket& output) -> Status {
     ControllerCall call(controller);
     return runtime.prepare(std::move(range), kind, output, call);
 }

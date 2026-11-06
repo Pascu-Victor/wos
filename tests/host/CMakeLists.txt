@@ -102,6 +102,10 @@ wos_add_unit_test(mmio_cache_runtime_test
                  ${WOS_KERN_SRC}/platform/mm/mmio_cache.cpp
 )
 set_tests_properties(mmio_cache_runtime_test PROPERTIES TIMEOUT 60)
+add_test(NAME mmio_cache_wc_authority_runtime
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_cache_wc_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR})
+set_tests_properties(mmio_cache_wc_authority_runtime PROPERTIES LABELS "host;unit;integration" TIMEOUT 240)
 add_test(NAME cpu_maintenance_runtime
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/cpu_maintenance_runtime_test.py
         --compiler ${CMAKE_CXX_COMPILER})

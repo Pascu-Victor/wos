@@ -219,8 +219,27 @@ class Runtime {
         return Status::ready;
     }
 
-    auto revalidate(const QualifiedUcRange& range) -> Status {
-        if (range.empty() || range.incarnation_ != COHORT_INCARNATION) return Status::invalid_configuration;
+    auto qualify(uint64_t physical, uint64_t bytes, QualifiedWcRange& output) -> Status {
+        if (!output.empty()) return Status::output_not_empty;
+        if (bytes == 0 || ((physical | bytes) & (cache_arch::PAGE_BYTES - 1)) != 0 || bytes > UINT64_MAX - physical)
+            return Status::invalid_geometry;
+        auto result = ensure_sealed();
+        if (result != Status::ready) return result;
+        uint64_t const expected = expected_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < CPU_LIMIT; ++i) {
+            if ((expected & (uint64_t{1} << i)) == 0) continue;
+            result = qualify_cpu_wc(cells_[i].value.policy, physical, bytes);
+            if (result != Status::ready) return result;
+        }
+        result = error_.load(std::memory_order_acquire);
+        if (result != Status::ready) return result;
+        output = QualifiedWcRange(physical, bytes, COHORT_INCARNATION);
+        return Status::ready;
+    }
+
+   private:
+    auto revalidate_range(uint64_t physical, uint64_t bytes, uint64_t incarnation) -> Status {
+        if (incarnation != COHORT_INCARNATION) return Status::invalid_configuration;
         auto result = ensure_sealed();
         if (result != Status::ready) return result;
         InterruptGuard guard;
@@ -244,8 +263,7 @@ class Runtime {
         // validator: only scalar token bounds and streamed hardware state belong
         // here. Publication still needs the separate completed CPU barrier.
         uint64_t const ceiling = cell.policy.mtrr.address_ceiling;
-        if (range.bytes_ == 0 || ((range.physical_ | range.bytes_) & (cache_arch::PAGE_BYTES - 1)) != 0 || range.physical_ >= ceiling ||
-            range.bytes_ > ceiling - range.physical_)
+        if (bytes == 0 || ((physical | bytes) & (cache_arch::PAGE_BYTES - 1)) != 0 || physical >= ceiling || bytes > ceiling - physical)
             return Status::invalid_geometry;
         platform::CpuIo io;
         uint32_t failed_msr = 0;
@@ -253,6 +271,10 @@ class Runtime {
         if (result != Status::ready) invalidate(result, bit);
         return result == Status::ready ? error_.load(std::memory_order_acquire) : result;
     }
+
+   public:
+    auto revalidate(const QualifiedUcRange& range) -> Status { return revalidate_range(range.physical_, range.bytes_, range.incarnation_); }
+    auto revalidate(const QualifiedWcRange& range) -> Status { return revalidate_range(range.physical_, range.bytes_, range.incarnation_); }
 };
 
 namespace {
@@ -272,6 +294,18 @@ auto QualifiedUcRange::operator=(QualifiedUcRange&& other) noexcept -> Qualified
     return *this;
 }
 
+QualifiedWcRange::QualifiedWcRange(uint64_t physical, uint64_t bytes, uint64_t incarnation)
+    : physical_(physical), bytes_(bytes), incarnation_(incarnation) {}
+QualifiedWcRange::QualifiedWcRange(QualifiedWcRange&& other) noexcept { *this = static_cast<QualifiedWcRange&&>(other); }
+auto QualifiedWcRange::operator=(QualifiedWcRange&& other) noexcept -> QualifiedWcRange& {
+    if (this == &other) return *this;
+    physical_ = other.physical_;
+    bytes_ = other.bytes_;
+    incarnation_ = other.incarnation_;
+    other.physical_ = other.bytes_ = other.incarnation_ = 0;
+    return *this;
+}
+
 auto configure_boot_cohort(size_t cpus) -> Status { return detail::runtime.configure(cpus); }
 auto capture_boot_cpu(size_t expected_logical) -> Status { return detail::runtime.capture(expected_logical); }
 auto cohort_observation() -> CohortObservation { return detail::runtime.observation(); }
@@ -280,6 +314,10 @@ auto qualify_uc_range(uint64_t physical, uint64_t page_rounded_bytes, QualifiedU
     return detail::runtime.qualify(physical, page_rounded_bytes, empty_output);
 }
 auto revalidate_current_cpu(const QualifiedUcRange& range) -> Status { return detail::runtime.revalidate(range); }
+auto qualify_wc_range(uint64_t physical, uint64_t page_rounded_bytes, QualifiedWcRange& empty_output) -> Status {
+    return detail::runtime.qualify(physical, page_rounded_bytes, empty_output);
+}
+auto revalidate_current_cpu(const QualifiedWcRange& range) -> Status { return detail::runtime.revalidate(range); }
 
 auto status_name(Status status) -> const char* {
     static constexpr std::array NAMES{"ready",
@@ -314,8 +352,9 @@ auto status_name(Status status) -> const char* {
                                       "protected_ranges_unobservable",
                                       "protected_range",
                                       "not_strict_uc",
-                                      "output_not_empty"};
-    static_assert(NAMES.size() == static_cast<size_t>(Status::output_not_empty) + 1);
+                                      "output_not_empty",
+                                      "not_strict_wc"};
+    static_assert(NAMES.size() == static_cast<size_t>(Status::not_strict_wc) + 1);
     auto const index = static_cast<size_t>(status);
     return index < NAMES.size() ? NAMES[index] : "invalid_status";
 }

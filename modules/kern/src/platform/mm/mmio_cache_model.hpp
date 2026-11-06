@@ -42,6 +42,7 @@ enum class Status : uint8_t {
     protected_range,
     not_strict_uc,
     output_not_empty,
+    not_strict_wc,
 };
 
 namespace detail {
@@ -136,6 +137,7 @@ struct CpuPolicy {
 [[nodiscard]] auto append_cpu_boundaries(const CpuPolicy& policy, uint64_t begin, uint64_t end, cache_arch::Boundaries& output) -> Status;
 [[nodiscard]] auto equivalent_cpu_policy(const CpuPolicy& left, const CpuPolicy& right) -> Status;
 [[nodiscard]] auto qualify_cpu_uc(const CpuPolicy& policy, uint64_t begin, uint64_t bytes) -> Status;
+[[nodiscard]] auto qualify_cpu_wc(const CpuPolicy& policy, uint64_t begin, uint64_t bytes) -> Status;
 
 }  // namespace detail
 }  // namespace ker::mod::mm::mmio_cache

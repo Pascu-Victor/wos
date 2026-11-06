@@ -955,7 +955,7 @@ auto prepare_fork_vm_snapshot_once(ker::mod::sched::task::Task& actor, ker::mod:
         ker::syscall::vmem::LegacyFileForkPreparation::EmptyMatch empty_legacy_match;
         if (!lazy.matches(actor) || !tmpfs.matches(actor)) return -EAGAIN;
         fail_at(ForkVmFailurePoint::DeviceMatch);
-        if (!device.matches_current(actor, publication)) return -EAGAIN;
+        if (!device.matches_current(actor, preparation, publication)) return -EAGAIN;
         fail_at(ForkVmFailurePoint::LegacyMatch);
         status = legacy_file.matches(actor, child, preparation, publication, conflict, &empty_legacy_match);
         if (status != 0) return status;

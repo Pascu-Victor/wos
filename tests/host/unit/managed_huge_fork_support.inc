@@ -6,7 +6,8 @@ namespace ker::mod::mm::device_vm {
 class PreparedFork {
    public:
     auto prepare_current(sched::task::Task&, const sys::SyscallPreparationScope&) -> int { return 0; }
-    auto matches_current(sched::task::Task&, const ker::syscall::vmem::SharedVmemPublicationGuard&) -> bool { return true; }
+    auto matches_current(sched::task::Task&, const sys::SyscallPreparationScope&,
+                         const ker::syscall::vmem::SharedVmemPublicationGuard&) -> bool { return true; }
     auto empty() const noexcept -> bool { return true; }
     auto attach_before_copy(sched::task::Task&, sched::task::Task&, paging::PageTable*,
                             const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> int { std::abort(); }

@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <mod/io/serial/serial.hpp>
 #include <new>
 #include <optional>
 #include <platform/acpi/apic/apic.hpp>
@@ -13898,6 +13899,17 @@ class DeviceObjectGuardStorage {
     ker::dev::mapping::ObjectCommitGuard* value_{};
 };
 
+auto device_fork_match_context(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                               const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> bool {
+    // Matching only borrows a root and reads the index. A reschedule deferred
+    // until syscall return does not require allocation/reclaim eligibility.
+    return preparation.ready() && publication.acquired_by_current_executor() && sched::has_run_queues() && current_process_root(actor) &&
+           sched::interrupts_enabled() && sched::preempt_count() == 0 && !io::serial::is_panic_mode() &&
+           !sys::usercopy::access_window_active() && !file_mapping::LifetimeRetirementExecutor::is_current_worker() &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) && !actor.exit_in_progress.load(std::memory_order_acquire) &&
+           !actor.usercopy_pagemap_closing.load(std::memory_order_acquire) && !actor.wants_block && actor.syscall_account_start_us != 0;
+}
+
 class DeviceCurrentAccess {
    public:
     DeviceCurrentAccess(sched::task::Task& actor, const ker::syscall::vmem::SharedVmemPublicationGuard& publication, bool exclusive,
@@ -13906,6 +13918,31 @@ class DeviceCurrentAccess {
         if (!publication.acquired_by_current_executor() || !current_process_root(actor) || !binding_root_context() ||
             (preparation != nullptr && !preparation->ready()))
             return;
+        acquire();
+    }
+    DeviceCurrentAccess(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                        const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept
+        : actor_(actor) {
+        if (!device_fork_match_context(actor, preparation, publication)) return;
+        acquire();
+    }
+    ~DeviceCurrentAccess() {
+        if (gate_ != USER_PAGEMAP_ACCESS_GATE_NONE) {
+            if (exclusive_)
+                end_user_pagemap_exclusive(gate_);
+            else
+                release_user_pagemap_access(gate_);
+        }
+        if (local_) actor_.release_usercopy_pagemap();
+    }
+    DeviceCurrentAccess(const DeviceCurrentAccess&) = delete;
+    auto operator=(const DeviceCurrentAccess&) -> DeviceCurrentAccess& = delete;
+    [[nodiscard]] auto status() const noexcept -> int { return status_; }
+    [[nodiscard]] auto root() const noexcept -> PageTable* { return status_ == 0 ? root_ : nullptr; }
+    [[nodiscard]] auto serial() const noexcept -> uint64_t { return serial_; }
+
+   private:
+    void acquire() noexcept {
 #ifdef WOS_KASAN
         if (kasan::is_enabled()) kasan::unpoison_range(&root_, sizeof(root_));
 #endif
@@ -13929,22 +13966,6 @@ class DeviceCurrentAccess {
         user_mapping_pin_lock.unlock_irqrestore(FLAGS);
         status_ = serial_ != 0 ? 0 : -EAGAIN;
     }
-    ~DeviceCurrentAccess() {
-        if (gate_ != USER_PAGEMAP_ACCESS_GATE_NONE) {
-            if (exclusive_)
-                end_user_pagemap_exclusive(gate_);
-            else
-                release_user_pagemap_access(gate_);
-        }
-        if (local_) actor_.release_usercopy_pagemap();
-    }
-    DeviceCurrentAccess(const DeviceCurrentAccess&) = delete;
-    auto operator=(const DeviceCurrentAccess&) -> DeviceCurrentAccess& = delete;
-    [[nodiscard]] auto status() const noexcept -> int { return status_; }
-    [[nodiscard]] auto root() const noexcept -> PageTable* { return status_ == 0 ? root_ : nullptr; }
-    [[nodiscard]] auto serial() const noexcept -> uint64_t { return serial_; }
-
-   private:
     sched::task::Task& actor_;
     PageTable* root_{};
     size_t gate_{USER_PAGEMAP_ACCESS_GATE_NONE};
@@ -14326,13 +14347,13 @@ auto VmAccess::revoke(PreparedRevoke& plan, virt::BindingRootMutationLease& leas
     return 0;
 }
 
-auto VmAccess::match_fork(PreparedFork& plan, sched::task::Task& actor,
+auto VmAccess::match_fork(PreparedFork& plan, sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
                           const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> bool {
     using namespace virt;
     if (!plan.storage_ || plan.storage_->consumed) return false;
     auto& s = *plan.storage_;
     if (s.count != 0 && (!s.source || !s.children)) return false;
-    DeviceCurrentAccess access(actor, publication, false);
+    DeviceCurrentAccess access(actor, preparation, publication);
     if (access.status() != 0 || access.serial() != s.serial) return false;
     DevicePteLocks const locks;
     size_t actual_count = 0;

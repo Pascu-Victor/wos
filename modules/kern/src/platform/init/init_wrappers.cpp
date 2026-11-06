@@ -386,6 +386,9 @@ void sched_init() {
     if (!CACHE_POLICY && (cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-rendezvous") ||
                           cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-state-refusal")))
         mod::dbg::panic_handler("cache diagnostic modifier requires --selftest-cache-policy");
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-wc") &&
+        (!CACHE_POLICY || !cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-rendezvous")))
+        mod::dbg::panic_handler("WC cache diagnostic requires --selftest-cache-policy and --selftest-cache-rendezvous");
     bool const UNMATCHED_MSR = cmdline_has_token(get_kernel_cmdline(), "--selftest-safe-msr-unmatched");
     bool const SAFE_MSR_ONLY = cmdline_has_token(get_kernel_cmdline(), "--selftest-safe-msr-only");
     if (SAFE_MSR_ONLY && (!cmdline_has_token(get_kernel_cmdline(), "--selftest") || UNMATCHED_MSR ||

@@ -46,7 +46,8 @@ struct VmAccess {
                        const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> int;
     static auto revoke(PreparedRevoke&, virt::BindingRootMutationLease&, const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept
         -> int;
-    static auto match_fork(PreparedFork&, sched::task::Task&, const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> bool;
+    static auto match_fork(PreparedFork&, sched::task::Task&, const sys::SyscallPreparationScope&,
+                           const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> bool;
     static auto attach_fork(PreparedFork&, sched::task::Task&, sched::task::Task&, paging::PageTable*,
                             const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> int;
 };
@@ -159,7 +160,8 @@ class PreparedFork {
     PreparedFork(PreparedFork&&) = delete;
     auto operator=(PreparedFork&&) -> PreparedFork& = delete;
     [[nodiscard]] auto prepare_current(sched::task::Task&, const sys::SyscallPreparationScope&, Limits = {}) -> int;
-    [[nodiscard]] auto matches_current(sched::task::Task&, const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> bool;
+    [[nodiscard]] auto matches_current(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                       const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> bool;
     [[nodiscard]] auto empty() const noexcept -> bool { return storage_ == nullptr || storage_->count == 0; }
     void reset() noexcept;
 

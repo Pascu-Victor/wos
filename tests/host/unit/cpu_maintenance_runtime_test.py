@@ -156,6 +156,9 @@ def copies(source: str) -> dict[str, tuple[str, str, bool]]:
     end = stale.index('\n}\n\nclass Reader', begin) + 2
     weakened = replace_once(stale[begin:end], '!= slot.id', '== 0')
     no_id = stale[:begin] + weakened + stale[end:]
+    holder = actual_definition(source, '[[nodiscard]] auto revalidate() const -> CacheStatus {')
+    wc_arm = 'mmio_cache::revalidate_current_cpu(wc_)'
+    no_wc_revalidation = replace_once(source, holder, replace_once(holder, wc_arm, 'CacheStatus::ready'))
     return {
         'pristine': (source, 'CpuMaintenance.General*', False),
         'finite-pauses-and-reader-limit': (finite, 'CpuMaintenance.Hook*:CpuMaintenance.FiniteFrozen*', False),
@@ -167,6 +170,8 @@ def copies(source: str) -> dict[str, tuple[str, str, bool]]:
         'control-controller-stack': (source, 'CpuMaintenance.GeneralPrivateActualProcessFinalizerSealsDrainsAndRevalidatesCurrentStackAndPhase', True),
         'control-controller-phase': (source, 'CpuMaintenance.GeneralPrivateActualProcessFinalizerSealsDrainsAndRevalidatesCurrentStackAndPhase', True),
         'control-controller-boot-identity': (source, 'CpuMaintenance.GeneralPrivateActualBootIssuerKeepsBothIncomingIrqStatesAndSameTicketRetry', True),
+        'control-wc-revalidation-removed': (no_wc_revalidation,
+                                            'CpuMaintenance.GeneralWcActualRevalidationRefusesPatDriftBeforeAnyLocalAction', True),
     }
 
 

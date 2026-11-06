@@ -580,4 +580,15 @@ TEST(MtrrPolicy, PatUcCompositionDistinguishesAmdCacheDisableAndInvalidInputs) {
         EXPECT_EQ(arch::effective_uc_pat_type(static_cast<Vendor>(255), TYPE), MemoryType::cd);
     }
 }
+
+TEST(MtrrPolicy, PatWcCompositionCoversEveryLegalOrdinaryRowWithoutAWbOnlyShortcut) {
+    for (unsigned raw_type = 0; raw_type < 256; ++raw_type) {
+        auto const type = static_cast<MemoryType>(raw_type);
+        bool const legal = raw_type == 0 || raw_type == 1 || raw_type == 4 || raw_type == 5 || raw_type == 6;
+        EXPECT_EQ(arch::effective_wc_pat_type(Vendor::intel, type), legal ? MemoryType::wc : MemoryType::cd);
+        EXPECT_EQ(arch::effective_wc_pat_type(Vendor::amd, type), legal ? MemoryType::wc : MemoryType::cd);
+        EXPECT_EQ(arch::effective_wc_pat_type(Vendor::unknown, type), MemoryType::cd);
+        EXPECT_EQ(arch::effective_wc_pat_type(static_cast<Vendor>(255), type), MemoryType::cd);
+    }
+}
 }  // namespace

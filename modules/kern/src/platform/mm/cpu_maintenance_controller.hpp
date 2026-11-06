@@ -52,6 +52,7 @@ class Controller final {
 // cache-policy seal. Qualification seals afterward. No request exists on timeout.
 [[nodiscard]] auto await_ready(const Controller&, uint64_t absolute_ns) -> Status;
 [[nodiscard]] auto prepare(const Controller&, mmio_cache::QualifiedUcRange&&, Kind, Ticket&) -> Status;
+[[nodiscard]] auto prepare(const Controller&, mmio_cache::QualifiedWcRange&&, Kind, Ticket&) -> Status;
 [[nodiscard]] auto publish(const Controller&, Ticket&) -> Status;
 [[nodiscard]] auto observe(const Controller&, const Ticket&) -> Report;
 [[nodiscard]] auto wait_until(const Controller&, Ticket&, uint64_t absolute_ns) -> Report;

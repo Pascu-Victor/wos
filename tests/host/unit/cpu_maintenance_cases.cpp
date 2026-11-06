@@ -60,6 +60,12 @@ auto range(uint64_t physical = ports::BAR) -> cache::QualifiedUcRange {
     return result;
 }
 
+auto wc_range(uint64_t physical = ports::BAR) -> cache::QualifiedWcRange {
+    cache::QualifiedWcRange result;
+    EXPECT_EQ(cache::qualify_wc_range(physical, 4096, result), cache::Status::ready);
+    return result;
+}
+
 auto deadline(uint64_t duration = 100'000'000) -> uint64_t { return host::now.load() + duration; }
 auto wait_flag(const std::atomic<bool>& flag) -> bool {
     auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -182,6 +188,147 @@ TEST(CpuMaintenance, GeneralOneAndSixtyFourTargetsIncludeOriginAndCurrentTaskRoo
             EXPECT_TRUE(ticket.empty());
             EXPECT_EQ(cm::pool_stats().complete, 0U);
         });
+}
+
+TEST(CpuMaintenance, GeneralWcActualTypedOwnerExecutesBothKindsWithExactSelectorAndTargets) {
+    for (auto kind : {Kind::translations, Kind::translations_then_cache})
+        isolated([kind] {
+            boot(4);
+            auto token = wc_range();
+            Ticket ticket;
+            ASSERT_EQ(cm::prepare(std::move(token), kind, ticket), Status::ready);
+            EXPECT_TRUE(token.empty());
+            EXPECT_EQ(cm::observe(ticket).pat_index, 5U);
+            ASSERT_EQ(cm::publish(ticket), Status::pending);
+            auto const done = cm::wait_until(ticket, deadline());
+            ASSERT_EQ(done.status, Status::complete);
+            EXPECT_EQ(done.pat_index, 5U);
+            EXPECT_EQ(done.physical, ports::BAR);
+            EXPECT_EQ(done.bytes, 4096U);
+            EXPECT_EQ(done.cohort_incarnation, cache::cohort_observation().incarnation);
+            EXPECT_EQ(done.translation_completed, 15U);
+            EXPECT_EQ(done.cache_completed, kind == Kind::translations ? 0U : 15U);
+            EXPECT_EQ(done.readers, 0U);
+            EXPECT_TRUE(done.admission_closed);
+            for (size_t cpu = 0; cpu < 4; ++cpu) {
+                EXPECT_EQ(done.cpus[cpu].translation_completed, ticket.id());
+                EXPECT_EQ(done.cpus[cpu].translation_apic, ports::cpus[cpu].apic);
+                EXPECT_EQ(done.cpus[cpu].translation_cr3, (cpu + 1) * 4096 + 0x100000);
+            }
+            EXPECT_EQ(host::events().size(), kind == Kind::translations ? 4U : 8U);
+            EXPECT_EQ(cm::release_complete(ticket), Status::complete);
+            EXPECT_TRUE(ticket.empty());
+        });
+}
+
+TEST(CpuMaintenance, GeneralWcPrepareAndPublishFailurePreserveTheOriginalTypedOwner) {
+    isolated([] {
+        boot(2);
+        auto token = wc_range();
+        auto const incarnation = token.incarnation();
+        Ticket ticket;
+        host::controller = false;
+        EXPECT_EQ(cm::prepare(std::move(token), Kind::translations, ticket), Status::invalid_context);
+        host::controller = true;
+        EXPECT_EQ(cm::prepare(std::move(token), static_cast<Kind>(255), ticket), Status::invalid_kind);
+        EXPECT_EQ(token.incarnation(), incarnation);
+        ASSERT_EQ(cm::prepare(std::move(token), Kind::translations_then_cache, ticket), Status::ready);
+        EXPECT_TRUE(token.empty());
+        host::clock_available.store(false);
+        EXPECT_EQ(cm::publish(ticket), Status::clock_unavailable);
+        auto const retained = cm::observe(ticket);
+        EXPECT_EQ(retained.phase, Phase::prepared);
+        EXPECT_EQ(retained.pat_index, 5U);
+        EXPECT_EQ(retained.cohort_incarnation, incarnation);
+        EXPECT_TRUE(host::events().empty());
+        host::clock_available.store(true);
+        ASSERT_EQ(cm::publish(ticket), Status::pending);
+        EXPECT_EQ(cm::wait_until(ticket, deadline()).status, Status::complete);
+        EXPECT_EQ(cm::release_complete(ticket), Status::complete);
+        cache::QualifiedWcRange empty;
+        EXPECT_EQ(cm::prepare(std::move(empty), Kind::translations, ticket), Status::empty_range);
+    });
+}
+
+TEST(CpuMaintenance, GeneralWcBothPhaseTimeoutsRetrySameOwnerThenReuseSlotForUcAndWc) {
+    for (auto phase : {Phase::translations, Phase::caches})
+        isolated([phase] {
+            boot(4);
+            Ticket ticket;
+            ASSERT_EQ(cm::prepare(wc_range(), Kind::translations_then_cache, ticket), Status::ready);
+            uint64_t const id = ticket.id();
+            ASSERT_EQ(cm::diagnostic_defer(ticket, phase, 1), Status::ready);
+            ASSERT_EQ(cm::publish(ticket), Status::pending);
+            auto const timed = cm::wait_until(ticket, deadline(5'000'000));
+            EXPECT_EQ(timed.status, Status::timeout_retained);
+            EXPECT_EQ(timed.pat_index, 5U);
+            EXPECT_EQ(timed.id, id);
+            EXPECT_TRUE(timed.timed_out_ever);
+            if (phase == Phase::translations) EXPECT_EQ(timed.cache_claimed | timed.cache_completed, 0U);
+            EXPECT_EQ(cm::release_complete(ticket), Status::busy);
+            ASSERT_EQ(cm::diagnostic_resume(ticket, phase), Status::ready);
+            auto const done = cm::wait_until(ticket, deadline());
+            ASSERT_EQ(done.status, Status::complete);
+            EXPECT_EQ(done.id, id);
+            EXPECT_EQ(done.pat_index, 5U);
+            EXPECT_TRUE(done.timed_out_ever);
+            auto const events = host::events();
+            ASSERT_EQ(events.size(), 8U);
+            for (size_t i = 0; i < 4; ++i) EXPECT_EQ(events[i].phase, Phase::translations);
+            for (size_t i = 4; i < 8; ++i) EXPECT_EQ(events[i].phase, Phase::caches);
+            EXPECT_EQ(cm::release_complete(ticket), Status::complete);
+            ASSERT_EQ(cm::prepare(range(ports::BAR + 4096), Kind::translations, ticket), Status::ready);
+            EXPECT_GT(ticket.id(), id);
+            EXPECT_EQ(cm::observe(ticket).pat_index, 3U);
+            ASSERT_EQ(cm::publish(ticket), Status::pending);
+            EXPECT_EQ(cm::wait_until(ticket, deadline()).status, Status::complete);
+            EXPECT_EQ(cm::release_complete(ticket), Status::complete);
+            ASSERT_EQ(cm::prepare(wc_range(ports::BAR + 8192), Kind::translations, ticket), Status::ready);
+            EXPECT_EQ(cm::observe(ticket).pat_index, 5U);
+            EXPECT_EQ(cm::observe(ticket).physical, ports::BAR + 8192);
+        });
+}
+
+TEST(CpuMaintenance, GeneralWcActualRevalidationRefusesPatDriftBeforeAnyLocalAction) {
+    isolated([] {
+        boot(2);
+        Ticket ticket;
+        ASSERT_EQ(cm::prepare(wc_range(), Kind::translations_then_cache, ticket), Status::ready);
+        ASSERT_EQ(cm::publish(ticket), Status::pending);
+        ports::cpus[1].msr[0x277] ^= uint64_t{7} << 40;
+        host::service(1);
+        auto const failed = cm::wait_until(ticket, deadline());
+        EXPECT_EQ(failed.status, Status::failed_retained);
+        EXPECT_EQ(failed.pat_index, 5U);
+        EXPECT_EQ(failed.failed, 2U);
+        EXPECT_EQ(failed.cpus[1].translation_status, cache::Status::state_drift);
+        EXPECT_EQ(failed.cpus[1].translation_completed, 0U);
+        EXPECT_EQ(failed.cache_claimed, 0U);
+        EXPECT_TRUE(host::events().empty());
+        EXPECT_EQ(cm::release_complete(ticket), Status::busy);
+    });
+}
+
+TEST(CpuMaintenance, GeneralWcPublishedAbandonmentRetainsOwnerAndCapacity) {
+    isolated([] {
+        boot(1);
+        host::auto_progress.store(false);
+        for (size_t i = 0; i < cm::POOL_CAPACITY; ++i) {
+            Ticket ticket;
+            ASSERT_EQ(cm::prepare(wc_range(), Kind::translations_then_cache, ticket), Status::ready);
+            EXPECT_EQ(cm::observe(ticket).pat_index, 5U);
+            ASSERT_EQ(cm::publish(ticket), Status::pending);
+        }
+        EXPECT_EQ(cm::pool_stats().retained, cm::POOL_CAPACITY);
+        auto token = wc_range();
+        Ticket output;
+        EXPECT_EQ(cm::prepare(std::move(token), Kind::translations, output), Status::capacity);
+        EXPECT_FALSE(token.empty());
+        host::service(0);
+        EXPECT_EQ(cm::pool_stats().retained, cm::POOL_CAPACITY);
+        EXPECT_EQ(host::events().size(), cm::POOL_CAPACITY);
+        for (auto const& event : host::events()) EXPECT_EQ(event.phase, Phase::translations);
+    });
 }
 
 TEST(CpuMaintenance, GeneralTlbDeferralCannotStartCacheAndExplicitSameIdRetryPreservesTimeoutHistory) {
@@ -449,6 +596,79 @@ TEST(CpuMaintenance, HookAfterAckReaderTailBlocksCompletionAndSlotReuse) {
     });
 }
 
+TEST(CpuMaintenance, HookWcReaderTailRetainsTypeUntilJoinThenSlotCanAdoptUc) {
+    isolated([] {
+        boot(2);
+        host::auto_progress.store(false);
+        Ticket ticket;
+        ASSERT_EQ(cm::prepare(wc_range(), Kind::translations, ticket), Status::ready);
+        ASSERT_EQ(cm::publish(ticket), Status::pending);
+        host::service(0);
+        host::post_armed.store(true);
+        std::thread reader([] {
+            ports::select(1, 2);
+            cm::detail::service_current_cpu();
+        });
+        EXPECT_TRUE(wait_flag(host::post_entered));
+        auto const waiting = cm::wait_until(ticket, deadline(5'000'000));
+        EXPECT_EQ(waiting.status, Status::timeout_retained);
+        EXPECT_EQ(waiting.phase, Phase::closing);
+        EXPECT_EQ(waiting.pat_index, 5U);
+        EXPECT_EQ(waiting.readers, 1U);
+        EXPECT_EQ(waiting.translation_completed, 3U);
+        EXPECT_EQ(cm::release_complete(ticket), Status::busy);
+        std::array<Ticket, cm::POOL_CAPACITY - 1> prepared;
+        for (auto& other : prepared) EXPECT_EQ(cm::prepare(wc_range(), Kind::translations, other), Status::ready);
+        auto uc = range(ports::BAR + 4096);
+        Ticket replacement;
+        EXPECT_EQ(cm::prepare(std::move(uc), Kind::translations, replacement), Status::capacity);
+        EXPECT_FALSE(uc.empty());
+        host::post_release.store(true, std::memory_order_release);
+        reader.join();
+        EXPECT_EQ(cm::wait_until(ticket, deadline()).status, Status::complete);
+        EXPECT_EQ(cm::release_complete(ticket), Status::complete);
+        ASSERT_EQ(cm::prepare(std::move(uc), Kind::translations, replacement), Status::ready);
+        EXPECT_EQ(cm::observe(replacement).pat_index, 3U);
+        EXPECT_EQ(cm::observe(replacement).physical, ports::BAR + 4096);
+    });
+}
+
+TEST(CpuMaintenance, HookWcPrejoinScannerAcrossUcToWcReuseReadsOnlyTheNewTypedGeneration) {
+    isolated([] {
+        boot(2);
+        host::auto_progress.store(false);
+        Ticket old;
+        ASSERT_EQ(cm::prepare(range(), Kind::translations, old), Status::ready);
+        uint64_t const old_id = old.id();
+        ASSERT_EQ(cm::publish(old), Status::pending);
+        host::service(0);
+        host::service(1);
+        host::pre_armed.store(true);
+        std::thread scanner([] {
+            ports::select(1, 2);
+            cm::detail::service_current_cpu();
+        });
+        EXPECT_TRUE(wait_flag(host::pre_entered));
+        EXPECT_EQ(cm::wait_until(old, deadline()).status, Status::complete);
+        EXPECT_EQ(cm::release_complete(old), Status::complete);
+        Ticket next;
+        auto const prepared = cm::prepare(wc_range(ports::BAR + 4096), Kind::translations, next);
+        EXPECT_EQ(prepared, Status::ready);
+        if (prepared == Status::ready) EXPECT_EQ(cm::publish(next), Status::pending);
+        host::pre_release.store(true, std::memory_order_release);
+        scanner.join();
+        ASSERT_FALSE(next.empty());
+        EXPECT_GT(next.id(), old_id);
+        auto const observed = cm::observe(next);
+        EXPECT_EQ(observed.pat_index, 5U);
+        EXPECT_EQ(observed.physical, ports::BAR + 4096);
+        EXPECT_EQ(observed.cpus[1].translation_completed, next.id());
+        EXPECT_NE(observed.cpus[1].translation_completed, old_id);
+        EXPECT_EQ(cm::wait_until(next, deadline()).status, Status::complete);
+        EXPECT_EQ(cm::release_complete(next), Status::complete);
+    });
+}
+
 TEST(CpuMaintenance, HookReaderSaturationDefersWithoutWrappingOrAcknowledging) {
     isolated([] {
         boot(2);
@@ -574,6 +794,74 @@ auto private_round_trip(const Controller& controller, bool defer) -> void {
     EXPECT_EQ(cm::detail::release_complete(controller, ticket), Status::complete);
     EXPECT_TRUE(ticket.empty());
     EXPECT_EQ(ports::flags, flags);
+}
+
+void private_wc_round_trip(const Controller& controller, Phase deferred) {
+    EXPECT_EQ(controller.context_status(), Status::ready);
+    Ticket ticket;
+    EXPECT_EQ(cm::detail::prepare(controller, wc_range(), Kind::translations_then_cache, ticket), Status::ready);
+    uint64_t const id = ticket.id();
+    EXPECT_EQ(cm::detail::observe(controller, ticket).pat_index, 5U);
+    if (deferred != Phase::empty) EXPECT_EQ(cm::detail::diagnostic_defer(controller, ticket, deferred, 1), Status::ready);
+    EXPECT_EQ(cm::detail::publish(controller, ticket), Status::pending);
+    if (deferred != Phase::empty) {
+        auto const timed = cm::detail::wait_until(controller, ticket, deadline(5'000'000));
+        EXPECT_EQ(timed.status, Status::timeout_retained);
+        EXPECT_EQ(timed.phase, deferred);
+        EXPECT_EQ(timed.pat_index, 5U);
+        EXPECT_EQ(timed.id, id);
+        EXPECT_EQ(cm::detail::diagnostic_resume(controller, ticket, deferred), Status::ready);
+    }
+    auto const done = cm::detail::wait_until(controller, ticket, deadline());
+    EXPECT_EQ(done.status, Status::complete);
+    EXPECT_EQ(done.id, id);
+    EXPECT_EQ(done.pat_index, 5U);
+    EXPECT_EQ(done.translation_completed, 3U);
+    EXPECT_EQ(done.cache_completed, 3U);
+    EXPECT_EQ(done.timed_out_ever, deferred != Phase::empty);
+    EXPECT_EQ(done.readers, 0U);
+    EXPECT_EQ(cm::detail::release_complete(controller, ticket), Status::complete);
+}
+
+TEST(CpuMaintenance, GeneralWcPrivateActualBootIssuerPreservesTypeAcrossBothSameTicketRetries) {
+    isolated([] {
+        boot(2);
+        host::controller = false;
+        issuers::boot_callback = [](const Controller& controller) {
+            Ticket refused;
+            EXPECT_EQ(cm::prepare(wc_range(), Kind::translations, refused), Status::invalid_context);
+            for (auto phase : {Phase::empty, Phase::translations, Phase::caches}) private_wc_round_trip(controller, phase);
+            EXPECT_EQ(host::yields.load(), 0U);
+        };
+        try {
+            ker::init::InitExecutor::run_all();
+        } catch (const issuers::Finished&) {
+        }
+        EXPECT_EQ(issuers::boot_calls, 1U);
+        EXPECT_EQ(cm::pool_stats().retained | cm::pool_stats().prepared | cm::pool_stats().complete, 0U);
+    });
+}
+
+TEST(CpuMaintenance, GeneralWcPrivateActualProcessFinalizerUsesItsGenuineController) {
+    isolated([] {
+        boot(2);
+        host::controller = false;
+        ker::mod::sched::task::Task task;
+        issuers::initialize(task);
+        issuers::finalizer_callback = [](const Controller& controller) {
+            EXPECT_EQ(issuers::current->type, ker::mod::sched::task::TaskType::PROCESS);
+            EXPECT_TRUE(issuers::current->kernel_shutdown_ownership.held());
+            private_wc_round_trip(controller, Phase::translations);
+        };
+        try {
+            (void)ker::mod::power::begin_reboot_command(ker::abi::power::RB_POWER_OFF);
+            FAIL() << "accepted finalization returned";
+        } catch (const issuers::Finished&) {
+        }
+        EXPECT_EQ(issuers::finalizer_calls, 1U);
+        EXPECT_EQ(issuers::effects.back(), "halt");
+        EXPECT_FALSE(task.kernel_shutdown_ownership.held());
+    });
 }
 
 TEST(CpuMaintenance, GeneralPrivateActualBootIssuerKeepsBothIncomingIrqStatesAndSameTicketRetry) {

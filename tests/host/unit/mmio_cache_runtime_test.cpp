@@ -713,3 +713,285 @@ TEST(MmioCacheRuntime, ConcurrentDistinctCpuCaptureAndTokenQueriesUseActualPubli
     });
 }
 }  // namespace
+
+namespace {
+using cache::QualifiedWcRange;
+static_assert(QualifiedUcRange::PAT_INDEX == 3 && QualifiedWcRange::PAT_INDEX == 5);
+static_assert(!std::is_copy_constructible_v<QualifiedWcRange> && !std::is_copy_assignable_v<QualifiedWcRange>);
+static_assert(std::is_nothrow_move_constructible_v<QualifiedWcRange> && std::is_nothrow_move_assignable_v<QualifiedWcRange>);
+static_assert(!std::is_constructible_v<QualifiedWcRange, uint64_t, uint64_t, uint64_t>);
+static_assert(!std::is_constructible_v<QualifiedWcRange, QualifiedUcRange&&> &&
+              !std::is_constructible_v<QualifiedUcRange, QualifiedWcRange&&>);
+static_assert(!std::is_assignable_v<QualifiedWcRange&, QualifiedUcRange&&> && !std::is_assignable_v<QualifiedUcRange&, QualifiedWcRange&&>);
+template <typename T>
+concept UcOutput = requires(T& output) { cache::qualify_uc_range(ports::BAR, 4096, output); };
+template <typename T>
+concept WcOutput = requires(T& output) { cache::qualify_wc_range(ports::BAR, 4096, output); };
+static_assert(UcOutput<QualifiedUcRange> && !UcOutput<QualifiedWcRange>);
+static_assert(WcOutput<QualifiedWcRange> && !WcOutput<QualifiedUcRange>);
+
+void expect_wc_empty(const QualifiedWcRange& range) {
+    EXPECT_TRUE(range.empty());
+    EXPECT_EQ(range.physical() | range.bytes() | range.incarnation(), 0U);
+}
+
+TEST(MmioCacheRuntime, WcActualCapturedIntelAndAmdTokensHaveDistinctMoveOnlyAuthority) {
+    for (auto vendor : {arch::Vendor::intel, arch::Vendor::amd})
+        isolated([vendor] {
+            ports::setup(2, vendor);
+            capture_all(2);
+            QualifiedWcRange source;
+            ASSERT_EQ(cache::qualify_wc_range(ports::BAR, 8192, source), Status::ready);
+            uint64_t const incarnation = source.incarnation();
+            EXPECT_EQ(incarnation, cache::cohort_observation().incarnation);
+            QualifiedWcRange moved(std::move(source));
+            expect_wc_empty(source);
+            EXPECT_EQ(moved.physical(), ports::BAR);
+            EXPECT_EQ(moved.bytes(), 8192U);
+            EXPECT_EQ(cache::qualify_wc_range(ports::BAR + 4096, 4096, moved), Status::output_not_empty);
+            EXPECT_EQ(cache::qualify_wc_range(1, 0, moved), Status::output_not_empty);
+            QualifiedWcRange assigned;
+            assigned = std::move(moved);
+            expect_wc_empty(moved);
+            EXPECT_EQ(assigned.incarnation(), incarnation);
+            ports::select(1);
+            EXPECT_EQ(cache::revalidate_current_cpu(assigned), Status::ready);
+            EXPECT_EQ(cache::revalidate_current_cpu(source), Status::invalid_configuration);
+            QualifiedUcRange independent;
+            EXPECT_EQ(cache::qualify_uc_range(ports::BAR, 8192, independent), Status::ready);
+            EXPECT_EQ(independent.incarnation(), incarnation);
+        });
+}
+
+TEST(MmioCacheRuntime, WcActualCollectorSupportsEveryEnabledDefaultRowForBothVendors) {
+    for (auto vendor : {arch::Vendor::intel, arch::Vendor::amd})
+        for (uint64_t type : {uint64_t{0}, uint64_t{1}, uint64_t{4}, uint64_t{5}, uint64_t{6}})
+            isolated([vendor, type] {
+                ports::setup(1, vendor);
+                ports::cpus[0].msr[0x2ff] = 0x800 | type;
+                capture_all(1);
+                QualifiedWcRange wc;
+                ASSERT_EQ(cache::qualify_wc_range(ports::BAR, 4096, wc), Status::ready);
+                EXPECT_EQ(cache::revalidate_current_cpu(wc), Status::ready);
+                QualifiedUcRange uc;
+                EXPECT_EQ(cache::qualify_uc_range(ports::BAR, 4096, uc),
+                          vendor == arch::Vendor::intel || type == 0 ? Status::ready : Status::not_strict_uc);
+            });
+}
+
+TEST(MmioCacheRuntime, WcActualProtectedAndAmdDestinationInteriorsRefuseWithoutGlobalPoison) {
+    for (auto vendor : {arch::Vendor::intel, arch::Vendor::amd})
+        isolated([vendor] {
+            ports::setup(1, vendor);
+            auto& cpu = ports::cpus[0];
+            constexpr uint64_t SIZE = 2 * 1024 * 1024;
+            if (vendor == arch::Vendor::intel) {
+                cpu.msr[0xfe] |= 0x800;
+                cpu.msr[0x1f3] = 0xffe00800;
+                cpu.msr[0x1f2] = ports::BAR | 6;
+            } else {
+                cpu.msr[0xc0010010U] = uint64_t{1} << 20;
+                cpu.msr[0xc001001aU] = 3ULL << 30;
+                cpu.msr[0xc0010016U] = ports::BAR | 16;
+                cpu.msr[0xc0010017U] = ((uint64_t{1} << 36) - SIZE) | 0x800;
+                cpu.msr[0xc0010019U] = 0;
+            }
+            capture_all(1);
+            QualifiedWcRange interior;
+            EXPECT_EQ(cache::qualify_wc_range(ports::BAR - 4096, SIZE + 8192, interior),
+                      vendor == arch::Vendor::intel ? Status::protected_range : Status::routing_override_unqualified);
+            expect_wc_empty(interior);
+            EXPECT_EQ(cache::cohort_observation().status, Status::ready);
+            EXPECT_EQ(cache::cohort_observation().invalidated_mask, 0U);
+            for (uint64_t address : {ports::BAR - 4096, ports::BAR + SIZE}) {
+                QualifiedWcRange adjacent;
+                EXPECT_EQ(cache::qualify_wc_range(address, 4096, adjacent), Status::ready);
+            }
+        });
+}
+
+TEST(MmioCacheRuntime, WcSelectorRefusalCannotMintAndDoesNotPoisonUc) {
+    for (uint8_t type : {uint8_t{0}, uint8_t{4}, uint8_t{5}, uint8_t{6}, uint8_t{7}})
+        isolated([type] {
+            ports::setup(2);
+            for (size_t i = 0; i < 2; ++i) {
+                auto& cpu = ports::cpus[i];
+                cpu.inherited_pat = cpu.msr[0x277] = (ports::PAT & ~(uint64_t{255} << 40)) | (uint64_t{type} << 40);
+            }
+            capture_all(2);
+            QualifiedWcRange refused;
+            EXPECT_EQ(cache::qualify_wc_range(ports::BAR, 4096, refused), Status::not_strict_wc);
+            expect_wc_empty(refused);
+            EXPECT_EQ(cache::cohort_observation().status, Status::ready);
+            EXPECT_EQ(cache::cohort_observation().invalidated_mask, 0U);
+            QualifiedUcRange ordinary;
+            EXPECT_EQ(cache::qualify_uc_range(ports::BAR, 4096, ordinary), Status::ready);
+            EXPECT_EQ(cache::revalidate_current_cpu(ordinary), Status::ready);
+        });
+}
+
+TEST(MmioCacheRuntime, WcCapabilityAndDisabledMtrrRefuseWithoutCoarseUcPoison) {
+    for (auto vendor : {arch::Vendor::intel, arch::Vendor::amd})
+        for (bool disabled : {false, true})
+            isolated([vendor, disabled] {
+                ports::setup(2, vendor);
+                // Both whole-space policies are semantically ordinary UC;
+                // their observed representation may differ on CPU1.
+                for (size_t i = 0; i < 2; ++i) ports::cpus[i].msr[0x2ff] = 0x800;
+                if (disabled)
+                    ports::cpus[1].msr[0x2ff] = 0;
+                else
+                    ports::cpus[1].msr[0xfe] &= ~uint64_t{0x400};
+                capture_all(2);
+                QualifiedWcRange refused;
+                EXPECT_EQ(cache::qualify_wc_range(ports::BAR, 4096, refused),
+                          disabled ? Status::unsupported_mode : Status::unsupported_capability);
+                expect_wc_empty(refused);
+                QualifiedUcRange ordinary;
+                ASSERT_EQ(cache::qualify_uc_range(ports::BAR, 4096, ordinary), Status::ready);
+                EXPECT_EQ(cache::cohort_observation().invalidated_mask, 0U);
+                ports::select(1);
+                EXPECT_EQ(cache::revalidate_current_cpu(ordinary), Status::ready);
+            });
+}
+
+TEST(MmioCacheRuntime, WcPartialCohortAndGeometryNeverMintAReplacementOwner) {
+    isolated([] {
+        ports::setup(2);
+        QualifiedWcRange output;
+        for (auto extent : {std::array<uint64_t, 2>{0, 0}, {1, 4096}, {0, 4097}, {UINT64_MAX - 4095, 4096}}) {
+            EXPECT_EQ(cache::qualify_wc_range(extent[0], extent[1], output), Status::invalid_geometry);
+            expect_wc_empty(output);
+        }
+        EXPECT_EQ(cache::qualify_wc_range(ports::BAR, 4096, output), Status::unconfigured);
+        ASSERT_EQ(cache::configure_boot_cohort(2), Status::ready);
+        ASSERT_EQ(cache::capture_boot_cpu(0), Status::ready);
+        EXPECT_EQ(cache::qualify_wc_range(ports::BAR, 4096, output), Status::pending);
+        expect_wc_empty(output);
+        ports::select(1);
+        ASSERT_EQ(cache::capture_boot_cpu(1), Status::ready);
+        ASSERT_EQ(cache::qualify_wc_range(ports::BAR, 4096, output), Status::ready);
+        EXPECT_EQ(cache::qualify_wc_range(uint64_t{1} << 36, 4096, output), Status::output_not_empty);
+        QualifiedWcRange beyond;
+        EXPECT_EQ(cache::qualify_wc_range(uint64_t{1} << 36, 4096, beyond), Status::invalid_geometry);
+        expect_wc_empty(beyond);
+    });
+}
+
+TEST(MmioCacheRuntime, WcAndUcConcurrentQueriesShareTheSameActualSealAndIncarnation) {
+    isolated([] {
+        ports::setup(4);
+        capture_all(4);
+        EXPECT_FALSE(cache::cohort_observation().sealed);
+        std::atomic<bool> start{false};
+        auto await_start = [&] {
+            ports::select(0);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        };
+        std::thread wc_queries([&] {
+            await_start();
+            for (unsigned i = 0; i < 32; ++i) {
+                QualifiedWcRange output;
+                auto const status = cache::qualify_wc_range(ports::BAR, 4096, output);
+                EXPECT_TRUE(status == Status::ready || status == Status::busy);
+                EXPECT_EQ(output.empty(), status != Status::ready);
+                if (status == Status::ready) EXPECT_EQ(output.incarnation(), cache::cohort_observation().incarnation);
+            }
+        });
+        std::thread uc_queries([&] {
+            await_start();
+            for (unsigned i = 0; i < 32; ++i) {
+                QualifiedUcRange output;
+                auto const status = cache::qualify_uc_range(ports::BAR, 4096, output);
+                EXPECT_TRUE(status == Status::ready || status == Status::busy);
+                EXPECT_EQ(output.empty(), status != Status::ready);
+                if (status == Status::ready) EXPECT_EQ(output.incarnation(), cache::cohort_observation().incarnation);
+            }
+        });
+        start.store(true, std::memory_order_release);
+        wc_queries.join();
+        uc_queries.join();
+        QualifiedWcRange wc;
+        QualifiedUcRange uc;
+        ASSERT_EQ(cache::qualify_wc_range(ports::BAR, 4096, wc), Status::ready);
+        ASSERT_EQ(cache::qualify_uc_range(ports::BAR, 4096, uc), Status::ready);
+        EXPECT_EQ(wc.incarnation(), uc.incarnation());
+        EXPECT_TRUE(cache::cohort_observation().sealed);
+        EXPECT_EQ(cache::cohort_observation().ready_mask, 15U);
+    });
+}
+
+TEST(MmioCacheRuntime, WcStillRequiresFullSemanticCohortAgreementBeyondEffectiveCandidateType) {
+    for (unsigned mode : {0U, 1U, 2U})
+        isolated([mode] {
+            ports::setup(2);
+            auto& other = ports::cpus[1];
+            if (mode == 0) other.msr[0x2ff] |= 6;  // Both rows compose WC at BAR; global policy still differs.
+            if (mode == 1) other.inherited_pat = other.msr[0x277] = (ports::PAT & ~(uint64_t{255} << 40)) | (uint64_t{6} << 40);
+            if (mode == 2) {
+                other.msr[0xfe] |= 0x800;
+                other.msr[0x1f3] = 0xfff00800;
+                other.msr[0x1f2] = 0x30000006;
+            }
+            capture_all(2);
+            QualifiedWcRange output;
+            EXPECT_EQ(cache::qualify_wc_range(ports::BAR, 4096, output), Status::inconsistent_policy);
+            expect_wc_empty(output);
+            EXPECT_FALSE(cache::cohort_observation().sealed);
+        });
+}
+
+TEST(MmioCacheRuntime, WcHardwareDriftPoisonsBothPoliciesAndPreservesImmutableCaptures) {
+    for (unsigned mode : {0U, 1U, 2U, 3U, 4U})
+        isolated([mode] {
+            ports::setup(1);
+            capture_all(1);
+            QualifiedWcRange wc;
+            QualifiedUcRange uc;
+            ASSERT_EQ(cache::qualify_wc_range(ports::BAR, 4096, wc), Status::ready);
+            ASSERT_EQ(cache::qualify_uc_range(ports::BAR, 4096, uc), Status::ready);
+            cache::CpuObservation saved{};
+            ASSERT_TRUE(cache::cpu_observation(0, saved));
+            auto const original = ports::cpus[0];
+            auto& cpu = ports::cpus[0];
+            if (mode == 0) cpu.msr[0x277] ^= uint64_t{7} << 40;
+            if (mode == 1) cpu.faults.insert(0x277);
+            if (mode == 2) cpu.cr0 |= uint64_t{1} << 30;
+            if (mode == 3) ports::local_apic += 1;
+            if (mode == 4) cpu.msr[0x201] = 0x800;
+            Status const expected = mode == 1 ? Status::read_fault : mode == 3 ? Status::wrong_cpu : Status::state_drift;
+            EXPECT_EQ(cache::revalidate_current_cpu(wc), expected);
+            ports::cpus[0] = original;
+            ports::select(0);
+            EXPECT_EQ(cache::revalidate_current_cpu(uc), expected);
+            QualifiedWcRange refused;
+            EXPECT_EQ(cache::qualify_wc_range(ports::BAR, 4096, refused), expected);
+            expect_wc_empty(refused);
+            EXPECT_EQ(cache::cohort_observation().invalidated_mask, 1U);
+            cache::CpuObservation immutable{};
+            ASSERT_TRUE(cache::cpu_observation(0, immutable));
+            EXPECT_EQ(immutable.raw.pat, saved.raw.pat);
+            EXPECT_EQ(immutable.raw.cr0, saved.raw.cr0);
+            EXPECT_EQ(immutable.raw.mtrr.variable[0].mask, saved.raw.mtrr.variable[0].mask);
+        });
+}
+
+TEST(MmioCacheRuntime, WcRevalidationRestoresIncomingIrqStateAndAllowsIncidentalTaskBits) {
+    for (uint64_t incoming : {uint64_t{2}, uint64_t{2} | ports::IF})
+        isolated([incoming] {
+            ports::setup(1);
+            capture_all(1);
+            QualifiedWcRange wc;
+            ASSERT_EQ(cache::qualify_wc_range(ports::BAR, 4096, wc), Status::ready);
+            ports::select(0, incoming);
+            ports::cpus[0].cr0 ^= uint64_t{1} << 3;
+            ports::cpus[0].cr4 |= uint64_t{1} << 4;
+            EXPECT_EQ(cache::revalidate_current_cpu(wc), Status::ready);
+            EXPECT_EQ(ports::flags, incoming);
+            ports::cpus[0].faults.insert(0x277);
+            EXPECT_EQ(cache::revalidate_current_cpu(wc), Status::read_fault);
+            EXPECT_EQ(ports::flags, incoming);
+            EXPECT_EQ(ports::irq_depth, 0U);
+        });
+}
+}  // namespace

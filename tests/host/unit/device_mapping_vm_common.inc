@@ -24,9 +24,9 @@
 #include <platform/sched/shutdown_ownership.hpp>
 
 namespace vm_fixture {
-inline unsigned cases{}, assertions{}, failures{}, puts{}, closes{}, flushes{}, table_attempts{};
+inline unsigned cases{}, assertions{}, failures{}, puts{}, closes{}, flushes{}, table_attempts{}, yields{};
 inline int fail_table_after{-1};
-inline bool access_window{}, worker{};
+inline bool access_window{}, worker{}, panic_mode{};
 inline void expect(bool value, const char* text) {
     ++assertions;
     if (!value && failures++ < 20) std::fprintf(stderr, "FAIL %s\n", text);
@@ -112,9 +112,13 @@ namespace vm_fixture { inline thread_local ker::mod::sched::task::Task* current{
 namespace ker::mod::sched {
 inline auto can_query_current_task() -> bool { return true; }
 inline auto get_current_task() -> task::Task* { return vm_fixture::current; }
-inline auto has_run_queues() -> bool { return true; }
+inline auto has_run_queues() -> bool { return object_fixture::ordinary; }
 inline auto interrupts_enabled() -> bool { return object_fixture::irq_depth == 0; }
 inline auto preempt_count() -> uint32_t { return 0; }
+inline void kern_yield() { ++vm_fixture::yields; }
+}
+namespace ker::mod::io::serial {
+inline auto is_panic_mode() -> bool { return vm_fixture::panic_mode; }
 }
 namespace ker::mod::sys::usercopy {
 inline constexpr uint64_t USER_ADDR_LIMIT = uint64_t{1} << 47;
