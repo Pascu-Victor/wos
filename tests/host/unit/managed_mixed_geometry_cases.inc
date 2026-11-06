@@ -487,6 +487,9 @@ class ManagedMixedProtect : public ManagedMixedGeometry {
 TEST_F(ManagedMixedProtect, MixedReadPreservesDataOutsideFlagsAndFileOwners) {
     mixed_seed();
     auto const base = TEST_VA + LARGE;
+    // The absent leaf is a real nonresident mapping, rather than an address
+    // hole: mprotect must cover every byte without populating that page.
+    for (auto* subject : {&actor, &sibling}) row(*subject, base + PAGE, base + 2 * PAGE);
     auto const refs = model.live_refs();
     int const files = file.refcount.load();
     ASSERT_EQ(invoke_protect(base - PAGE, 6 * PAGE, ker::abi::vmem::PROT_READ), 0);
@@ -588,6 +591,11 @@ TEST_F(ManagedMixedProtect, InvalidCopiedPolicyRefusesBeforePublication) {
     unchanged();
 }
 TEST_F(ManagedMixedProtect, ZeroAndSubFourMiBKeepExistingProtectionCompatibility) {
+    for (auto* subject : {&actor, &sibling}) {
+        subject->shares_user_pagemap = true;
+        row(*subject, 0, PAGE);
+        row(*subject, LARGE, LARGE + PAGE);
+    }
     EXPECT_EQ(invoke_protect(0, PAGE, ker::abi::vmem::PROT_NONE), 0);
     EXPECT_EQ(invoke_protect(LARGE, PAGE, ker::abi::vmem::PROT_READ), 0);
     EXPECT_EQ(host_protect::map_calls + host_protect::acks, 0U);

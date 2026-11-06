@@ -1,5 +1,17 @@
 // Only physical/ref/root/index/TLB/scheduler endpoints are modeled. The original
 // exclusive class, actual survey/split, coordinator and full copier are extracted.
+// These maintained pre-device vectors have no Object/grant/family provider.
+// A prepared device hook is an explicit empty endpoint; nonempty use aborts.
+namespace ker::mod::mm::device_vm {
+class PreparedFork {
+   public:
+    auto prepare_current(sched::task::Task&, const sys::SyscallPreparationScope&) -> int { return 0; }
+    auto matches_current(sched::task::Task&, const ker::syscall::vmem::SharedVmemPublicationGuard&) -> bool { return true; }
+    auto empty() const noexcept -> bool { return true; }
+    auto attach_before_copy(sched::task::Task&, sched::task::Task&, paging::PageTable*,
+                            const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> int { std::abort(); }
+};
+}
 namespace {
 size_t fork_fail_table_at = SIZE_MAX, fork_table_attempts{};
 unsigned fork_source_wait_samples{};

@@ -26,9 +26,11 @@ class ManagedMremapPolicy : public ManagedRange {
         host_policy::unique_ranges = true;
         host_policy::free_error = 0;
         actor.pending_mremap_ps_policies = nullptr;
+        virt::host_device_overlap = false;
     }
     void TearDown() override {
         host_policy::raw_current_endpoint = host_policy::hardware_current = false;
+        virt::host_device_overlap = false;
         policy::cancel_mremap_ps_policies(actor);
         EXPECT_EQ(actor.pending_mremap_ps_policies, nullptr);
         EXPECT_EQ(virt::host_root_control.ps_admission_suspensions, 0U);
@@ -293,6 +295,9 @@ TEST_F(ManagedMremapPolicy, FinalValidatorRejectsIncompleteStaleAndChangedSerial
                   if (result != huge::Error::None) return result;
                   huge::RootKey key{reinterpret_cast<uint64_t>(runtime_root), runtime_serial};
                   EXPECT_EQ(huge::detail::validate_mremap_ps_free(actor, preparation, publication, root, key, cursor), huge::Error::None);
+                  virt::host_device_overlap = true;
+                  EXPECT_EQ(huge::detail::validate_mremap_ps_free(actor, preparation, publication, root, key, cursor), huge::Error::Again);
+                  virt::host_device_overlap = false;
                   cursor.complete = false;
                   EXPECT_EQ(huge::detail::validate_mremap_ps_free(actor, preparation, publication, root, key, cursor), huge::Error::Again);
                   cursor.complete = true;

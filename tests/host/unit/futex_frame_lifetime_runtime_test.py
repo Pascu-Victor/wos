@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import runpy
 import shutil
 import signal
 import subprocess
@@ -586,6 +587,9 @@ def capture(source: str, anchor: str, *, declaration: bool = False) -> tuple[str
 def generate(scratch: Path, selected: Path) -> list[dict]:
     include = scratch / "include"
     actual = []
+    nondevice = runpy.run_path(str(Path(__file__).with_name("nondevice_object_fixture.py")))
+    empty_owners, owner_rows = nondevice["empty_object_owners"](lambda name: KERN / name)
+    actual.extend(owner_rows)
 
     def write(name: str, text: str) -> None:
         path = include / name
@@ -601,8 +605,20 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     user_pin, row = capture(virt, "struct UserPagePin {", declaration=True); actual.append(row)
     futex_identity, row = capture(virt, "struct UserFutexIdentity {", declaration=True); actual.append(row)
     pin_attempt, row = capture(virt, "enum class UserPagePinAttempt :", declaration=True); actual.append(row)
-    write("platform/mm/virt.hpp", '#pragma once\n#include "fixture-common.hpp"\n'
-          'namespace ker::mod::mm::file_mapping { class FileMappingBinding; }\n'
+    write("platform/mm/virt.hpp", '#pragma once\n#include "fixture-common.hpp"\n#include <dev/device_mapping_object.hpp>\n'
+          + nondevice["nondevice_family"]()
+          + '''namespace ker::mod::mm::file_mapping {
+// No indexed File binding exists in these original frame-only vectors.
+class FileMappingBinding {
+ public:
+ auto lifetime() const -> NonDeviceFamily* {std::abort();}
+ auto start() const -> uint64_t {std::abort();}
+ auto end() const -> uint64_t {std::abort();}
+ auto file_offset() const -> uint64_t {std::abort();}
+};
+}
+'''
+          +
           'namespace ker::mod::sched::task { struct Task; }\n'
           'namespace ker::mod::mm::virt { using PageTable=paging::PageTable; inline constexpr uint64_t PADDR_INVALID=UINT64_MAX;\n'
           + user_pin + '\n' + futex_identity + '\n' + pin_attempt + '\n'
@@ -631,7 +647,7 @@ inline void kern_yield() {fixture::check(false,"ordinary retry unsupported in fr
     write("platform/mm/dyn/kmalloc.hpp", '#pragma once\n')
     write("platform/ktime/ktime.hpp", '#pragma once\n#include "fixture-common.hpp"\n'
           'namespace ker::mod::time { inline uint64_t get_us(){return fixture::now_us;} }\n')
-    for name in ["platform/sys/usercopy.hpp", "util/hashtable.hpp", "abi/callnums/futex.h", "syscalls_impl/futex/futex.hpp"]:
+    for name in ["platform/sys/usercopy.hpp", "dev/device_mapping_object.hpp", "util/hashtable.hpp", "abi/callnums/futex.h", "syscalls_impl/futex/futex.hpp"]:
         data = (KERN / name).read_bytes()
         destination = include / name
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -679,6 +695,7 @@ inline auto ordinary_usercopy_retry_context(sched::task::Task*) -> bool {return 
 }
 '''
     text += 'namespace ker::mod::sys {\nclass SyscallPreparationScope {\n public:\n  explicit SyscallPreparationScope(sched::task::Task&) {}\n  auto ready() const -> bool { return false; }\n};\n}\nnamespace ker::mod::mm::virt {\ninline auto prepare_current_anonymous_user_page(sched::task::Task&,uint64_t,bool,\n const sys::SyscallPreparationScope&) -> int {\n fixture::check(false,"ordinary preparation unsupported in frame/root-only fixtures"); return -EWOULDBLOCK;\n}\n}\nnamespace ker::mod::sys::usercopy {\nauto copy_from_current_task_partial(sched::task::Task&task,uint64_t address,void*dst,size_t size)->CopyResult {\n bool const ok=copy_from_task(task,address,dst,size);return {ok?size:0,!ok};\n}\n}\n'
+    text += empty_owners
     text += '\nnamespace ker::mod::sys::usercopy {\n' + '\n\n'.join(bodies) + '\n}\n'
     text += '#include "actual-futex.cpp"\n' + CASES
     (scratch / "harness.cpp").write_text(text)
@@ -838,9 +855,10 @@ def main() -> int:
         with compiler.open("rb") as executable:
             if executable.read(4) != b"\x7fELF":
                 raise ValueError("--cxx must resolve to one executable Host ELF compiler")
-        watched = [selected, Path(__file__).resolve(), compiler, *[KERN / name for name in
+        watched = [selected, Path(__file__).resolve(), Path(__file__).with_name("nondevice_object_fixture.py"), compiler, *[KERN / name for name in
                    ["platform/sys/usercopy.hpp", "platform/sys/usercopy.cpp", "platform/mm/phys.hpp",
                     "platform/mm/phys.opt.cpp", "platform/mm/virt.hpp", "util/hashtable.hpp",
+                    "dev/device_mapping_object.hpp", "dev/device_mapping_object.cpp",
                     "abi/callnums/futex.h", "syscalls_impl/futex/futex.hpp"]]]
         before = [pin(p) for p in watched]
         result["input_pins"] = before

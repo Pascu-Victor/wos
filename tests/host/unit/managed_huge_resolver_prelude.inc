@@ -266,7 +266,14 @@ void owned_frame_track_fresh_normal_mapping(PageTable* root, uint64_t, uint64_t,
     EXPECT_GE(snapshot.splitting_pages, huge::LEAF_PAGES);
     ++tracked_pages;
 }
+inline bool host_device_overlap = false;
 struct HostBindingIndex {
+    // Finite no-device endpoint for the old managed/anonymous vectors.
+    auto count_device_root_locked(PageTable*, uint64_t, size_t& count) const noexcept -> bool { count = 0; return true; }
+    auto device_overlap_locked(PageTable*, uint64_t, uint64_t, uint64_t, bool& found) const noexcept -> bool {
+        found = host_device_overlap;
+        return true;
+    }
     auto matches_pin_locked(PageTable*, uint64_t, uint64_t, file_mapping::FileMappingBinding* binding) -> bool {
         return binding_matches && binding == nullptr;
     }

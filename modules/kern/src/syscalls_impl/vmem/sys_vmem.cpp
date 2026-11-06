@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <dev/device_mapping_client.hpp>
 #include <limits>
 #include <memory>
 #include <new>
@@ -26,6 +27,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/device_mapping_vm.hpp>
 #include <platform/mm/managed_huge.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/page_alloc.hpp>
@@ -480,6 +482,10 @@ auto push_lazy_vmem_range_copy(LazyVmemRangeVec& ranges, const LazyVmemRange& ra
 // File. Legacy RAW mutation entrances keep their existing behavior.
 void advance_mmap_cursor(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size);
 auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length) -> bool;
+auto device_overlap_locked(ker::mod::sched::task::Task&, uint64_t start, uint64_t length, const SharedVmemPublicationGuard&, bool& found)
+    -> int;
+auto change_device_range_if_needed(ker::mod::sched::task::Task&, uint64_t start, uint64_t length, bool protect, uint64_t protections = 0)
+    -> std::optional<uint64_t>;
 class SharedLazyVmemUpdate {
     using Task = ker::mod::sched::task::Task;
     using Clone = ker::mod::sched::task::LazyVmemClone;
@@ -2804,8 +2810,11 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     }
 
     std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
-    if (route == MutationRoute::Public && (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0) ordinary_preparation.emplace(*task);
-    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, hint, hint + size);
+    if ((route == MutationRoute::Public || task->type == ker::mod::sched::task::TaskType::PROCESS) &&
+        (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0)
+        ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, route == MutationRoute::Public && ordinary_preparation ? &*ordinary_preparation : nullptr, hint,
+                                 hint + size);
     for (unsigned attempt = 0; attempt < PublicRangeMutation::MAX_ATTEMPTS; ++attempt) {
         MutationAttempt const outcome = [&]() -> MutationAttempt {
             // Keep address selection/reservation, PTE installation, shared lazy-range
@@ -2830,6 +2839,10 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
                     return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
                 }
                 if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
+                bool device = false;
+                int const DEVICE_CHECK = device_overlap_locked(*task, hint, size, publication_guard, device);
+                if (DEVICE_CHECK != 0) return static_cast<uint64_t>(DEVICE_CHECK);
+                if (device) return static_cast<uint64_t>(-EOPNOTSUPP);
                 vaddr = hint;
                 MutationAttempt const ADMITTED =
                     mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size, hint, size);
@@ -2973,6 +2986,43 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 // Original internal/nonfixed delegate remains unprepared, including MAP_FIXED hint0.
 auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t {
     return anon_allocate(hint, size, prot, flags, nullptr);
+}
+
+auto device_overlap_locked(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length,
+                           const SharedVmemPublicationGuard& publication, bool& found) -> int {
+    // Device publication is current PROCESS only. Preserve the legacy private
+    // construction path, which cannot acquire a public device binding.
+    if (get_current_task() != &task || task.type != ker::mod::sched::task::TaskType::PROCESS) {
+        found = false;
+        return 0;
+    }
+    if (length == 0 || start > UINT64_MAX - length) return -EINVAL;
+    return ker::mod::mm::device_vm::current_device_overlap(task, start, start + length, publication, found);
+}
+
+auto change_device_range_if_needed(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length, bool protect, uint64_t protections)
+    -> std::optional<uint64_t> {
+    if (get_current_task() != &task || task.type != ker::mod::sched::task::TaskType::PROCESS) return std::nullopt;
+    ker::mod::sys::SyscallPreparationScope preparation(task);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    {
+        SharedVmemPublicationGuard publication;
+        bool found = false;
+        int const CHECK = device_overlap_locked(task, start, length, publication, found);
+        if (CHECK != 0) return static_cast<uint64_t>(CHECK);
+        if (!found) return std::nullopt;
+        if (overlaps_kernel_managed_user_layout_locked(&task, start, length)) return static_cast<uint64_t>(-EINVAL);
+    }
+    ker::mod::mm::device_vm::PreparedChange change;
+    int const PREPARED =
+        change.prepare_current(task, start, start + length,
+                               protect ? ker::mod::mm::device_vm::Change::Protect : ker::mod::mm::device_vm::Change::Remove, protections);
+    if (PREPARED != 0) return static_cast<uint64_t>(PREPARED);
+    SharedVmemPublicationGuard publication;
+    // The prepared plan refuses any changed incarnation or mixed live backing
+    // before effects. AS observation recounts actual committed eager PTEs.
+    ker::mod::sched::resource::AddressSpaceObservation observation(&task);
+    return static_cast<uint64_t>(change.commit_current(task, preparation, publication));
 }
 
 auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length) -> bool {
@@ -3181,17 +3231,23 @@ auto anon_free(uint64_t addr, uint64_t size, PreparedRangeDemotion* prepared = n
 
     if (prepared != nullptr && !prepared->matches(*task, addr, addr + size)) return static_cast<uint64_t>(-EINVAL);
     if (prepared != nullptr && !prepared->ordinary_context()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    if (auto result = change_device_range_if_needed(*task, addr, size, false)) return *result;
     if (public_shared_file_overlap(*task, addr, size)) return change_public_shared_file(*task, addr, size, false);
 
     std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
-    if (route == MutationRoute::Public) ordinary_preparation.emplace(*task);
-    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, addr, addr + size);
+    if (route == MutationRoute::Public || task->type == ker::mod::sched::task::TaskType::PROCESS) ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, route == MutationRoute::Public && ordinary_preparation ? &*ordinary_preparation : nullptr, addr,
+                                 addr + size);
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
         MutationAttempt const outcome = [&]() -> MutationAttempt {
             // Fork must observe either the complete mapping or the complete removal,
             // including file-range and lazy-range metadata.
             SharedVmemPublicationGuard publication_guard;
             if (public_shared_file_overlap(*task, addr, size)) return static_cast<uint64_t>(-EAGAIN);
+            bool device = false;
+            int const DEVICE_CHECK = device_overlap_locked(*task, addr, size, publication_guard, device);
+            if (DEVICE_CHECK != 0) return static_cast<uint64_t>(DEVICE_CHECK);
+            if (device) return static_cast<uint64_t>(-EAGAIN);
             ker::mod::sched::resource::AddressSpaceObservation observation(task);
             if (overlaps_kernel_managed_user_layout_locked(task, addr, size)) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
@@ -3280,6 +3336,7 @@ auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion*
 
     if (prepared != nullptr && !prepared->matches(*task, ADDR, ADDR + size)) return static_cast<uint64_t>(-EINVAL);
     if (prepared != nullptr && !prepared->ordinary_context()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    if (auto result = change_device_range_if_needed(*task, ADDR, size, true, PROT)) return *result;
     if (public_shared_file_overlap(*task, ADDR, size)) return change_public_shared_file(*task, ADDR, size, true, PROT);
 
     numa::AllocationContext placement;
@@ -3291,12 +3348,17 @@ auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion*
     }
 
     std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
-    if (route == MutationRoute::Public) ordinary_preparation.emplace(*task);
-    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, ADDR, ADDR + size);
+    if (route == MutationRoute::Public || task->type == ker::mod::sched::task::TaskType::PROCESS) ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, route == MutationRoute::Public && ordinary_preparation ? &*ordinary_preparation : nullptr, ADDR,
+                                 ADDR + size);
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
         MutationAttempt const outcome = [&]() -> MutationAttempt {
             SharedVmemPublicationGuard publication_guard;
             if (public_shared_file_overlap(*task, ADDR, size)) return static_cast<uint64_t>(-EAGAIN);
+            bool device = false;
+            int const DEVICE_CHECK = device_overlap_locked(*task, ADDR, size, publication_guard, device);
+            if (DEVICE_CHECK != 0) return static_cast<uint64_t>(DEVICE_CHECK);
+            if (device) return static_cast<uint64_t>(-EAGAIN);
             if (overlaps_kernel_managed_user_layout_locked(task, ADDR, size)) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }
@@ -3328,6 +3390,18 @@ auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion*
                     }
                     cursor = NEXT;
                 }
+            }
+
+            // A logical mapping may be nonresident or PROT_NONE, but every
+            // byte requested by mprotect must still belong to a mapping. The
+            // occupied-range helper combines actual PTE reservations and lazy
+            // metadata; its result need not merge adjacent/overlapping spans.
+            uint64_t coverage = ADDR;
+            while (coverage < ADDR + size) {
+                auto const OCCUPIED = first_occupied_range(task, coverage, ADDR + size);
+                if (!OCCUPIED.found || OCCUPIED.start > coverage || OCCUPIED.end <= coverage)
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                coverage = OCCUPIED.end;
             }
 
             if (GEOMETRY.stage == MutationStage::NeedDemotion) return GEOMETRY;
@@ -3382,6 +3456,65 @@ auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion*
 }
 
 // Allocate file-backed memory with one admitted open description.
+auto allocate_device_shared_wb(ker::mod::sched::task::Task& task, ker::vfs::File& file, uint64_t hint, uint64_t length,
+                               uint64_t protections, uint64_t flags, uint64_t fake_offset) -> uint64_t {
+    namespace fm = ker::mod::mm::file_mapping;
+    namespace device_vm = ker::mod::mm::device_vm;
+    ker::mod::sys::SyscallPreparationScope preparation(task);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    if (!file.device_client) return static_cast<uint64_t>(-ENODEV);
+    ker::dev::mapping::PreparedGrant grant;
+    int const LOOKUP = file.device_client.get()->lookup(fake_offset, length, protections, flags, grant);
+    if (LOOKUP != 0) return static_cast<uint64_t>(LOOKUP);
+    bool const FIXED = (flags & ker::abi::vmem::MAP_FIXED) != 0;
+    if (FIXED && (hint < USER_SPACE_START || hint > USER_SPACE_END - length || (hint & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0))
+        return static_cast<uint64_t>(-EINVAL);
+    auto release_family = [](fm::FileMappingLifetime* family) {
+        if (family != nullptr) family->release(fm::FamilyOwner::PREPARED);
+    };
+    int error = 0;
+    std::unique_ptr<fm::FileMappingLifetime, decltype(release_family)> family(
+        fm::FileMappingLifetime::prepare_device_shared_wb(file, grant.object(), grant.object_offset(), grant.length(),
+                                                          grant.max_protections(), error),
+        release_family);
+    if (!family) return static_cast<uint64_t>(error);
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint64_t address = 0;
+        {
+            SharedVmemPublicationGuard publication;
+            address = FIXED ? hint : find_free_range(&task, length, hint);
+            if (address == 0) return static_cast<uint64_t>(-ENOMEM);
+            if (overlaps_kernel_managed_user_layout_locked(&task, address, length)) return static_cast<uint64_t>(-EINVAL);
+            if (!mmap_range_is_free(&task, address, length)) {
+                if (FIXED) return static_cast<uint64_t>(-EOPNOTSUPP);
+                continue;
+            }
+        }
+        device_vm::PreparedMap mapping;
+        int const PREPARED = mapping.prepare(*family, address, grant.object_offset(), length, protections);
+        if (PREPARED != 0) return static_cast<uint64_t>(PREPARED);
+        {
+            SharedVmemPublicationGuard publication;
+            if (!mmap_range_is_free(&task, address, length)) {
+                if (FIXED) return static_cast<uint64_t>(-EOPNOTSUPP);
+                continue;
+            }
+            if (overlaps_kernel_managed_user_layout_locked(&task, address, length)) return static_cast<uint64_t>(-EINVAL);
+            ker::mod::sched::resource::AddressSpaceObservation observation(&task);
+            auto const ADMISSION = observation.try_admit_mapping(task.pagemap, length);
+            if (ADMISSION == ker::mod::sched::resource::MappingAdmission::GateBusy) continue;
+            if (ADMISSION != ker::mod::sched::resource::MappingAdmission::Admitted) return static_cast<uint64_t>(-ENOMEM);
+            int const COMMITTED = mapping.publish_current(task, preparation, publication);
+            if (COMMITTED == -EAGAIN) continue;
+            if (COMMITTED != 0) return static_cast<uint64_t>(COMMITTED);
+            advance_shared_mmap_cursor_locked(&task, address, length);
+            observation.commit_mapping();
+        }
+        return address;
+    }
+    return static_cast<uint64_t>(-EAGAIN);
+}
+
 auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset,
                    const ker::mod::sys::SyscallPreparationScope* preparation, MutationRoute route = MutationRoute::Legacy) -> uint64_t {
     if (task == nullptr || task->pagemap == nullptr) {
@@ -3407,6 +3540,14 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
     if (RETAIN == -EOVERFLOW) return static_cast<uint64_t>(RETAIN);
     std::unique_ptr<ker::vfs::File, decltype(release_file)> retained_file(captured_file, release_file);
     auto* file = retained_file.get();
+    if (file != nullptr && file->device_client) {
+        if (get_current_task() != task || route != MutationRoute::Public) return static_cast<uint64_t>(-EOPNOTSUPP);
+        ordinary_preparation.emplace(*task);
+        if (!ordinary_preparation->ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+        uint64_t const LENGTH = page_align_up(size);
+        if (LENGTH == 0 || LENGTH > USER_SPACE_END - USER_SPACE_START) return static_cast<uint64_t>(-EOVERFLOW);
+        return allocate_device_shared_wb(*task, *file, hint, LENGTH, prot, flags, offset);
+    }
     ker::vfs::Stat st{};
     int const STAT_RET = ker::vfs::vfs_fstat_file(file, &st);
     if (STAT_RET < 0) {
@@ -3466,8 +3607,11 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         if (PREPARED != 0) return static_cast<uint64_t>(PREPARED);
     }
 
-    if (route == MutationRoute::Public && (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0) ordinary_preparation.emplace(*task);
-    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, hint, hint + size);
+    if ((route == MutationRoute::Public || task->type == ker::mod::sched::task::TaskType::PROCESS) &&
+        (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0)
+        ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, route == MutationRoute::Public && ordinary_preparation ? &*ordinary_preparation : nullptr, hint,
+                                 hint + size);
     for (unsigned attempt = 0; attempt < PublicRangeMutation::MAX_ATTEMPTS; ++attempt) {
         MutationAttempt const outcome = [&]() -> MutationAttempt {
             // Keep reservation, page-table construction, lazy/file metadata, and
@@ -3488,6 +3632,10 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
                     return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
                 }
                 if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
+                bool device = false;
+                int const DEVICE_CHECK = device_overlap_locked(*task, hint, size, publication_guard, device);
+                if (DEVICE_CHECK != 0) return static_cast<uint64_t>(DEVICE_CHECK);
+                if (device) return static_cast<uint64_t>(-EOPNOTSUPP);
                 vaddr = hint;
                 MutationAttempt const ADMITTED =
                     mutation.admit_mapping(observation, route == MutationRoute::Public, task->pagemap, size, hint, size);
@@ -5969,6 +6117,15 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
     // This first public profile has no managed relocation/split transaction.
     // Refuse before allocating a destination or acquiring either copy pin.
     if (public_shared_file_overlap(*task, old_addr, OLD_SIZE)) return static_cast<uint64_t>(-EOPNOTSUPP);
+    {
+        ker::mod::sys::SyscallPreparationScope preparation(*task);
+        if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+        SharedVmemPublicationGuard publication;
+        bool device = false;
+        int const CHECK = device_overlap_locked(*task, old_addr, OLD_SIZE, publication, device);
+        if (CHECK != 0) return static_cast<uint64_t>(CHECK);
+        if (device) return static_cast<uint64_t>(-EOPNOTSUPP);
+    }
 
     if (NEW_SIZE == OLD_SIZE) {
         return old_addr;
@@ -6083,7 +6240,13 @@ auto mmap_msync(uint64_t addr, uint64_t size, uint64_t flags) -> uint64_t {
 
     // Keep the collected File identity bound to its pages until snapshots and
     // writes finish, matching munmap and MAP_FIXED's existing serialization.
+    ker::mod::sys::SyscallPreparationScope preparation(*task);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
     SharedVmemPublicationGuard publication_guard;
+    bool device = false;
+    int const CHECK = device_overlap_locked(*task, addr, size, publication_guard, device);
+    if (CHECK != 0) return static_cast<uint64_t>(CHECK);
+    if (device) return static_cast<uint64_t>(-EOPNOTSUPP);
     int const RET = sync_file_mmap_range(*task, addr, size);
     return RET < 0 ? static_cast<uint64_t>(RET) : 0;
 }

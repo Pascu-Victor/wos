@@ -22,6 +22,7 @@ import tempfile
 import time
 
 from file_mmap_registry_runtime_test import command, pin, subreaper
+from nondevice_object_fixture import empty_object_owners
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'modules/kern/src').is_dir())
 KERN = ROOT / 'modules/kern/src'
@@ -716,14 +717,18 @@ def main() -> int:
         watched = sources + [KERN / p for p in ('platform/sched/task.hpp', 'platform/sched/task.cpp',
             'platform/mm/numa_alloc.hpp', 'platform/mm/numa_alloc.cpp', 'platform/mm/numa_policy.hpp', 'platform/mm/paging.hpp',
             'platform/mm/file_mapping_lifetime.cpp', 'platform/mm/file_mapping_lifetime.hpp',
-            'platform/mm/lifetime_retirement_executor.hpp')] + [Path(__file__).resolve(),
-            ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler]
+            'platform/mm/lifetime_retirement_executor.hpp', 'dev/device_mapping_object.hpp',
+            'dev/device_mapping_object.cpp', 'abi/callnums/vmem.h')] + [Path(__file__).resolve(),
+            ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py',
+            ROOT / 'tests/host/unit/nondevice_object_fixture.py', compiler]
         before = [pin(path) for path in watched]
         scratch = Path(tempfile.mkdtemp(prefix='wos-native-lazy-file-', dir='/tmp'))
         include = scratch / 'include'
         include.mkdir()
         (include / 'fixture_common.hpp').write_text(FAMILY_COMMON)
-        (scratch / 'family-seams.cpp').write_text(FAMILY_SEAMS)
+        empty_owners, owner_rows = empty_object_owners(lambda name: KERN / name)
+        result['nondevice_object_definitions'] = owner_rows
+        (scratch / 'family-seams.cpp').write_text(FAMILY_SEAMS + empty_owners)
         for name, text in FAMILY_HEADERS.items():
             path = include / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -732,6 +737,10 @@ def main() -> int:
             target = include / 'platform/mm' / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((KERN / 'platform/mm' / name).read_bytes())
+        for name in ('dev/device_mapping_object.hpp', 'abi/callnums/vmem.h'):
+            target = include / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((KERN / name).read_bytes())
         for control in ('current', 'ordinary-reader', 'accept-all-caps'):
             source, actual = generate(virt=sources[0].read_text(), vmem=sources[2].read_text(),
                                       header=sources[1].read_text(), control=control)

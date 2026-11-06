@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <dev/device_mapping_object.hpp>
 
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
@@ -44,7 +45,9 @@ class UserAccessGuard {
 [[nodiscard]] auto access_window_active() -> bool;
 
 // Owns one allocator frame reference independently of Task/pagemap access
-// leases. A live StableUserPage supplies the checked aligned frame and hint.
+// leases. Device-backed frames additionally retain their counted Object export
+// and charge, with no File/Client/Task/root edge. A live StableUserPage supplies
+// the checked frame, binding association and hint. Reset is IRQ-safe.
 class UserPageFrameRef {
    public:
     UserPageFrameRef() = default;
@@ -61,6 +64,7 @@ class UserPageFrameRef {
     friend class StableUserPage;
     void* m_page{};
     mm::phys::PageLookupHint m_lookup_hint{};
+    ker::dev::mapping::ObjectExportRef m_device_export;
 };
 
 // Holds both the target Task pagemap-access gate and one allocator frame

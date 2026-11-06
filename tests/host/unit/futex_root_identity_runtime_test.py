@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import runpy
 import shutil
 import signal
 import subprocess
@@ -400,6 +401,9 @@ def kernel_path(name: str) -> Path:
 def generate(scratch: Path, selected: Path) -> list[dict]:
     include = scratch / "include"
     actual = []
+    nondevice = runpy.run_path(str(Path(__file__).with_name("nondevice_object_fixture.py")))
+    empty_owners, owner_rows = nondevice["empty_object_owners"](kernel_path)
+    actual.extend(owner_rows)
 
     def write(name, text):
         destination = include / name
@@ -516,6 +520,7 @@ inline void kern_yield() {fixture::check(false,"ordinary retry unsupported in ro
     )
     for name in [
         "platform/sys/usercopy.hpp",
+        "dev/device_mapping_object.hpp",
         "platform/mm/file_mapping_lifetime.hpp",
         "util/hashtable.hpp",
         "abi/callnums/futex.h",
@@ -692,6 +697,7 @@ inline void kern_yield() {fixture::check(false,"ordinary retry unsupported in ro
         + MAP_SEAMS
         + 'namespace ker::mod::sys::usercopy {\n// Existing root/frame vectors expose no ordinary executor context.\ninline auto ordinary_usercopy_retry_context(sched::task::Task*) -> bool {return false;}\n}\n'
         + 'namespace ker::mod::sys {\nclass SyscallPreparationScope {\n public:\n  explicit SyscallPreparationScope(sched::task::Task&) {}\n  auto ready() const -> bool { return false; }\n};\n}\nnamespace ker::mod::mm::virt {\ninline auto prepare_current_anonymous_user_page(sched::task::Task&,uint64_t,bool,\n const sys::SyscallPreparationScope&) -> int {\n fixture::check(false,"ordinary preparation unsupported in frame/root-only fixtures"); return -EWOULDBLOCK;\n}\n}\nnamespace ker::mod::sys::usercopy {\nauto copy_from_current_task_partial(sched::task::Task&task,uint64_t address,void*dst,size_t size)->CopyResult {\n bool const ok=copy_from_task(task,address,dst,size);return {ok?size:0,!ok};\n}\n}\n'
+        + empty_owners
         + "\nnamespace ker::mod::sys::usercopy{\n"
         + user_bodies
         + '\n}\n#include "actual-futex.cpp"\n'
@@ -741,12 +747,15 @@ def main() -> int:
         watched = [
             selected,
             Path(__file__).resolve(),
+            Path(__file__).with_name("nondevice_object_fixture.py"),
             compiler,
             *[
                 kernel_path(name)
                 for name in [
                     "platform/sys/usercopy.hpp",
                     "platform/sys/usercopy.cpp",
+                    "dev/device_mapping_object.hpp",
+                    "dev/device_mapping_object.cpp",
                     "platform/mm/phys.hpp",
                     "platform/mm/phys.opt.cpp",
                     "platform/mm/page_alloc.hpp",

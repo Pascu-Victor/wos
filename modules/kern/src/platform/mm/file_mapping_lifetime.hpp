@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <dev/device_mapping_object.hpp>
 #include <memory>
 
 namespace ker::vfs {
@@ -18,6 +19,9 @@ struct PageTable;
 }
 namespace ker::mod::mm::virt {
 class BindingRootMutationLease;
+}
+namespace ker::mod::mm::device_vm::detail {
+class BindingAccess;
 }
 
 namespace ker::mod::mm::file_mapping {
@@ -92,7 +96,13 @@ struct BindingOwnerCounts {
 };
 
 class FileMappingBinding;
-enum class FileMappingBackingMode : uint8_t { PRIVATE_COPY, TMPFS_READ_SHARED, TMPFS_DEMAND_READ_SHARED, TMPFS_DEMAND_WRITE_SHARED };
+enum class FileMappingBackingMode : uint8_t {
+    PRIVATE_COPY,
+    TMPFS_READ_SHARED,
+    TMPFS_DEMAND_READ_SHARED,
+    TMPFS_DEMAND_WRITE_SHARED,
+    DEVICE_SHARED_WB
+};
 
 // One family owns exactly one File reference, independent of its typed consumers.
 // The explicit readonly TMPFS mode also owns its fixed-EOF canonical backing.
@@ -119,6 +129,12 @@ class FileMappingLifetime {
                                                                int& error) -> FileMappingLifetime*;
     [[nodiscard]] static auto prepare_demand_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length,
                                                           bool write_capable, int& error) -> FileMappingLifetime*;
+    // The caller holds the exact grant obtained from this File's retained
+    // Client. All metadata is prepared outside PUB/MM/IRQ guards. The immutable
+    // window uses Object byte offsets, never the per-open fake mmap offset.
+    [[nodiscard]] static auto prepare_device_shared_wb(ker::vfs::File& borrowed_file, const ker::dev::mapping::ObjectRef& grant_owner,
+                                                       uint64_t window_base, uint64_t window_length, uint64_t max_protections, int& error)
+        -> FileMappingLifetime*;
     // Caller already owns/protects a live owner; a bare pointer cannot resurrect.
     [[nodiscard]] auto try_acquire(FamilyOwner role) noexcept -> bool;
     void release(FamilyOwner role) noexcept;
@@ -130,6 +146,14 @@ class FileMappingLifetime {
     [[nodiscard]] auto observe_return(RetirementCompletion& empty) noexcept -> bool;
     [[nodiscard]] auto file() const noexcept -> ker::vfs::File* { return file_; }
     [[nodiscard]] auto backing_mode() const noexcept -> FileMappingBackingMode { return backing_mode_; }
+    [[nodiscard]] auto is_device_backed() const noexcept -> bool { return backing_mode_ == FileMappingBackingMode::DEVICE_SHARED_WB; }
+    // Borrowed under a real family/binding owner; no Object->File/root backedge.
+    [[nodiscard]] auto device_object() const noexcept -> ker::dev::mapping::Object* { return device_object_.get(); }
+    [[nodiscard]] auto device_object_owner() const noexcept -> const ker::dev::mapping::ObjectRef& { return device_object_; }
+    [[nodiscard]] auto device_generation() const noexcept -> uint64_t { return device_generation_; }
+    [[nodiscard]] auto device_max_protections() const noexcept -> uint64_t { return device_max_protections_; }
+    [[nodiscard]] auto device_window_base() const noexcept -> uint64_t { return device_window_base_; }
+    [[nodiscard]] auto device_window_end() const noexcept -> uint64_t { return device_window_end_; }
     [[nodiscard]] auto is_demand_shared() const noexcept -> bool {
         return backing_mode_ == FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED ||
                backing_mode_ == FileMappingBackingMode::TMPFS_DEMAND_WRITE_SHARED;
@@ -160,11 +184,17 @@ class FileMappingLifetime {
     FileMappingBackingMode backing_mode_{FileMappingBackingMode::PRIVATE_COPY};
     std::unique_ptr<ker::vfs::tmpfs::TmpfsReadSharedBacking> read_shared_backing_{};
     std::unique_ptr<ker::vfs::tmpfs::TmpfsDemandSharedBacking> demand_read_shared_backing_{};
+    ker::dev::mapping::ObjectRef device_object_{};
+    uint64_t device_generation_{};
+    uint64_t device_max_protections_{};
+    uint64_t device_window_base_{};
+    uint64_t device_window_end_{};
 };
 
 class FileMappingIndex;
 class FileMappingTlbRetirement;
 class FileBindingSnapshot;
+class DeviceBindingRegistry;
 
 // Translation retirement only. COMPLETE does not imply pins/installers or
 // destructive binding/family/File callbacks have returned.
@@ -204,6 +234,7 @@ class FileMappingBinding {
    private:
     friend class FileMappingIndex;
     friend class FileMappingTlbRetirement;
+    friend class DeviceBindingRegistry;
     enum class IndexState : uint8_t { PREPARED, INDEXED, DETACHED, COMPLETE };
     static_assert(std::atomic<IndexState>::is_always_lock_free);
     explicit FileMappingBinding(FileMappingLifetime& lifetime) noexcept;
@@ -219,6 +250,8 @@ class FileMappingBinding {
     uint64_t file_offset_{};
     FileMappingBinding* index_next_{};   // Actual user_mapping_pin_lock only.
     FileMappingBinding* retire_next_{};  // Exclusive retirement batch after detach.
+    FileMappingBinding* device_next_{};  // Permanent owner-count lock, no owning ref.
+    bool device_registered_{};
     std::atomic<IndexState> index_state_{IndexState::PREPARED};
 };
 
@@ -241,10 +274,25 @@ class FileBindingSnapshot {
    private:
     friend class FileMappingIndex;
     friend class ker::mod::mm::virt::BindingRootMutationLease;
+    friend class DeviceBindingRegistry;
+    friend class ker::mod::mm::device_vm::detail::BindingAccess;
     FileMappingBinding* binding_{};
     // A live root lease borrows this exact wrapper; moving or dropping it then
     // is a caller bug and traps before an owner can be lost.
     mutable bool borrowed_{};
+};
+
+// Actual reverse membership persists from PREPARED through callback start,
+// independently of root/index detach. The ObjectRef argument keeps the exact
+// object identity live; this API grants no root mutation authority. A zero-owner
+// row awaiting its callback is counted but never resurrected as a snapshot.
+class DeviceBindingRegistry {
+   public:
+    [[nodiscard]] static auto count(const ker::dev::mapping::ObjectRef&, size_t& count) noexcept -> bool;
+    // Slots start empty. Refusal preserves the acquired prefix; reset it only
+    // after this function returns. awaiting_callbacks reports zero-owner rows.
+    [[nodiscard]] static auto snapshot(const ker::dev::mapping::ObjectRef&, FileBindingSnapshot* output, size_t capacity, size_t& acquired,
+                                       size_t& awaiting_callbacks) noexcept -> bool;
 };
 
 // Owns exact INDEX refs transferred as TLB refs, without a new acquisition.
@@ -287,6 +335,9 @@ class FileMappingIndex {
     [[nodiscard]] auto matches_pin_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t address,
                                           const FileMappingBinding* binding) const noexcept -> bool;
     [[nodiscard]] auto count_root_locked(paging::PageTable* root, uint64_t root_incarnation, size_t& count) const noexcept -> bool;
+    [[nodiscard]] auto count_device_root_locked(paging::PageTable* root, uint64_t root_incarnation, size_t& count) const noexcept -> bool;
+    [[nodiscard]] auto device_overlap_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t start, uint64_t end,
+                                             bool& has_device) const noexcept -> bool;
 #ifdef WOS_SELFTEST
     // Same real user_mapping_pin_lock as attach/detach; refusal preserves out.
     [[nodiscard]] auto selftest_count_all_locked(uint64_t& empty_count) const noexcept -> bool;

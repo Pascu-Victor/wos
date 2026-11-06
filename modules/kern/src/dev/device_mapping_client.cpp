@@ -88,6 +88,43 @@ auto Endpoint::create(unsigned major, unsigned minor, std::string_view name, con
 
 Client::Client(EndpointRef endpoint, const ker::mod::security::Snapshot& credentials, ClientAccess access)
     : endpoint_(std::move(endpoint)), credentials_(credentials), access_(access) {}
+Client::~Client() { close_grants(); }
+
+auto Client::configure_grants(size_t capacity) const -> int {
+    std::unique_ptr<GrantTable> prepared;
+    int const result = GrantTable::create(capacity, prepared);
+    if (result != 0) return result;
+    ker::mod::sys::MutexGuard const guard(grant_lock_);
+    if (grants_closed_) return -ENODEV;
+    if (grants_) return -EALREADY;
+    grants_ = std::move(prepared);
+    return 0;
+}
+auto Client::grant_table() const noexcept -> GrantTable* {
+    ker::mod::sys::MutexGuard const guard(grant_lock_);
+    return grants_.get();  // Immutable attachment; caller retains this Client.
+}
+auto Client::grant(const ObjectRef& object, uint64_t offset, uint64_t length, uint64_t maximum, Grant& empty) const -> int {
+    auto* table = grant_table();
+    return table != nullptr ? table->grant(access_, object, offset, length, maximum, empty) : -ENODEV;
+}
+auto Client::lookup(uint64_t offset, uint64_t length, uint64_t protections, uint64_t flags, PreparedGrant& empty) const -> int {
+    auto* table = grant_table();
+    return table != nullptr ? table->lookup(access_, offset, length, protections, flags, empty) : -ENODEV;
+}
+auto Client::remove_grant(Grant grant) const -> int {
+    auto* table = grant_table();
+    return table != nullptr ? table->remove(grant) : -ENODEV;
+}
+void Client::close_grants() const noexcept {
+    GrantTable* table;
+    {
+        ker::mod::sys::MutexGuard const guard(grant_lock_);
+        grants_closed_ = true;
+        table = grants_.get();
+    }
+    if (table != nullptr) table->close();
+}
 
 auto Client::open(const EndpointRef& endpoint, const ker::mod::security::Snapshot& credentials, ClientAccess access, ClientRef& empty)
     -> int {

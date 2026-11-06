@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <object_pages.hpp>
 #include <optional>
 #include <thread>
 #include <type_traits>
@@ -347,6 +348,170 @@ TEST_F(BindingSnapshotTest, PreparedCancellationAndReservationFailuresDoNotClaim
     EXPECT_EQ(world.family->owner_counts().total, 1U);
     EXPECT_EQ(world.file.refcount.load(), 2);
     EXPECT_EQ(fixture::closes, 0U);
+    fixture::fail_reserve_after = -1;
+}
+namespace dm = ker::dev::mapping;
+struct DeviceWorld {
+    static constexpr uint64_t PAGE = 4096, START = 0x600000, SERIAL = 29;
+    ker::vfs::File file;
+    dm::QuotaAccountRef account;
+    dm::ObjectRef object;
+    fm::FileMappingLifetime* family{};
+    fm::FileMappingIndex index;
+    ker::mod::mm::paging::PageTable root{};
+    DeviceWorld() {
+        EXPECT_EQ(dm::QuotaAccount::create({.resident_pages = 16, .objects = 4}, account), 0);
+        EXPECT_EQ(dm::Object::create(account, 8 * PAGE, 3, object), 0);
+        int error = 0;
+        family = fm::FileMappingLifetime::prepare_device_shared_wb(file, object, 2 * PAGE, 4 * PAGE, 3, error);
+        EXPECT_EQ(error, 0);
+    }
+    ~DeviceWorld() {
+        fm::FileMappingTlbRetirement retirement;
+        {
+            fixture::IndexGuard guard;
+            EXPECT_TRUE(index.detach_root_locked(&root, SERIAL, retirement));
+        }
+        retirement.release_after_completed_tlb();
+        if (family != nullptr) family->release(fm::FamilyOwner::PREPARED);
+        object.reset();
+        fixture::drain();
+        EXPECT_EQ(account.get()->usage().resident_pages, 0U);
+        account.reset();
+        fixture::drain();
+        EXPECT_EQ(object_fixture::live_pages(), 0U);
+        ker::vfs::vfs_put_file(&file);
+    }
+    auto prepared(uint64_t start = START, uint64_t offset = 2 * PAGE, uint64_t pages = 1) -> fm::FileMappingBinding* {
+        return fm::FileMappingBinding::prepare(*family, &root, SERIAL, start, start + pages * PAGE, offset);
+    }
+};
+
+TEST_F(BindingSnapshotTest, DeviceFamilyCapturesObjectWindowAndCannotWidenItsRights) {
+    DeviceWorld world;
+    ASSERT_NE(world.family, nullptr);
+    EXPECT_TRUE(world.family->is_device_backed());
+    EXPECT_EQ(world.family->device_object(), world.object.get());
+    EXPECT_EQ(world.family->device_generation(), world.object.get()->generation());
+    EXPECT_EQ(world.family->device_window_base(), 2 * DeviceWorld::PAGE);
+    EXPECT_EQ(world.family->device_window_end(), 6 * DeviceWorld::PAGE);
+    EXPECT_EQ(world.family->device_max_protections(), 3U);
+    EXPECT_EQ(world.family->device_object_owner().role(), dm::ObjectRole::binding);
+    int error = 0;
+    EXPECT_EQ(fm::FileMappingLifetime::prepare_device_shared_wb(world.file, world.object, 0, DeviceWorld::PAGE, 7, error), nullptr);
+    EXPECT_EQ(error, -EINVAL);
+    EXPECT_EQ(
+        fm::FileMappingLifetime::prepare_device_shared_wb(world.file, world.object, 7 * DeviceWorld::PAGE, 2 * DeviceWorld::PAGE, 1, error),
+        nullptr);
+    EXPECT_EQ(world.file.refcount.load(), 2);
+}
+
+TEST_F(BindingSnapshotTest, DeviceBindingRefusesOutOfWindowWithoutChangingPreparedIdentity) {
+    DeviceWorld world;
+    auto* binding = fm::FileMappingBinding::prepare_unbound(*world.family);
+    ASSERT_NE(binding, nullptr);
+    EXPECT_FALSE(binding->configure_unpublished(&world.root, DeviceWorld::SERIAL, DeviceWorld::START,
+                                                DeviceWorld::START + DeviceWorld::PAGE, DeviceWorld::PAGE));
+    EXPECT_EQ(binding->root(), nullptr);
+    EXPECT_FALSE(binding->configure_unpublished(&world.root, DeviceWorld::SERIAL, DeviceWorld::START,
+                                                DeviceWorld::START + 2 * DeviceWorld::PAGE, 5 * DeviceWorld::PAGE));
+    EXPECT_TRUE(binding->configure_unpublished(&world.root, DeviceWorld::SERIAL, DeviceWorld::START, DeviceWorld::START + DeviceWorld::PAGE,
+                                               5 * DeviceWorld::PAGE));
+    binding->release(fm::BindingOwner::PREPARED);
+}
+
+TEST_F(BindingSnapshotTest, DeviceRegistryKeepsPreparedAndZeroOwnerPendingCallbacksDistinct) {
+    DeviceWorld world;
+    auto* binding = world.prepared();
+    ASSERT_NE(binding, nullptr);
+    size_t count = 0, acquired = 0, pending = 0;
+    ASSERT_TRUE(fm::DeviceBindingRegistry::count(world.object, count));
+    EXPECT_EQ(count, 1U);
+    fm::FileBindingSnapshot snapshot;
+    ASSERT_TRUE(fm::DeviceBindingRegistry::snapshot(world.object, &snapshot, 1, acquired, pending));
+    EXPECT_EQ(acquired, 1U);
+    EXPECT_EQ(pending, 0U);
+    EXPECT_EQ(snapshot.retirement_state(), State::PREPARED);
+    binding->release(fm::BindingOwner::PREPARED);
+    EXPECT_FALSE(fixture::run_one());
+    snapshot.reset();
+    acquired = pending = 0;
+    ASSERT_TRUE(fm::DeviceBindingRegistry::snapshot(world.object, &snapshot, 1, acquired, pending));
+    EXPECT_TRUE(snapshot.empty());
+    EXPECT_EQ(acquired, 0U);
+    EXPECT_EQ(pending, 1U);
+    EXPECT_EQ(count, 1U);
+    ASSERT_TRUE(fixture::run_one());
+    ASSERT_TRUE(fm::DeviceBindingRegistry::count(world.object, count));
+    EXPECT_EQ(count, 0U);
+}
+
+TEST_F(BindingSnapshotTest, DeviceRegistrySurvivesIndexDetachAndAckUntilCallback) {
+    DeviceWorld world;
+    auto* prepared = world.prepared();
+    ASSERT_NE(prepared, nullptr);
+    {
+        fixture::IndexGuard guard;
+        ASSERT_TRUE(world.index.attach_locked(prepared, DeviceWorld::SERIAL));
+        bool found = false;
+        EXPECT_TRUE(world.index.device_overlap_locked(&world.root, DeviceWorld::SERIAL, DeviceWorld::START,
+                                                      DeviceWorld::START + DeviceWorld::PAGE, found));
+        EXPECT_TRUE(found);
+        EXPECT_FALSE(world.index.device_overlap_locked(&world.root, DeviceWorld::SERIAL + 1, DeviceWorld::START,
+                                                       DeviceWorld::START + DeviceWorld::PAGE, found));
+        EXPECT_TRUE(found);  // Refusal preserves output.
+    }
+    fm::FileBindingSnapshot snapshot;
+    size_t acquired = 0, pending = 0;
+    ASSERT_TRUE(fm::DeviceBindingRegistry::snapshot(world.object, &snapshot, 1, acquired, pending));
+    fm::FileMappingTlbRetirement retirement;
+    {
+        fixture::IndexGuard guard;
+        ASSERT_TRUE(world.index.detach_root_locked(&world.root, DeviceWorld::SERIAL, retirement));
+    }
+    EXPECT_EQ(snapshot.retirement_state(), State::TLB_PENDING);
+    retirement.release_after_completed_tlb();
+    EXPECT_EQ(snapshot.retirement_state(), State::TLB_COMPLETE);
+    size_t count = 0;
+    EXPECT_TRUE(fm::DeviceBindingRegistry::count(world.object, count));
+    EXPECT_EQ(count, 1U);
+    snapshot.reset();
+    ASSERT_TRUE(fixture::run_one());
+    EXPECT_TRUE(fm::DeviceBindingRegistry::count(world.object, count));
+    EXPECT_EQ(count, 0U);
+}
+
+TEST_F(BindingSnapshotTest, DeviceSnapshotRefusalPreservesItsExactAcquiredPrefix) {
+    DeviceWorld world;
+    auto* first = world.prepared();
+    auto* second = world.prepared(DeviceWorld::START + DeviceWorld::PAGE, 3 * DeviceWorld::PAGE);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    fm::FileBindingSnapshot snapshot;
+    size_t acquired = 0, pending = 0;
+    EXPECT_FALSE(fm::DeviceBindingRegistry::snapshot(world.object, &snapshot, 1, acquired, pending));
+    EXPECT_EQ(acquired, 1U);
+    EXPECT_EQ(snapshot.binding_, second);
+    EXPECT_EQ(first->owner_counts().count(fm::BindingOwner::SNAPSHOT), 0U);
+    EXPECT_EQ(second->owner_counts().count(fm::BindingOwner::SNAPSHOT), 1U);
+    first->release(fm::BindingOwner::PREPARED);
+    second->release(fm::BindingOwner::PREPARED);
+    snapshot.reset();
+}
+
+TEST_F(BindingSnapshotTest, DeviceFactoryAndBindingReservationFailureRestoreAllOwners) {
+    DeviceWorld world;
+    auto const BEFORE = world.object.get()->owners();
+    fixture::fail_reserve_after = 0;
+    int error = 0;
+    EXPECT_EQ(fm::FileMappingLifetime::prepare_device_shared_wb(world.file, world.object, 0, DeviceWorld::PAGE, 1, error), nullptr);
+    EXPECT_EQ(error, -ENOMEM);
+    EXPECT_EQ(world.file.refcount.load(), 2);
+    EXPECT_EQ(world.object.get()->owners().total, BEFORE.total);
+    EXPECT_EQ(fm::FileMappingBinding::prepare_unbound(*world.family), nullptr);
+    size_t count = 99;
+    EXPECT_TRUE(fm::DeviceBindingRegistry::count(world.object, count));
+    EXPECT_EQ(count, 0U);
     fixture::fail_reserve_after = -1;
 }
 }  // namespace

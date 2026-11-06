@@ -1,3 +1,5 @@
+#include <abi/callnums/vmem.h>
+
 #include <cerrno>
 #include <climits>
 #include <new>
@@ -21,6 +23,9 @@ namespace {
 // Permanent storage: a callback may delete its object after submit_ready, even
 // before the last releaser unlocks. No retiring object owns this lock/guard.
 constinit sys::Spinlock owner_count_lock{};
+// Separate from the root index and TLB batches. No reference is held by this
+// list; zero-owner rows remain here until their reserved callback runs.
+constinit FileMappingBinding* device_binding_head{};
 
 class OwnerCountGuard {
    public:
@@ -201,6 +206,38 @@ auto FileMappingLifetime::prepare_demand_shared_tmpfs(ker::vfs::File& borrowed_f
     return owner;
 }
 
+auto FileMappingLifetime::prepare_device_shared_wb(ker::vfs::File& borrowed_file, const ker::dev::mapping::ObjectRef& grant_owner,
+                                                   uint64_t window_base, uint64_t window_length, uint64_t max_protections, int& error)
+    -> FileMappingLifetime* {
+    constexpr uint64_t PAGE_MASK = paging::PAGE_SIZE - 1;
+    constexpr uint64_t ALLOWED = ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE;
+    auto* const OBJECT = grant_owner.get();
+    error = -EINVAL;
+    if (OBJECT == nullptr || window_length == 0 || ((window_base | window_length) & PAGE_MASK) != 0 || window_base > OBJECT->bytes() ||
+        window_length > OBJECT->bytes() - window_base || (max_protections & ~ALLOWED) != 0 ||
+        (max_protections & ~OBJECT->max_protections()) != 0)
+        return nullptr;
+    ker::dev::mapping::ObjectRef object;
+    if (!grant_owner.clone_into(object, ker::dev::mapping::ObjectRole::binding)) {
+        error = -EAGAIN;
+        return nullptr;
+    }
+    auto* const FAMILY = prepare(borrowed_file);
+    if (FAMILY == nullptr) {
+        error = -ENOMEM;
+        return nullptr;
+    }
+    // Sole unpublished PREPARED owner. No failure or backend call follows.
+    FAMILY->device_generation_ = OBJECT->generation();
+    FAMILY->device_max_protections_ = max_protections;
+    FAMILY->device_window_base_ = window_base;
+    FAMILY->device_window_end_ = window_base + window_length;
+    FAMILY->device_object_ = std::move(object);
+    FAMILY->backing_mode_ = FileMappingBackingMode::DEVICE_SHARED_WB;
+    error = 0;
+    return FAMILY;
+}
+
 auto FileMappingLifetime::try_acquire(FamilyOwner role) noexcept -> bool {
     OwnerCountGuard const GUARD;
     return acquire_owner(owners_, role);
@@ -253,6 +290,7 @@ auto FileMappingLifetime::finish(void* argument) noexcept -> int {
     // and finally mount busy ownership before the executor publishes RETURNED.
     owner->read_shared_backing_.reset();
     owner->demand_read_shared_backing_.reset();
+    owner->device_object_.reset();
     delete owner;
 #ifdef WOS_SELFTEST
     lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::FAMILY);
@@ -288,6 +326,12 @@ auto FileMappingBinding::prepare_unbound(FileMappingLifetime& lifetime) -> FileM
         lifetime.release(FamilyOwner::BINDING);
         return nullptr;
     }
+    if (lifetime.is_device_backed()) {
+        OwnerCountGuard const GUARD;
+        binding->device_next_ = device_binding_head;
+        binding->device_registered_ = true;
+        device_binding_head = binding;
+    }
     return binding;
 }
 
@@ -297,6 +341,9 @@ auto FileMappingBinding::configure_unpublished(paging::PageTable* root, uint64_t
     if (root == nullptr || root_incarnation == 0 || start >= end || end > sys::usercopy::USER_ADDR_LIMIT || (start & PAGE_MASK) != 0 ||
         (end & PAGE_MASK) != 0 || (file_offset & PAGE_MASK) != 0 || file_offset > INT64_MAX ||
         end - start - 1 > static_cast<uint64_t>(INT64_MAX) - file_offset)
+        return false;
+    if (lifetime_->is_device_backed() && (file_offset < lifetime_->device_window_base() || file_offset > lifetime_->device_window_end() ||
+                                          end - start > lifetime_->device_window_end() - file_offset))
         return false;
     OwnerCountGuard const GUARD;
     if (root_ != nullptr || index_state_ != IndexState::PREPARED || owners_.total != 1 || owners_.count(BindingOwner::PREPARED) != 1)
@@ -377,6 +424,16 @@ auto FileMappingBinding::finish(void* argument) noexcept -> int {
             (STATE != IndexState::PREPARED && STATE != IndexState::COMPLETE) || binding->index_next_ != nullptr ||
             binding->retire_next_ != nullptr)
             __builtin_trap();
+        if (binding->device_registered_) {
+            auto** link = &device_binding_head;
+            while (*link != nullptr && *link != binding) link = &(*link)->device_next_;
+            if (*link != binding || !binding->lifetime_->is_device_backed()) __builtin_trap();
+            *link = binding->device_next_;
+            binding->device_next_ = nullptr;
+            binding->device_registered_ = false;
+        } else if (binding->device_next_ != nullptr || binding->lifetime_->is_device_backed()) {
+            __builtin_trap();
+        }
         lifetime = std::exchange(binding->lifetime_, nullptr);
         if (lifetime == nullptr) __builtin_trap();
     }
@@ -411,6 +468,41 @@ void FileBindingSnapshot::reset() noexcept {
     if (borrowed_) __builtin_trap();
     auto* const BINDING = std::exchange(binding_, nullptr);
     if (BINDING != nullptr) BINDING->release(BindingOwner::SNAPSHOT);
+}
+
+auto DeviceBindingRegistry::count(const ker::dev::mapping::ObjectRef& object, size_t& count) noexcept -> bool {
+    if (!object) return false;
+    OwnerCountGuard const GUARD;
+    size_t found = 0;
+    for (auto* row = device_binding_head; row != nullptr; row = row->device_next_) {
+        if (row->lifetime_->device_object() != object.get()) continue;
+        if (found == SIZE_MAX) return false;
+        ++found;
+    }
+    count = found;
+    return true;
+}
+
+auto DeviceBindingRegistry::snapshot(const ker::dev::mapping::ObjectRef& object, FileBindingSnapshot* output, size_t capacity,
+                                     size_t& acquired, size_t& awaiting_callbacks) noexcept -> bool {
+    if (!object || acquired != 0 || awaiting_callbacks != 0 || (output == nullptr && capacity != 0)) return false;
+    for (size_t i = 0; i < capacity; ++i) {
+        if (!output[i].empty() || output[i].borrowed_) return false;
+    }
+    OwnerCountGuard const GUARD;
+    for (auto* row = device_binding_head; row != nullptr; row = row->device_next_) {
+        if (row->lifetime_->device_object() != object.get()) continue;
+        // The callback owns storage after total reaches zero. Its reservation
+        // is real but is not permission to resurrect a SNAPSHOT reference.
+        if (row->owners_.total == 0) {
+            if (awaiting_callbacks == SIZE_MAX) return false;
+            ++awaiting_callbacks;
+            continue;
+        }
+        if (acquired == capacity || !acquire_owner(row->owners_, BindingOwner::SNAPSHOT)) return false;
+        output[acquired++].binding_ = row;
+    }
+    return true;
 }
 
 FileMappingTlbRetirement::~FileMappingTlbRetirement() {
@@ -570,6 +662,32 @@ auto FileMappingIndex::count_root_locked(paging::PageTable* root, uint64_t root_
         ++found;
     }
     count = found;
+    return true;
+}
+
+auto FileMappingIndex::count_device_root_locked(paging::PageTable* root, uint64_t root_incarnation, size_t& count) const noexcept -> bool {
+    if (root == nullptr || root_incarnation == 0 || !root_matches_locked(root, root_incarnation)) return false;
+    size_t found = 0;
+    for (auto* row = heads_[bucket(root)]; row != nullptr; row = row->index_next_) {
+        if (row->root_ != root || !row->lifetime_->is_device_backed()) continue;
+        if (found == SIZE_MAX) return false;
+        ++found;
+    }
+    count = found;
+    return true;
+}
+
+auto FileMappingIndex::device_overlap_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t start, uint64_t end,
+                                             bool& has_device) const noexcept -> bool {
+    constexpr uint64_t PAGE_MASK = paging::PAGE_SIZE - 1;
+    if (root == nullptr || root_incarnation == 0 || start >= end || end > sys::usercopy::USER_ADDR_LIMIT ||
+        ((start | end) & PAGE_MASK) != 0 || !root_matches_locked(root, root_incarnation))
+        return false;
+    bool found = false;
+    for (auto* row = heads_[bucket(root)]; row != nullptr; row = row->index_next_) {
+        if (row->root_ == root && row->start_ < end && start < row->end_ && row->lifetime_->is_device_backed()) found = true;
+    }
+    has_device = found;
     return true;
 }
 

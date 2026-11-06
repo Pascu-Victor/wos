@@ -171,11 +171,13 @@ TEST(PublicForkError, CompletePhaseStatusTable) {
     Row const rows[] = {{FailurePoint::Context, pass},
                         {FailurePoint::LazyPrepare, pass},
                         {FailurePoint::TmpfsPrepare, pass},
+                        {FailurePoint::DevicePrepare, pass},
                         {FailurePoint::LegacyPrepare, legacy},
                         {FailurePoint::SwapPrepare, swap},
                         {FailurePoint::ShmPrepare, boolean},
                         {FailurePoint::GeometryPrepare, geometry},
                         {FailurePoint::FinalLazyTmpfsMatch, fresh},
+                        {FailurePoint::DeviceMatch, fresh},
                         {FailurePoint::LegacyMatch, fresh},
                         {FailurePoint::ShmMatch, boolean},
                         {FailurePoint::LazyConsume, boolean},
@@ -185,7 +187,7 @@ TEST(PublicForkError, CompletePhaseStatusTable) {
                         {FailurePoint::LegacyCommit, boolean},
                         {FailurePoint::Complete, invalid},
                         {FailurePoint::SourceAdmission, boolean},
-                        {static_cast<FailurePoint>(17), invalid},
+                        {static_cast<FailurePoint>(19), invalid},
                         {static_cast<FailurePoint>(255), invalid}};
     for (auto const& row : rows)
         for (size_t i = 0; i < std::size(statuses); ++i)

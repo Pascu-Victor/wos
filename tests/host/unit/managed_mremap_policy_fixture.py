@@ -95,8 +95,7 @@ class Builder:
         text = self.replace(text, "namespace ker::mod::sched::task {\nstruct LazyVmemRange;",
                             "namespace ker::syscall::vmem { class PendingMremapPsPolicy; }\nnamespace ker::mod::sched::task {\nstruct LazyVmemRange;")
         text = self.replace(text, " mm::paging::PageTable* pagemap{};", """ mm::paging::PageTable* pagemap{};
- uint64_t pid{7}; bool is_thread{}; void* thread{};
- std::atomic<bool> scheduler_published{false}, exec_preparation_teardown_in_progress{false};
+ std::atomic<bool> exec_preparation_teardown_in_progress{false};
  std::atomic<void*> native_file_mapping_retirement{nullptr};
  ker::syscall::vmem::PendingMremapPsPolicy* pending_mremap_ps_policies{};""")
         task.write_text(text)
@@ -135,7 +134,7 @@ auto pin_task_user_page(ker::mod::sched::task::Task&,uint64_t,bool,bool,StableUs
 }
 }
 namespace ker::syscall::vmem {
-using ker::mod::sched::get_current_task;
+// The maintained actual PUB context already provides its current-task wrapper.
 auto page_align_up(uint64_t value) -> uint64_t {return (value+4095)&~uint64_t{4095};}
 auto public_shared_file_overlap(ker::mod::sched::task::Task&,uint64_t,uint64_t) -> bool {return host_policy::overlap;}
 auto anon_free(uint64_t,uint64_t) -> uint64_t {host_policy::ordinary();++host_policy::frees;return static_cast<uint64_t>(host_policy::free_error);}
@@ -160,8 +159,8 @@ auto claim_pending_exec_handoff(ker::mod::sched::task::Task&) -> void* {++host_p
         # This finite root-identity route is separate from every fork hook.
         # Disabled defaults preserve even the inherited null-root predicates.
         text = self.replace(text,
-            "if (fork_mode && root == fork_child) return &host_child_control;",
-            "if (host_policy::independent_root != nullptr && root == host_policy::independent_root) return &host_child_control;\n    if (fork_mode && root == fork_child) return &host_child_control;")
+            "if (fork_mode && root == fork_child) return host_child_control_missing ? nullptr : &host_child_control;",
+            "if (host_policy::independent_root != nullptr && root == host_policy::independent_root) return &host_child_control;\n    if (fork_mode && root == fork_child) return host_child_control_missing ? nullptr : &host_child_control;")
         text = self.replace(text,
             "if ((root != runtime_root && !(fork_mode && root == fork_child)) || host_range::reader_busy || host_range::exclusive) return false;",
             "if ((root != runtime_root && !(fork_mode && root == fork_child) && !(host_policy::independent_root != nullptr && root == host_policy::independent_root)) || host_range::reader_busy || host_range::exclusive) return false;")
@@ -191,11 +190,19 @@ auto claim_pending_exec_handoff(ker::mod::sched::task::Task&) -> void* {++host_p
         hooks += "}\n"
         return (prefix + text + ports + "\nnamespace ker::mod::mm::virt {\n" + self.mapper + "\n" + self.raw
                 + "\n}\nnamespace ker::mod::mm::huge::detail {\n" + self.mm + "\n" + self.batch_adapter
-                + "\n}\nnamespace ker::syscall::vmem {\n" + self.constants + "\n" + self.align + "\n" + self.token + "\n" + self.remap
+                + "\n}\nnamespace ker::syscall::vmem {\n" + '''
+// These original anonymous vectors have no device provider. The final actual
+// validator separately samples host_device_overlap under its installed policy.
+auto device_overlap_locked(ker::mod::sched::task::Task&,uint64_t,uint64_t,const SharedVmemPublicationGuard&,bool& found)->int {
+ found=false; return 0;
+}
+''' + self.constants + "\n" + self.align + "\n" + self.token + "\n" + self.remap
                 + "\n}\nnamespace ker::syscall::process {\n" + self.exec_prefix + "\n" + self.pending_prefix + "\n}\n"
                 + hooks + self.case_path.read_text())
 
     def controls(self, text):
+        yield ("mremap-validator-ignores-device", self.replace(text, "!has_device", "true"),
+               "ManagedMremapPolicy.FinalValidatorRejectsIncompleteStaleAndChangedSerial")
         bad = self.replace(text, "control->ps_admission_suspensions == 0 &&", "true &&")
         bad = self.replace(bad, "if (control != nullptr && control->ps_admission_suspensions != 0) return huge::Error::Again;", "/* omitted actual batch suspension guard */")
         yield ("mremap-publishers-ignore-count", bad, "ManagedMremapPolicy.PreparedSingleAndBatchPublishersRefuseBeforeTransfer")

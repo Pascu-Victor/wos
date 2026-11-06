@@ -135,11 +135,10 @@ captures permanently invalidate readiness without replacing observations. This
 does not qualify MTRRs, cache aliases or physical resources and grants no new WC
 mapping authority. WOS does not write PAT or MTRRs in this path.
 
-Until retained device mapping providers exist, file-backed mmap rejects
-nonregular Files with ENODEV after open/mount authorization and before allocation,
-reads, lazy publication or MAP_FIXED replacement. Device files cannot silently
-become copied or zero-filled anonymous pages. Regular-file mappings continue
-through their existing retained File and fault paths.
+Files without an admitted retained device provider still reject nonregular mmap
+with ENODEV after open/mount authorization and before allocation, reads, lazy
+publication or MAP_FIXED replacement. Device files cannot silently become copied
+or zero-filled anonymous pages. Regular-file mappings retain their existing paths.
 
 ## Retained endpoint and mapping ownership
 
@@ -173,9 +172,60 @@ Owned retirement observations distinguish INDEXED, TLB_PENDING and TLB_COMPLETE.
 Only the existing post-invalidation batch return publishes COMPLETE. This does
 not prove pins/installers ended, destructive File callbacks returned, or a device
 stopped DMA. Existing shootdown waits are not made bounded by try-only root
-admission. These internal owners prepare the device mapping transaction; user
-device mmap still refuses until partial unmap, fork, protection and actual
-multi-root revocation are implemented together.
+admission.
+
+## Coherent system-page mapping providers
+
+`dev/device_mapping_object` owns zeroed ordinary PMM pages and a separately
+retained quota account. Admission requires complete CPU PAT observations with
+selector zero encoding WB. This does not establish MTRR or aperture authority.
+Resident charges cover objects even when unmapped; address-space aliases remain
+subject to each process's AS limit. The diagnostic PMM tag USER_SHARED_MEMORY
+does not replace either quota. Configurable object limits default to 1 GiB;
+checked allocation and actual permanent retirement-ticket capacity can refuse.
+
+A provider configures a per-open Client grant table (default/maximum 256 entries).
+Grants identify complete globally nonreused page-aligned offset intervals, each
+followed by a guard page. Lookup uses only that retained File's Client, supports
+base-plus-page-delta, and intersects the object, grant and captured open/mount
+rights. Removal closes future lookup; a prepared operation also rechecks object
+state and generation at publication. No physical address is accepted as a user
+handle. Grant creation is a kernel-provider API; generic non-PTY ioctl requests
+still do not pass unchecked user pointers to a driver.
+
+The initial mapping class is eager shared ordinary WB system pages, NX, with
+READ, WRITE or NONE protections. PROT_NONE retains its owned supervisor PTE and
+binding. Private, executable, aperture, doorbell and UC/WC mappings are not
+admitted. Occupied MAP_FIXED replacement, mixed device/other-backing changes,
+device mremap and device msync refuse before effects. Partial device-only unmap
+and protection changes prepare replacement bindings before withdrawal. Holes are
+permitted for unmap and return ENOMEM for protection. Ordinary mutation routes
+recheck device coverage under their final publication guard.
+
+Preparation allocates loans, bindings and table spares before publication.
+Commit retains actual root authority across complete validation, bounded IRQ
+slices and the real TLB barrier. A typed fork attaches child bindings after its
+genuine empty-child proof and before copying shared leaves. Raw copiers refuse
+device sources. The existing counted remap suspension also excludes new device
+publication while generic relocation copies its source.
+
+Each family owns the exact File, Object generation and immutable object-relative
+window/protection ceiling. Objects own no File, Client, Task or root. Reverse
+binding membership is nonowning and persists from preparation through callback
+start, including detached translations; zero-owner callback rows cannot be
+resurrected. Independent user-frame exports, including queued futex frames,
+retain an IRQ-safe counted Object export without retaining a binding or Task.
+Their PMM reference returns before the export token. Final Object/account puts
+submit pre-reserved actual callbacks; backing and charges return before the
+executor publishes callback completion.
+
+`device_vm::revoke_cpu_mappings` permanently closes admission, captures actual
+bindings and withdraws each through its exact typed root lease. EAGAIN preserves
+closed storage for retry while roots, prepared operations, TLB retirement,
+callbacks, pins or exports remain. A recycled/missing root is not an ACK. Final
+Object counts decide drain after snapshots are dropped. This is CPU mapping
+revocation; it is not DMA, interrupt, bounded hardware reset or storage-reuse
+qualification.
 
 ## Remaining platform work
 
@@ -191,8 +241,8 @@ not-DRIVER_OK device state before handler publication. Large apertures still map
 in proportion to their 4 KiB page count; bounded/on-demand mapping remains open.
 
 The fixed 64-device capacity is shared by PCI, ECAM and IOMMU ownership metadata;
-changing only enumeration is unsafe. Vendor firmware catalogs and device-backed
-mmap, WC architecture policy, charged revocable user-page pins, GPU-scale SG,
+changing only enumeration is unsafe. Vendor firmware catalogs, aperture/doorbell
+mappings, WC architecture policy, charged revocable user-page pins, GPU-scale SG,
 AMD-Vi and interrupt remapping also remain open. Existing Intel DMA strict mode
 does not provide MSI isolation. Reuse the current MM binding/root/TLB lifetime
 contracts when adding device mappings.

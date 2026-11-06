@@ -15,6 +15,9 @@ struct ForkCopyRefusalWitness;
 namespace ker::mod::sys {
 class SyscallPreparationScope;
 }
+namespace ker::mod::mm::device_vm {
+class PreparedFork;
+}
 namespace ker::syscall::vmem {
 class SharedVmemPublicationGuard;
 class SharedVmemPublicationTryGuard;
@@ -294,7 +297,7 @@ void release_mremap_ps_policy(RootKey& owned) noexcept;
     const ker::syscall::vmem::SharedVmemPublicationGuard&, const RangeSplitSurvey&, PreparedTables&, numa::AllocationContext*,
     numa::AllocationResult*, virt::PreparedAnonymousSwapFork* = nullptr, virt::ForkCopyRefusalWitness* refusal = nullptr,
     sched::task::Task* private_child = nullptr, virt::ForkPrivateChildRoot* authority = nullptr,
-    virt::ForkSourceOwner* source_owner = nullptr) noexcept -> int;
+    virt::ForkSourceOwner* source_owner = nullptr, device_vm::PreparedFork* device_fork = nullptr) noexcept -> int;
 // At most16 cursor steps/48 raw hierarchy loads; owns COW->pin only internally.
 [[nodiscard]] auto survey_range_chunk(paging::PageTable*, RangeSplitCursor&, RangeSurveyMode, SplitPlanStorage*,
                                       RangePrepareSite* failure_site = nullptr) noexcept -> Error;

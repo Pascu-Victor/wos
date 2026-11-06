@@ -95,6 +95,7 @@ namespace ker::mod::mm::phys {
 @CAN_WAIT_IMPL@
 @CAN_WAIT@
 }
+namespace ker::mod::mm::device_vm::detail { struct VmAccess; }
 namespace ker::mod::mm::virt {
 using PageTable = paging::PageTable;
 @LEASE_ENUM@

@@ -1,5 +1,6 @@
 #include "virt.hpp"
 
+#include <platform/mm/device_mapping_vm.hpp>
 #include <platform/mm/managed_huge.hpp>
 
 #ifdef WOS_SELFTEST
@@ -12651,8 +12652,24 @@ auto valid_fork_placement(PageTable* src, PageTable* dst, const numa::Allocation
 auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_copy, numa::AllocationContext* placement,
                                      numa::AllocationResult* output, uint64_t fail_before_private_page,
                                      const UserPagemapExclusiveScope& exclusive, bool require_4k,
-                                     PreparedAnonymousSwapFork* prepared_swap = nullptr, int* prepared_error = nullptr) -> bool {
+                                     PreparedAnonymousSwapFork* prepared_swap = nullptr, int* prepared_error = nullptr,
+                                     bool device_bindings_prepared = false) -> bool {
     if (!exclusive.owns(src)) return false;
+    {
+        uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+        auto const* control = find_user_root_control_locked(src);
+        size_t devices = 0;
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(&devices, sizeof(devices));
+#endif
+        bool const VALID = control != nullptr && file_mapping_index.count_device_root_locked(src, control->serial, devices) &&
+                           (devices == 0 || device_bindings_prepared);
+        user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+        if (!VALID) {
+            if (prepared_error != nullptr) *prepared_error = -EOPNOTSUPP;
+            return false;
+        }
+    }
 
     constexpr size_t USER_PML4_ENTRIES = 256;
     bool const EAGER_COPY_WRITABLE_PRIVATE = eager_copy;
@@ -12953,7 +12970,8 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
                                          PreparedTables& tables, numa::AllocationContext* eager_context,
                                          numa::AllocationResult* empty_result, virt::PreparedAnonymousSwapFork* prepared_swap,
                                          virt::ForkCopyRefusalWitness* refusal, sched::task::Task* private_child,
-                                         virt::ForkPrivateChildRoot* authority, virt::ForkSourceOwner* source_owner) noexcept -> int {
+                                         virt::ForkPrivateChildRoot* authority, virt::ForkSourceOwner* source_owner,
+                                         device_vm::PreparedFork* device_fork) noexcept -> int {
     if (refusal != nullptr) *refusal = {};
     constexpr uint64_t USER_END = uint64_t{1} << 47;
     using Site = virt::ForkCopyRefusalSite;
@@ -13026,6 +13044,11 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
                 return refuse(Site::SplitCommit, -EAGAIN, static_cast<uint32_t>(SPLIT));
         }
     }
+    if (device_fork != nullptr && !device_fork->empty()) {
+        if (private_child == nullptr) return refuse(Site::SourceAuthority, -EOPNOTSUPP);
+        int const ATTACHED = device_fork->attach_before_copy(actor, *private_child, child, publication);
+        if (ATTACHED != 0) return refuse(Site::SourceAuthority, ATTACHED);
+    }
     // Actual split publication, table transfer, ACK, trackers and cap credits
     // have completed. Preserve C47's one-nodeLOCAL legacy walk choice without
     // calling the compatibility wrapper that would reacquire its exclusive.
@@ -13039,8 +13062,9 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
     int prepared_error = 0;
     {
         sched::PreemptGuard const COW_PREEMPT;
-        copied = virt::deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope,
-                                                       true, prepared_swap, &prepared_error);
+        copied =
+            virt::deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope, true,
+                                                  prepared_swap, &prepared_error, device_fork != nullptr && !device_fork->empty());
     }
     if (!copied) {
         // An old compatible failure may have changed a parent COW prefix.
@@ -13276,11 +13300,18 @@ auto validate_mremap_ps_free(sched::task::Task& subject, const sys::SyscallPrepa
     uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
     uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
     auto const* control = virt::find_user_root_control_locked(access.root);
-    Error const error = control != nullptr && control->serial == owned.incarnation && control->ps_admission_suspensions != 0 &&
-                                control->ps_geometry_epoch != 0 && control->ps_geometry_epoch != UINT64_MAX &&
-                                control->ps_geometry_epoch == cursor.stamp.epoch
-                            ? Error::None
-                            : Error::Again;
+    bool has_device = false;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&has_device, sizeof(has_device));
+#endif
+    Error const error =
+        control != nullptr && control->serial == owned.incarnation && control->ps_admission_suspensions != 0 &&
+                control->ps_geometry_epoch != 0 && control->ps_geometry_epoch != UINT64_MAX &&
+                control->ps_geometry_epoch == cursor.stamp.epoch &&
+                virt::file_mapping_index.device_overlap_locked(access.root, owned.incarnation, cursor.start, cursor.end, has_device) &&
+                !has_device
+            ? Error::None
+            : Error::Again;
     virt::user_mapping_pin_lock.unlock_irqrestore(pin);
     virt::cow_pte_lock.unlock_irqrestore(cow);
     return error;
@@ -13617,3 +13648,538 @@ void interpret_activity(const MmDebtSnapshot& a, const MmDebtSnapshot& b, const 
 }
 }  // namespace ker::test::numa_lifecycle::mm_debt
 #endif
+
+// Device mappings use ordinary WB PMM frames, but their exact binding/object
+// authority is independent of lazy-file machinery. All privileged operations
+// stay in this TU beside the actual gate, root controls, PTE lock and index.
+namespace ker::mod::mm::virt {
+namespace {
+constexpr uint64_t DEVICE_VM_PAGE = paging::PAGE_SIZE;
+constexpr size_t DEVICE_VM_CHUNK = 64;
+
+// This TU is excluded from ASan. An inline default constructor may still bind
+// to an instrumented COMDAT, so expose exactly this owned storage BEFORE birth.
+class DeviceObjectGuardStorage {
+   public:
+    DeviceObjectGuardStorage() noexcept {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(storage_, sizeof(storage_));
+#endif
+        value_ = ::new (static_cast<void*>(storage_)) ker::dev::mapping::ObjectCommitGuard{};
+    }
+    ~DeviceObjectGuardStorage() { value_->~ObjectCommitGuard(); }
+    DeviceObjectGuardStorage(const DeviceObjectGuardStorage&) = delete;
+    auto operator=(const DeviceObjectGuardStorage&) -> DeviceObjectGuardStorage& = delete;
+    [[nodiscard]] auto get() noexcept -> ker::dev::mapping::ObjectCommitGuard& { return *value_; }
+
+   private:
+    alignas(ker::dev::mapping::ObjectCommitGuard) uint8_t storage_[sizeof(ker::dev::mapping::ObjectCommitGuard)];
+    ker::dev::mapping::ObjectCommitGuard* value_{};
+};
+
+class DeviceCurrentAccess {
+   public:
+    DeviceCurrentAccess(sched::task::Task& actor, const ker::syscall::vmem::SharedVmemPublicationGuard& publication, bool exclusive,
+                        const sys::SyscallPreparationScope* preparation = nullptr) noexcept
+        : actor_(actor), exclusive_(exclusive) {
+        if (!publication.acquired_by_current_executor() || !current_process_root(actor) || !binding_root_context() ||
+            (preparation != nullptr && !preparation->ready()))
+            return;
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(&root_, sizeof(root_));
+#endif
+        local_ = actor_.try_acquire_usercopy_pagemap(root_);
+        if (!local_ || root_ == nullptr || root_ != actor_.pagemap || root_ == kernel_pagemap) {
+            status_ = -EAGAIN;
+            return;
+        }
+        if (exclusive_) {
+            gate_ = try_begin_user_pagemap_exclusive(root_);
+        } else if (!acquire_user_pagemap_access(root_, false, gate_)) {
+            gate_ = USER_PAGEMAP_ACCESS_GATE_NONE;
+        }
+        if (gate_ == USER_PAGEMAP_ACCESS_GATE_NONE) {
+            status_ = -EAGAIN;
+            return;
+        }
+        uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+        auto const* control = find_user_root_control_locked(root_);
+        if (control != nullptr) serial_ = control->serial;
+        user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+        status_ = serial_ != 0 ? 0 : -EAGAIN;
+    }
+    ~DeviceCurrentAccess() {
+        if (gate_ != USER_PAGEMAP_ACCESS_GATE_NONE) {
+            if (exclusive_)
+                end_user_pagemap_exclusive(gate_);
+            else
+                release_user_pagemap_access(gate_);
+        }
+        if (local_) actor_.release_usercopy_pagemap();
+    }
+    DeviceCurrentAccess(const DeviceCurrentAccess&) = delete;
+    auto operator=(const DeviceCurrentAccess&) -> DeviceCurrentAccess& = delete;
+    [[nodiscard]] auto status() const noexcept -> int { return status_; }
+    [[nodiscard]] auto root() const noexcept -> PageTable* { return status_ == 0 ? root_ : nullptr; }
+    [[nodiscard]] auto serial() const noexcept -> uint64_t { return serial_; }
+
+   private:
+    sched::task::Task& actor_;
+    PageTable* root_{};
+    size_t gate_{USER_PAGEMAP_ACCESS_GATE_NONE};
+    uint64_t serial_{};
+    int status_{-EWOULDBLOCK};
+    bool exclusive_{}, local_{};
+};
+
+class DevicePteLocks {
+   public:
+    DevicePteLocks() : cow_(cow_pte_lock.lock_irqsave()), pin_(user_mapping_pin_lock.lock_irqsave()) {}
+    ~DevicePteLocks() {
+        user_mapping_pin_lock.unlock_irqrestore(pin_);
+        cow_pte_lock.unlock_irqrestore(cow_);
+    }
+    DevicePteLocks(const DevicePteLocks&) = delete;
+    auto operator=(const DevicePteLocks&) -> DevicePteLocks& = delete;
+
+   private:
+    uint64_t cow_, pin_;
+};
+
+auto device_control_matches(PageTable* root, uint64_t serial) noexcept -> bool {
+    auto const* control = find_user_root_control_locked(root);
+    return control != nullptr && serial != 0 && control->serial == serial;
+}
+
+// A missing ancestor is cold, not a failed lookup. Every present ancestor must
+// be a real sole-owner ordinary table. No huge/aperture/cache fallback exists.
+auto device_leaf_locked(PageTable* root, uint64_t address, bool& valid, size_t* missing = nullptr,
+                        std::array<uint64_t, 3>* last_missing = nullptr) noexcept -> PageTableEntry* {
+    valid = false;
+    auto* table = root;
+    for (int level = 4; level > 1; --level) {
+        auto const slot = static_cast<size_t>(4 - level);
+        auto const prefix = address >> (12U + 9U * static_cast<unsigned>(level - 1));
+        if (table == nullptr) {
+            if (missing != nullptr && last_missing->at(slot) != prefix) {
+                last_missing->at(slot) = prefix;
+                ++*missing;
+            }
+            continue;
+        }
+        auto const entry = entry_at(table, index_of(address, level));
+        if (!entry.present) {
+            if (pte_raw(entry) != 0) return nullptr;
+            if (missing != nullptr && last_missing->at(slot) != prefix) {
+                last_missing->at(slot) = prefix;
+                ++*missing;
+            }
+            table = nullptr;
+            continue;
+        }
+        if (entry.pagesize || !entry.user || !entry.writable || entry.no_execute || entry.frame == 0) return nullptr;
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+        if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) return nullptr;
+    }
+    valid = true;
+    return table != nullptr ? &entry_at(table, index_of(address, 1)) : nullptr;
+}
+
+auto device_existing_leaf_locked(PageTable* root, uint64_t serial, uint64_t address, const file_mapping::FileMappingBinding& binding,
+                                 PageTableEntry*& leaf) noexcept -> bool {
+    auto const& family = *binding.lifetime();
+    auto const* object = family.device_object();
+    if (!family.is_device_backed() || object == nullptr || family.device_generation() != object->generation() ||
+        address < binding.start() || address >= binding.end() || !device_control_matches(root, serial) || binding.root() != root ||
+        binding.root_incarnation() != serial || !file_mapping_index.matches_pin_locked(root, serial, address, &binding) ||
+        find_anonymous_swap_mapping_locked(root, address) != nullptr)
+        return false;
+    uint64_t const OFFSET = binding.file_offset() + (address - binding.start());
+    uint64_t expected = 0;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&expected, sizeof(expected));
+#endif
+    if (OFFSET < family.device_window_base() || OFFSET >= family.device_window_end() ||
+        DEVICE_VM_PAGE > family.device_window_end() - OFFSET || !object->frame_at(OFFSET, expected))
+        return false;
+    bool valid = false;
+    leaf = device_leaf_locked(root, address, valid);
+    if (!valid || leaf == nullptr) return false;
+    uint64_t const RAW = pte_raw(*leaf);
+    constexpr uint64_t REQUIRED = paging::PAGE_PRESENT | paging::PAGE_SHARED | paging::PAGE_NX;
+    constexpr uint64_t FORBIDDEN = paging::PAGE_COW | paging::PAGE_PWT | paging::PAGE_PCD | paging::PAGE_PAT_4K;
+    return (RAW & REQUIRED) == REQUIRED && (RAW & FORBIDDEN) == 0 && (leaf->frame << paging::PAGE_SHIFT) == expected &&
+           ((RAW & paging::PAGE_WRITE) == 0 || ((RAW & paging::PAGE_USER) != 0 && (family.device_max_protections() & 2U) != 0));
+}
+
+auto device_install_leaf_locked(PageTable* root, uint64_t address, PageTable** spares, const uint64_t* physical, size_t capacity,
+                                size_t& used) noexcept -> PageTableEntry& {
+    auto* table = root;
+    for (int level = 4; level > 1; --level) {
+        auto& entry = entry_at(table, index_of(address, level));
+        if (!entry.present) {
+            if (pte_raw(entry) != 0 || used == capacity || spares[used] == nullptr) __builtin_trap();
+            auto* next = std::exchange(spares[used], nullptr);
+            entry = paging::create_page_table_entry(physical[used++], paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITE);
+            table = next;
+        } else {
+            if (entry.pagesize || !entry.user || !entry.writable || entry.no_execute || entry.frame == 0) __builtin_trap();
+            table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+        }
+    }
+    return entry_at(table, index_of(address, 1));
+}
+
+auto device_leaf_flags(uint64_t protections, uint64_t maximum) noexcept -> uint64_t {
+    return paging::PAGE_PRESENT | paging::PAGE_SHARED | paging::PAGE_NX | (protections != 0 ? paging::PAGE_USER : 0) |
+           ((protections & 2U) != 0 ? paging::PAGE_WRITE : 0) | ((maximum & 2U) == 0 ? paging::PAGE_WRITE_RESTRICTED : 0);
+}
+}  // namespace
+}  // namespace ker::mod::mm::virt
+
+namespace ker::mod::mm::device_vm {
+auto current_device_overlap(sched::task::Task& actor, uint64_t start, uint64_t end,
+                            const ker::syscall::vmem::SharedVmemPublicationGuard& publication, bool& has_device) noexcept -> int {
+    virt::DeviceCurrentAccess access(actor, publication, false);
+    if (access.status() != 0) return access.status();
+    uint64_t const FLAGS = virt::user_mapping_pin_lock.lock_irqsave();
+    bool const VALID = virt::file_mapping_index.device_overlap_locked(access.root(), access.serial(), start, end, has_device);
+    virt::user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return VALID ? 0 : -EAGAIN;
+}
+namespace detail {
+auto count_current_bindings(sched::task::Task& actor, const ker::syscall::vmem::SharedVmemPublicationGuard& publication, size_t& count,
+                            uint64_t& serial) noexcept -> int {
+    if (count != 0 || serial != 0) return -EINVAL;
+    virt::DeviceCurrentAccess access(actor, publication, false);
+    if (access.status() != 0) return access.status();
+    uint64_t const FLAGS = virt::user_mapping_pin_lock.lock_irqsave();
+    bool const VALID = virt::file_mapping_index.count_root_locked(access.root(), access.serial(), count);
+    virt::user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    if (VALID) serial = access.serial();
+    return VALID ? 0 : -EAGAIN;
+}
+auto capture_current_bindings(sched::task::Task& actor, const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                              std::span<file_mapping::FileBindingSnapshot> output, size_t& count, uint64_t& serial) noexcept -> int {
+    if (count != 0 || serial != 0) return -EINVAL;
+    virt::DeviceCurrentAccess access(actor, publication, false);
+    if (access.status() != 0) return access.status();
+    uint64_t const FLAGS = virt::user_mapping_pin_lock.lock_irqsave();
+    bool const VALID = virt::file_mapping_index.snapshot_root_locked(access.root(), access.serial(), output.data(), output.size(), count);
+    virt::user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    if (VALID) serial = access.serial();
+    return VALID ? 0 : -EAGAIN;
+}
+
+auto VmAccess::publish(PreparedMap& plan, sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                       const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> int {
+    using namespace virt;
+#ifdef WOS_SELFTEST
+    CurrentRootSemanticOperation const current_root_operation;
+#endif
+    if (!plan.storage_ || plan.storage_->consumed) return -EBUSY;
+    auto& s = *plan.storage_;
+    s.consumed = true;
+    if (s.binding == nullptr || !s.loans || !s.tables || !s.table_physical || !kernel_nx_supported) return -EINVAL;
+    auto& family = *s.binding->lifetime();
+    auto* object = family.device_object();
+    if (object == nullptr) return -EINVAL;
+    DeviceCurrentAccess access(actor, publication, true, &preparation);
+    if (access.status() != 0) return access.status();
+    auto* root = access.root();
+    uint64_t const SERIAL = access.serial();
+    // Root glue also checks its managed layout and AS admission. This direct
+    // check prevents publishing over an otherwise PTE-cold lazy extent.
+    {
+        uint64_t const FLAGS = actor.lazy_vmem_lock.lock_irqsave();
+        bool overlap = false;
+        for (auto const& row : actor.lazy_vmem_ranges)
+            if (row.start < s.end && s.start < row.end) overlap = true;
+        actor.lazy_vmem_lock.unlock_irqrestore(FLAGS);
+        if (overlap) return -EAGAIN;
+    }
+    size_t missing = 0;
+    std::array<uint64_t, 3> last{UINT64_MAX, UINT64_MAX, UINT64_MAX};
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&last, sizeof(last));
+#endif
+    for (uint64_t cursor = s.start; cursor < s.end;) {
+        uint64_t const END = cursor + std::min<uint64_t>(s.end - cursor, DEVICE_VM_CHUNK * DEVICE_VM_PAGE);
+        DevicePteLocks const locks;
+        auto const* control = find_user_root_control_locked(root);
+        if (control == nullptr || control->serial != SERIAL || control->ps_admission_suspensions != 0) return -EAGAIN;
+        for (; cursor < END; cursor += DEVICE_VM_PAGE) {
+            bool valid = false;
+            auto* leaf = device_leaf_locked(root, cursor, valid, &missing, &last);
+            if (!valid || (leaf != nullptr && pte_raw(*leaf) != 0) ||
+                !file_mapping_index.matches_pin_locked(root, SERIAL, cursor, nullptr) ||
+                find_anonymous_swap_mapping_locked(root, cursor) != nullptr)
+                return -EAGAIN;
+            size_t const PAGE = static_cast<size_t>((cursor - s.start) / DEVICE_VM_PAGE);
+            uint64_t expected = 0;
+#ifdef WOS_KASAN
+            if (kasan::is_enabled()) kasan::unpoison_range(&expected, sizeof(expected));
+#endif
+            if (!s.loans[PAGE] || !object->frame_at(s.offset + cursor - s.start, expected) || s.loans[PAGE].physical() != expected)
+                return -EINVAL;
+        }
+    }
+    if (missing > s.table_count) return -E2BIG;
+    size_t used = 0;
+    bool published = false;
+    for (uint64_t cursor = s.start; cursor < s.end;) {
+        uint64_t const END = cursor + std::min<uint64_t>(s.end - cursor, DEVICE_VM_CHUNK * DEVICE_VM_PAGE);
+        DevicePteLocks const locks;
+        DeviceObjectGuardStorage guard_storage;
+        auto& object_guard = guard_storage.get();
+        if (!object_guard.try_acquire(family.device_object_owner(), family.device_generation(), publication)) {
+            if (published) __builtin_trap();
+            return -ENODEV;
+        }
+        if (!published) {
+            if (!s.binding->configure_unpublished(root, SERIAL, s.start, s.end, s.offset)) return -EAGAIN;
+            if (!file_mapping_index.attach_locked(s.binding, SERIAL)) __builtin_trap();
+            published = true;
+        }
+        for (; cursor < END; cursor += DEVICE_VM_PAGE) {
+            size_t const PAGE = static_cast<size_t>((cursor - s.start) / DEVICE_VM_PAGE);
+            uint64_t const PHYSICAL = s.loans[PAGE].physical();
+            auto& leaf = device_install_leaf_locked(root, cursor, s.tables.get(), s.table_physical.get(), s.table_count, used);
+            if (pte_raw(leaf) != 0 || !object_guard.commit_loan(s.loans[PAGE], family.device_object_owner())) __builtin_trap();
+            leaf = paging::create_page_table_leaf_4k(PHYSICAL, device_leaf_flags(s.protections, family.device_max_protections()));
+        }
+    }
+    flush_pagemap_after_update(root, 0, true);
+    return 0;
+}
+
+auto VmAccess::change(PreparedChange& plan, sched::task::Task& actor, const sys::SyscallPreparationScope& preparation,
+                      const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> int {
+    using namespace virt;
+#ifdef WOS_SELFTEST
+    CurrentRootSemanticOperation const current_root_operation;
+#endif
+    if (!plan.storage_ || plan.storage_->consumed) return -EBUSY;
+    auto& s = *plan.storage_;
+    s.consumed = true;
+    if (s.count == 0 || !s.old || !s.fragments || !s.removed || !s.after_tlb.empty()) return -EINVAL;
+    DeviceCurrentAccess access(actor, publication, true, &preparation);
+    if (access.status() != 0) return access.status();
+    auto* root = access.root();
+    uint64_t const SERIAL = access.serial();
+    if (SERIAL != s.serial) return -EAGAIN;
+    {
+        uint64_t const FLAGS = actor.lazy_vmem_lock.lock_irqsave();
+        bool overlap = false;
+        for (auto const& row : actor.lazy_vmem_ranges)
+            if (row.start < s.end && s.start < row.end) overlap = true;
+        actor.lazy_vmem_lock.unlock_irqrestore(FLAGS);
+        if (overlap) return -EOPNOTSUPP;
+    }
+    // Validate the complete transaction before configuring or detaching any
+    // old incarnation. Holes are legal for remove and ENOMEM for mprotect;
+    // a present nondevice leaf is unsupported mixed backing, never fallback.
+    size_t index = 0;
+    for (uint64_t cursor = s.start; cursor < s.end;) {
+        uint64_t const END = cursor + std::min<uint64_t>(s.end - cursor, DEVICE_VM_CHUNK * DEVICE_VM_PAGE);
+        DevicePteLocks const locks;
+        if (!device_control_matches(root, SERIAL)) return -EAGAIN;
+        for (; cursor < END; cursor += DEVICE_VM_PAGE) {
+            while (index < s.count && BindingAccess::get(s.old[index])->end() <= cursor) ++index;
+            auto const* binding = index < s.count ? BindingAccess::get(s.old[index]) : nullptr;
+            if (binding == nullptr || cursor < binding->start()) {
+                bool valid = false;
+                auto* leaf = device_leaf_locked(root, cursor, valid);
+                if (!valid || (leaf != nullptr && pte_raw(*leaf) != 0) ||
+                    !file_mapping_index.matches_pin_locked(root, SERIAL, cursor, nullptr) ||
+                    find_anonymous_swap_mapping_locked(root, cursor) != nullptr)
+                    return -EOPNOTSUPP;
+                if (s.change == Change::Protect) return -ENOMEM;
+                continue;
+            }
+            PageTableEntry* leaf = nullptr;
+            if (!device_existing_leaf_locked(root, SERIAL, cursor, *binding, leaf)) return -EAGAIN;
+            if (s.change == Change::Protect) {
+                auto const* object = binding->lifetime()->device_object();
+                if ((s.protections & ~binding->lifetime()->device_max_protections()) != 0) return -EACCES;
+                if (object->state() != ker::dev::mapping::ObjectState::live) return -ENODEV;
+            }
+        }
+    }
+    {
+        DevicePteLocks const locks;
+        for (size_t i = 0; i < s.count; ++i) {
+            auto const* old = BindingAccess::get(s.old[i]);
+            if (!old || !device_control_matches(root, SERIAL) || old->root() != root || old->root_incarnation() != SERIAL ||
+                !file_mapping_index.matches_pin_locked(root, SERIAL, old->start(), old))
+                return -EAGAIN;
+        }
+        for (size_t i = 0; i < s.fragment_count; ++i) {
+            auto& next = s.fragments[i];
+            if (!next.binding || !next.binding->configure_unpublished(root, SERIAL, next.start, next.end, next.offset)) return -EAGAIN;
+        }
+        // Every role/interval/serial premise is now proven. Detach old coverage,
+        // then install all prepared nonoverlapping fragments under the same pin.
+        for (size_t i = 0; i < s.count; ++i) {
+            auto* old = const_cast<file_mapping::FileMappingBinding*>(BindingAccess::get(s.old[i]));
+            if (!file_mapping_index.detach_locked(*old, s.after_tlb)) __builtin_trap();
+        }
+        for (size_t i = 0; i < s.fragment_count; ++i)
+            if (!file_mapping_index.attach_locked(s.fragments[i].binding, SERIAL)) __builtin_trap();
+    }
+    // The root exclusive and PUB span every slice and the final CPU barrier.
+    // PTE frame ownership stays in the returned scratch until ordinary reset.
+    index = 0;
+    for (uint64_t cursor = s.start; cursor < s.end;) {
+        uint64_t const END = cursor + std::min<uint64_t>(s.end - cursor, DEVICE_VM_CHUNK * DEVICE_VM_PAGE);
+        DevicePteLocks const locks;
+        for (; cursor < END; cursor += DEVICE_VM_PAGE) {
+            while (index < s.count && BindingAccess::get(s.old[index])->end() <= cursor) ++index;
+            auto const* binding = index < s.count ? BindingAccess::get(s.old[index]) : nullptr;
+            if (binding == nullptr || cursor < binding->start()) continue;
+            bool valid = false;
+            auto* leaf = device_leaf_locked(root, cursor, valid);
+            if (!valid || leaf == nullptr || !leaf->present) __builtin_trap();
+            if (s.change == Change::Remove) {
+                if (s.removed_count == s.page_capacity) __builtin_trap();
+                s.removed[s.removed_count++] = *leaf;
+                owned_frame_untrack_leaf(root, cursor, *leaf);
+                *leaf = {};
+            } else {
+                auto* raw = reinterpret_cast<uint64_t*>(leaf);
+                uint64_t observed = __atomic_load_n(raw, __ATOMIC_ACQUIRE);
+                uint64_t desired = 0;
+                do {
+                    desired = (observed & ~(paging::PAGE_USER | paging::PAGE_WRITE)) | (s.protections != 0 ? paging::PAGE_USER : 0) |
+                              ((s.protections & 2U) != 0 ? paging::PAGE_WRITE : 0);
+                } while (!__atomic_compare_exchange_n(raw, &observed, desired, true, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+            }
+        }
+    }
+    flush_pagemap_after_update(root, 0, true);
+    return 0;
+}
+
+auto VmAccess::revoke(PreparedRevoke& plan, virt::BindingRootMutationLease& lease,
+                      const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> int {
+    using namespace virt;
+#ifdef WOS_SELFTEST
+    CurrentRootSemanticOperation const current_root_operation;
+#endif
+    if (!plan.storage_ || plan.storage_->consumed) return -EBUSY;
+    auto& s = *plan.storage_;
+    s.consumed = true;
+    if (!lease.acquired() || lease.publication_ != &publication || lease.snapshot_ != s.snapshot || lease.binding_ != s.binding ||
+        !s.removed || !s.after_tlb.empty())
+        return -EINVAL;
+    auto* root = lease.root_;
+    auto& binding = *lease.binding_;
+    auto const* object = binding.lifetime()->device_object();
+    if (object == nullptr || object->state() == ker::dev::mapping::ObjectState::live) return -EBUSY;
+    // Existing closed-generation authority is withdrawal, not a LIVE publisher.
+    for (uint64_t cursor = binding.start(); cursor < binding.end();) {
+        uint64_t const END = cursor + std::min<uint64_t>(binding.end() - cursor, DEVICE_VM_CHUNK * DEVICE_VM_PAGE);
+        DevicePteLocks const locks;
+        for (; cursor < END; cursor += DEVICE_VM_PAGE) {
+            PageTableEntry* leaf = nullptr;
+            if (!device_existing_leaf_locked(root, lease.serial_, cursor, binding, leaf)) return -EAGAIN;
+        }
+    }
+    {
+        DevicePteLocks const locks;
+        if (!file_mapping_index.detach_locked(binding, s.after_tlb)) __builtin_trap();
+    }
+    for (uint64_t cursor = binding.start(); cursor < binding.end();) {
+        uint64_t const END = cursor + std::min<uint64_t>(binding.end() - cursor, DEVICE_VM_CHUNK * DEVICE_VM_PAGE);
+        DevicePteLocks const locks;
+        for (; cursor < END; cursor += DEVICE_VM_PAGE) {
+            bool valid = false;
+            auto* leaf = device_leaf_locked(root, cursor, valid);
+            if (!valid || leaf == nullptr || !leaf->present || s.removed_count == s.page_capacity) __builtin_trap();
+            s.removed[s.removed_count++] = *leaf;
+            owned_frame_untrack_leaf(root, cursor, *leaf);
+            *leaf = {};
+        }
+    }
+    flush_pagemap_after_update(root, 0, true);
+    return 0;
+}
+
+auto VmAccess::match_fork(PreparedFork& plan, sched::task::Task& actor,
+                          const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> bool {
+    using namespace virt;
+    if (!plan.storage_ || plan.storage_->consumed) return false;
+    auto& s = *plan.storage_;
+    if (s.count != 0 && (!s.source || !s.children)) return false;
+    DeviceCurrentAccess access(actor, publication, false);
+    if (access.status() != 0 || access.serial() != s.serial) return false;
+    DevicePteLocks const locks;
+    size_t actual_count = 0;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&actual_count, sizeof(actual_count));
+#endif
+    if (!file_mapping_index.count_root_locked(access.root(), access.serial(), actual_count)) return false;
+    // Exact device coverage, not merely each old entry, is required. Any newly
+    // admitted device binding invalidates this prepared child plan.
+    size_t found = 0;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&found, sizeof(found));
+#endif
+    // Count each device interval by a root-bucket query over the captured
+    // coverage: the index supplies an allocation-free device-specific count.
+    if (!file_mapping_index.count_device_root_locked(access.root(), access.serial(), found) || found != s.count) return false;
+    for (size_t i = 0; i < s.count; ++i) {
+        auto const* binding = BindingAccess::get(s.source[i]);
+        if (!binding || !s.children[i] || !binding->lifetime()->is_device_backed() || binding->root() != access.root() ||
+            binding->root_incarnation() != access.serial() ||
+            !file_mapping_index.matches_pin_locked(access.root(), access.serial(), binding->start(), binding) ||
+            binding->lifetime()->device_object()->state() != ker::dev::mapping::ObjectState::live)
+            return false;
+    }
+    return true;
+}
+
+auto VmAccess::attach_fork(PreparedFork& plan, sched::task::Task& actor, sched::task::Task& child, paging::PageTable* root,
+                           const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> int {
+    using namespace virt;
+#ifdef WOS_SELFTEST
+    CurrentRootSemanticOperation const current_root_operation;
+#endif
+    if (!plan.storage_ || plan.storage_->consumed || !publication.acquired_by_current_executor() || root == nullptr ||
+        child.pagemap != root || root == actor.pagemap || !current_process_root(actor))
+        return -EINVAL;
+    auto& s = *plan.storage_;
+    s.consumed = true;
+    DevicePteLocks const locks;
+    auto const* source_control = find_user_root_control_locked(actor.pagemap);
+    auto const* child_control = find_user_root_control_locked(root);
+    size_t source_devices = 0;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&source_devices, sizeof(source_devices));
+#endif
+    if (source_control == nullptr || source_control->serial != s.serial || child_control == nullptr || child_control->serial == 0 ||
+        !file_mapping_index.root_empty_locked(root) ||
+        !file_mapping_index.count_device_root_locked(actor.pagemap, s.serial, source_devices) || source_devices != s.count)
+        return -EAGAIN;
+    uint64_t const CHILD_SERIAL = child_control->serial;
+    for (size_t i = 0; i < s.count; ++i) {
+        auto const* source = BindingAccess::get(s.source[i]);
+        if (!source || !s.children[i] || source->root() != actor.pagemap ||
+            !file_mapping_index.matches_pin_locked(actor.pagemap, s.serial, source->start(), source) ||
+            source->lifetime()->device_object()->state() != ker::dev::mapping::ObjectState::live ||
+            !s.children[i]->configure_unpublished(root, CHILD_SERIAL, source->start(), source->end(), source->file_offset()))
+            return -EAGAIN;
+    }
+    for (size_t i = 0; i < s.count; ++i) {
+        auto const* source = BindingAccess::get(s.source[i]);
+        auto& family = *source->lifetime();
+        DeviceObjectGuardStorage guard_storage;
+        auto& object_guard = guard_storage.get();
+        if (!object_guard.try_acquire(family.device_object_owner(), family.device_generation(), publication) ||
+            !file_mapping_index.attach_locked(s.children[i], CHILD_SERIAL))
+            __builtin_trap();
+    }
+    return 0;
+}
+}  // namespace detail
+}  // namespace ker::mod::mm::device_vm

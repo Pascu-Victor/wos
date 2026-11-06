@@ -56,6 +56,7 @@
 #ifdef WOS_SELFTEST
 #include <test/binding_root_runtime_ktest.hpp>
 #include <test/cache_policy_runtime_ktest.hpp>
+#include <test/device_mapping_vm_ktest.hpp>
 #include <test/firmware_runtime_ktest.hpp>
 #endif
 
@@ -442,6 +443,8 @@ void sched_init() {
 
 void kernel_start() {
 #ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-device-mapping") && !ker::test::start_device_mapping_vm_selftest())
+        mod::dbg::panic_handler("unable to post scheduled device mapping selftest");
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-binding-root") && !ker::test::start_binding_root_runtime_selftest())
         mod::dbg::panic_handler("unable to post scheduled binding root selftest");
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-policy") && !ker::test::start_cache_policy_runtime_selftest())

@@ -18,6 +18,7 @@
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <test/binding_root_runtime_ktest.hpp>
 #include <test/device_mapping_client_ktest.hpp>
+#include <test/device_mapping_object_ktest.hpp>
 #include <vfs/fs/tmpfs.hpp>
 #include <vfs/vfs.hpp>
 
@@ -405,10 +406,11 @@ void runtime_entry() {
                        "actual scheduled context and permanent retirement executor");
         log::info("BINDING_ROOT_RUNTIME BEGIN");
         checks.require(run_device_mapping_client_selftest(), "actual retained device endpoint/client lifecycle cases");
+        checks.require(run_device_mapping_object_selftest(), "actual backing quota, grants and IRQ export retirement cases");
         lease_lifecycle(checks);
         collision_lifecycle(checks);
         checks.require(checks.cases == 6, "all actual lease lifecycle cases returned");
-        log::info("BINDING_ROOT_RUNTIME PASS cases=%lu assertions=%lu provider_enabled=0", checks.cases, checks.assertions);
+        log::info("BINDING_ROOT_RUNTIME PASS cases=%lu assertions=%lu device_map_exercised=0", checks.cases, checks.assertions);
         wait_for_init_mounts(checks);
     }
     {

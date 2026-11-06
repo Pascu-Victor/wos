@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <dev/device.hpp>
+#include <dev/device_mapping_grants.hpp>
 #include <memory>
 #include <platform/security/credentials.hpp>
 #include <string_view>
@@ -114,15 +115,28 @@ class Client {
     [[nodiscard]] auto credentials() const noexcept -> const ker::mod::security::Snapshot& { return credentials_; }
     [[nodiscard]] auto access() const noexcept -> ClientAccess { return access_; }
     [[nodiscard]] auto endpoint() const noexcept -> const Endpoint& { return *endpoint_.get(); }
+    // Ordinary kernel provider API. User mmap resolves these grants through
+    // the retained File; creating grants is never a raw user-pointer callback.
+    [[nodiscard]] auto configure_grants(size_t capacity = GrantTable::MAX_CAPACITY) const -> int;
+    [[nodiscard]] auto grant(const ObjectRef&, uint64_t object_offset, uint64_t length, uint64_t max_protections, Grant& empty) const
+        -> int;
+    [[nodiscard]] auto lookup(uint64_t fake_offset, uint64_t length, uint64_t protections, uint64_t flags, PreparedGrant& empty) const
+        -> int;
+    [[nodiscard]] auto remove_grant(Grant) const -> int;
+    void close_grants() const noexcept;
 
    private:
     friend class ClientRef;
     Client(EndpointRef endpoint, const ker::mod::security::Snapshot& credentials, ClientAccess access);
-    ~Client() = default;
+    ~Client();
+    [[nodiscard]] auto grant_table() const noexcept -> GrantTable*;
     detail::ReferenceCount references_;
     EndpointRef endpoint_;
     ker::mod::security::Snapshot credentials_;
     ClientAccess access_;
+    mutable ker::mod::sys::Mutex grant_lock_;
+    mutable std::unique_ptr<GrantTable> grants_;
+    mutable bool grants_closed_{};
 };
 
 // Reference owners are movable only. Shared consumers first retain the exact

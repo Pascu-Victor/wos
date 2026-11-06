@@ -13,6 +13,7 @@
 #include <memory>
 #include <mod/io/serial/serial.hpp>
 #include <new>
+#include <platform/mm/device_mapping_vm.hpp>
 #include <platform/mm/managed_huge.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/sched/resource_as.hpp>
@@ -818,6 +819,8 @@ enum class ForkVmFailurePoint : uint8_t {
     LegacyCommit,
     Complete,
     SourceAdmission,
+    DevicePrepare,
+    DeviceMatch,
 };
 static_assert(static_cast<uint32_t>(ForkVmFailurePoint::Copy) == 11);
 
@@ -838,6 +841,7 @@ auto public_fork_vm_error(ForkVmFailurePoint point, int status) -> int {
         case ForkVmFailurePoint::Context:
         case ForkVmFailurePoint::LazyPrepare:
         case ForkVmFailurePoint::TmpfsPrepare:
+        case ForkVmFailurePoint::DevicePrepare:
             return status < 0 ? status : -EINVAL;
         case ForkVmFailurePoint::LegacyPrepare:
             if (status == -EOPNOTSUPP || status == -ENOMEM || status == -EOVERFLOW) return -ENOMEM;
@@ -847,6 +851,7 @@ auto public_fork_vm_error(ForkVmFailurePoint point, int status) -> int {
             return status < 0 ? status : -EINVAL;
         case ForkVmFailurePoint::FinalLazyTmpfsMatch:
         case ForkVmFailurePoint::LegacyMatch:
+        case ForkVmFailurePoint::DeviceMatch:
             return status == -EAGAIN ? status : -EINVAL;
         case ForkVmFailurePoint::GeometryPrepare:
             switch (status) {
@@ -895,6 +900,7 @@ auto prepare_fork_vm_snapshot_once(ker::mod::sched::task::Task& actor, ker::mod:
     // Every fallible owner is instrumented here, before PUB/IRQ/root ownership.
     sched::task::LazyVmemClone lazy;
     ker::syscall::vmem::PublicFileForkPreparation tmpfs;
+    mm::device_vm::PreparedFork device;
     ker::syscall::vmem::LegacyFileForkPreparation legacy_file;
     mm::virt::PreparedAnonymousSwapFork swap;
     ker::syscall::shm::ShmForkPreparation shm;
@@ -908,6 +914,12 @@ auto prepare_fork_vm_snapshot_once(ker::mod::sched::task::Task& actor, ker::mod:
     fail_at(ForkVmFailurePoint::TmpfsPrepare);
     status = tmpfs.prepare(actor, lazy);
     if (status != 0) return status;
+    fail_at(ForkVmFailurePoint::DevicePrepare);
+    status = device.prepare_current(actor, preparation);
+    if (status != 0) return status;
+    // Device bindings require the genuine empty-child proof and the private
+    // pre-copy attachment hook. The legacy raw-root path cannot supply either.
+    if (!device.empty() && private_child_authority == nullptr) return -EOPNOTSUPP;
     fail_at(ForkVmFailurePoint::LegacyPrepare);
     status = legacy_file.prepare(actor, child, preparation);
     if (status != 0) return status;
@@ -942,6 +954,8 @@ auto prepare_fork_vm_snapshot_once(ker::mod::sched::task::Task& actor, ker::mod:
         ker::syscall::vmem::SharedVmemPublicationGuard publication;
         ker::syscall::vmem::LegacyFileForkPreparation::EmptyMatch empty_legacy_match;
         if (!lazy.matches(actor) || !tmpfs.matches(actor)) return -EAGAIN;
+        fail_at(ForkVmFailurePoint::DeviceMatch);
+        if (!device.matches_current(actor, publication)) return -EAGAIN;
         fail_at(ForkVmFailurePoint::LegacyMatch);
         status = legacy_file.matches(actor, child, preparation, publication, conflict, &empty_legacy_match);
         if (status != 0) return status;
@@ -992,7 +1006,7 @@ auto prepare_fork_vm_snapshot_once(ker::mod::sched::task::Task& actor, ker::mod:
             if (private_child_authority != nullptr)
                 status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner,
                                                                            preparation, publication, survey, tables, eager_context,
-                                                                           empty_result, swap, copy_failure);
+                                                                           empty_result, swap, copy_failure, &device);
             else
                 status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables,
                                                                            eager_context, empty_result, swap, copy_failure);

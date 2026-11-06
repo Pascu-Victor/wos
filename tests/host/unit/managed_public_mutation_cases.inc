@@ -188,6 +188,71 @@ TEST_F(ManagedPublicMutation, LongCountIsAllocationFreeBeforeWriteRestrictionRef
     EXPECT_EQ(model.live_refs(), 1U);
     EXPECT_GT(host_range::yields, 0U);
 }
+TEST_F(ManagedPublicMutation, EmptyAndInteriorProtectionHolesHaveNoEffects) {
+    auto const address = TEST_VA + 4 * LARGE;
+    for (uint64_t prot : {uint64_t{0}, uint64_t{1}, uint64_t{3}}) {
+        EXPECT_EQ(static_cast<int64_t>(request(Call::Protect, address, 3 * PAGE, prot, 0, 0, UINT_MAX)), -ENOMEM);
+        EXPECT_EQ(observed_raw(address), 0U);
+    }
+    normal(address, 0x6a000000);
+    normal(address + 2 * PAGE, 0x6a002000);
+    auto const first = observed_raw(address), last = observed_raw(address + 2 * PAGE);
+    auto const attempts = table_attempt;
+    for (uint64_t prot : {uint64_t{0}, uint64_t{1}, uint64_t{3}}) {
+        EXPECT_EQ(static_cast<int64_t>(request(Call::Protect, address, 3 * PAGE, prot, 0, 0, UINT_MAX)), -ENOMEM);
+        EXPECT_EQ(static_cast<int64_t>(request(Call::Protect, address - PAGE, 2 * PAGE, prot, 0, 0, UINT_MAX)), -ENOMEM);
+        EXPECT_EQ(static_cast<int64_t>(request(Call::Protect, address + 2 * PAGE, 2 * PAGE, prot, 0, 0, UINT_MAX)), -ENOMEM);
+        EXPECT_EQ(observed_raw(address), first);
+        EXPECT_EQ(observed_raw(address + 2 * PAGE), last);
+    }
+    EXPECT_TRUE(actor.lazy_vmem_ranges.empty());
+    EXPECT_TRUE(sibling.lazy_vmem_ranges.empty());
+    EXPECT_EQ(table_attempt, attempts);
+    EXPECT_EQ(host_protect::acks, 0U);
+    EXPECT_EQ(model.live_refs(), 2U);
+}
+TEST_F(ManagedPublicMutation, ResidentLazyNoneAndReservationUnionIsMapped) {
+    auto const address = TEST_VA + 4 * LARGE;
+    normal(address, 0x6a010000);
+    normal(address + 3 * PAGE, 0x6a013000, mm::paging::PAGE_PRESENT | mm::paging::PAGE_NX);
+    for (auto* subject : {&actor, &sibling}) {
+        subject->shares_user_pagemap = true;
+        row(*subject, address + PAGE, address + 3 * PAGE);
+    }
+    auto* reserved = virt::leaf_entry(runtime_root, address + 4 * PAGE);
+    ASSERT_NE(reserved, nullptr);
+    *reserved = virt::pte_from_raw(mm::paging::PAGE_RESERVED | mm::paging::PAGE_COW);
+    EXPECT_EQ(request(Call::Protect, address, 5 * PAGE, 0, 0, 0, UINT_MAX), 0U);
+    EXPECT_EQ(observed_raw(address) & mm::paging::PAGE_USER, 0U);
+    EXPECT_EQ(observed_raw(address + 3 * PAGE) & mm::paging::PAGE_USER, 0U);
+    EXPECT_EQ(observed_raw(address + 4 * PAGE) & mm::paging::PAGE_RESERVED, mm::paging::PAGE_RESERVED);
+    ASSERT_EQ(actor.lazy_vmem_ranges.size(), 1U);
+    ASSERT_EQ(sibling.lazy_vmem_ranges.size(), 1U);
+    EXPECT_EQ(actor.lazy_vmem_ranges[0].prot, 0U);
+    EXPECT_EQ(sibling.lazy_vmem_ranges[0].prot, 0U);
+    EXPECT_EQ(model.live_refs(), 2U);
+}
+TEST_F(ManagedPublicMutation, GapBeforeLazySuffixPreservesRowsAndPte) {
+    auto const address = TEST_VA + 4 * LARGE;
+    normal(address, 0x6a020000);
+    for (auto* subject : {&actor, &sibling}) {
+        subject->shares_user_pagemap = true;
+        row(*subject, address + 2 * PAGE, address + 4 * PAGE);
+    }
+    auto const before = observed_raw(address);
+    auto const attempts = table_attempt;
+    for (uint64_t prot : {uint64_t{0}, uint64_t{1}, uint64_t{3}}) {
+        EXPECT_EQ(static_cast<int64_t>(request(Call::Protect, address, 4 * PAGE, prot, 0, 0, UINT_MAX)), -ENOMEM);
+        EXPECT_EQ(observed_raw(address), before);
+        ASSERT_EQ(actor.lazy_vmem_ranges.size(), 1U);
+        ASSERT_EQ(sibling.lazy_vmem_ranges.size(), 1U);
+        EXPECT_EQ(actor.lazy_vmem_ranges[0].prot, 3U);
+        EXPECT_EQ(sibling.lazy_vmem_ranges[0].prot, 3U);
+    }
+    EXPECT_EQ(table_attempt, attempts);
+    EXPECT_EQ(host_protect::acks, 0U);
+    EXPECT_EQ(model.live_refs(), 1U);
+}
 TEST_F(ManagedPublicMutation, LegacyFileAuthorizationPrecedesSplitAllocation) {
     mixed_seed();
     file.open_flags = 0;
@@ -291,6 +356,9 @@ TEST_F(ManagedPublicMutation, FixedHintZeroStaysNonfixedAndProtectZeroRetainsOld
     auto const address = request(Call::MapAnon, 0, PAGE, ker::abi::vmem::PROT_NONE, 16, 0, 1);
     EXPECT_GE(address, vmem::MMAP_START);
     EXPECT_EQ(covering(actor, address), 1U);
+    // Low addresses retain the existing geometry semantics when logically
+    // mapped; an empty address interval is covered by the ENOMEM cases.
+    row(actor, 0, PAGE);
     EXPECT_EQ(request(Call::Protect, 0, PAGE, ker::abi::vmem::PROT_READ, 0, 0, 1), 0U);
     EXPECT_EQ(host_file::fd_lookups, 0U);
 }

@@ -51,7 +51,19 @@ void submit(void*, fm::LifetimeRetirementTicket& ticket) noexcept {
 auto observe(void*, fm::LifetimeRetirementTicket&, fm::LifetimeRetirementRun, void*, fm::RetirementCompletion&) noexcept -> bool {
     return false;  // Real generation-return observations belong to native tests.
 }
-auto cancel(void*, fm::LifetimeRetirementTicket&, fm::LifetimeRetirementRun, void*) noexcept -> bool { return false; }
+auto cancel(void*, fm::LifetimeRetirementTicket& ticket, fm::LifetimeRetirementRun run, void* argument) noexcept -> bool {
+    auto const flags = queue_lock.lock_irqsave();
+    for (auto& slot : slots) {
+        if (&slot.ticket != &ticket || slot.state != QueueState::RESERVED || slot.run != run || slot.argument != argument) continue;
+        slot.state = QueueState::FREE;
+        slot.run = nullptr;
+        slot.argument = nullptr;
+        queue_lock.unlock_irqrestore(flags);
+        return true;
+    }
+    queue_lock.unlock_irqrestore(flags);
+    return false;
+}
 const fm::LifetimeRetirementPort port{nullptr, reserve, submit, observe, cancel};
 }  // namespace
 

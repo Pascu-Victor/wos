@@ -333,8 +333,8 @@ def require_mapping_stable_pin_contract() -> None:
         fail("unpin must not run a final binding release under the mapping lock")
 
     for name, mutation in [
-        ("map_page", "entry = paging::create_page_table_entry"),
-        ("map_page_batched", "entry = paging::create_page_table_entry"),
+        ("map_page", "entry = paging::create_page_table_leaf_4k"),
+        ("map_page_batched", "entry = paging::create_page_table_leaf_4k"),
         ("unmap_page", "*entry = paging::purge_page_table_entry()"),
         ("unify_page_flags", "entry.writable ="),
     ]:
@@ -420,7 +420,7 @@ def require_mapping_stable_pin_contract() -> None:
              "UserPagemapExclusiveScopesource_usercopy_scope(source,source_owner);",
              "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
              "sched::PreemptGuardconstCOW_PREEMPT;",
-             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)",
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error,device_fork!=nullptr&&!device_fork->empty())",
              "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);",
              "returnrefuse(Site::CowWalk,prepared_error!=0?prepared_error:-ENOMEM);"]
     cursor = 0
@@ -976,7 +976,7 @@ def require_fork_private_child_factory_authority() -> None:
     typed = "".join(managed[wrapper.start():end + 1].split())
     if "~InvalidateAuthority(){source_owner.finish();authority.invalidate();}" not in typed or "constINVALIDATE{authority,source_owner};" not in typed:
         fail("every early typed wrapper return must terminally invalidate its caller-owned token")
-    if "&swap,refusal,&child,&authority,&source_owner)" not in typed:
+    if "&swap,refusal,&child,&authority,&source_owner,device_fork)" not in typed:
         fail("typed wrapper must forward the exact child and issued authority with original metadata owners")
     fork = "".join(function_body(process, "wos_proc_fork").split())
     cursor = 0

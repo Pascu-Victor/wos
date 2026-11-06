@@ -652,14 +652,12 @@ auto PreparedAnonymousSwapFork::prepare(sched::task::Task& actor, sched::task::T
     return detail::prepare_anonymous_swap_fork(actor, child, preparation, *this);
 }
 namespace {
-auto deep_copy_current_user_pagemap_prepared_impl(sched::task::Task& actor, PageTable* child,
-                                                  const sys::SyscallPreparationScope& preparation,
-                                                  const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
-                                                  const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
-                                                  numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
-                                                  PreparedAnonymousSwapFork* prepared_swap, ForkCopyRefusalWitness* refusal = nullptr,
-                                                  sched::task::Task* private_child = nullptr, ForkPrivateChildRoot* authority = nullptr,
-                                                  ForkSourceOwner* source_owner = nullptr) noexcept -> int {
+auto deep_copy_current_user_pagemap_prepared_impl(
+    sched::task::Task& actor, PageTable* child, const sys::SyscallPreparationScope& preparation,
+    const ker::syscall::vmem::SharedVmemPublicationGuard& publication, const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+    numa::AllocationContext* eager_context, numa::AllocationResult* empty_result, PreparedAnonymousSwapFork* prepared_swap,
+    ForkCopyRefusalWitness* refusal = nullptr, sched::task::Task* private_child = nullptr, ForkPrivateChildRoot* authority = nullptr,
+    ForkSourceOwner* source_owner = nullptr, device_vm::PreparedFork* device_fork = nullptr) noexcept -> int {
     if (refusal != nullptr) *refusal = {};
     auto refuse = [refusal](ForkCopyRefusalSite site, int status, uint32_t detail = 0) {
         if (refusal != nullptr) *refusal = {.valid = true, .site = site, .raw_status = status, .detail = detail};
@@ -679,7 +677,7 @@ auto deep_copy_current_user_pagemap_prepared_impl(sched::task::Task& actor, Page
         if (SOURCE == nullptr) return refuse(ForkCopyRefusalSite::SourceAuthority, -EINVAL);
         return huge::detail::copy_current_user_pagemap_exclusive(actor, SOURCE, child, preparation, publication, survey, tables,
                                                                  eager_context, empty_result, prepared_swap, refusal, private_child,
-                                                                 authority, source_owner);
+                                                                 authority, source_owner, device_fork);
     }
     // Instrumented caller-born storage: Task writes its result into this actual
     // addressable output. Deliberately do not acquire a striped reader here.
@@ -728,7 +726,8 @@ auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, sched::ta
                                              const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
                                              const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
                                              numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
-                                             PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal) noexcept -> int {
+                                             PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal,
+                                             device_vm::PreparedFork* device_fork) noexcept -> int {
     struct InvalidateAuthority {
         ForkPrivateChildRoot& authority;
         ForkSourceOwner& source_owner;
@@ -738,7 +737,7 @@ auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, sched::ta
         }
     } const INVALIDATE{authority, source_owner};
     return deep_copy_current_user_pagemap_prepared_impl(actor, child.pagemap, preparation, publication, survey, tables, eager_context,
-                                                        empty_result, &swap, refusal, &child, &authority, &source_owner);
+                                                        empty_result, &swap, refusal, &child, &authority, &source_owner, device_fork);
 }
 
 }  // namespace ker::mod::mm::virt

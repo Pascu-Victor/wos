@@ -8,6 +8,7 @@ bodies are extracted unchanged. No fake current Task/GS or kernel runtime claim.
 import os
 import shutil
 import subprocess
+import runpy
 import tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[3]
@@ -24,7 +25,11 @@ def extract(text,signature,declaration=False):
   i+=1
  return text[start:i]+(';' if declaration else '')
 def program(v,t,c,vh,ch):
- core=v[v.index('#ifdef WOS_SELFTEST\nnamespace ker::test::numa_lifecycle::mm_debt {'):]
+ nondevice=runpy.run_path(str(Path(__file__).with_name('nondevice_object_fixture.py')))
+ empty_owners,_=nondevice['empty_object_owners'](lambda name: ROOT/'modules/kern/src'/name)
+ core_start=v.index('#ifdef WOS_SELFTEST\nnamespace ker::test::numa_lifecycle::mm_debt {')
+ core_end=v.index('}  // namespace ker::test::numa_lifecycle::mm_debt',core_start)
+ core=v[core_start:v.index('#endif',core_end)+len('#endif')]+'\n'
  setup=r'''
 #include <array>
 #include <atomic>
@@ -37,7 +42,7 @@ def program(v,t,c,vh,ch):
 #include <utility>
 #include <platform/mm/lifecycle_census.hpp>
 #include <test/numa_lifecycle_mm_debt.hpp>
-'''+core+r'''
+'''+core+empty_owners+nondevice['nondevice_family']()+r'''
 namespace nl=ker::test::numa_lifecycle;
 namespace debt=nl::mm_debt;
 using DebtField=nl::CounterField;
@@ -62,7 +67,10 @@ void page_ref_dec(void* p,PageLookupHint*){CHECK(p==frame.bytes.data()&&frame.re
 }
 namespace file_mapping {
 enum class BindingOwner{PIN};enum class FileMappingPinResult{ACQUIRED,REFUSE};
-struct FileMappingBinding{unsigned refs{};bool expect_full_tail{};void release(BindingOwner){auto x=snap();CHECK(refs>0);if(expect_full_tail)CHECK(x.user_page_pins>0&&x.pin_returns>0&&x.access_readers==0);--refs;}};
+struct FileMappingBinding{unsigned refs{};bool expect_full_tail{};
+auto lifetime() const -> NonDeviceFamily* {return &nondevice_family;}
+auto start() const -> uint64_t {std::abort();}auto end() const -> uint64_t {std::abort();}auto file_offset() const -> uint64_t {std::abort();}
+void release(BindingOwner){auto x=snap();CHECK(refs>0);if(expect_full_tail)CHECK(x.user_page_pins>0&&x.pin_returns>0&&x.access_readers==0);--refs;}};
 }
 namespace addr{auto get_virt_pointer(uint64_t p){return p;}}
 namespace virt {
@@ -81,10 +89,10 @@ auto page_align_down(uint64_t p){return p&~uint64_t{4095};}
 bool snapshot_user_page_mapping_locked(PageTable* r,uint64_t,bool w,uint64_t& pa,bool* dirty=nullptr){++snapshots;pa=reinterpret_cast<uint64_t>(phys::frame.bytes.data());if(dirty)*dirty=true;if(change_second_snapshot&&snapshots%2==0)return false;return r&&r->present&&(!w||r->writable);}
 unsigned raw_gate_services{};std::atomic<bool>* raw_gate_release{};
 void service_user_pagemap_gate_wait(uint64_t& n){++n;++raw_gate_services;auto x=snap();CHECK(x.inflight==0&&x.access_readers==0);if(raw_gate_release){raw_gate_release->store(false);raw_gate_release=nullptr;}std::this_thread::yield();}
-'''+extract(vh,'struct UserPagePin {',True)+extract(vh,'struct UserFutexIdentity {',True)+r'''
+'''+extract(vh,'struct UserPagePin {',True)+extract(vh,'struct UserFutexIdentity {',True)+extract(vh,'enum class UserPagePinAttempt :',True)+r'''
 }
 }
-namespace ker::mod::mm::paging {using PageTable=virt::PageTable;}
+namespace ker::mod::mm::paging {using PageTable=virt::PageTable;constexpr uint64_t PAGE_SIZE=4096;}
 namespace ker::mod::sched::task {
 enum class TaskState{ACTIVE,EXITING,DEAD};
 struct Task {
@@ -103,13 +111,21 @@ enum class PublicReadPrepareResult:uint8_t{NOT_TRACKED,READY,REFUSED};
 bool refuse_prepare{},refuse_pin{};
 auto prepare_tmpfs_read_shared_page(sched::task::Task&,uint64_t,bool){return refuse_prepare?PublicReadPrepareResult::REFUSED:PublicReadPrepareResult::NOT_TRACKED;}
 auto pin_user_page_for_task(sched::task::Task*,PageTable*root,uint64_t va,bool writable,bool,UserPagePin&out)->bool{if(refuse_pin)return false;size_t gate=USER_PAGEMAP_ACCESS_GATE_NONE;if(!acquire_user_pagemap_access(root,false,gate))return false;if(try_pin_current_user_page_mapping(root,va,writable,gate,out))return true;release_user_pagemap_access(gate);return false;}
+// These finite debt vectors expose no busy/ordinary syscall frontier.
+auto try_pin_user_page_for_task(sched::task::Task*t,PageTable*r,uint64_t a,bool w,bool f,UserPagePin&out)->UserPagePinAttempt{return pin_user_page_for_task(t,r,a,w,f,out)?UserPagePinAttempt::Pinned:UserPagePinAttempt::Failed;}
 bool user_page_pin_still_mapped(const UserPagePin&p){return p.hhdm_page!=nullptr;}
 bool user_page_pin_commit_write(const UserPagePin&p){return p.hhdm_page!=nullptr;}
 bool capture_user_futex_identity(const UserPagePin&,uint64_t,UserFutexIdentity&){return false;}
 bool user_futex_identity_still_mapped(const UserPagePin&,const UserFutexIdentity&){return false;}
 }
+namespace ker::mod::sched {
+auto can_query_current_task()->bool{return false;}auto get_current_task()->task::Task*{return nullptr;}
+auto interrupts_enabled()->bool{return false;}void kern_yield(){std::abort();}
+}
+namespace ker::mod::sys {struct SyscallPreparationScope {explicit SyscallPreparationScope(sched::task::Task&){}auto ready()->bool{return false;}};}
 namespace ker::mod::sys::usercopy {
 constexpr uint64_t USER_ADDR_LIMIT=0x0000800000000000ULL;
+auto ordinary_usercopy_retry_context(sched::task::Task*)->bool{return false;}
 '''+extract(ch,'class UserPageFrameRef {',True)+extract(ch,'class StableUserPage {',True)+'\n'
  owners=['UserPageFrameRef::~UserPageFrameRef()','UserPageFrameRef::UserPageFrameRef(UserPageFrameRef&&','auto UserPageFrameRef::operator=','auto UserPageFrameRef::valid()','void UserPageFrameRef::reset()','StableUserPage::~StableUserPage()','auto StableUserPage::valid()','auto StableUserPage::retain_frame','void StableUserPage::reset()','auto range_valid(','auto pin_task_user_page(']
  # Constructor's first braces are a member initializer, so preserve the exact complete known definition.
@@ -156,8 +172,8 @@ int main(){fixture::tests();std::printf("PASS actual MM access/pin/Task/usercopy
 def main():
  compiler=os.environ.get('HOST_CXX') or shutil.which('g++',path=os.defpath) or shutil.which('clang++',path=os.defpath)
  if compiler is None:raise SystemExit('no Host C++ compiler')
- paths=[VIRT,TASK,COPY,VH,CH];before=[p.read_bytes() for p in paths]
- code=program(*(b.decode() for b in before))
+ paths=[VIRT,TASK,COPY,VH,CH,Path(__file__).with_name('nondevice_object_fixture.py'),ROOT/'modules/kern/src/dev/device_mapping_object.hpp',ROOT/'modules/kern/src/dev/device_mapping_object.cpp'];before=[p.read_bytes() for p in paths]
+ code=program(*(b.decode() for b in before[:5]))
  environment={**os.environ,'ASAN_OPTIONS':'detect_leaks=0:halt_on_error=1','UBSAN_OPTIONS':'halt_on_error=1:print_stacktrace=1'}
  with tempfile.TemporaryDirectory(prefix='wos-numa-mm-debt-pin-') as scratch:
   scratch=Path(scratch);cpp=scratch/'actual.cpp';binary=scratch/'actual';cpp.write_text(code)

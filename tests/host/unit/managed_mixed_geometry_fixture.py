@@ -148,6 +148,7 @@ auto mapped_physical_address(sched::task::Task&,uint64_t,bool=false)->uint64_t;
             "inline auto is_watched_mmap_vaddr(", "auto align_user_vmem_size(", "struct OccupiedVmemRange {",
             "auto table_from_entry(", "auto page_table_index(", "auto next_table_boundary(",
             "auto pte_raw(const ker::mod::mm::paging::PageTableEntry& entry) -> uint64_t {", "auto is_reserved_leaf(", "auto first_pagemap_occupied_range(",
+            "auto first_lazy_vmem_overlap(", "auto first_occupied_range(",
             "void release_lazy_vmem_range_files(", "auto push_lazy_vmem_range(", "auto push_lazy_vmem_range_copy(",
             "auto remove_lazy_vmem_range("):
             out.append(d("syscalls_impl/vmem/sys_vmem.cpp", anchor))
@@ -160,6 +161,10 @@ auto mapped_physical_address(sched::task::Task&,uint64_t,bool=false)->uint64_t;
                        "auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length) -> bool {"):
             out.append(d("syscalls_impl/vmem/sys_vmem.cpp", anchor))
         out.append(r'''
+// These original ordinary file/anonymous vectors supply no device provider.
+// Device VM transactions are exercised by their separate actual-body suite.
+auto change_device_range_if_needed(log_mixed_task&,uint64_t,uint64_t,bool,uint64_t=0)->std::optional<uint64_t>{return std::nullopt;}
+auto device_overlap_locked(log_mixed_task&,uint64_t,uint64_t,const SharedVmemPublicationGuard&,bool& found)->int{found=false;return 0;}
 // Preserve the actual dispatch and unchanged production typed checks by source
 // guards. This finite return endpoint does not execute a binding mutation.
 auto change_public_shared_file(log_mixed_task&,uint64_t,uint64_t,bool protect,uint64_t=0)->uint64_t{
@@ -472,7 +477,7 @@ auto try_admit_mapping_count(task::Task* subject,mm::paging::PageTable* root,uin
  if(admitted_bytes)*admitted_bytes=added;
  return MappingAdmission::Admitted;
 }
-using ker::mod::sched::get_current_task;
+// The actual PUB context already declares the current-task wrapper.
 ''', d("platform/sched/resource_as.cpp", "auto can_reuse_mapping_count("),
                d("platform/sched/resource_as.cpp", "auto AddressSpaceObservation::try_admit_mapping("),
                d("platform/sched/resource_as.cpp", "auto AddressSpaceObservation::admit_mapping("),
@@ -489,7 +494,6 @@ auto anon_zero_cow_enabled()->bool{return host_fixed::zero_cow;}
         for anchor in (
             "auto clamp_perf_u16(", "auto clamp_perf_u32(", "auto vmem_latency_since(",
             "auto perf_status_from_vmem_result(", "void record_local_vmem_event(",
-            "auto first_lazy_vmem_overlap(", "auto first_occupied_range(",
             "auto mmap_range_is_free(", "auto find_free_range_from(",
             "void advance_mmap_cursor(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size) {",
             "void advance_shared_mmap_cursor_locked(", "auto find_free_range(",
@@ -653,6 +657,9 @@ namespace ker::mod::security {
 ''', r'''
 }
 namespace ker::syscall::vmem {
+auto allocate_device_shared_wb(ker::mod::sched::task::Task&,ker::vfs::File&,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)->uint64_t{
+ std::abort(); // Explicitly unreachable: the finite File endpoint has no client.
+}
 auto lazy_file_mmap_enabled()->bool{return host_file::lazy;}
 auto file_mmap_page_cache_enabled()->bool{return host_file::cache;}
 // The cache lookup/loan is a supplied reference, not native cache coherence.
@@ -709,7 +716,7 @@ constexpr unsigned S_IFMT=0170000,S_IFREG=0100000;
 struct Stat {uint64_t st_mode=S_IFREG,st_dev=1,st_ino=1;off_t st_size=64*4096;struct Time{long tv_sec{},tv_nsec{};}st_mtim,st_ctim;};
 struct FileOps{void(*vfs_write)(){};};
 struct File {std::atomic<int>refcount{1};FileOps*fops{};unsigned open_flags{2};bool read_only{};
- FSType fs_type{FSType::SOCKET};void*mount_owner{};off_t pos{17};const char*vfs_path{};Stat stat{};};
+ FSType fs_type{FSType::SOCKET};void*mount_owner{};off_t pos{17};const char*vfs_path{};Stat stat{};bool device_client{};};
 '''
         assert source.count(old) == 1
         source = source.replace(old, new, 1)
@@ -938,8 +945,15 @@ void admission_boundary(){
         return "\nnamespace ker::syscall::vmem {\n" + "\n".join(blocks) + "\n}\n" if blocks else ""
 
     def controls(self, source):
-        # Exactly four new controls; original profiles retain every inherited
-        # control. This profile still executes all185 baseline bodies once.
+        # Original profiles retain every inherited control. Coverage refusal
+        # is independently checked against the same complete public body.
+        coverage = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto protect_range(")
+        start = coverage.index("            uint64_t coverage = ADDR;")
+        end = coverage.index("            if (GEOMETRY.stage == MutationStage::NeedDemotion)", start)
+        omitted = coverage[:start] + coverage[end:]
+        assert source.count(coverage.strip()) == 1
+        yield "public-protect-skips-logical-coverage", source.replace(coverage.strip(), omitted.strip(), 1), \
+            "ManagedPublicMutation.EmptyAndInteriorProtectionHolesHaveNoEffects:ManagedPublicMutation.GapBeforeLazySuffixPreservesRowsAndPte"
         actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto sys_vmem(uint64_t op,")
         old = "return anon_free(a1, a2, nullptr, MutationRoute::Public);"
         assert actual.count(old) == 1 and source.count(actual) == 1

@@ -124,7 +124,7 @@ auto observe_mapping_count(task::Task& subject,mm::paging::PageTable*,uint64_t)-
 }
 """, d("platform/sched/resource_as.cpp", "auto AddressSpaceObservation::observe("),
                     d("platform/sched/resource_as.cpp", "AddressSpaceObservation::~AddressSpaceObservation()"), "}\n",
-                    "namespace ker::syscall::vmem {\nusing ker::mod::sched::get_current_task;\n",
+                    "namespace ker::syscall::vmem {\n",
                     "using LazyVmemRange=ker::mod::sched::task::LazyVmemRange;using LazyVmemKind=ker::mod::sched::task::LazyVmemKind;using LazyVmemRangeVec=ker::mod::sched::task::LazyVmemRangeVec;\n",
                     "constexpr uint64_t USER_SPACE_START=0x400000;\nvoid advance_mmap_cursor(ker::mod::sched::task::Task*,uint64_t,uint64_t);\n",
                     d("syscalls_impl/vmem/sys_vmem.cpp", "struct KernelManagedLayoutOverlapQuery {"),

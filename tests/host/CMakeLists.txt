@@ -63,15 +63,34 @@ wos_add_unit_test(cache_policy_test
 wos_add_unit_test(file_binding_snapshot_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim/retirement_port.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim/object_pages.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/file_mapping_lifetime.cpp
+                 ${WOS_KERN_SRC}/dev/device_mapping_object.cpp
 )
-target_include_directories(file_binding_snapshot_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim)
+target_include_directories(file_binding_snapshot_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim)
 set_tests_properties(file_binding_snapshot_test PROPERTIES TIMEOUT 30)
 wos_add_unit_test(device_mapping_client_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_client_test.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim/object_pages.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim/retirement_port.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/device_mapping_client.cpp
+                 ${WOS_KERN_SRC}/dev/device_mapping_object.cpp
+                 ${WOS_KERN_SRC}/dev/device_mapping_grants.cpp
 )
+target_include_directories(device_mapping_client_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim)
 set_tests_properties(device_mapping_client_test PROPERTIES TIMEOUT 30)
+wos_add_unit_test(device_mapping_object_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_test.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim/object_pages.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim/retirement_port.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/device_mapping_object.cpp
+                 ${WOS_KERN_SRC}/dev/device_mapping_grants.cpp
+                 ${WOS_KERN_SRC}/dev/device_mapping_client.cpp
+)
+target_include_directories(device_mapping_object_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_object_shim)
+set_tests_properties(device_mapping_object_test PROPERTIES TIMEOUT 30)
 wos_add_unit_test(pci_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/pci.cpp
@@ -312,6 +331,30 @@ add_test(NAME binding_root_lease_runtime_test
 set_tests_properties(binding_root_lease_runtime_test PROPERTIES
     LABELS "host;unit;runtime" TIMEOUT 120
 )
+add_test(NAME device_frame_export_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_frame_export_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(device_frame_export_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 120
+)
+add_test(NAME device_mapping_vm_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_vm_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(device_mapping_vm_runtime_test PROPERTIES
+    LABELS "host;unit;runtime" TIMEOUT 150
+)
+foreach(device_vm_control IN ITEMS no-sort ignore-lazy ignore-mremap-policy ignore-fork-count)
+    string(REPLACE "-" "_" device_vm_control_name "${device_vm_control}")
+    add_test(NAME device_mapping_vm_control_${device_vm_control_name}
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_mapping_vm_runtime_test.py
+            --cxx ${CMAKE_CXX_COMPILER} --control ${device_vm_control}
+    )
+    set_tests_properties(device_mapping_vm_control_${device_vm_control_name} PROPERTIES
+        LABELS "host;unit;runtime;counterexample" TIMEOUT 150
+    )
+endforeach()
 add_test(NAME tmpfs_page_ownership_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_page_ownership_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER}

@@ -31,8 +31,14 @@ struct AllocationResult;
 namespace ker::mod::sys {
 class SyscallPreparationScope;
 }
+namespace ker::mod::mm::device_vm {
+class PreparedFork;
+}
 namespace ker::mod::mm::file_mapping {
 class FileBindingSnapshot;
+}
+namespace ker::mod::mm::device_vm::detail {
+struct VmAccess;
 }
 namespace ker::syscall::vmem {
 class SharedVmemPublicationGuard;
@@ -341,6 +347,7 @@ class BindingRootMutationLease {
     void finish() noexcept;
 
    private:
+    friend struct ker::mod::mm::device_vm::detail::VmAccess;
     friend auto try_acquire_binding_root(const file_mapping::FileBindingSnapshot&, const ker::syscall::vmem::SharedVmemPublicationGuard&,
                                          BindingRootMutationLease&) noexcept -> BindingRootAdmission;
     [[nodiscard]] auto acquire(const file_mapping::FileBindingSnapshot&, const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept
@@ -1051,11 +1058,14 @@ bool deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst);
                                                            ForkCopyRefusalWitness* refusal) noexcept -> int;
 // Genuine factory-born fork path. The typed call invalidates authority on
 // every exit and consumes the real source owner without another acquisition.
-[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(
-    sched::task::Task& actor, sched::task::Task& child, ForkPrivateChildRoot& authority, ForkSourceOwner& source_owner,
-    const sys::SyscallPreparationScope& preparation, const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
-    const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables, numa::AllocationContext* eager_context,
-    numa::AllocationResult* empty_result, PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal = nullptr) noexcept -> int;
+[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, sched::task::Task& child,
+                                                           ForkPrivateChildRoot& authority, ForkSourceOwner& source_owner,
+                                                           const sys::SyscallPreparationScope& preparation,
+                                                           const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                                           const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                                           numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
+                                                           PreparedAnonymousSwapFork& swap, ForkCopyRefusalWitness* refusal = nullptr,
+                                                           device_vm::PreparedFork* device_fork = nullptr) noexcept -> int;
 #ifdef WOS_SELFTEST
 // Caller exclusively owns both distinct registered never-active mutable roots.
 // Same walker, local eager decision only. Controlled refusal is not PMM pressure.

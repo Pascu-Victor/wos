@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import runpy
 import shutil
 import signal
 import subprocess
@@ -34,6 +35,7 @@ SOURCE = KERN / "syscalls_impl/vmem/sys_vmem.cpp"
 SMALLVEC = KERN / "util/smallvec.hpp"
 FAMILY_HEADER = KERN / "platform/mm/file_mapping_lifetime.hpp"
 NATIVE_HEADER = KERN / "platform/mm/unpublished_mapping_retirement.hpp"
+OBJECT_HEADER = KERN / "dev/device_mapping_object.hpp"
 SCRATCH_BUDGET = 64 * 1024 * 1024
 LOG_BUDGET = 1024 * 1024
 FILE_BUDGET = 8 * 1024 * 1024
@@ -355,18 +357,25 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     include = scratch / "include"
     actual = []
     for name, data in [("util/smallvec.hpp", SMALLVEC.read_bytes()),
+                       ("dev/device_mapping_object.hpp", OBJECT_HEADER.read_bytes()),
                        ("platform/mm/file_mapping_lifetime.hpp", FAMILY_HEADER.read_bytes()),
                        ("platform/mm/unpublished_mapping_retirement.hpp", NATIVE_HEADER.read_bytes()),
                        ("platform/mm/dyn/kmalloc.hpp", b"#pragma once\n"),
+                       # No Object is constructed by these old RAW vectors.
+                       # Only its genuine header needs a complete lock type.
+                       ("platform/sys/spinlock.hpp", b"#pragma once\nnamespace ker::mod::sys {struct Spinlock {}; }\n"),
                        ("util/hcf.hpp", b"#pragma once\n#include <cstdlib>\n[[noreturn]] inline void hcf(){std::abort();}\n")]:
         path = include / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
     actual.append({"name": "whole-real-util/smallvec.hpp", **pin(SMALLVEC)})
-    for header in [FAMILY_HEADER, NATIVE_HEADER]:
+    for header in [FAMILY_HEADER, NATIVE_HEADER, OBJECT_HEADER]:
         actual.append({"name": "whole-real-" + header.name, **pin(header)})
     source = selected.read_text()
-    chunks = [PRELUDE, "\nnamespace ker::syscall::vmem {\n"]
+    nondevice = runpy.run_path(str(Path(__file__).with_name("nondevice_object_fixture.py")))
+    empty_owners, owner_rows = nondevice["empty_object_owners"](lambda name: KERN / name)
+    actual.extend(owner_rows)
+    chunks = [PRELUDE, empty_owners, "\nnamespace ker::syscall::vmem {\n"]
     for anchor, declaration in [("struct FileMmapRange {", True),
                                  ("auto ranges_overlap(", False),
                                  ("auto checked_range_end(", False),
@@ -591,7 +600,9 @@ def main() -> int:
             if evidence.parent.resolve(strict=True) != evidence.parent or os.path.lexists(evidence):
                 raise ValueError("--evidence-dir needs an existing canonical parent and a fresh exclusive directory")
             evidence.mkdir(mode=0o700)
-        watched = [selected, SMALLVEC, FAMILY_HEADER, NATIVE_HEADER, Path(__file__).resolve(), compiler]
+        watched = [selected, SMALLVEC, FAMILY_HEADER, NATIVE_HEADER, OBJECT_HEADER,
+                   KERN / "dev/device_mapping_object.cpp", Path(__file__).with_name("nondevice_object_fixture.py"),
+                   Path(__file__).resolve(), compiler]
         before = [pin(path) for path in watched]
         result["source_before"] = before
         result["selected_vmem_source"] = before[0]

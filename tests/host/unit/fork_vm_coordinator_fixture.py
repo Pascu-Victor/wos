@@ -42,6 +42,11 @@ class Builder:
         self.public = PublicWiring(self)
         self.inputs.extend(self.public.inputs)
         self.test_count += self.public.test_count + 7
+        from nondevice_object_fixture import empty_object_owners
+        self.empty_object_bodies, rows = empty_object_owners(kernel_file)
+        self.extractions.extend(rows)
+        self.inputs.extend([support / 'nondevice_object_fixture.py', kernel_file('dev/device_mapping_object.cpp'),
+                            kernel_file('dev/device_mapping_object.hpp')])
 
     def body(self, file, anchor):
         import hashlib
@@ -222,6 +227,7 @@ namespace ker::mod::mm::file_mapping {
 struct LifetimeRetirementTicket {LifetimeRetirementRun run{};void* arg{};bool pending{};};
 namespace {
 host_fork_vm::Spin owner_count_lock;
+constinit FileMappingBinding* device_binding_head{};
 """,
         ]
         out += [d("platform/mm/file_mapping_lifetime.cpp", "class OwnerCountGuard {")]
@@ -399,7 +405,7 @@ auto get_kernel_pagemap()->PageTable*{return kernel_pagemap;}
         # overload's optional witness, without changing any copied prototype.
         out += ["#ifndef WOS_HOST_PREPARED_FORK_DECLARATIONS922\n#define WOS_HOST_PREPARED_FORK_DECLARATIONS922\n"
                 + header[a : header.index("#ifdef WOS_SELFTEST", a)] + "\n#endif\n", "}\n"]
-        return "\n".join(out)
+        return "\n".join(out) + "\n" + self.empty_object_bodies
 
     def compose(
         self,
@@ -917,8 +923,8 @@ TEST_F(ForkVmCoordinator, CoordinatorForwardsChildRefusalAndClearsEveryAttempt) 
             ),
             (
                 "coordinator-typed-copy-witness-not-forwarded",
-                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure);",
-                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, nullptr);",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, copy_failure, &device);",
+                "status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child, *private_child_authority, source_owner, preparation, publication, survey, tables, eager_context, empty_result, swap, nullptr, &device);",
                 "ForkVmCoordinator.TypedCoordinatorForwardsExactChildRefusalWithoutCopyRetry",
             ),
             (

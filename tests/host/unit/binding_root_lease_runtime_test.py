@@ -23,6 +23,7 @@ import time
 sys.dont_write_bytecode = True
 from file_mmap_registry_runtime_test import command, pin, subreaper
 from native_lazy_file_fault_runtime_test import definition
+from nondevice_object_fixture import empty_object_owners
 
 ROOT = next(path for path in Path(__file__).resolve().parents
             if (path / 'modules/kern/src').is_dir() and (path / 'tests/host').is_dir())
@@ -123,6 +124,7 @@ def main() -> int:
             KERN / 'platform/mm/file_mapping_lifetime.cpp', KERN / 'platform/mm/file_mapping_lifetime.hpp',
             KERN / 'platform/mm/lifetime_retirement_executor.hpp', KERN / 'platform/mm/paging.hpp',
             KERN / 'platform/sched/shutdown_ownership.hpp',
+            KERN / 'dev/device_mapping_object.cpp', KERN / 'dev/device_mapping_object.hpp', UNIT / 'nondevice_object_fixture.py',
             ROOT / 'tests/host/kern_shim/defines/defines.hpp']
         watched += sorted(path for path in SHIM.rglob('*') if path.is_file())
         before = [pin(path) for path in watched]
@@ -130,11 +132,13 @@ def main() -> int:
         source, result['actual_definitions'] = generate(*(path.read_text() for path in sources))
         translation, binary = scratch / 'lease.cpp', scratch / 'lease'
         translation.write_text(source)
+        empty_owners, _ = empty_object_owners(lambda p: KERN / p)
+        (scratch / 'empty-object.cpp').write_text('#include <cstdlib>\n#include <utility>\n' + empty_owners)
         argv = [str(compiler_driver), '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
                 '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer',
                 '-I', str(SHIM), '-I', str(ROOT / 'tests/host/kern_shim'), '-I', str(KERN), '-I', str(ROOT / 'modules'),
                 str(translation), str(KERN / 'platform/mm/file_mapping_lifetime.cpp'),
-                str(SHIM / 'retirement_port.cpp'), '-o', str(binary)]
+                str(SHIM / 'retirement_port.cpp'), str(scratch / 'empty-object.cpp'), '-o', str(binary)]
         row = command(argv, scratch / 'compile.log', scratch, deadline, groups)
         result['commands'].append(row)
         if row['exit'] != 0:

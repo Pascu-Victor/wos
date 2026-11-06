@@ -113,13 +113,16 @@ auto access_window_active() -> bool {
 UserPageFrameRef::~UserPageFrameRef() { reset(); }
 
 UserPageFrameRef::UserPageFrameRef(UserPageFrameRef&& other) noexcept
-    : m_page(std::exchange(other.m_page, nullptr)), m_lookup_hint(std::exchange(other.m_lookup_hint, mm::phys::PageLookupHint{})) {}
+    : m_page(std::exchange(other.m_page, nullptr)),
+      m_lookup_hint(std::exchange(other.m_lookup_hint, mm::phys::PageLookupHint{})),
+      m_device_export(std::move(other.m_device_export)) {}
 
 auto UserPageFrameRef::operator=(UserPageFrameRef&& other) noexcept -> UserPageFrameRef& {
     if (this != &other) {
         reset();
         m_page = std::exchange(other.m_page, nullptr);
         m_lookup_hint = std::exchange(other.m_lookup_hint, mm::phys::PageLookupHint{});
+        m_device_export = std::move(other.m_device_export);
     }
     return *this;
 }
@@ -139,6 +142,10 @@ void UserPageFrameRef::reset() noexcept {
         debt::drop(DebtField::PIN_RETURNS);
 #endif
     }
+    // The exported Object owns its base frame/charge through the actual PMM
+    // return above. Its final put only queues its pre-reserved callback, even
+    // when a futex bucket retires this independent owner with IRQs disabled.
+    m_device_export.reset();
 }
 
 StableUserPage::~StableUserPage() { reset(); }
@@ -169,6 +176,27 @@ auto StableUserPage::retain_frame(UserPageFrameRef& out) const -> bool {
     if (!valid() || out.valid()) {
         return false;
     }
+    ker::dev::mapping::ObjectExportRef device_export;
+    if (auto* binding = m_pin.file_binding; binding != nullptr) {
+        // The live exact PIN owns immutable binding/family storage. Retaining
+        // that PIN in an independent frame could create a File->Task cycle.
+        auto* const FAMILY = binding->lifetime();
+        if (FAMILY == nullptr) return false;
+        if (FAMILY->is_device_backed()) {
+            constexpr uint64_t PAGE_SIZE = mm::paging::PAGE_SIZE;
+            constexpr uint64_t PAGE_MASK = PAGE_SIZE - 1;
+            auto* const OBJECT = FAMILY->device_object();
+            if (OBJECT == nullptr || FAMILY->device_generation() == 0 || FAMILY->device_generation() != OBJECT->generation() ||
+                ((m_pin.user_page | m_pin.physical_page | binding->file_offset()) & PAGE_MASK) != 0 || m_pin.user_page < binding->start() ||
+                m_pin.user_page >= binding->end() || binding->end() - m_pin.user_page < PAGE_SIZE)
+                return false;
+            uint64_t offset = 0;
+            if (__builtin_add_overflow(binding->file_offset(), m_pin.user_page - binding->start(), &offset) ||
+                offset < FAMILY->device_window_base() || offset > FAMILY->device_window_end() ||
+                PAGE_SIZE > FAMILY->device_window_end() - offset || !OBJECT->export_page(offset, m_pin.physical_page, device_export))
+                return false;
+        }
+    }
     mm::phys::PageLookupHint hint = m_pin.lookup_hint;
     // The live pin already owns this frame across concurrent unmap. Duplicate
     // only its allocator reference; the new owner never keeps a root reader.
@@ -183,6 +211,7 @@ auto StableUserPage::retain_frame(UserPageFrameRef& out) const -> bool {
     }
     out.m_page = m_pin.hhdm_page;
     out.m_lookup_hint = hint;
+    out.m_device_export = std::move(device_export);
 #ifdef WOS_SELFTEST
     debt::add(DebtField::RETAINED_FRAME_REFS);
     debt::end_change();
