@@ -22,6 +22,13 @@ KTEST(IommuDomains, PublishedDomainsMatchHardwareAndPhysicalPageAccounting) {
     KEXPECT_EQ(balance.owners[static_cast<size_t>(mm::PhysicalPageOwner::IOMMU_TABLE)].objects, STATS.table_pages);
     auto const* inventory = iommu::discovery();
     KREQUIRE_TRUE(inventory != nullptr);
+    if (STATS.active_units != 0) KEXPECT_EQ(inventory->vendor, iommu::FirmwareVendor::intel);
+    if (inventory->vendor == iommu::FirmwareVendor::amd) {
+        KEXPECT_EQ(STATS.active_units, size_t{0});
+        KEXPECT_EQ(STATS.table_pages, size_t{0});
+        KEXPECT_FALSE(STATS.strict);
+        KEXPECT_NULL(iommu::group_inventory());
+    }
     for (size_t i = 0; i < STATS.devices; ++i) {
         auto* device = pci::pci_get_device(i);
         auto const DOMAIN = iommu::domain_info(device);

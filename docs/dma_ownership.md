@@ -15,8 +15,17 @@ its BAR and interrupt lifetime are retained through WKI/IRQ retirement.
 | `--iommu-off` | Explicit software passthrough. Conflicts with either translation option. |
 
 Strict mode is opt-in. Successful normal compatibility boots do not demonstrate
-DMA isolation. Existing firmware-active translation is refused rather than
-replaced without ownership proof.
+DMA isolation. Existing firmware-active Intel translation is refused rather
+than replaced without ownership proof.
+
+AMD IVRS firmware is structurally observed and privately retained, without AMD
+register probing or an AMD-Vi backend. AMD-only compatibility/off boots remain
+explicit software passthrough; AMD requested translation/strict mode refuses
+with known bus masters inhibited. Ambiguous DMAR/IVRS selection (two non-absent
+lookup results, including untrustworthy root errors) refuses every policy before
+the off branch, so it cannot hide inherited active Intel state. The observer's
+bounded grammar and unsupported features are documented in
+[the GPU platform contract](gpu_platform.md#amd-firmware-observations-and-backend-policy).
 
 Strict admission uses validated ACPI DMAR scopes, complete PCI topology and
 bounded MCFG/configuration evidence. Integrated root-complex functions rely on

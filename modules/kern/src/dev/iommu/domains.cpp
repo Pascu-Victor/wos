@@ -327,7 +327,9 @@ auto invalidate_unit(void* context) -> bool {
 }
 
 auto prepare(const Discovery& inventory, size_t cache_line, bool translated, bool strict) -> bool {
-    if (inventory.state != DiscoveryState::discovered || !inventory.ownership.valid() || !pci::pci_enumeration_complete()) return false;
+    if (inventory.vendor != FirmwareVendor::intel || inventory.state != DiscoveryState::discovered || !inventory.ownership.valid() ||
+        !pci::pci_enumeration_complete())
+        return false;
     std::array<scopes::Device, scopes::MAX_DEVICES> topology{};
     std::array<groups::Evidence, scopes::MAX_DEVICES> evidence{};
     std::array<pci::ecam::Capabilities, scopes::MAX_DEVICES> strict_capabilities{};
@@ -485,6 +487,9 @@ void initialize_domains(bool disabled, bool strict, bool translated) {
     if (stats.devices > domains.size()) fail_boot("PCI inventory exceeds DMA domain capacity");
     auto const* inventory = discovery();
     if (inventory == nullptr) fail_boot("DMA domain initialization preceded firmware discovery");
+    // Without choosing a unique vendor we cannot even rule out inherited live
+    // Intel state. Do not hide that takeover hazard behind --iommu-off.
+    if (inventory->state == DiscoveryState::conflicting_firmware) fail_boot("Ambiguous Intel DMAR and AMD IVRS firmware selection");
     for (size_t i = 0; i < inventory->unit_count; ++i)
         if (inventory->units[i].state == UnitState::firmware_active) fail_boot("Cannot take over firmware-active IOMMU state");
     if (disabled) {
@@ -501,10 +506,12 @@ void initialize_domains(bool disabled, bool strict, bool translated) {
     if (!prepare(*inventory, cache_line_bytes(), translated, strict)) {
         if (translated) {
             release_unpublished_tables();
+            if (inventory->vendor == FirmwareVendor::amd) fail_boot("Requested DMA translation requires an unavailable AMD-Vi backend");
             fail_boot(strict ? "Requested strict DMA isolation cannot be safely prepared"
                              : "Requested translated DMA domains cannot be safely prepared");
         }
-        publish_fallback("unavailable capabilities, topology or table storage");
+        publish_fallback(inventory->vendor == FirmwareVendor::amd ? "AMD-Vi backend unavailable; firmware registers unprobed"
+                                                                  : "unavailable capabilities, topology or table storage");
         for (size_t i = 0; i < stats.devices; ++i)
             if (was_master[i] && !pci::pci_set_bus_master(pci::pci_get_device(i), true))
                 fail_boot("Cannot restore explicit fallback bus mastering");

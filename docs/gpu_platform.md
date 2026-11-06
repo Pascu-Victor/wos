@@ -5,6 +5,52 @@ and NVIDIA drivers; it does not yet provide a GPU driver or a hardware support
 claim. The selected deployment is a whole physical PCI function on bare metal
 or passed to WOS by an external VFIO host. Emulated GPUs do not qualify it.
 
+## AMD firmware observations and backend policy
+
+`dev/iommu/ivrs.hpp` is a bounded, allocation-free IVRS syntax observer. It
+retains raw revision/IVinfo and counts IVHD hardware blocks, IVMD memory blocks
+and device entries. Alternative IVHD10/11/40 blocks can describe the same IOMMU;
+the block count is not a unique-unit inventory. Syntax success grants no PCI
+ownership, register mapping, DMA translation or interrupt-remapping authority.
+AMD-Vi activation, requester normalization and IVMD mapping policy remain open.
+
+The observer bounds the whole accessible table to 64 KiB, 256 blocks and 4096
+entries. It checks the ACPI signature/length/checksum and header reserved bytes,
+IVHD10/11/40 fixed lengths, IVMD20/21/22 framing and complete entry extents.
+Ordinary and alias/extended ranges require a matched, nondecreasing inclusive
+end; an alias range has one destination requester ID. Padding can intervene,
+but other range interleaving is outside this subset. Entries below 0x80 have
+4/8-byte framing. HID entry 0xf0 has 22 fixed bytes plus its bounded UID length;
+other upper encodings are rejected rather than assigned an invented size.
+HID/CID/UID values are retained without decoding or AML identity resolution.
+
+Revisions 1/2, legacy capability offsets 0x40..0xfc aligned to four bytes,
+nonzero page-aligned register bases and positive, nonwrapping full-page IVMD
+extents are explicit WOS observer policies. They are not universal claims about
+newer firmware. IVHD flags, feature/attribute words, EFR/EFR2 and IVMD segment
+bytes are preserved. Extended alternatives/entries, HID, unknown safely framed
+forms, unfamiliar padding and reserved-setting bits report unsupported semantics.
+They never create an Intel `Unit` or resolved requester ownership. Failed parses
+return no partial table or counts.
+
+Layout provenance is [AMD publication 43872 Rev. 3.05, sections 8.2/8.3](https://www.amd.com/content/dam/amd/en/documents/archived-tech-docs/programmer-references/43872.pdf)
+and [ACPICA's pinned IVRS declarations](https://github.com/open-acpica/acpica/blob/e85aa3bebaae81ed1e6d163511ac7e1eafe732cf/source/include/actbl2.h).
+The older AMD document describes a particular chipset; the full modern 48882
+specification was unavailable during this checkpoint. Complete modern reserved
+field, revision and activation rules must be pinned before a hardware backend.
+The WOS byte parser is original code; no Linux driver implementation is imported.
+
+Boot discovery looks for both DMAR and IVRS before any vendor register access,
+copies the selected bounded bytes privately, then parses that retained copy.
+AMD discovery never maps or probes its register banks. A single valid DMAR keeps
+the existing Intel probe path. Two non-absent lookup results, including ambiguous
+root/table errors, refuse every boot policy before `--iommu-off`: WOS cannot
+safely choose a vendor or rule out inherited active Intel state. A single AMD
+source supports only the existing explicitly nonisolating compatibility/off
+fallback; requested translated/strict operation inhibits known PCI requesters
+and refuses boot because the AMD-Vi backend is unavailable. Synthetic table
+tests establish parsing/refusal behavior, not physical AMD hardware support.
+
 ## PCI resource validation
 
 `dev/pci_resource.hpp` interprets complete Type0/Type1 BAR arrays. A 64-bit BAR

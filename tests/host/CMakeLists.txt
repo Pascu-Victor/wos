@@ -440,6 +440,17 @@ set_tests_properties(vfs_mkdir_progress_runtime_test PROPERTIES
 wos_add_unit_test(dmar_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/dmar_test.cpp
 )
+wos_add_unit_test(ivrs_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ivrs_test.cpp
+)
+wos_add_unit_test(iommu_discovery_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/iommu_discovery_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/iommu/discovery.cpp
+)
+target_include_directories(iommu_discovery_runtime_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/iommu_discovery_runtime_shim)
+target_compile_options(iommu_discovery_runtime_test PRIVATE -UNDEBUG)
+set_tests_properties(iommu_discovery_runtime_test PROPERTIES TIMEOUT 30)
 wos_add_unit_test(vtd_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_model_test.cpp
 )
@@ -680,6 +691,9 @@ wos_add_unit_test(dma_manager_test
 )
 wos_add_fuzz_target(dmar_fuzz
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/dmar_fuzz.cpp
+)
+wos_add_fuzz_target(ivrs_fuzz
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/ivrs_fuzz.cpp
 )
 
 wos_add_unit_test(time_arithmetic_test

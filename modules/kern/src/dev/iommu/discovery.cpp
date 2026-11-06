@@ -11,6 +11,7 @@ namespace ker::dev::iommu {
 namespace {
 using log = mod::dbg::logger<"iommu">;
 std::array<uint8_t, dmar::MAX_TABLE_SIZE> firmware_copy{};
+static_assert(ivrs::MAX_TABLE_SIZE <= firmware_copy.size());
 Discovery inventory{};
 std::atomic<bool> published{false};
 
@@ -56,14 +57,8 @@ void probe(Unit& unit) {
                                            : UnitState::capability_error;
 }
 
-void build_inventory() {
-    auto const FOUND = mod::acpi::find_table_bounded("DMAR");
-    if (!FOUND.valid()) {
-        inventory.firmware_error = FOUND.error;
-        inventory.state = FOUND.error == mod::acpi::bounded::Error::not_found ? DiscoveryState::absent : DiscoveryState::firmware_error;
-        return;
-    }
-    auto const PARSED = dmar::parse(FOUND.bytes);
+void build_intel(std::span<const uint8_t> bytes) {
+    auto const PARSED = dmar::parse(bytes);
     if (!PARSED.valid()) {
         inventory.table_error = PARSED.error;
         inventory.state = DiscoveryState::dmar_error;
@@ -73,9 +68,7 @@ void build_inventory() {
         inventory.state = DiscoveryState::inventory_limit;
         return;
     }
-    std::memcpy(firmware_copy.data(), FOUND.bytes.data(), FOUND.bytes.size());
     inventory.table = PARSED.table;
-    inventory.table.bytes = std::span<const uint8_t>{firmware_copy}.first(FOUND.bytes.size());
     auto const BYTES = inventory.table.bytes;
     for (size_t offset = dmar::HEADER_SIZE; offset < BYTES.size(); offset += dmar::detail::read(BYTES, offset + 2, 2)) {
         if (dmar::detail::read(BYTES, offset, 2) != 0) {
@@ -110,6 +103,62 @@ void build_inventory() {
     inventory.ownership =
         scopes::qualify(inventory.table.bytes, std::span<const scopes::Device>{devices}.first(COUNT), pci::pci_enumeration_complete());
 }
+
+void build_inventory() {
+    using FirmwareError = mod::acpi::bounded::Error;
+    // Source selection precedes every vendor-specific MMIO access. Even a
+    // malformed second table or an untrustworthy root prevents a unique choice.
+    auto const DMAR = mod::acpi::find_table_bounded("DMAR");
+    auto const IVRS = mod::acpi::find_table_bounded("IVRS");
+    bool const HAS_DMAR = DMAR.error != FirmwareError::not_found;
+    bool const HAS_IVRS = IVRS.error != FirmwareError::not_found;
+    if (HAS_DMAR && HAS_IVRS) {
+        inventory.vendor = FirmwareVendor::ambiguous;
+        inventory.state = DiscoveryState::conflicting_firmware;
+        if (!DMAR.valid())
+            inventory.firmware_error = DMAR.error;
+        else if (!IVRS.valid())
+            inventory.firmware_error = IVRS.error;
+        return;
+    }
+    if (!HAS_DMAR && !HAS_IVRS) {
+        inventory.state = DiscoveryState::absent;
+        return;
+    }
+    inventory.vendor = HAS_DMAR ? FirmwareVendor::intel : FirmwareVendor::amd;
+    auto const& found = HAS_DMAR ? DMAR : IVRS;
+    if (!found.valid()) {
+        inventory.firmware_error = found.error;
+        inventory.state = DiscoveryState::firmware_error;
+        return;
+    }
+    if (found.bytes.size() > firmware_copy.size()) {
+        if (HAS_DMAR) {
+            inventory.table_error = dmar::Error::length;
+            inventory.state = DiscoveryState::dmar_error;
+        } else {
+            inventory.ivrs_error = ivrs::Error::length;
+            inventory.state = DiscoveryState::ivrs_error;
+        }
+        return;
+    }
+    // Validate the retained copy itself. Firmware mutation after the bounded
+    // lookup must not turn a validated source into an unvalidated publication.
+    if (!found.bytes.empty()) std::memcpy(firmware_copy.data(), found.bytes.data(), found.bytes.size());
+    auto const BYTES = std::span<const uint8_t>{firmware_copy}.first(found.bytes.size());
+    if (HAS_DMAR) {
+        build_intel(BYTES);
+        return;
+    }
+    auto const PARSED = ivrs::parse(BYTES);
+    if (!PARSED.valid()) {
+        inventory.ivrs_error = PARSED.error;
+        inventory.state = DiscoveryState::ivrs_error;
+        return;
+    }
+    inventory.amd_table = PARSED.table;
+    inventory.state = DiscoveryState::ivrs_discovered_unsupported;
+}
 }  // namespace
 
 void discover() {
@@ -117,9 +166,16 @@ void discover() {
         return;
     }
     build_inventory();
-    log::info("discovery=%u firmware_error=%u table_error=%u units=%zu; DMA isolation unavailable (unmanaged boot DMA)",
-              static_cast<unsigned>(inventory.state), static_cast<unsigned>(inventory.firmware_error),
-              static_cast<unsigned>(inventory.table_error), inventory.unit_count);
+    log::info(
+        "discovery=%u firmware_error=%u table_error=%u units=%zu vendor=%u ivrs_error=%u; DMA isolation unavailable (unmanaged boot DMA)",
+        static_cast<unsigned>(inventory.state), static_cast<unsigned>(inventory.firmware_error),
+        static_cast<unsigned>(inventory.table_error), inventory.unit_count, static_cast<unsigned>(inventory.vendor),
+        static_cast<unsigned>(inventory.ivrs_error));
+    if (inventory.vendor == FirmwareVendor::amd) {
+        log::info("IVRS hardware_blocks=%zu memory_blocks=%zu entries=%zu unsupported=%u; AMD-Vi backend unavailable, registers unprobed",
+                  inventory.amd_table.hardware_blocks, inventory.amd_table.memory_blocks, inventory.amd_table.device_entries,
+                  static_cast<unsigned>(inventory.amd_table.unsupported));
+    }
     for (size_t i = 0; i < inventory.unit_count; ++i) {
         auto const& unit = inventory.units[i];
         log::info(

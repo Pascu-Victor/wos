@@ -11,6 +11,8 @@ KTEST(IommuDiscovery, BootInventoryIsPublishedAndRetained) {
     KEXPECT_NE(inventory->state, iommu::DiscoveryState::not_run);
     KEXPECT_TRUE(inventory->unit_count <= iommu::MAX_UNITS);
     if (inventory->state == iommu::DiscoveryState::discovered) {
+        KEXPECT_EQ(inventory->vendor, iommu::FirmwareVendor::intel);
+        KEXPECT_TRUE(inventory->amd_table.bytes.empty());
         auto const PARSED = iommu::dmar::parse(inventory->table.bytes);
         KREQUIRE_TRUE(PARSED.valid());
         KEXPECT_EQ(PARSED.table.units, inventory->unit_count);
@@ -25,6 +27,17 @@ KTEST(IommuDiscovery, BootInventoryIsPublishedAndRetained) {
     } else {
         KEXPECT_EQ(inventory->unit_count, size_t{0});
         KEXPECT_TRUE(inventory->table.bytes.empty());
+    }
+    if (inventory->state == iommu::DiscoveryState::ivrs_discovered_unsupported) {
+        KEXPECT_EQ(inventory->vendor, iommu::FirmwareVendor::amd);
+        auto const PARSED = iommu::ivrs::parse(inventory->amd_table.bytes);
+        KREQUIRE_TRUE(PARSED.valid());
+        KEXPECT_EQ(PARSED.table.hardware_blocks, inventory->amd_table.hardware_blocks);
+        KEXPECT_EQ(PARSED.table.device_entries, inventory->amd_table.device_entries);
+        KEXPECT_TRUE(PARSED.table.hardware_blocks != 0);
+        KEXPECT_FALSE(inventory->ownership.valid());
+    } else {
+        KEXPECT_TRUE(inventory->amd_table.bytes.empty());
     }
 }
 
