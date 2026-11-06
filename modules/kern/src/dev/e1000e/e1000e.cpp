@@ -20,6 +20,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <string_view>
+#include <utility>
 
 #include "dev/pci.hpp"
 
@@ -579,17 +580,20 @@ auto retire_buffers(E1000Device* dev, bool quiesced) -> bool {
 struct RetirementBackend {
     E1000Device* dev;
     bool stopped = false, masked = false, bme_off = false;
-    void close_admission() { dev->admission.close(); }
+    void close_admission() {
+        dev->admission.close();
+        dev->driver_claim.close_data_admission();
+    }
     auto drain_readers() -> bool {
         auto const START = ker::mod::time::get_ms();
         for (size_t n = 0; n < 10'000'000 && ker::mod::time::get_ms() - START < 5000; ++n) {
-            if (dev->admission.drained()) return true;
+            if (dev->admission.drained() && dev->driver_claim.operations_drained()) return true;
             if (ker::mod::sched::can_query_current_task())
                 ker::mod::sched::kern_yield();
             else
                 asm volatile("pause" ::: "memory");
         }
-        return dev->admission.drained();
+        return dev->admission.drained() && dev->driver_claim.operations_drained();
     }
     void unpublish() {
         if (dev->published) {
@@ -644,10 +648,13 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     if (shutdown_started.load(std::memory_order_acquire) || device_count >= MAX_E1000_DEVICES) return;
     for (size_t i = 0; i < device_count; ++i)
         if (devices[i]->pci == pci_dev) return;
+    auto claim = pci::try_claim_driver(pci_dev, pci::DriverKind::e1000e);
+    if (!claim) return;
     if (!pci::pci_set_bus_master(pci_dev, false)) return;
     auto* dev = new (std::nothrow) E1000Device{};
     if (dev == nullptr) return;
     dev->pci = pci_dev;
+    dev->driver_claim = std::move(*claim);
     devices[device_count++] = dev;
     pci::pci_enable_memory_space(pci_dev);
     dev->mmio = static_cast<volatile uint32_t*>(pci::pci_map_bar(pci_dev, 0));

@@ -3,6 +3,7 @@
 #include <cstring>
 #include <dev/dma/manager.hpp>
 #include <dev/iommu/domains.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -25,7 +26,10 @@ struct Backend {
         // init context; there is no task preemption depth to inspect yet.
         return !mod::sched::can_query_current_task() || mod::mm::phys::can_wait_for_reclaim();
     }
+    auto begin_allocation(const pci::PCIDevice* device) -> pci::DriverOperation { return pci::begin_dma_allocation(device); }
+    auto begin_submission(const pci::PCIDevice* device) -> pci::DriverOperation { return pci::try_dma_operation(device); }
     auto admit(const pci::PCIDevice* device) -> bool {
+        if (!pci::driver_dma_admission_allowed(device)) return false;
         auto const MODE = iommu::domain_info(device).mode;
         return MODE == iommu::DomainMode::software_passthrough || MODE == iommu::DomainMode::hardware_passthrough ||
                MODE == iommu::DomainMode::translated;

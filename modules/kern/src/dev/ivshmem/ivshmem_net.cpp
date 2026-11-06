@@ -140,6 +140,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
         log::error("PCI shared-memory resource admission failed");
         return -1;
     }
+    ProbeAdmission probe_admission(idev->resources);
     auto* regs = idev->resources.regs;
     auto* shmem = idev->resources.shared;
 
@@ -238,6 +239,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     ker::net::napi_enable(&idev->napi);
 
     devices.at(device_count++) = idev;
+    probe_admission.commit();
 
     log::info("%s vm_id=%u shmem=0x%lx ready", idev->netdev.name.data(), idev->my_vm_id, reinterpret_cast<uint64_t>(shmem));
 #ifdef WOS_SELFTEST

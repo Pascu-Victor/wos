@@ -4,6 +4,7 @@
 #include <dev/dma/lifecycle.hpp>
 #include <dev/ivshmem/pci_model.hpp>
 #include <dev/pci.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <platform/interrupt/gates.hpp>
 
 namespace ker::dev::ivshmem {
@@ -24,6 +25,7 @@ struct PciResources {
     std::atomic<uint64_t> test_irqs{0};
 #endif
     pci::PCIDevice* device = nullptr;
+    pci::DriverClaim driver_claim;
     volatile uint32_t* regs = nullptr;
     uint8_t* shared = nullptr;
     volatile uint32_t* vector_control = nullptr;
@@ -47,5 +49,24 @@ struct PciResources {
     // Only vector-control MMIO; allocation-free and safe in IRQ/NAPI.
     void mask_vector(bool masked) const;
     void ring(uint16_t peer, uint16_t vector = 0) const;
+};
+
+// Ordinary probe context only. A failed shared-resource or class probe closes
+// metadata admission; BAR, IRQ and peer storage still require real retirement.
+class ProbeAdmission {
+    PciResources& owner_;
+    bool committed_ = false;
+
+   public:
+    explicit ProbeAdmission(PciResources& owner) : owner_(owner) {}
+    ~ProbeAdmission() {
+        if (!committed_) {
+            owner_.callbacks.close();
+            owner_.driver_claim.close_data_admission();
+        }
+    }
+    ProbeAdmission(const ProbeAdmission&) = delete;
+    auto operator=(const ProbeAdmission&) -> ProbeAdmission& = delete;
+    void commit() { committed_ = true; }
 };
 }  // namespace ker::dev::ivshmem

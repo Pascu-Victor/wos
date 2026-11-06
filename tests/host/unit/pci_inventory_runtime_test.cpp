@@ -12,6 +12,7 @@
 #include <dev/iommu/domains.hpp>
 #include <dev/iommu/groups.hpp>
 #include <dev/pci.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <dev/pci_extended.hpp>
 #include <dev/pci_port_io.hpp>
 #include <limits>
@@ -342,6 +343,14 @@ void rejected_ledgers(Fixture& fixture, pci::InventoryError reason) {
     EXPECT_NE(pci::extended_inventory().state, pci::ExtendedState::ready);
     EXPECT_EQ(fixture.calls.ecam_maps, 0U);
     for (size_t i = 0; i < pci::pci_device_count(); ++i) {
+        auto const BEFORE = fixture.calls;
+        auto* device = pci::pci_get_device(i);
+        EXPECT_FALSE(pci::try_claim_driver(device, pci::DriverKind::diagnostic));
+        EXPECT_FALSE(pci::begin_dma_allocation(device));
+        EXPECT_FALSE(pci::try_dma_operation(device));
+        EXPECT_FALSE(pci::driver_dma_admission_allowed(device));
+        EXPECT_EQ(pci::driver_claim_status(device)->phase, pci::DriverPhase::unclaimed);
+        EXPECT_EQ(fixture.calls, BEFORE);
         auto const* snapshot = pci::extended_config(pci::pci_get_device(i));
         ASSERT_NE(snapshot, nullptr);
         EXPECT_NE(snapshot->state, pci::ExtendedState::ready);

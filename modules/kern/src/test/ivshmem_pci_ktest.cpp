@@ -35,8 +35,12 @@ KTEST_FINAL(IvshmemPci, UnpublishedProbeOwnsAndDrainsInterrupts) {
     auto const BEFORE = ker::dev::dma::stats(device);
     KEXPECT_EQ(BEFORE.regions, size_t{0});
     constexpr size_t MINIMUM_SHARED = 16 * 1024 * 1024;
-    bool const UNDERSIZED = pci::pci_get_bar_size(device, 2) < MINIMUM_SHARED;
     bool const PREPARED = owner.prepare(device, MINIMUM_SHARED);
+    // prepare acquires exclusive function ownership before its first sizing
+    // write. This later read uses the retained size, including failed prepare.
+    auto const SHARED_BYTES = pci::pci_get_bar_size_checked(device, 2);
+    KREQUIRE_TRUE(SHARED_BYTES.has_value());
+    bool const UNDERSIZED = *SHARED_BYTES < MINIMUM_SHARED;
     KEXPECT_FALSE(bus_master(device));
     if (UNDERSIZED) {
         KEXPECT_FALSE(PREPARED);

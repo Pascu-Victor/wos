@@ -40,8 +40,12 @@ struct Mapping {
 enum class State : uint8_t { free, reserved, cpu, preparing, device, completing, releasing, quarantined };
 
 // Kernel-lifetime, nonmovable registry. Backend lock/unlock protect metadata
-// only. All other backend calls occur without that lock. Backend allocation
-// returns exclusive PAGE-aligned contiguous storage, zeroed over backing bytes.
+// only. Admission and atomic submission entry may run under that lock; other
+// backend calls run unlocked. Allocation entry may reserve a function claim and
+// must run before the registry lock. Move-only operation guards are mandatory
+// and outlive the registry locks, mapping/unwind and submission publication.
+// Allocation returns exclusive PAGE-aligned contiguous storage, zeroed over
+// backing bytes.
 // map publishes/invalidate-syncs translations before success; unmap succeeds
 // only after invalidation/draining. Failure with uncertain exposure pins storage.
 // Host tests instantiate THIS manager, not a second implementation of its rules.
@@ -87,7 +91,8 @@ class Manager {
         if (!backend_.allocation_context()) return {.error = Error::invalid_context};
         auto const PLAN = layout(bytes, alignment, mask);
         if (!PLAN) return {.error = Error::invalid_argument};
-        if (!backend_.admit(device)) return {.error = Error::unavailable_device};
+        auto operation = backend_.begin_allocation(device);
+        if (!operation || !backend_.admit(device)) return {.error = Error::unavailable_device};
         Handle handle{};
         {
             Guard guard{backend_};
@@ -136,7 +141,28 @@ class Manager {
                 }
             }
         }
-        if (error != Error::none && !mapping.quarantine) {
+        auto retain_mapping = [&](State state) {
+            auto& r = records_[handle.slot];
+            r.storage = STORAGE;
+            r.backing = PLAN->backing;
+            r.offset = offset;
+            r.address = mapping.address;
+            r.state = state;
+        };
+        if (error == Error::none && !mapping.quarantine) {
+            {
+                Guard guard{backend_};
+                if (backend_.admit(device)) {
+                    retain_mapping(State::cpu);
+                    return {.allocation = {handle, borrowed == nullptr ? STORAGE.cpu + offset : nullptr, bytes}};
+                }
+            }
+            // Closing may race the unlocked hardware map. Keep the function
+            // operation until exact invalidation or quarantine owns that map.
+            error = Error::unavailable_device;
+            mapping.quarantine = !backend_.unmap(device, mapping.address, STORAGE.physical + offset, PLAN->mapped, direction);
+        }
+        if (!mapping.quarantine) {
             backend_.free(STORAGE, PLAN->backing);
             Guard guard{backend_};
             records_[handle.slot] = {};
@@ -144,15 +170,9 @@ class Manager {
         }
         {
             Guard guard{backend_};
-            auto& r = records_[handle.slot];
-            r.storage = STORAGE;
-            r.backing = PLAN->backing;
-            r.offset = offset;
-            r.address = mapping.address;
-            r.state = mapping.quarantine ? State::quarantined : State::cpu;
+            retain_mapping(State::quarantined);
         }
-        return {.error = mapping.quarantine ? Error::quarantined : Error::none,
-                .allocation = {handle, borrowed == nullptr && !mapping.quarantine ? STORAGE.cpu + offset : nullptr, bytes}};
+        return {.error = Error::quarantined, .allocation = {handle, nullptr, bytes}};
     }
 
    public:
@@ -201,6 +221,7 @@ class Manager {
         return Error::none;
     }
     auto prepare(Handle handle) -> SubmissionResult {
+        auto operation = backend_.begin_submission(handle.device);
         Record snapshot{};
         {
             Guard guard{backend_};
@@ -208,7 +229,7 @@ class Manager {
             if (r == nullptr) return {.error = Error::invalid_handle};
             if (r->state == State::quarantined) return {.error = Error::quarantined};
             if (r->state != State::cpu) return {.error = Error::busy};
-            if (!backend_.admit(r->device)) return {.error = Error::unavailable_device};
+            if (!operation || !backend_.admit(r->device)) return {.error = Error::unavailable_device};
             if (r->streaming && r->borrowed == nullptr) return {.error = Error::invalid_argument};
             if (r->sequence == CounterLimit) return {.error = Error::exhausted};
             ++r->sequence;
@@ -221,9 +242,19 @@ class Manager {
         backend_.for_device(cpu, snapshot.mapped, snapshot.direction);
         {
             Guard guard{backend_};
-            records_[handle.slot].state = State::device;
+            if (backend_.admit(snapshot.device)) {
+                records_[handle.slot].state = State::device;
+                return {.submission = {handle, snapshot.sequence, snapshot.address, snapshot.size}};
+            }
         }
-        return {.submission = {handle, snapshot.sequence, snapshot.address, snapshot.size}};
+        // No address was submitted. Restore CPU ownership outside the lock;
+        // closing still waits for this operation through the final state store.
+        backend_.for_cpu(cpu, snapshot.mapped, snapshot.direction);
+        {
+            Guard guard{backend_};
+            records_[handle.slot].state = State::cpu;
+        }
+        return {.error = Error::unavailable_device};
     }
     auto complete(Submission submission, size_t completed_bytes, Retirement proof) -> Error {
         Record snapshot{};

@@ -7,6 +7,7 @@
 #include <dev/dma/manager.hpp>
 #include <functional>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace dma = ker::dev::dma;
@@ -30,12 +31,49 @@ struct Backend {
     bool allow_buffer = true;
     bool allow_allocation = true;
     bool allow_device = true;
+    bool data_admission = true;
+    size_t active_operations = 0, operation_limit = 16;
+    size_t allocation_entries = 0, submission_entries = 0;
     uint64_t unmapped_address = 0, unmapped_physical = 0;
     size_t unmapped_bytes = 0;
     dma::Direction unmapped_direction = dma::Direction::to_device;
     size_t frees = 0;
     std::function<void()> copy_hook;
     std::function<void()> unmap_hook;
+    std::function<void()> map_hook;
+    std::function<void()> free_hook;
+    std::function<void()> for_device_hook;
+    std::function<void()> for_cpu_hook;
+    std::function<void()> operation_release_hook;
+    class Operation {
+       public:
+        Operation() = default;
+        ~Operation() { reset(); }
+        Operation(const Operation&) = delete;
+        auto operator=(const Operation&) -> Operation& = delete;
+        Operation(Operation&& other) noexcept : backend_(std::exchange(other.backend_, nullptr)) {}
+        auto operator=(Operation&& other) noexcept -> Operation& {
+            if (this != &other) {
+                reset();
+                backend_ = std::exchange(other.backend_, nullptr);
+            }
+            return *this;
+        }
+        explicit operator bool() const { return backend_ != nullptr; }
+
+       private:
+        friend struct Backend;
+        explicit Operation(Backend& backend) : backend_(&backend) {}
+        void reset() {
+            auto* backend = std::exchange(backend_, nullptr);
+            if (backend == nullptr) return;
+            EXPECT_FALSE(locked);
+            EXPECT_NE(backend->active_operations, 0U);
+            --backend->active_operations;
+            if (backend->operation_release_hook) backend->operation_release_hook();
+        }
+        Backend* backend_ = nullptr;
+    };
     ~Backend() {
         for (auto* p : allocations) std::free(p);
     }
@@ -50,7 +88,23 @@ struct Backend {
         locked = false;
         mutex.unlock();
     }
-    auto admit(const ker::dev::pci::PCIDevice* dev) -> bool { return allow_device && (dev == &first || dev == &second); }
+    auto admit(const ker::dev::pci::PCIDevice* dev) -> bool { return data_admission && allow_device && (dev == &first || dev == &second); }
+    auto begin_allocation(const ker::dev::pci::PCIDevice* dev) -> Operation {
+        EXPECT_FALSE(locked);
+        ++allocation_entries;
+        return begin_operation(dev);
+    }
+    auto begin_submission(const ker::dev::pci::PCIDevice* dev) -> Operation {
+        ++submission_entries;
+        return begin_operation(dev);
+    }
+    auto begin_operation(const ker::dev::pci::PCIDevice* dev) -> Operation {
+        if (!admit(dev) || active_operations >= operation_limit) return {};
+        ++active_operations;
+        return Operation{*this};
+    }
+    void close_data_admission() { data_admission = false; }
+    auto operations_drained() const -> bool { return active_operations == 0; }
     auto allocation_context() -> bool { return allow_allocation; }
     auto kernel_buffer(std::span<std::byte>) -> bool { return allow_buffer; }
     auto allocate(size_t bytes) -> detail::Storage {
@@ -67,6 +121,7 @@ struct Backend {
         EXPECT_FALSE(locked);
         ++frees;
         events.push_back(6);
+        if (free_hook) free_hook();
         auto it = std::find(allocations.begin(), allocations.end(), storage.cpu);
         ASSERT_NE(it, allocations.end());
         std::free(*it);
@@ -75,6 +130,7 @@ struct Backend {
     auto map(const ker::dev::pci::PCIDevice*, uint64_t address, size_t bytes, size_t, uint64_t mask, dma::Direction) -> detail::Mapping {
         EXPECT_FALSE(locked);
         events.push_back(2);
+        if (map_hook) map_hook();
         if (fail_map || uncertain_map) return {dma::Error::mapping_failed, address, uncertain_map};
         if (!detail::extent_fits(address, bytes, mask)) return {.error = dma::Error::address_limit};
         return {.address = bad_iova ? address + 1 : address};
@@ -98,10 +154,12 @@ struct Backend {
     void for_device(std::byte*, size_t, dma::Direction) {
         EXPECT_FALSE(locked);
         events.push_back(3);
+        if (for_device_hook) for_device_hook();
     }
     void for_cpu(std::byte*, size_t, dma::Direction) {
         EXPECT_FALSE(locked);
         events.push_back(4);
+        if (for_cpu_hook) for_cpu_hook();
     }
 };
 using Manager = detail::Manager<Backend, 2>;
@@ -411,6 +469,194 @@ TEST(DmaManager, ClosedUnitRefusesNewSubmissionsFromPreviouslyAllocatedPools) {
     EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::quarantined);
     EXPECT_EQ(b.frees, 0U);
     EXPECT_EQ(m.stats().quarantined, 1U);
+}
+
+TEST(DmaManager, FunctionOperationLivesThroughAllocationAndSubmissionPublication) {
+    Backend b;
+    Manager m{b};
+    bool device_owned = false;
+    size_t releases = 0;
+    b.map_hook = [&] {
+        EXPECT_EQ(b.active_operations, 1U);
+        EXPECT_FALSE(b.operations_drained());
+        EXPECT_EQ(m.stats().regions, 1U);
+    };
+    b.for_device_hook = [&] {
+        EXPECT_EQ(b.active_operations, 1U);
+        EXPECT_FALSE(b.operations_drained());
+        EXPECT_EQ(m.stats().device_owned, 0U);
+    };
+    b.operation_release_hook = [&] {
+        ++releases;
+        EXPECT_TRUE(b.operations_drained());
+        auto const STATS = m.stats();
+        EXPECT_EQ(STATS.regions, 1U);
+        EXPECT_EQ(STATS.backing_pages, 1U);
+        EXPECT_EQ(STATS.device_owned, device_owned ? 1U : 0U);
+    };
+    auto allocation = m.allocate_coherent(&first, 4096, 4096, UINT64_MAX);
+    ASSERT_EQ(allocation.error, dma::Error::none);
+    EXPECT_EQ(releases, 1U);
+    EXPECT_EQ(b.allocation_entries, 1U);
+    device_owned = true;
+    auto submission = m.prepare(allocation.allocation.handle);
+    ASSERT_EQ(submission.error, dma::Error::none);
+    EXPECT_EQ(releases, 2U);
+    EXPECT_EQ(b.submission_entries, 1U);
+    EXPECT_TRUE(b.operations_drained());
+    EXPECT_EQ(m.complete(submission.submission, 0, dma::Retirement::device_quiesced), dma::Error::none);
+    EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::none);
+    EXPECT_EQ(releases, 2U);
+}
+
+TEST(DmaManager, CloseDuringMapInvalidatesBeforeFreeOrQuarantinesBeforeOperationDrains) {
+    for (bool fail_invalidation : {false, true}) {
+        Backend b;
+        Manager m{b};
+        b.fail_unmap = fail_invalidation;
+        b.map_hook = [&] {
+            EXPECT_EQ(b.active_operations, 1U);
+            b.close_data_admission();
+            EXPECT_FALSE(b.operations_drained());
+        };
+        b.unmap_hook = [&] {
+            EXPECT_EQ(b.active_operations, 1U);
+            EXPECT_FALSE(b.operations_drained());
+            EXPECT_EQ(b.frees, 0U);
+        };
+        b.free_hook = [&] {
+            EXPECT_EQ(b.active_operations, 1U);
+            EXPECT_FALSE(b.operations_drained());
+        };
+        size_t releases = 0;
+        b.operation_release_hook = [&] {
+            ++releases;
+            auto const STATS = m.stats();
+            EXPECT_EQ(STATS.regions, fail_invalidation ? 1U : 0U);
+            EXPECT_EQ(STATS.backing_pages, fail_invalidation ? 2U : 0U);
+            EXPECT_EQ(STATS.quarantined, fail_invalidation ? 1U : 0U);
+        };
+        auto result = m.allocate_coherent(&first, 5000, 4096, UINT64_MAX);
+        EXPECT_EQ(result.error, fail_invalidation ? dma::Error::quarantined : dma::Error::unavailable_device);
+        EXPECT_EQ(result.allocation.cpu, nullptr);
+        EXPECT_EQ(result.allocation.handle.registry != nullptr, fail_invalidation);
+        EXPECT_EQ(b.unmapped_address, b.physical);
+        EXPECT_EQ(b.unmapped_physical, b.physical);
+        EXPECT_EQ(b.unmapped_bytes, 8192U);
+        EXPECT_EQ(b.unmapped_direction, dma::Direction::bidirectional);
+        EXPECT_EQ(b.frees, fail_invalidation ? 0U : 1U);
+        EXPECT_EQ(b.events, (fail_invalidation ? std::vector<int>{1, 2, 5} : std::vector<int>{1, 2, 5, 6}));
+        EXPECT_EQ(releases, 1U);
+        EXPECT_TRUE(b.operations_drained());
+        if (fail_invalidation) {
+            EXPECT_EQ(m.prepare(result.allocation.handle).error, dma::Error::quarantined);
+            EXPECT_EQ(m.release(result.allocation.handle), dma::Error::quarantined);
+        }
+    }
+}
+
+TEST(DmaManager, ClosedClaimRefusesAllocationAndPreparationWithoutCopyOrSync) {
+    Backend b;
+    Manager m{b};
+    std::array<std::byte, 16> buffer{};
+    buffer.fill(std::byte{0x57});
+    auto allocation = m.map_streaming(&first, buffer, dma::Direction::bidirectional, UINT64_MAX);
+    ASSERT_EQ(allocation.error, dma::Error::none);
+    b.close_data_admission();
+    auto const EVENTS = b.events;
+    b.copy_hook = [] { FAIL() << "closed claim must not copy"; };
+    b.for_device_hook = [] { FAIL() << "closed claim must not synchronize a submission"; };
+    auto rejected = m.prepare(allocation.allocation.handle);
+    EXPECT_EQ(rejected.error, dma::Error::unavailable_device);
+    EXPECT_EQ(rejected.submission.handle.registry, nullptr);
+    EXPECT_EQ(rejected.submission.sequence, 0U);
+    EXPECT_EQ(rejected.submission.address, 0U);
+    EXPECT_EQ(m.allocate_coherent(&first, 4096, 4096, UINT64_MAX).error, dma::Error::unavailable_device);
+    EXPECT_EQ(b.events, EVENTS);
+    EXPECT_EQ(b.allocations.front()[0], std::byte{0});
+    EXPECT_EQ(m.stats().regions, 1U);
+    EXPECT_EQ(m.stats().device_owned, 0U);
+    EXPECT_TRUE(b.operations_drained());
+    EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::none);
+}
+
+TEST(DmaManager, CloseDuringPreparationRestoresCpuOwnershipBeforeOperationDrains) {
+    Backend b;
+    Manager m{b};
+    std::array<std::byte, 16> buffer{};
+    buffer.fill(std::byte{0x32});
+    auto allocation = m.map_streaming(&first, buffer, dma::Direction::bidirectional, UINT64_MAX);
+    ASSERT_EQ(allocation.error, dma::Error::none);
+    b.copy_hook = [&] {
+        EXPECT_EQ(b.active_operations, 1U);
+        b.close_data_admission();
+        EXPECT_FALSE(b.operations_drained());
+        EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::busy);
+    };
+    b.for_device_hook = [&] {
+        EXPECT_EQ(b.active_operations, 1U);
+        EXPECT_FALSE(b.operations_drained());
+    };
+    b.for_cpu_hook = [&] {
+        EXPECT_EQ(b.active_operations, 1U);
+        EXPECT_FALSE(b.operations_drained());
+        EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::busy);
+    };
+    size_t releases = 0;
+    b.operation_release_hook = [&] {
+        ++releases;
+        EXPECT_TRUE(b.operations_drained());
+        EXPECT_EQ(m.stats().device_owned, 0U);
+        EXPECT_EQ(m.stats().regions, 1U);
+    };
+    auto rejected = m.prepare(allocation.allocation.handle);
+    EXPECT_EQ(rejected.error, dma::Error::unavailable_device);
+    EXPECT_EQ(rejected.submission.handle.registry, nullptr);
+    EXPECT_EQ(rejected.submission.address, 0U);
+    EXPECT_EQ(b.events, (std::vector<int>{1, 2, 3, 4}));
+    EXPECT_EQ(releases, 1U);
+    EXPECT_EQ(m.stats().device_owned, 0U);
+    EXPECT_TRUE(std::all_of(buffer.begin(), buffer.end(), [](std::byte value) { return value == std::byte{0x32}; }));
+    EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::none);
+    EXPECT_EQ(m.stats().regions, 0U);
+}
+
+TEST(DmaManager, CompletionAndReleaseRemainAvailableAfterClaimClosure) {
+    Backend b;
+    Manager m{b};
+    std::array<std::byte, 8> buffer{};
+    auto allocation = m.map_streaming(&first, buffer, dma::Direction::from_device, UINT64_MAX);
+    ASSERT_EQ(allocation.error, dma::Error::none);
+    auto submission = m.prepare(allocation.allocation.handle);
+    ASSERT_EQ(submission.error, dma::Error::none);
+    b.close_data_admission();
+    std::memset(b.allocations.front(), 0x73, buffer.size());
+    EXPECT_EQ(m.complete(submission.submission, 3, dma::Retirement::command_completed), dma::Error::none);
+    EXPECT_EQ(buffer[2], std::byte{0x73});
+    EXPECT_EQ(buffer[3], std::byte{0});
+    EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::none);
+    EXPECT_EQ(m.stats().regions, 0U);
+    EXPECT_TRUE(b.operations_drained());
+}
+
+TEST(DmaManager, FunctionOperationExhaustionHasNoAllocationOrPreparationEffects) {
+    Backend b;
+    Manager m{b};
+    auto allocation = m.allocate_coherent(&first, 4096, 4096, UINT64_MAX);
+    ASSERT_EQ(allocation.error, dma::Error::none);
+    b.operation_limit = 1;
+    auto blocker = b.begin_submission(&first);
+    ASSERT_TRUE(blocker);
+    auto const EVENTS = b.events;
+    EXPECT_EQ(m.prepare(allocation.allocation.handle).error, dma::Error::unavailable_device);
+    EXPECT_EQ(m.allocate_coherent(&first, 4096, 4096, UINT64_MAX).error, dma::Error::unavailable_device);
+    EXPECT_EQ(b.events, EVENTS);
+    EXPECT_EQ(b.active_operations, 1U);
+    EXPECT_EQ(m.stats().regions, 1U);
+    EXPECT_EQ(m.stats().device_owned, 0U);
+    blocker = Backend::Operation{};
+    EXPECT_TRUE(b.operations_drained());
+    EXPECT_EQ(m.release(allocation.allocation.handle), dma::Error::none);
 }
 
 TEST(DmaManager, FaultLookupRetainsGenerationAndDistinguishesPendingReleaseFromFree) {

@@ -7,6 +7,7 @@
 #include <dev/iommu/domains.hpp>
 #include <dev/pci_bar_probe.hpp>
 #include <dev/pci_boot_resource.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <dev/pci_extended.hpp>
 #include <dev/pci_msix.hpp>
 #include <dev/pci_port_io.hpp>
@@ -41,6 +42,19 @@ struct DeviceResources {
 };
 constinit std::array<DeviceResources, inventory_limits::FUNCTION_CAPACITY> resources{};
 int device_count = 0;
+std::atomic<size_t> published_device_count{0};
+constexpr uint32_t DRIVER_CLOSED = uint32_t{1} << 31;
+constexpr uint32_t DRIVER_OPERATIONS = DRIVER_CLOSED - 1;
+struct DriverSlot {
+    std::atomic<DriverPhase> phase{DriverPhase::unclaimed};
+    std::atomic<uint32_t> operations{0};
+    DriverKind driver = DriverKind::diagnostic;
+    uint64_t epoch = 0;
+};
+static_assert(std::atomic<DriverPhase>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free &&
+              std::atomic<size_t>::is_always_lock_free);
+constinit std::array<DriverSlot, inventory_limits::FUNCTION_CAPACITY> driver_slots{};
+uint64_t driver_epoch = 0;  // config_lock; never wraps or reuses a claim.
 bool enumerated = false;
 bool enumeration_error = false;
 InventoryError first_enumeration_error = InventoryError::none;
@@ -102,9 +116,53 @@ void config_write16_unlocked(const PCIDevice& device, uint8_t offset, uint16_t v
     outw(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 2U)), value);
 }
 auto device_index(const PCIDevice* device) -> std::optional<size_t> {
-    for (int i = 0; i < device_count; ++i)
-        if (device == &discovered_devices[static_cast<size_t>(i)]) return static_cast<size_t>(i);
-    return std::nullopt;
+    // Integer membership avoids both dereferencing a foreign pointer and
+    // subtracting/comparing unrelated C++ pointers. Interior pointers refuse.
+    auto const ADDRESS = reinterpret_cast<uintptr_t>(device);
+    auto const BASE = reinterpret_cast<uintptr_t>(discovered_devices.data());
+    if (ADDRESS < BASE) return std::nullopt;
+    uintptr_t const OFFSET = ADDRESS - BASE;
+    if (OFFSET % sizeof(PCIDevice) != 0) return std::nullopt;
+    size_t const INDEX = OFFSET / sizeof(PCIDevice);
+    return INDEX < static_cast<size_t>(device_count) ? std::optional<size_t>{INDEX} : std::nullopt;
+}
+auto published_device_index(const PCIDevice* device) -> std::optional<size_t> {
+    auto const ADDRESS = reinterpret_cast<uintptr_t>(device);
+    auto const BASE = reinterpret_cast<uintptr_t>(discovered_devices.data());
+    if (ADDRESS < BASE) return std::nullopt;
+    uintptr_t const OFFSET = ADDRESS - BASE;
+    if (OFFSET % sizeof(PCIDevice) != 0) return std::nullopt;
+    size_t const INDEX = OFFSET / sizeof(PCIDevice);
+    return INDEX < published_device_count.load(std::memory_order_acquire) ? std::optional<size_t>{INDEX} : std::nullopt;
+}
+auto driver_activation_allowed(size_t index) -> bool {
+    auto const& slot = driver_slots[index];
+    return slot.phase.load(std::memory_order_acquire) == DriverPhase::unclaimed ||
+           (slot.operations.load(std::memory_order_acquire) & DRIVER_CLOSED) == 0;
+}
+auto reserve_driver_unlocked(size_t index, DriverKind kind) -> bool {
+    auto& slot = driver_slots[index];
+    if (!enumerated || enumeration_error || slot.phase.load(std::memory_order_acquire) != DriverPhase::unclaimed ||
+        driver_epoch == UINT64_MAX)
+        return false;
+    // A raw boot producer must finish before a new owner can adopt the slot.
+    // Claimed producers instead hold an operation until publication completes.
+    auto const& record = resources[index];
+    if (record.msix.state() == resource::BootState::preparing) return false;
+    for (size_t i = 0; i < BAR_COUNT; ++i)
+        if (record.sizes[i].state() == resource::BootState::preparing || record.mappings[i].state() == resource::BootState::preparing)
+            return false;
+    slot.driver = kind;
+    slot.epoch = ++driver_epoch;
+    slot.phase.store(DriverPhase::open, std::memory_order_release);
+    return true;
+}
+void close_driver_unlocked(size_t index, uint64_t epoch, bool retained) {
+    auto& slot = driver_slots[index];
+    auto const PHASE = slot.phase.load(std::memory_order_acquire);
+    if (PHASE == DriverPhase::unclaimed || slot.epoch != epoch) return;
+    slot.operations.fetch_or(DRIVER_CLOSED, std::memory_order_acq_rel);
+    if (PHASE != DriverPhase::retained) slot.phase.store(retained ? DriverPhase::retained : DriverPhase::closed, std::memory_order_release);
 }
 auto resource_dma_allowed(size_t index) -> bool {
     auto const& record = resources[index];
@@ -150,6 +208,93 @@ auto bus_master_write_allowed(uint8_t bus, uint8_t slot, uint8_t func, uint32_t 
     }
     return false;
 }
+// config_lock is held. Cleanup command RMW may preserve an existing BME bit,
+// but a closed claim must never make a fresh 0->1 transition. Old poison and
+// domain admission remain mandatory even for a preserving write.
+auto bus_master_transition_allowed_unlocked(uint8_t bus, uint8_t slot, uint8_t func, uint32_t value) -> bool {
+    if (!bus_master_write_allowed(bus, slot, func, value)) return false;
+    if ((value & PCI_COMMAND_BUS_MASTER) == 0) return true;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& device = discovered_devices[static_cast<size_t>(i)];
+        if (device.bus == bus && device.slot == slot && device.function == func)
+            return driver_activation_allowed(static_cast<size_t>(i)) ||
+                   (config_read16_unlocked(device, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0;
+    }
+    return false;
+}
+// Do not undo a terminal INTx mask through a stale command RMW. Byte5 is
+// independently writable, so this check uses the effective port width too.
+auto preserve_closed_intx_mask_unlocked(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, size_t width, uint32_t value) -> uint32_t {
+    if (offset > PCI_COMMAND + 1U || offset + width <= PCI_COMMAND + 1U) return value;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& device = discovered_devices[static_cast<size_t>(i)];
+        if (device.bus != bus || device.slot != slot || device.function != func) continue;
+        if (!driver_activation_allowed(static_cast<size_t>(i)) &&
+            (config_read16_unlocked(device, PCI_COMMAND) & PCI_COMMAND_INT_DISABLE) != 0)
+            value |= uint32_t{1} << ((PCI_COMMAND + 1U - offset) * 8U + 2U);
+        break;
+    }
+    return value;
+}
+// Only closed claims need this bounded capability walk. Effective offsets
+// match the byte/word/dword port access, including unaligned public arguments.
+// Ambiguous malformed/looping chains cannot authorize a capability write.
+auto closed_irq_control_write_allowed_unlocked(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, size_t width, uint32_t value)
+    -> bool {
+    if (offset < 0x40) return true;
+    const PCIDevice* device = nullptr;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+        if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+            if (driver_activation_allowed(static_cast<size_t>(i))) return true;
+            device = &candidate;
+            break;
+        }
+    }
+    if (device == nullptr || (config_read16_unlocked(*device, PCI_STATUS) & (1U << 4)) == 0) return true;
+    auto next = static_cast<uint8_t>(config_read32_unlocked(*device, PCI_CAP_PTR));
+    uint64_t visited = 0;
+    for (int limit = 48; next != 0 && limit-- > 0;) {
+        if (next < 0x40 || (next & 3U) != 0 || (visited & (uint64_t{1} << (next / 4U))) != 0) return false;
+        visited |= uint64_t{1} << (next / 4U);
+        auto const HEADER = config_read32_unlocked(*device, next);
+        auto const KIND = static_cast<uint8_t>(HEADER);
+        auto const CONTROL_OFFSET = static_cast<uint16_t>(next) + 2U;
+        auto const OLD = static_cast<uint16_t>(HEADER >> 16U);
+        if ((KIND == PCI_CAP_ID_MSI || KIND == PCI_CAP_ID_MSIX) && offset < CONTROL_OFFSET + 2U && offset + width > CONTROL_OFFSET) {
+            uint16_t updated = OLD;
+            for (size_t byte = 0; byte < width; ++byte) {
+                size_t const AT = offset + byte;
+                if (AT < CONTROL_OFFSET || AT >= CONTROL_OFFSET + 2U) continue;
+                auto const SHIFT = static_cast<unsigned>((AT - CONTROL_OFFSET) * 8U);
+                updated = static_cast<uint16_t>((updated & ~(uint16_t{255} << SHIFT)) | (((value >> (byte * 8U)) & 255U) << SHIFT));
+            }
+            if (KIND == PCI_CAP_ID_MSI && (OLD & 1U) == 0 && (updated & 1U) != 0) return false;
+            if (KIND == PCI_CAP_ID_MSI && ((OLD ^ updated) & 0x70U) != 0) return false;
+            if (KIND == PCI_CAP_ID_MSIX &&
+                (((OLD & 0x8000U) == 0 && (updated & 0x8000U) != 0) || ((OLD & 0x4000U) != 0 && (updated & 0x4000U) == 0)))
+                return false;
+        }
+        if (KIND == PCI_CAP_ID_MSI) {
+            bool const WIDE = (OLD & 0x80U) != 0;
+            bool const MASKING = (OLD & 0x100U) != 0;
+            uint16_t const DATA = static_cast<uint16_t>(next + (WIDE ? 12U : 8U));
+            uint16_t const MASK = static_cast<uint16_t>(next + (WIDE ? 16U : 12U));
+            if (DATA + 2U > 256U || (MASKING && MASK + 8U > 256U)) return false;
+            for (size_t byte = 0; byte < width; ++byte) {
+                size_t const AT = offset + byte;
+                bool const DESTINATION = (AT >= next + 4U && AT < DATA) || (AT >= DATA && AT < DATA + 2U);
+                bool const MASK_BYTE = MASKING && AT >= MASK && AT < MASK + 4U;
+                if (!DESTINATION && !MASK_BYTE) continue;
+                auto const PRIOR = static_cast<uint8_t>(config_read32_unlocked(*device, static_cast<uint8_t>(AT)) >> ((AT & 3U) * 8U));
+                auto const UPDATED = static_cast<uint8_t>(value >> (byte * 8U));
+                if ((DESTINATION && UPDATED != PRIOR) || (MASK_BYTE && (PRIOR & ~UPDATED) != 0)) return false;
+            }
+        }
+        next = static_cast<uint8_t>(HEADER >> 8U);
+    }
+    return next == 0;
+}
 void authorize_bus_master_write(uint8_t bus, uint8_t slot, uint8_t func, uint32_t value) {
     if (bus_master_write_allowed(bus, slot, func, value)) return;
     mod::dbg::panic_handler("Raw PCI command write attempted bus mastering without a ready DMA domain");
@@ -162,7 +307,7 @@ struct ConfigReader {
     auto read16(uint8_t offset) -> uint16_t { return config_read16_unlocked(*device, offset); }
     void write32(uint8_t offset, uint32_t value) { config_write32_unlocked(*device, offset, value); }
     void write16(uint8_t offset, uint16_t value) {
-        if (offset == PCI_COMMAND && !bus_master_write_allowed(device->bus, device->slot, device->function, value))
+        if (offset == PCI_COMMAND && !bus_master_transition_allowed_unlocked(device->bus, device->slot, device->function, value))
             value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
         config_write16_unlocked(*device, offset, value);
     }
@@ -324,6 +469,103 @@ void scan_bus(uint8_t bus, uint16_t parent = NO_PARENT) {
 }
 }  // namespace
 
+DriverClaim::~DriverClaim() { retain(); }
+DriverClaim::DriverClaim(DriverClaim&& other) noexcept
+    : device_(std::exchange(other.device_, nullptr)), epoch_(std::exchange(other.epoch_, 0)) {}
+auto DriverClaim::operator=(DriverClaim&& other) noexcept -> DriverClaim& {
+    if (this != &other) {
+        retain();
+        device_ = std::exchange(other.device_, nullptr);
+        epoch_ = std::exchange(other.epoch_, 0);
+    }
+    return *this;
+}
+void DriverClaim::close_data_admission() {
+    auto const INDEX = published_device_index(device_);
+    if (!INDEX) return;
+    ConfigGuard const GUARD;
+    close_driver_unlocked(*INDEX, epoch_, false);
+}
+auto DriverClaim::operations_drained() const -> bool {
+    auto const INDEX = published_device_index(device_);
+    if (!INDEX) return true;
+    auto const& slot = driver_slots[*INDEX];
+    return slot.phase.load(std::memory_order_acquire) != DriverPhase::unclaimed && slot.epoch == epoch_ &&
+           slot.operations.load(std::memory_order_acquire) == DRIVER_CLOSED;
+}
+void DriverClaim::retain() {
+    auto const INDEX = published_device_index(device_);
+    if (INDEX) {
+        ConfigGuard const GUARD;
+        close_driver_unlocked(*INDEX, epoch_, true);
+    }
+    device_ = nullptr;
+    epoch_ = 0;
+}
+
+DriverOperation::~DriverOperation() { release(); }
+DriverOperation::DriverOperation(DriverOperation&& other) noexcept : device_(std::exchange(other.device_, nullptr)) {}
+auto DriverOperation::operator=(DriverOperation&& other) noexcept -> DriverOperation& {
+    if (this != &other) {
+        release();
+        device_ = std::exchange(other.device_, nullptr);
+    }
+    return *this;
+}
+void DriverOperation::release() {
+    auto const INDEX = published_device_index(device_);
+    if (INDEX) driver_slots[*INDEX].operations.fetch_sub(1, std::memory_order_release);
+    device_ = nullptr;
+}
+
+auto try_claim_driver(PCIDevice* device, DriverKind kind) -> std::optional<DriverClaim> {
+    auto const INDEX = published_device_index(device);
+    if (!INDEX || static_cast<uint8_t>(kind) > static_cast<uint8_t>(DriverKind::ivshmem)) return std::nullopt;
+    ConfigGuard const GUARD;
+    if (!reserve_driver_unlocked(*INDEX, kind)) return std::nullopt;
+    return DriverClaim{device, driver_slots[*INDEX].epoch};
+}
+auto try_dma_operation(const PCIDevice* device) -> DriverOperation {
+    auto const INDEX = published_device_index(device);
+    if (!INDEX) return {};
+    auto& slot = driver_slots[*INDEX];
+    if (slot.phase.load(std::memory_order_acquire) == DriverPhase::unclaimed) return {};
+    auto operations = slot.operations.load(std::memory_order_acquire);
+    for (;;) {
+        if ((operations & DRIVER_CLOSED) != 0 || operations == DRIVER_OPERATIONS) return {};
+        if (slot.operations.compare_exchange_weak(operations, operations + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+            return DriverOperation{device};
+    }
+}
+auto begin_dma_allocation(const PCIDevice* device) -> DriverOperation {
+    auto const INDEX = published_device_index(device);
+    if (!INDEX) return {};
+    if (driver_slots[*INDEX].phase.load(std::memory_order_acquire) == DriverPhase::unclaimed) {
+        ConfigGuard const GUARD;
+        if (driver_slots[*INDEX].phase.load(std::memory_order_acquire) == DriverPhase::unclaimed &&
+            !reserve_driver_unlocked(*INDEX, DriverKind::diagnostic))
+            return {};
+    }
+    return try_dma_operation(device);
+}
+auto driver_dma_admission_allowed(const PCIDevice* device) -> bool {
+    auto const INDEX = published_device_index(device);
+    if (!INDEX) return false;
+    auto const& slot = driver_slots[*INDEX];
+    return slot.phase.load(std::memory_order_acquire) != DriverPhase::unclaimed &&
+           (slot.operations.load(std::memory_order_acquire) & DRIVER_CLOSED) == 0;
+}
+auto driver_claim_status(const PCIDevice* device) -> std::optional<DriverStatus> {
+    auto const INDEX = published_device_index(device);
+    if (!INDEX) return std::nullopt;
+    auto const& slot = driver_slots[*INDEX];
+    auto const PHASE = slot.phase.load(std::memory_order_acquire);
+    if (PHASE == DriverPhase::unclaimed) return DriverStatus{};
+    auto const OPERATIONS = slot.operations.load(std::memory_order_acquire);
+    return DriverStatus{PHASE == DriverPhase::open && (OPERATIONS & DRIVER_CLOSED) != 0 ? DriverPhase::closed : PHASE, slot.driver,
+                        slot.epoch, OPERATIONS & DRIVER_OPERATIONS};
+}
+
 // Read 32-bit from PCI configuration space
 auto pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint32_t {
     if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return UINT32_MAX;
@@ -352,8 +594,10 @@ auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
     ConfigGuard const GUARD;
     if (!bar_write_allowed(bus, slot, func, offset, 4)) return;
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
-    if ((offset & 0xfcU) == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
+    if ((offset & 0xfcU) == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, value))
         value = static_cast<uint32_t>(value & ~PCI_COMMAND_BUS_MASTER);
+    value = preserve_closed_intx_mask_unlocked(bus, slot, func, offset & 0xfcU, 4, value);
+    if (!closed_irq_control_write_allowed_unlocked(bus, slot, func, offset & 0xfcU, 4, value)) return;
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outl(PCI_CONFIG_DATA, value);
 }
@@ -366,8 +610,10 @@ auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
     ConfigGuard const GUARD;
     if (!bar_write_allowed(bus, slot, func, offset, 2)) return;
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
-    if ((offset & 0xfeU) == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
+    if ((offset & 0xfeU) == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, value))
         value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
+    value = static_cast<uint16_t>(preserve_closed_intx_mask_unlocked(bus, slot, func, offset & 0xfeU, 2, value));
+    if (!closed_irq_control_write_allowed_unlocked(bus, slot, func, offset & 0xfeU, 2, value)) return;
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outw(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 2U)), value);
 }
@@ -380,8 +626,10 @@ auto pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, 
     ConfigGuard const GUARD;
     if (!bar_write_allowed(bus, slot, func, offset, 1)) return;
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
-    if (offset == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
+    if (offset == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, value))
         value = static_cast<uint8_t>(value & ~PCI_COMMAND_BUS_MASTER);
+    value = static_cast<uint8_t>(preserve_closed_intx_mask_unlocked(bus, slot, func, offset, 1, value));
+    if (!closed_irq_control_write_allowed_unlocked(bus, slot, func, offset, 1, value)) return;
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outb(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 3U)), value);
 }
@@ -423,6 +671,7 @@ auto pci_enumerate_all() -> int {
     }
 
     collect_extended_config();
+    published_device_count.store(static_cast<size_t>(device_count), std::memory_order_release);
     return device_count;
 }
 
@@ -482,9 +731,10 @@ auto pci_enable_bus_master(PCIDevice* dev) -> void {
 
 auto pci_set_bus_master(PCIDevice* dev, bool enable) -> bool {
     auto const INDEX = device_index(dev);
-    if (!INDEX || (enable && (!resource_dma_allowed(*INDEX) || !iommu::bus_master_allowed(dev)))) return false;
+    if (!INDEX || (enable && (!driver_activation_allowed(*INDEX) || !resource_dma_allowed(*INDEX) || !iommu::bus_master_allowed(dev))))
+        return false;
     ConfigGuard const GUARD;
-    if (enable && (!resource_dma_allowed(*INDEX) || !iommu::bus_master_allowed(dev))) return false;
+    if (enable && (!driver_activation_allowed(*INDEX) || !resource_dma_allowed(*INDEX) || !iommu::bus_master_allowed(dev))) return false;
     outl(PCI_CONFIG_ADDRESS, config_address(dev->bus, dev->slot, dev->function, PCI_COMMAND));
     auto command = static_cast<uint16_t>(inl(PCI_CONFIG_DATA));
     command = enable ? static_cast<uint16_t>(command | PCI_COMMAND_BUS_MASTER) : static_cast<uint16_t>(command & ~PCI_COMMAND_BUS_MASTER);
@@ -496,7 +746,7 @@ auto pci_enable_memory_space(PCIDevice* dev) -> void {
     auto const INDEX = device_index(dev);
     if (!INDEX) return;
     ConfigGuard const GUARD;
-    if (resources[*INDEX].poisoned.load(std::memory_order_acquire)) return;
+    if (resources[*INDEX].poisoned.load(std::memory_order_acquire) || !driver_activation_allowed(*INDEX)) return;
     ConfigReader reader{dev};
     reader.write16(PCI_COMMAND, static_cast<uint16_t>(reader.read16(PCI_COMMAND) | PCI_COMMAND_MEM_SPACE));
 }
@@ -526,8 +776,22 @@ auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t {
 auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int {
     auto const APIC = destination(target_cpu, vector);
     auto const INDEX = device_index(dev);
-    if (!APIC || !INDEX || !resource_dma_allowed(*INDEX)) return -1;
-    uint8_t const MSI_OFF = pci_find_capability(dev, PCI_CAP_ID_MSI);
+    if (!APIC || !INDEX) return -1;
+    // Keep final admission and all capability writes in one transaction, so a
+    // concurrent close cannot complete before a late MSI enable write.
+    ConfigGuard const GUARD;
+    if (!driver_activation_allowed(*INDEX) || !resource_dma_allowed(*INDEX)) return -1;
+    if ((config_read16_unlocked(*dev, PCI_STATUS) & (1U << 4)) == 0) return -1;
+    uint8_t offset = static_cast<uint8_t>(config_read32_unlocked(*dev, PCI_CAP_PTR) & 0xfcU);
+    uint8_t MSI_OFF = 0;
+    for (int limit = 48; offset >= 0x40 && limit-- > 0;) {
+        auto const HEADER = config_read32_unlocked(*dev, offset);
+        if ((HEADER & 255U) == PCI_CAP_ID_MSI) {
+            MSI_OFF = offset;
+            break;
+        }
+        offset = static_cast<uint8_t>((HEADER >> 8U) & 0xfcU);
+    }
     if (MSI_OFF == 0) {
         return -1;
     }
@@ -538,7 +802,7 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int 
     // +8: Message Address (upper 32) [if 64-bit capable]
     // then: Message Data (16)
 
-    uint16_t msg_ctrl = pci_config_read16(dev->bus, dev->slot, dev->function, MSI_OFF + 2);
+    uint16_t msg_ctrl = config_read16_unlocked(*dev, MSI_OFF + 2);
     bool const IS_64BIT = ((msg_ctrl >> 7) & 1) != 0;
     if (MSI_OFF > (IS_64BIT ? 0xf0 : 0xf4)) return -1;
 
@@ -546,23 +810,24 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int 
     // target_cpu is a logical CPU index; translate to APIC ID for the hardware.
     uint32_t const APIC_ID = *APIC;
     uint32_t const MSG_ADDR = 0xFEE00000U | (APIC_ID << 12);
-    pci_config_write32(dev->bus, dev->slot, dev->function, MSI_OFF + 4, MSG_ADDR);
+    config_write32_unlocked(*dev, MSI_OFF + 4, MSG_ADDR);
 
     if (IS_64BIT) {
-        pci_config_write32(dev->bus, dev->slot, dev->function, MSI_OFF + 8, 0);
-        pci_config_write16(dev->bus, dev->slot, dev->function, MSI_OFF + 12, vector);
+        config_write32_unlocked(*dev, MSI_OFF + 8, 0);
+        config_write16_unlocked(*dev, MSI_OFF + 12, vector);
     } else {
-        pci_config_write16(dev->bus, dev->slot, dev->function, MSI_OFF + 8, vector);
+        config_write16_unlocked(*dev, MSI_OFF + 8, vector);
     }
 
     // Enable MSI (bit 0), request 1 vector (bits 4-6 = 000)
     msg_ctrl = (msg_ctrl & ~(0x7 << 4)) | 1;
-    pci_config_write16(dev->bus, dev->slot, dev->function, MSI_OFF + 2, msg_ctrl);
+    config_write16_unlocked(*dev, MSI_OFF + 2, msg_ctrl);
 
     // Disable legacy INTx
-    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
+    uint16_t cmd = config_read16_unlocked(*dev, PCI_COMMAND);
     cmd |= PCI_COMMAND_INT_DISABLE;
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
+    ConfigReader reader{dev};
+    reader.write16(PCI_COMMAND, cmd);
 
     return 0;
 }
@@ -574,6 +839,9 @@ auto pci_prepare_msix(PCIDevice* dev) -> int {
     ConfigGuard guard;
     if (record.poisoned.load(std::memory_order_acquire)) return -1;
     if (auto const* prepared = record.msix.get()) return prepared->present ? 0 : 1;
+    if (!driver_activation_allowed(*INDEX)) return -1;
+    auto operation = try_dma_operation(dev);
+    if (driver_slots[*INDEX].phase.load(std::memory_order_acquire) != DriverPhase::unclaimed && !operation) return -1;
     if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return -1;
     auto const* prepared = record.msix.prepare([&]() -> std::optional<PreparedMsix> {
         ConfigReader reader{dev};
@@ -613,6 +881,10 @@ auto pci_prepare_msix(PCIDevice* dev) -> int {
         auto* table = reinterpret_cast<volatile uint32_t*>(base + LAYOUT->table_offset);
         {
             ConfigGuard const GUARD;
+            if (!driver_activation_allowed(*INDEX)) {
+                poison_unlocked(*INDEX, CAP.offset);
+                return std::nullopt;
+            }
             uint16_t const COMMAND = config_read16_unlocked(*dev, PCI_COMMAND);
             reader.write16(PCI_COMMAND, static_cast<uint16_t>(COMMAND | PCI_COMMAND_MEM_SPACE));
             if (reader.read16(PCI_COMMAND) != static_cast<uint16_t>(COMMAND | PCI_COMMAND_MEM_SPACE)) {
@@ -645,7 +917,7 @@ auto pci_enable_msix(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int
     auto& record = resources[*INDEX];
     auto const* prepared = record.msix.get();
     if (!prepared || !prepared->present || record.activated || record.poisoned.load(std::memory_order_acquire) ||
-        !iommu::bus_master_allowed(dev))
+        !driver_activation_allowed(*INDEX) || !iommu::bus_master_allowed(dev))
         return -1;
     ConfigReader reader{dev};
     auto const OFFSET = static_cast<uint8_t>(prepared->layout.capability + 2);
@@ -687,9 +959,11 @@ auto pci_get_bar_size_checked(PCIDevice* dev, int bar_idx) -> std::optional<uint
     auto& cache = record.sizes[static_cast<size_t>(bar_idx)];
     if (record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
     if (auto const* value = cache.get()) return *value;
+    if (!driver_activation_allowed(*INDEX)) return std::nullopt;
     ConfigGuard const GUARD;
     if (record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
     if (auto const* value = cache.get()) return *value;
+    if (!driver_activation_allowed(*INDEX)) return std::nullopt;
     if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return std::nullopt;
     auto const* value = cache.prepare([&]() -> std::optional<uint64_t> {
         ConfigReader reader{dev};
@@ -712,6 +986,9 @@ auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
     ConfigGuard guard;
     if (record.poisoned.load(std::memory_order_acquire)) return nullptr;
     if (auto const* value = cache.get()) return *value;
+    if (!driver_activation_allowed(*INDEX)) return nullptr;
+    auto operation = try_dma_operation(dev);
+    if (driver_slots[*INDEX].phase.load(std::memory_order_acquire) != DriverPhase::unclaimed && !operation) return nullptr;
     if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return nullptr;
     auto const* value = cache.prepare([&]() -> std::optional<void*> {
         guard.release();
@@ -739,6 +1016,14 @@ auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
             }))
             return fail();
         mod::mm::virt::map_range_to_kernel_page_table({RANGE->start, RANGE->end}, mod::mm::virt::kernel_mmio_page_flags());
+        // Mapping is retained even when closure wins during page-table work;
+        // never hand a newly prepared pointer to the closed probe. Generic
+        // unmap cannot release these borrowed device frames.
+        ConfigGuard const GUARD;
+        if (!driver_activation_allowed(*INDEX)) {
+            poison_unlocked(*INDEX);
+            return std::nullopt;
+        }
         return reinterpret_cast<void*>(mod::mm::addr::get_virt_pointer(BAR.address));
     });
     return value ? *value : nullptr;
@@ -753,7 +1038,7 @@ auto pci_configure_msix_entry(PCIDevice* dev, uint32_t entry_idx, uint8_t vector
     auto const& record = resources[*INDEX];
     auto const* prepared = record.msix.get();
     if (!prepared || !prepared->present || !record.activated || record.poisoned.load(std::memory_order_acquire) ||
-        !iommu::bus_master_allowed(dev))
+        !driver_activation_allowed(*INDEX) || !iommu::bus_master_allowed(dev))
         return -1;
     TableReader reader{*INDEX, *prepared};
     return msix::program_entry(reader, prepared->layout.entries, entry_idx, vector, *APIC) ? 0 : -1;
@@ -767,7 +1052,7 @@ auto pci_mask_msix_entry(PCIDevice* dev, uint32_t entry_idx, bool masked) -> int
     auto const* prepared = record.msix.get();
     if (!prepared || !prepared->present || entry_idx >= prepared->layout.entries || record.poisoned.load(std::memory_order_acquire))
         return -1;
-    if (!masked && (!record.activated || !iommu::bus_master_allowed(dev))) return -1;
+    if (!masked && (!record.activated || !driver_activation_allowed(*INDEX) || !iommu::bus_master_allowed(dev))) return -1;
     uint32_t const WORD = entry_idx * 4U + 3U;
     uint32_t const CONTROL = prepared->table[WORD];
     uint32_t const VALUE = masked ? CONTROL | 1U : CONTROL & ~uint32_t{1};

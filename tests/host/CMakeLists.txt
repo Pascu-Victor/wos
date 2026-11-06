@@ -94,6 +94,7 @@ set_tests_properties(device_mapping_object_test PROPERTIES TIMEOUT 30)
 wos_add_unit_test(pci_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/pci.cpp
+                 ${WOS_KERN_SRC}/dev/dma/dma.cpp
 )
 target_include_directories(pci_runtime_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_runtime_shim)
 target_compile_options(pci_runtime_test PRIVATE -UNDEBUG)

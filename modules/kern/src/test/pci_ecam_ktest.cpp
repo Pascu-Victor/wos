@@ -1,4 +1,5 @@
 #include <dev/pci.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <dev/pci_extended.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <test/ktest.hpp>
@@ -47,4 +48,35 @@ KTEST(PciEcam, RetainedSnapshotMatchesLegacyIdentityAndCapabilityHeader) {
     // Collection is idempotent and performs no further MMIO or state mutation.
     pci::collect_extended_config();
     KEXPECT_EQ(pci::extended_inventory().readable, ready);
+}
+
+KTEST(PciOwnership, BootDriverClaimsAreExclusiveAndRetained) {
+    namespace pci = ker::dev::pci;
+    std::array<size_t, 6> owners{};
+    size_t closed = 0;
+    for (size_t i = 0; i < pci::pci_device_count(); ++i) {
+        auto* device = pci::pci_get_device(i);
+        auto const STATUS = pci::driver_claim_status(device);
+        KREQUIRE_TRUE(STATUS.has_value());
+        if (STATUS->phase == pci::DriverPhase::unclaimed) {
+            KEXPECT_EQ(STATUS->epoch, uint64_t{0});
+            KEXPECT_FALSE(pci::try_dma_operation(device));
+            continue;
+        }
+        KEXPECT_NE(STATUS->epoch, uint64_t{0});
+        KEXPECT_TRUE(static_cast<size_t>(STATUS->driver) < owners.size());
+        ++owners.at(static_cast<size_t>(STATUS->driver));
+        KEXPECT_FALSE(pci::try_claim_driver(device, pci::DriverKind::diagnostic));
+        if (STATUS->phase != pci::DriverPhase::open) {
+            ++closed;
+            KEXPECT_FALSE(pci::driver_dma_admission_allowed(device));
+            KEXPECT_FALSE(pci::try_dma_operation(device));
+        }
+    }
+    pci::PCIDevice copied{};
+    KEXPECT_FALSE(pci::driver_claim_status(&copied));
+    KEXPECT_FALSE(pci::try_dma_operation(nullptr));
+    ker::mod::dbg::logger<"pci-ownership-test">::info(
+        "claims diagnostic=%zu ahci=%zu e1000e=%zu virtio=%zu xhci=%zu ivshmem=%zu closed=%zu", owners[0], owners[1], owners[2], owners[3],
+        owners[4], owners[5], closed);
 }

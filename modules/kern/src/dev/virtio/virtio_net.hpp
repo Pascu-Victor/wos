@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <dev/pci.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <dev/virtio/virtio.hpp>
 #include <dev/virtio/virtio_lifecycle.hpp>
 #include <net/netdevice.hpp>
@@ -66,6 +67,7 @@ struct VirtIONetQueuePair {
 struct VirtIONetDevice {
     ker::net::NetDevice netdev;  // Embedded, first member for casting
     ker::dev::pci::PCIDevice* pci{};
+    pci::DriverClaim driver_claim;
     std::array<VirtIONetQueuePair, VIRTIO_NET_MAX_QUEUE_PAIRS> queue_pairs{};
     managed::Region control_buffer;
     bool callbacks_published{};

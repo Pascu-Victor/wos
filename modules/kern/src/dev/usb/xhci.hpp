@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <dev/dma/lifecycle.hpp>
 #include <dev/pci.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <dev/usb/xhci_dma.hpp>
 #include <dev/usb/xhci_lifecycle.hpp>
 #include <dev/usb/xhci_terminal.hpp>
@@ -378,6 +379,7 @@ struct XhciController {
     volatile uint32_t* db;   // Doorbell registers
 
     pci::PCIDevice* pci;
+    pci::DriverClaim driver_claim;
     uint64_t dma_mask = UINT64_MAX;
     std::array<xhci_dma::Coherent, xhci_dma::CAPACITY> controller_dma{};
     uint8_t irq_vector;

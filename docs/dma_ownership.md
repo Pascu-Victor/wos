@@ -51,6 +51,16 @@ identity-mapped and separate from driver allocation accounting.
 
 ## Ownership contract
 
+Managed drivers first acquire an exclusive boot `pci::DriverClaim`. Its epoch
+cannot transfer or repeat, even after probe failure. Closing it denies new DMA
+allocation/preparation and hardware activation. Function operation guards stay
+held through real mapping/publication or rollback, and driver shutdown drains
+them alongside callback admission. A map closed before publication is invalidated
+before free, or quarantined if invalidation is uncertain. Completion and release
+of old owned records remain available after closure. Trusted kernel diagnostic
+allocations may pin an anonymous claim on an otherwise unclaimed function.
+The claim gate does not prove hardware quiescence or replace IRQ/DMA retirement.
+
 1. Allocate coherent memory or a streaming pool in ordinary boot/task context.
    Allocation, mapping and release may wait; never call them while holding a
    driver spinlock or from IRQ/NAPI context.

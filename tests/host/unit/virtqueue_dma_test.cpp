@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace dma = ker::dev::dma;
@@ -19,17 +20,44 @@ struct PCIDevice {};
 namespace {
 ker::dev::pci::PCIDevice device;
 struct Backend {
+    struct Operation {
+        Backend* owner = nullptr;
+        Operation() = default;
+        explicit Operation(Backend* value) : owner(value) { ++owner->operations; }
+        Operation(const Operation&) = delete;
+        auto operator=(const Operation&) -> Operation& = delete;
+        Operation(Operation&& other) noexcept : owner(std::exchange(other.owner, nullptr)) {}
+        auto operator=(Operation&& other) noexcept -> Operation& {
+            if (this != &other) {
+                release();
+                owner = std::exchange(other.owner, nullptr);
+            }
+            return *this;
+        }
+        ~Operation() { release(); }
+        explicit operator bool() const { return owner != nullptr; }
+        void release() {
+            if (owner != nullptr) {
+                EXPECT_FALSE(owner->locked);
+                EXPECT_GT(owner->operations, 0U);
+                --owner->operations;
+                owner = nullptr;
+            }
+        }
+    };
     struct Backing {
         dma::detail::Storage storage;
         size_t bytes;
     };
     std::mutex mutex;
     bool locked = false, allocation_allowed = true;
+    size_t operations = 0;
     size_t allocation_calls = 0, fail_after = SIZE_MAX, copies = 0;
     uint64_t next_address = 0x100000;
     std::vector<Backing> backing;
     std::function<void()> copy_observer;
     ~Backend() {
+        EXPECT_EQ(operations, 0U);
         for (auto const& b : backing) std::free(b.storage.cpu);
     }
     auto lock() -> uint64_t {
@@ -45,6 +73,11 @@ struct Backend {
     }
     auto allocation_context() -> bool { return allocation_allowed; }
     auto admit(const ker::dev::pci::PCIDevice* p) -> bool { return p == &device; }
+    auto begin_allocation(const ker::dev::pci::PCIDevice* p) -> Operation {
+        EXPECT_FALSE(locked);
+        return admit(p) ? Operation{this} : Operation{};
+    }
+    auto begin_submission(const ker::dev::pci::PCIDevice* p) -> Operation { return admit(p) ? Operation{this} : Operation{}; }
     auto kernel_buffer(std::span<std::byte>) -> bool { return true; }
     auto allocate(size_t bytes) -> dma::detail::Storage {
         EXPECT_FALSE(locked);

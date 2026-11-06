@@ -23,6 +23,7 @@
 #include <platform/sched/task.hpp>
 #include <span>
 #include <string_view>
+#include <utility>
 
 #include "dev/pci.hpp"
 
@@ -64,13 +65,16 @@ class CallbackGuard {
     [[nodiscard]] explicit operator bool() const { return static_cast<bool>(admission_); }
 };
 
-auto drain_admission(dma::lifecycle::Admission& admission) -> bool {
+auto drain_admission(dma::lifecycle::Admission& admission, const pci::DriverClaim* claim = nullptr) -> bool {
     auto const START = mod::time::get_ms();
     for (size_t n = 0; n < 10'000'000 && mod::time::get_ms() - START < 5000; ++n) {
-        if (admission.drained()) return true;
-        mod::sched::kern_yield();
+        if (admission.drained() && (claim == nullptr || claim->operations_drained())) return true;
+        if (mod::sched::can_query_current_task())
+            mod::sched::kern_yield();
+        else
+            asm volatile("pause" ::: "memory");
     }
-    return admission.drained();
+    return admission.drained() && (claim == nullptr || claim->operations_drained());
 }
 
 struct Alloc {
@@ -962,6 +966,13 @@ auto halt_controller(XhciController* hc) -> bool {
 // Published-controller terminal retirement needs a separate software drain.
 auto cleanup_controller(XhciController* hc, bool irq_registered) -> bool {
     if (hc == nullptr) return true;
+    hc->lifecycle_admission.close();
+    hc->io_admission.close();
+    hc->driver_claim.close_data_admission();
+    if (!drain_admission(hc->lifecycle_admission) || !drain_admission(hc->io_admission, &hc->driver_claim)) {
+        (void)pci::pci_set_bus_master(hc->pci, false);
+        return false;
+    }
     write32(hc->op, XHCI_OP_USBCMD, read32(hc->op, XHCI_OP_USBCMD) & ~(XHCI_CMD_INTE | XHCI_CMD_RUN));
     write32(hc->rt, XHCI_RT_IMAN, 0);
     bool const MASKED = (read32(hc->op, XHCI_OP_USBCMD) & XHCI_CMD_INTE) == 0 && (read32(hc->rt, XHCI_RT_IMAN) & XHCI_IMAN_IE) == 0;
@@ -993,7 +1004,10 @@ auto cleanup_controller(XhciController* hc, bool irq_registered) -> bool {
 struct TerminalBackend {
     XhciController& hc;
     bool masked = false, halted = false, bme_off = false;
-    void close_lifecycle() { hc.lifecycle_admission.close(); }
+    void close_lifecycle() {
+        hc.lifecycle_admission.close();
+        hc.driver_claim.close_data_admission();
+    }
     void close_io() { hc.io_admission.close(); }
     auto drain_lifecycle() -> bool { return drain_admission(hc.lifecycle_admission); }
     auto close_io_and_slots() -> bool {
@@ -1013,7 +1027,7 @@ struct TerminalBackend {
         }
         return closed;
     }
-    auto drain_io() -> bool { return drain_admission(hc.io_admission); }
+    auto drain_io() -> bool { return drain_admission(hc.io_admission, &hc.driver_claim); }
     auto drain_classes() -> bool {
         bool drained = true;
         for (auto& dev : hc.devices) {
@@ -1094,6 +1108,8 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     if (CONTROLLER_INDEX >= controllers.size() || (need_worker && !ensure_usb_worker())) {
         return -1;
     }
+    auto claim = pci::try_claim_driver(pci_device, pci::DriverKind::xhci);
+    if (!claim) return -ENODEV;
     if (!pci::pci_set_bus_master(pci_device, false) || !configure_coherent_dma(pci_device)) return -1;
     pci::pci_enable_memory_space(pci_device);
     auto* bar = pci::pci_map_bar(pci_device, 0);
@@ -1140,6 +1156,7 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     hc->rt = rt;
     hc->db = doorbells;
     hc->pci = pci_device;
+    hc->driver_claim = std::move(*claim);
     hc->dma_mask = (HCCPARAMS1 & 1U) != 0 ? UINT64_MAX : UINT32_MAX;
 #ifdef WOS_SELFTEST
     if (dma_test_probing) dma_test_controller = hc;

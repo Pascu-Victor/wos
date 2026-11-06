@@ -35,9 +35,12 @@ return no partial table or counts.
 
 Layout provenance is [AMD publication 43872 Rev. 3.05, sections 8.2/8.3](https://www.amd.com/content/dam/amd/en/documents/archived-tech-docs/programmer-references/43872.pdf)
 and [ACPICA's pinned IVRS declarations](https://github.com/open-acpica/acpica/blob/e85aa3bebaae81ed1e6d163511ac7e1eafe732cf/source/include/actbl2.h).
-The older AMD document describes a particular chipset; the full modern 48882
-specification was unavailable during this checkpoint. Complete modern reserved
-field, revision and activation rules must be pinned before a hardware backend.
+The older AMD document describes a particular chipset. The complete modern
+[48882-PUB Rev. 3.11, April 2026](https://docs.amd.com/v/u/en-US/48882_3.11_IOMMU_PUB)
+is now pinned locally (SHA256
+`f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`).
+Its reserved-field, revision, aperture and activation rules still need to be
+implemented and qualified before a hardware backend is available.
 The WOS byte parser is original code; no Linux driver implementation is imported.
 
 Boot discovery looks for both DMAR and IVRS before any vendor register access,
@@ -137,6 +140,30 @@ masking/BME inhibition and permanently denies later BME admission; backing stays
 retained. CPU steering preserves the owned vector and callback lifetime; an
 already-issued IRQ may reach its old CPU. Batch placement can have partial
 changes when an IRQ update fails, and reports the error without claiming rollback.
+
+## Exclusive boot driver claims
+
+`dev/pci_driver_claim.hpp` gives each completely enumerated function one
+move-only driver claim with a nonzero, nonreused boot epoch. AHCI, e1000e,
+virtio-net, xHCI and both ivshmem transports acquire it before their first probe
+control write. Competing probes cannot adopt the same function. A discarded or
+failed claim stays retained until reboot; it cannot be rebound.
+
+Closing a claim blocks new DMA allocation/preparation, cold resource preparation,
+bus-master enable and IRQ activation/unmasking. Counted operations cover actual
+DMA mapping, preparation, publication and rollback; terminal drains join them
+with existing driver callbacks. Raw config writes preserve terminal INTx masks,
+refuse new MSI/MSI-X enable/unmask and MSI steering, and cannot restore BME after
+it has been cleared. Emergency masking and BME disable remain available.
+Trusted kernel DMA diagnostics may reserve a permanently pinned anonymous claim
+on an otherwise unclaimed function, outside the DMA registry lock.
+
+An allocation closed during mapping unmaps and invalidates before physical free;
+uncertain invalidation quarantines its backing. Old submissions can still complete
+and release after closure under existing retirement proofs. A drained operation
+gate proves software preparation ended. Hardware quiescence, IRQ retirement,
+releasable MMIO and reset authority require their own proofs; these boot claims
+do not grant any of them. Existing BAR and MSI-X aliases remain pinned.
 
 ## Immutable firmware service
 
@@ -324,8 +351,9 @@ device-specific treatment. Existing xHCI/virtio activation relies on halted or
 not-DRIVER_OK device state before handler publication. Large apertures still map
 in proportion to their 4 KiB page count; bounded/on-demand mapping remains open.
 
-The fixed 64-device capacity is shared by PCI, ECAM and IOMMU ownership metadata;
-changing only enumeration is unsafe. Vendor firmware catalogs, aperture/doorbell
+The shared 256-function capacity now covers PCI, ECAM and IOMMU ownership
+metadata with bounded traversal; it does not add resource/reset authority.
+Vendor firmware catalogs, aperture/doorbell
 mappings, WC architecture policy, charged revocable user-page pins, GPU-scale SG,
 AMD-Vi and interrupt remapping also remain open. Existing Intel DMA strict mode
 does not provide MSI isolation. Reuse the current MM binding/root/TLB lifetime

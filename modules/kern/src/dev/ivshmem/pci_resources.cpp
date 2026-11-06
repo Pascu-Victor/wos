@@ -6,6 +6,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <utility>
 #ifdef WOS_SELFTEST
 #include <platform/init/limine_requests.hpp>
 #include <string_view>
@@ -38,6 +39,10 @@ auto valid_bar(pci::PCIDevice* p, int index, uint64_t minimum) -> bool {
 
 auto PciResources::prepare(pci::PCIDevice* pci_device, size_t minimum_shared) -> bool {
     if (callbacks.closed() || device != nullptr || pci_device == nullptr) return false;
+    auto claim = pci::try_claim_driver(pci_device, pci::DriverKind::ivshmem);
+    if (!claim) return false;
+    driver_claim = std::move(*claim);
+    ProbeAdmission admission(*this);
     device = pci_device;
     if (!pci::pci_set_bus_master(device, false) || !iommu::bus_master_allowed(device)) return false;
     auto const REVISION = pci::pci_config_read8(device->bus, device->slot, device->function, 8);
@@ -66,6 +71,7 @@ auto PciResources::prepare(pci::PCIDevice* pci_device, size_t minimum_shared) ->
     if (prepared)
         log::info("prepared PCI %02x:%02x.%x mode=%s BAR2=%zu BME=0 guest-DMA-regions=0", device->bus, device->slot, device->function,
                   mode == model::Mode::msix ? "msix" : "plain-poll", shared_size);
+    if (prepared) admission.commit();
     return prepared;
 }
 
@@ -83,8 +89,11 @@ auto PciResources::mask_interrupts() -> bool {
 }
 
 auto PciResources::stop_interrupts() -> bool {
+    callbacks.close();
+    driver_claim.close_data_admission();
     bool const MASKED = mask_interrupts();
     bool const BME_OFF = device == nullptr || pci::pci_set_bus_master(device, false);
+    if (!driver_claim.operations_drained()) return false;
     bool proved = MASKED;
 #ifdef WOS_SELFTEST
     if (state.load(std::memory_order_acquire) == State::retiring && selftest_flag("--ivshmem-test-withhold-stop")) proved = false;
@@ -107,8 +116,14 @@ auto PciResources::retire(void (*unpublish)(void*), void* data, bool (*other_dra
         void (*remove)(void*);
         void* data;
         bool (*other_drained)(void*);
-        auto drained() -> bool { return owner.callbacks.drained() && (other_drained == nullptr || other_drained(data)); }
-        void close_callbacks() { owner.callbacks.close(); }
+        auto drained() -> bool {
+            return owner.callbacks.drained() && owner.driver_claim.operations_drained() &&
+                   (other_drained == nullptr || other_drained(data));
+        }
+        void close_callbacks() {
+            owner.callbacks.close();
+            owner.driver_claim.close_data_admission();
+        }
         auto drain_callbacks() -> bool {
             auto const START = mod::time::get_ms();
             for (size_t n = 0; n < 10'000'000 && mod::time::get_ms() - START < 5000; ++n) {
@@ -141,6 +156,7 @@ auto PciResources::retire(void (*unpublish)(void*), void* data, bool (*other_dra
 
 auto PciResources::activate(mod::gates::irq_handler_fn handler, void* data, const char* name) -> bool {
     if (callbacks.closed() || !prepared || activation_attempted || irq_owned) return false;
+    ProbeAdmission admission(*this);
     activation_attempted = true;
     struct Backend {
         PciResources& owner;
@@ -166,6 +182,7 @@ auto PciResources::activate(mod::gates::irq_handler_fn handler, void* data, cons
         void unwind_irq() { (void)owner.stop_interrupts(); }
     } backend{*this, handler, data, name};
     activated = model::activate(mode, backend);
+    if (activated) admission.commit();
     if (activated)
         log::info("active mode=%s irq_owned=%u vector=%u BME=%u guest-DMA-regions=0", mode == model::Mode::msix ? "msix" : "plain-poll",
                   irq_owned, irq_vector, (read16(device, pci::PCI_COMMAND) & pci::PCI_COMMAND_BUS_MASTER) != 0);

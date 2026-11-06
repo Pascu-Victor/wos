@@ -6,6 +6,7 @@
 #include <dev/dma/lifecycle.hpp>
 #include <dev/e1000e/dma.hpp>
 #include <dev/pci.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
@@ -119,6 +120,7 @@ constexpr uint8_t TX_STATUS_DD = (1U << 0);  // Descriptor Done
 struct E1000Device {
     ker::net::NetDevice netdev;  // embedded NetDevice (first member for casting)
     pci::PCIDevice* pci = nullptr;
+    pci::DriverClaim driver_claim;
     volatile uint32_t* mmio = nullptr;  // mapped BAR0
 
     // RX ring

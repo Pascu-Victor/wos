@@ -33,6 +33,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <utility>
 
 #include "dev/pci.hpp"
 #include "dev/virtio/virtio.hpp"
@@ -1133,11 +1134,14 @@ auto retire_regions(VirtIONetDevice* dev, bool quiesced) -> bool {
 struct RetirementBackend {
     VirtIONetDevice* dev;
     bool reset_observed = false, interrupts_masked = false, bme_disabled = false;
-    void close_admission() { dev->admission.close(); }
+    void close_admission() {
+        dev->admission.close();
+        dev->driver_claim.close_data_admission();
+    }
     auto drain_readers() -> bool {
         uint64_t const DEADLINE = future_deadline_ms(5000);
         for (size_t spins = 0; spins < 10'000'000 && ker::mod::time::get_ms() < DEADLINE; ++spins) {
-            if (dev->admission.drained()) return true;
+            if (dev->admission.drained() && dev->driver_claim.operations_drained()) return true;
             if (ker::mod::sched::can_query_current_task())
                 ker::mod::sched::kern_yield();
             else
@@ -1157,7 +1161,7 @@ struct RetirementBackend {
             }
         }
 #endif
-        return dev->admission.drained();
+        return dev->admission.drained() && dev->driver_claim.operations_drained();
     }
     void unpublish() {
         ker::net::netdev_mark_control_retiring(&dev->netdev);
@@ -1238,6 +1242,14 @@ auto publish_irqs(VirtIONetDevice* dev) -> bool {
 auto fail_probe(VirtIONetDevice* dev) -> int {
     if (dev->callbacks_published) {
         net_log::error("refusing probe unwind after callback publication");
+        return -1;
+    }
+    RetirementBackend readers{dev};
+    readers.close_admission();
+    if (!readers.drain_readers()) {
+        (void)readers.disable_bus_master();
+        dev->failed_probe_next = failed_probes;
+        failed_probes = dev;
         return -1;
     }
     bool const MASKED = mask_interrupts(dev);
@@ -1928,7 +1940,7 @@ auto selftest_probe_boundary(VirtIONetDevice* dev, uint16_t pairs) -> int {
 #endif
 
 // Only -ENOTSUP permits legacy fallback; owned probe failures are terminal.
-auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
+auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev, pci::DriverClaim& claim) -> int {
     uint8_t const COMMON_CAP = virtio_find_cap(pci_dev, VIRTIO_PCI_CAP_COMMON_CFG);
     uint8_t const NOTIFY_CAP = virtio_find_cap(pci_dev, VIRTIO_PCI_CAP_NOTIFY_CFG);
     if (COMMON_CAP == 0 || NOTIFY_CAP == 0) {
@@ -1976,6 +1988,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
     init_queue_pair_contexts(dev);
     dev->pci = pci_dev;
+    dev->driver_claim = std::move(claim);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): PCI BAR0 is fixed config-space layout.
     dev->io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3U);
     dev->hdr_size = static_cast<uint8_t>(VIRTIO_NET_HDR_SIZE);
@@ -2338,7 +2351,9 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -1;
     }
 
-    int const MODERN = init_device_modern(pci_dev);
+    auto claim = pci::try_claim_driver(pci_dev, pci::DriverKind::virtio_net);
+    if (!claim) return -ENODEV;
+    int const MODERN = init_device_modern(pci_dev, *claim);
     if (MODERN != -ENOTSUP) return MODERN;
     if (iommu::domain_info(pci_dev).mode == iommu::DomainMode::translated) {
         net_log::error("legacy virtio refused in translated DMA mode: ACCESS_PLATFORM unavailable");
@@ -2360,6 +2375,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (dev == nullptr) return -1;
     init_queue_pair_contexts(dev);
     dev->pci = pci_dev;
+    dev->driver_claim = std::move(*claim);
     dev->io_base = io_base;
     if (!prepare_probe(dev)) return fail_probe(dev);
 

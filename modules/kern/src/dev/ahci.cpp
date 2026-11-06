@@ -21,6 +21,7 @@
 #include <platform/sys/spinlock.hpp>
 #endif
 #include <dev/dma/dma.hpp>
+#include <dev/pci_driver_claim.hpp>
 #include <net/wki/remotable.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
@@ -114,6 +115,7 @@ constexpr uint64_t ENGINE_TIMEOUT_NS = 1000000000ULL;
 constexpr uint64_t COMMAND_TIMEOUT_NS = 30000000000ULL;
 constexpr uint64_t MAX_WAIT_ITERATIONS = 100000000ULL;
 pci::PCIDevice* controller = nullptr;
+pci::DriverClaim controller_claim;
 uint64_t dma_mask = UINT32_MAX;
 std::atomic<bool> controller_failed{false};
 lifecycle::Admission admission;
@@ -1407,7 +1409,10 @@ struct RetirementBackend {
     ~RetirementBackend() {
         while (locked_ports != 0) port_locks[--locked_ports].unlock();
     }
-    void close_admission() { admission.close(); }
+    void close_admission() {
+        admission.close();
+        controller_claim.close_data_admission();
+    }
     auto drain_readers() -> bool {
         // A command has a 30-second completion deadline plus bounded recovery.
         constexpr uint64_t DRAIN_TIMEOUT_NS = COMMAND_TIMEOUT_NS + 4 * ENGINE_TIMEOUT_NS;
@@ -1415,6 +1420,7 @@ struct RetirementBackend {
             if (!wait_until([&] { return port_locks[locked_ports].try_lock(); }, DRAIN_TIMEOUT_NS)) return false;
             ++locked_ports;
         }
+        if (!wait_until([] { return controller_claim.operations_drained(); }, DRAIN_TIMEOUT_NS)) return false;
 #ifdef WOS_ASYNC_BLOCK_IO
         // No admitted request/CPU reader remains; mask and drain IRQ readers
         // before the final polled flush so IRQ acknowledgement cannot hide an error.
@@ -1536,6 +1542,7 @@ auto ahci_shutdown() -> int {
     if (shutdown_attempted) return shutdown_result;
     shutdown_attempted = true;
     admission.close();
+    controller_claim.close_data_admission();
     if (controller == nullptr || hba_mem == nullptr) return 0;
 #ifdef WOS_ASYNC_BLOCK_IO
     bool queues_drained = true;
@@ -1641,6 +1648,8 @@ auto ahci_controller_init() -> void {
     // Discover AHCI controller via PCI
     auto* ahci_dev = ker::dev::pci::pci_find_ahci_controller();
     if (ahci_dev != nullptr) {
+        auto claim = pci::try_claim_driver(ahci_dev, pci::DriverKind::ahci);
+        if (!claim) return;
         log::info("controller found, setting up");
         // Extract MMIO base from BAR5
         uint32_t const BAR5 = ahci_dev->bar.at(5);
@@ -1655,6 +1664,7 @@ auto ahci_controller_init() -> void {
             uint64_t const AHCI_KERNEL_VADDR = HHDM + PHYSICAL;
             // MMIO access precedes engine stop; BME admission moves into
             // ahci_init after every required managed ring/buffer mapping.
+            controller_claim = std::move(*claim);
             pci::pci_enable_memory_space(ahci_dev);
             controller = ahci_dev;
             // PCIe Device Control: disable Relaxed Ordering and No Snoop for
@@ -1663,6 +1673,7 @@ auto ahci_controller_init() -> void {
             if (PCIE != 0) {
                 if (PCIE > 0xf4) {
                     (void)pci::pci_set_bus_master(controller, false);
+                    controller_claim.close_data_admission();
                     return;
                 }
                 auto const OFFSET = static_cast<uint8_t>(PCIE + 8);
@@ -1672,6 +1683,7 @@ auto ahci_controller_init() -> void {
                 if ((pci::pci_config_read16(controller->bus, controller->slot, controller->function, OFFSET) & 0x810U) != 0) {
                     (void)pci::pci_set_bus_master(controller, false);
                     log::error("cannot establish coherent ordered PCIe DMA");
+                    controller_claim.close_data_admission();
                     return;
                 }
             }
@@ -1687,7 +1699,7 @@ auto ahci_controller_init() -> void {
             ahci_set_base(ahci_base);
 
             // Now initialize AHCI
-            ahci_init();
+            if (ahci_init() != 0) controller_claim.close_data_admission();
         } else {
             (void)pci::pci_set_bus_master(ahci_dev, false);
             log::error("invalid MMIO BAR5/HHDM range: bar=0x%x hhdm=0x%lx", BAR5, HHDM);

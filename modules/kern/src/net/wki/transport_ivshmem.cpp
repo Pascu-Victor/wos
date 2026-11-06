@@ -356,6 +356,7 @@ void wki_ivshmem_transport_init() {
         ker::mod::dbg::log("[WKI] ivshmem: PCI resource preparation failed");
         return;
     }
+    dev::ivshmem::ProbeAdmission probe_admission(s_ivshmem_priv.resources);
     auto* regs = s_ivshmem_priv.resources.regs;
     auto* shmem = s_ivshmem_priv.resources.shared;
 
@@ -465,6 +466,7 @@ void wki_ivshmem_transport_init() {
     wki_transport_register(&s_ivshmem_transport);
 
     s_ivshmem_initialized = true;
+    probe_admission.commit();
     ker::mod::dbg::log("[WKI] ivshmem message transport initialized (vm_id=%u, raw RDMA disabled)", s_ivshmem_priv.my_vm_id);
 #ifdef WOS_SELFTEST
     dev::ivshmem::selftest_start(&s_ivshmem_priv.resources, "wki", wki_ivshmem_transport_shutdown, selftest_late_calls, [](bool acquire) {
