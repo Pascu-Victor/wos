@@ -6,6 +6,9 @@
 namespace ker::dev::pci {
 
 struct PCIDevice;
+namespace detail {
+class ColdMmioAccess;
+}
 
 enum class DriverKind : uint8_t { diagnostic, ahci, e1000e, virtio_net, xhci, ivshmem };
 enum class DriverPhase : uint8_t { unclaimed, open, closed, retained };
@@ -64,6 +67,7 @@ class DriverOperation {
     explicit DriverOperation(const PCIDevice* device) : device_(device) {}
     void release();
     friend auto try_dma_operation(const PCIDevice*) -> DriverOperation;
+    friend class detail::ColdMmioAccess;
 };
 
 [[nodiscard]] auto try_claim_driver(PCIDevice*, DriverKind) -> std::optional<DriverClaim>;

@@ -86,6 +86,11 @@ auto alloc_zeroed_page_table() -> PageTable* {
     CHECK(!user_mapping_pin_lock.held && next_table < 32); ++allocations;
     return &tables[next_table++];
 }
+// This existing boot fixture deliberately selects the flag-absent mapper.
+// New selected-branch allocation retirement is an unavailable finite port.
+struct PageTableReleaseOrigin { void* caller; uint64_t owner; };
+auto try_release_page_table_to_pool(PageTable*, PageTableReleaseOrigin) -> bool { throw Refused{}; }
+namespace phys { void page_free(void*) { throw Refused{}; } }
 void owned_frame_untrack_leaf(PageTable*, uint64_t, PageTableEntry const&) { ++untracks; }
 void owned_frame_track_private_mapping(PageTable*, uint64_t, uint64_t, uint64_t) { ++tracks; }
 void invalidate_local_tlb_if_current(PageTable*, uint64_t, bool) { ++tlbs; }
@@ -268,14 +273,17 @@ def main() -> int:
     source_path = (args.virt_source or root / "modules/kern/src/platform/mm/virt.opt.cpp").resolve()
     header_path = root / "modules/kern/src/platform/mm/virt.hpp"
     paging_path = root / "modules/kern/src/platform/mm/paging.opt.cpp"
-    compiler = Path(shutil.which(args.cxx) or args.cxx).resolve()
+    # Preserve the ++ driver name: resolving clang++ to its clang ELF changes
+    # automatic C++ runtime linkage. pin() still records the resolved ELF.
+    compiler = Path(shutil.which(args.cxx) or args.cxx).absolute()
     output = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix="kernel-hhdm-result-"))
     if args.output:
         output.mkdir(parents=True, exist_ok=False)
     scratch = Path(tempfile.mkdtemp(prefix="scratch-", dir=output))
     started = time.monotonic()
     commands, errors, groups = [], [], {}
-    selected = [Path(__file__), source_path, header_path, paging_path, compiler]
+    disabled_ports = Path(__file__).with_name("mmio_disabled_virt_ports.inc")
+    selected = [Path(__file__), source_path, header_path, paging_path, compiler, disabled_ports]
     before, emitted = [], []
     environment = dict(os.environ, TMPDIR=str(scratch), ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
                        UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
@@ -355,7 +363,10 @@ def main() -> int:
         batch = header[batch_start:header.index("\n};", batch_start) + 3]
         stats_start = source.index("struct BootDirectMapStats {")
         stats = source[stats_start:source.index("\n};", stats_start) + 3]
-        names = ["auto index_of(", "auto entry_at(PageTable*", "auto table_flags_for_leaf(", "auto is_aligned_to(", "auto direct_map_flags_for_entry(",
+        # table_flags_for_leaf now comes from the actual paging.hpp included
+        # above; it no longer has a separate virt.opt.cpp definition.
+        names = ["auto pte_raw(const paging::PageTableEntry& e)", "auto index_of(", "auto entry_at(PageTable*",
+                 "auto is_aligned_to(", "auto direct_map_flags_for_entry(",
                  "auto boot_direct_map_allows_2m(", "auto kernel_hhdm_2m_flags_match(", "auto kernel_hhdm_entry_raw(",
                  "auto kernel_hhdm_2m_mapping_matches(", "auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted)",
                  "void map_page(PageTable*", "void init_page_map_batch(", "void map_page_batched(PageMapBatch* batch, const",
@@ -369,7 +380,8 @@ def main() -> int:
                 signature = "void init_page_map_batch(PageMapBatch* batch, PageTable* page_table, const uint64_t FLAGS) {"
             bodies.append(function(source, signature))
         # The real constructor is compiled from its authoritative TU body.
-        constructor = function(paging_path.read_text(), "auto create_page_table_entry(")
+        constructor = "\n".join(function(paging_path.read_text(), anchor) for anchor in (
+            "auto create_page_table_entry(", "auto create_page_table_leaf_4k("))
         code = PRELUDE + "\n" + batch + "\n" + stats + "\nnamespace ker::mod::mm::paging {\n" + constructor + "\n}\n"
         code += "\n".join(bodies) + "\n" + CASES
         # Admission must use the actual type helper, not an inferred RO flag.
@@ -393,6 +405,7 @@ def main() -> int:
             cpp, binary, dep = (scratch / (label + suffix) for suffix in (".cpp", ".exe", ".d"))
             cpp.write_text(body)
             flags = [compiler, "-std=c++23", "-O1", "-g", "-fno-strict-aliasing", "-fno-pie", "-no-pie",
+                     "-include", disabled_ports,
                      "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I" + str(root / "modules/kern/src"),
                      "-I" + str(root / "modules")]
             run("compile-" + label, flags + ["-MD", "-MF", dep, cpp, "-o", binary])

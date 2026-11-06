@@ -537,3 +537,303 @@ TEST(CpuMaintenance, InjectedStaleCompletedIdCannotAdvanceTheRealRequest) {
     });
 }
 }  // namespace
+
+namespace {
+namespace issuers = controller_host;
+using Controller = cm::detail::Controller;
+static_assert(!std::is_default_constructible_v<Controller> && !std::is_copy_constructible_v<Controller> &&
+              !std::is_move_constructible_v<Controller>);
+static_assert(!std::is_constructible_v<Controller, const ker::init::InitExecutor&>);
+static_assert(!std::is_constructible_v<Controller, const ker::mod::power::FinalizerExecution&>);
+static_assert(!std::is_default_constructible_v<ker::init::InitExecutor>);
+static_assert(!std::is_constructible_v<ker::mod::power::FinalizerExecution, ker::mod::power::ShutdownAction>);
+
+auto private_round_trip(const Controller& controller, bool defer) -> void {
+    EXPECT_EQ(controller.context_status(), Status::ready);
+    uint64_t const flags = ports::flags;
+    EXPECT_EQ(cm::detail::await_ready(controller, deadline()), Status::ready);
+    Ticket ticket;
+    EXPECT_EQ(cm::detail::prepare(controller, range(), Kind::translations_then_cache, ticket), Status::ready);
+    uint64_t const id = ticket.id();
+    if (defer) EXPECT_EQ(cm::detail::diagnostic_defer(controller, ticket, Phase::translations, 1), Status::ready);
+    EXPECT_EQ(cm::detail::publish(controller, ticket), Status::pending);
+    if (defer) {
+        auto const timed = cm::detail::wait_until(controller, ticket, deadline(100'000));
+        EXPECT_EQ(timed.status, Status::timeout_retained);
+        EXPECT_EQ(timed.id, id);
+        EXPECT_EQ(timed.cache_claimed, 0U);
+        EXPECT_EQ(cm::detail::diagnostic_resume(controller, ticket, Phase::translations), Status::ready);
+    }
+    auto const complete = cm::detail::wait_until(controller, ticket, deadline());
+    EXPECT_EQ(complete.status, Status::complete);
+    EXPECT_EQ(complete.id, id);
+    EXPECT_EQ(complete.timed_out_ever, defer);
+    EXPECT_EQ(complete.translation_completed, 3U);
+    EXPECT_EQ(complete.cache_completed, 3U);
+    EXPECT_EQ(cm::detail::observe(controller, ticket).status, Status::complete);
+    EXPECT_EQ(cm::detail::release_complete(controller, ticket), Status::complete);
+    EXPECT_TRUE(ticket.empty());
+    EXPECT_EQ(ports::flags, flags);
+}
+
+TEST(CpuMaintenance, GeneralPrivateActualBootIssuerKeepsBothIncomingIrqStatesAndSameTicketRetry) {
+    for (uint64_t flags : {uint64_t{2}, uint64_t{2} | ports::IF})
+        isolated([flags] {
+            boot(2);
+            host::controller = false;  // The ordinary DAEMON entry genuinely refuses.
+            ports::flags = flags;
+            issuers::boot_callback = [](const Controller& controller) {
+                EXPECT_FALSE(issuers::scheduled);
+                EXPECT_FALSE(cache::cohort_observation().sealed);
+                EXPECT_EQ(cm::detail::await_ready(controller, deadline()), Status::ready);
+                EXPECT_FALSE(cache::cohort_observation().sealed);  // No circular seal prerequisite.
+                Ticket denied;
+                EXPECT_EQ(cm::prepare(range(), Kind::translations, denied), Status::invalid_context);
+                private_round_trip(controller, true);
+                EXPECT_EQ(host::yields.load(), 0U);
+                bool const scheduled = issuers::scheduled;
+                issuers::scheduled = true;
+                EXPECT_EQ(controller.context_status(), Status::invalid_context);
+                issuers::scheduled = scheduled;
+                host::kernel_root = false;
+                EXPECT_EQ(controller.context_status(), Status::invalid_context);
+                host::kernel_root = true;
+                ports::select(1);
+                EXPECT_EQ(controller.context_status(), Status::invalid_context);
+                ports::select(0);
+            };
+            try {
+                ker::init::InitExecutor::run_all();
+            } catch (const issuers::Finished&) {
+            }
+            EXPECT_EQ(issuers::boot_calls, 1U);
+            // The callback deliberately switches the finite local CPU at its end.
+            EXPECT_EQ(ports::flags, 2U | ports::IF);
+        });
+}
+
+TEST(CpuMaintenance, GeneralPrivateBootReadinessTimeoutHasNoTicketSealOrPoolEffect) {
+    isolated([] {
+        host::setup(2);
+        ASSERT_EQ(cm::detail::initialize_boot(0x70), Status::ready);
+        ASSERT_EQ(cache::configure_boot_cohort(2), cache::Status::ready);
+        ports::select(0);
+        ASSERT_EQ(cache::capture_boot_cpu(0), cache::Status::ready);
+        ASSERT_EQ(cm::detail::note_current_cpu_ready(), Status::ready);
+        issuers::boot_callback = [](const Controller& controller) {
+            EXPECT_EQ(cm::detail::await_ready(controller, deadline(100'000)), Status::not_ready);
+            EXPECT_EQ(cm::pool_stats().prepared, 0U);
+            EXPECT_EQ(cm::pool_stats().published, 0U);
+            EXPECT_FALSE(cache::cohort_observation().sealed);
+            EXPECT_EQ(host::yields.load(), 0U);
+        };
+        try {
+            ker::init::InitExecutor::run_all();
+        } catch (const issuers::Finished&) {
+        }
+        EXPECT_EQ(issuers::boot_calls, 1U);
+    });
+}
+
+TEST(CpuMaintenance, GeneralPrivateActualProcessFinalizerSealsDrainsAndRevalidatesCurrentStackAndPhase) {
+    isolated([] {
+        boot(2);
+        host::controller = false;
+        ker::mod::sched::task::Task task;
+        issuers::initialize(task);
+        ports::flags &= ~ports::IF;  // Genuine syscall ingress may have IF clear.
+        issuers::finalizer_callback = [](const Controller& controller) {
+            EXPECT_EQ(issuers::seals, 1U);
+            EXPECT_EQ(issuers::effects, (std::vector<std::string_view>{"processes", "files", "workers", "wki", "sync", "unmount", "ahci",
+                                                                       "virtio", "e1000"}));
+            EXPECT_EQ(ker::mod::power::shutdown_phase(), ker::mod::power::ShutdownPhase::ROOT_UNMOUNT);
+            auto* task = issuers::current;
+            EXPECT_EQ(task->type, ker::mod::sched::task::TaskType::PROCESS);
+            EXPECT_TRUE(task->kernel_shutdown_ownership.held());
+            private_round_trip(controller, true);
+            uint64_t const top = task->context.syscall_kernel_stack;
+            task->context.syscall_kernel_stack += 2 * ker::mod::mm::KERNEL_STACK_SIZE;
+            EXPECT_EQ(controller.context_status(), Status::invalid_context);
+            task->context.syscall_kernel_stack = top;
+            for (auto phase : {ker::mod::power::ShutdownPhase::PREPARING, ker::mod::power::ShutdownPhase::CPU_QUIESCE,
+                               ker::mod::power::ShutdownPhase::PLATFORM_ACTION}) {
+                ker::mod::power::g_phase.store(phase);
+                EXPECT_EQ(controller.context_status(), Status::invalid_context);
+            }
+            ker::mod::power::g_phase.store(ker::mod::power::ShutdownPhase::ROOT_UNMOUNT);
+            issuers::preempt = 1;
+            EXPECT_EQ(controller.context_status(), Status::invalid_context);
+            issuers::preempt = 0;
+            ports::flags &= ~ports::IF;
+            EXPECT_EQ(controller.context_status(), Status::invalid_context);
+            ports::flags |= ports::IF;
+            EXPECT_EQ(controller.context_status(), Status::ready);
+        };
+        try {
+            (void)ker::mod::power::begin_reboot_command(ker::abi::power::RB_POWER_OFF);
+            FAIL() << "accepted finalization returned";
+        } catch (const issuers::Finished&) {
+        }
+        EXPECT_EQ(issuers::authorizations, 1U);
+        EXPECT_EQ(issuers::finalizer_calls, 1U);
+        EXPECT_FALSE(task.kernel_shutdown_ownership.held());
+        EXPECT_EQ(issuers::effects.back(), "halt");
+        EXPECT_EQ(ker::mod::power::begin_reboot_command(ker::abi::power::RB_POWER_OFF), -EBUSY);
+        EXPECT_EQ(issuers::finalizer_calls, 1U);
+    });
+}
+
+TEST(CpuMaintenance, GeneralPrivateSelftestUsesActualAdmissionAndDiagnosticSubjectNeverReplacesCurrent) {
+    for (bool selftest : {false, true})
+        isolated([selftest] {
+            boot(2);
+            ker::mod::sched::task::Task subject;
+            subject.credential_snapshot = ker::mod::security::Snapshot::bootstrap_root();
+            // A borrowed authorized subject grants no actual current execution.
+            EXPECT_EQ(ker::mod::power::selftest_begin_reboot_for_subject(&subject, ker::abi::power::RB_POWER_OFF), -EWOULDBLOCK);
+            EXPECT_EQ(issuers::seals, 0U);
+            EXPECT_EQ(ker::mod::power::shutdown_phase(), ker::mod::power::ShutdownPhase::IDLE);
+            issuers::initialize(subject);
+            if (selftest) {
+                subject.type = ker::mod::sched::task::TaskType::DAEMON;
+                subject.credential_snapshot = {};  // The established test-only credential bypass remains explicit.
+            }
+            issuers::finalizer_callback = [](const Controller& controller) { EXPECT_EQ(controller.context_status(), Status::ready); };
+            try {
+                if (selftest)
+                    ker::mod::power::selftest_shutdown();
+                else
+                    (void)ker::mod::power::selftest_begin_reboot_for_subject(&subject, ker::abi::power::RB_POWER_OFF);
+                FAIL() << "accepted finalization returned";
+            } catch (const issuers::Finished&) {
+            }
+            EXPECT_EQ(issuers::seals, 1U);
+            EXPECT_EQ(issuers::finalizer_calls, 1U);
+        });
+}
+}  // namespace
+
+namespace {
+TEST(CpuMaintenance, GeneralPrivateNativeProtectionHelperRefusesMissingNxeWpIdtAndMsrFault) {
+    isolated([] {
+        host::setup(1);
+        auto const saved = cm::detail::platform::save_disable_interrupts();
+        auto& cpu = ports::cpus[0];
+        EXPECT_EQ(cm::detail::platform::private_protection_status(), cache::Status::ready);
+        cpu.msr[0xc0000080] = 0;
+        EXPECT_EQ(cm::detail::platform::private_protection_status(), cache::Status::unsupported_mode);
+        cpu.msr[0xc0000080] = uint64_t{1} << 11;
+        cpu.cr0 &= ~(uint64_t{1} << 16);
+        EXPECT_EQ(cm::detail::platform::private_protection_status(), cache::Status::unsupported_mode);
+        cpu.cr0 |= uint64_t{1} << 16;
+        cpu.faults.insert(0xc0000080);
+        EXPECT_EQ(cm::detail::platform::private_protection_status(), cache::Status::read_fault);
+        cpu.faults.clear();
+        cpu.idt = false;
+        EXPECT_EQ(cm::detail::platform::private_protection_status(), cache::Status::local_idt_unavailable);
+        cm::detail::platform::restore_interrupts(saved);
+    });
+}
+
+TEST(CpuMaintenance, GeneralPrivateMissingProtectionNeverChangesLegacyReadinessOrPublicProtocol) {
+    for (bool wp : {false, true})
+        isolated([wp] {
+            host::setup(2);
+            if (wp)
+                ports::cpus[1].cr0 &= ~(uint64_t{1} << 16);
+            else
+                ports::cpus[1].msr[0xc0000080] = 0;
+            ASSERT_EQ(cm::detail::initialize_boot(0x70), Status::ready);
+            ASSERT_EQ(cache::configure_boot_cohort(2), cache::Status::ready);
+            for (size_t i = 0; i < 2; ++i) {
+                ports::select(i);
+                ASSERT_EQ(cache::capture_boot_cpu(i), cache::Status::ready);
+                ASSERT_EQ(cm::detail::note_current_cpu_ready(), Status::ready);
+            }
+            ports::select(0);
+            EXPECT_EQ(cm::service_observation().status, Status::ready);
+            EXPECT_EQ(cm::service_observation().ready_mask, 3U);
+            EXPECT_EQ(cm::detail::protection_observation().ready_mask, 1U);
+            EXPECT_EQ(cm::detail::protection_observation().error, cache::Status::unsupported_mode);
+            Ticket legacy;
+            ASSERT_EQ(cm::prepare(range(), Kind::translations_then_cache, legacy), Status::ready);
+            ASSERT_EQ(cm::publish(legacy), Status::pending);
+            EXPECT_EQ(cm::wait_until(legacy, deadline()).status, Status::complete);
+            EXPECT_EQ(cm::release_complete(legacy), Status::complete);
+            issuers::boot_callback = [](const Controller& controller) {
+                EXPECT_EQ(cm::detail::await_ready(controller, deadline()), Status::failed_retained);
+                auto qualified = range();
+                Ticket refused;
+                EXPECT_EQ(cm::detail::prepare(controller, std::move(qualified), Kind::translations, refused), Status::failed_retained);
+                EXPECT_FALSE(qualified.empty());
+                EXPECT_TRUE(refused.empty());
+                EXPECT_EQ(cm::pool_stats().prepared, 0U);
+                EXPECT_EQ(cm::pool_stats().published, 0U);
+            };
+            try {
+                ker::init::InitExecutor::run_all();
+            } catch (const issuers::Finished&) {
+            }
+            EXPECT_EQ(issuers::boot_calls, 1U);
+        });
+}
+
+TEST(CpuMaintenance, GeneralPrivateTaggedServiceRechecksNxeBeforeActionAndNeverAcknowledgesRefusal) {
+    isolated([] {
+        boot(2);
+        issuers::boot_callback = [](const Controller& controller) {
+            Ticket ticket;
+            ASSERT_EQ(cm::detail::prepare(controller, range(), Kind::translations_then_cache, ticket), Status::ready);
+            uint64_t const id = ticket.id();
+            ports::cpus[1].msr[0xc0000080] = 0;  // EFER is outside the old18b cache-type field set.
+            ASSERT_EQ(cm::detail::publish(controller, ticket), Status::pending);
+            auto const failed = cm::detail::wait_until(controller, ticket, deadline());
+            EXPECT_EQ(failed.status, Status::failed_retained);
+            EXPECT_EQ(failed.id, id);
+            EXPECT_EQ(failed.cpus[1].translation_status, cache::Status::unsupported_mode);
+            EXPECT_EQ(failed.cpus[1].translation_claimed, id);
+            EXPECT_EQ(failed.cpus[1].translation_completed, 0U);
+            EXPECT_EQ(failed.cache_claimed, 0U);
+            EXPECT_EQ(cm::detail::release_complete(controller, ticket), Status::busy);
+            for (auto const& action : host::events()) EXPECT_NE(action.cpu, 1U);
+        };
+        try {
+            ker::init::InitExecutor::run_all();
+        } catch (const issuers::Finished&) {
+        }
+        EXPECT_EQ(cm::pool_stats().retained, 1U);
+        // The failed private request does not poison the legacy global service.
+        EXPECT_EQ(cm::service_observation().status, Status::ready);
+    });
+}
+}  // namespace
+
+namespace {
+TEST(CpuMaintenance, GeneralPrivateFinalizerRetriesOnlyEagainAtMostThreeWithSameLiveController) {
+    for (auto results : {std::vector<int>{-EAGAIN, -EAGAIN, 0}, std::vector<int>{-EAGAIN, -EAGAIN, -EAGAIN, 0}, std::vector<int>{-EIO, 0},
+                         std::vector<int>{-EBUSY, 0}, std::vector<int>{0}})
+        isolated([results] {
+            boot(2);
+            ker::mod::sched::task::Task task;
+            issuers::initialize(task);
+            issuers::retirement_results = results;
+            issuers::finalizer_callback = [](const Controller& controller) {
+                EXPECT_EQ(controller.context_status(), Status::ready);
+                EXPECT_EQ(ker::mod::power::shutdown_phase(), ker::mod::power::ShutdownPhase::ROOT_UNMOUNT);
+                EXPECT_TRUE(issuers::current->kernel_shutdown_ownership.held());
+            };
+            try {
+                (void)ker::mod::power::begin_reboot_command(ker::abi::power::RB_POWER_OFF);
+                FAIL() << "accepted finalization returned";
+            } catch (const issuers::Finished&) {
+            }
+            size_t const expected = results.front() == -EAGAIN ? 3 : 1;
+            EXPECT_EQ(issuers::finalizer_calls, expected);
+            EXPECT_EQ(issuers::retirement_clears, expected);
+            EXPECT_EQ(issuers::seals, 1U);
+            ASSERT_EQ(issuers::finalizer_scopes.size(), expected);
+            for (auto scope : issuers::finalizer_scopes) EXPECT_EQ(scope, issuers::finalizer_scopes.front());
+            EXPECT_EQ(issuers::effects.back(), "halt");
+        });
+}
+}  // namespace

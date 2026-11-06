@@ -4,6 +4,7 @@
 #include <atomic>
 #include <dev/iommu/domains.hpp>
 #include <dev/pci.hpp>
+#include <dev/pci_mmio_private.hpp>
 #include <platform/acpi/acpi.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -31,7 +32,7 @@ auto safe_window(const ecam::Window& window, uint8_t physical_bits) -> bool {
 struct Reader {
     volatile uint8_t* base;
     auto write16(uint16_t offset, uint16_t value) const -> bool {
-        if (offset % 2 != 0 || offset > 4094) return false;
+        if (offset % 2 != 0 || offset > 4094 || detail::cold_configuration_sealed()) return false;
         *reinterpret_cast<volatile uint16_t*>(base + offset) = value;
         return true;
     }
@@ -124,8 +125,9 @@ auto extended_config(const PCIDevice* device) -> const ExtendedConfig* {
     return nullptr;
 }
 auto enable_strict_acs(std::span<ecam::Capabilities> capabilities) -> bool {
-    if (!published.load(std::memory_order_acquire) || inventory.state != ExtendedState::ready || inventory.devices != capabilities.size() ||
-        inventory.devices > snapshots.size() || iommu::domain_stats().ready || acs_attempted.exchange(true, std::memory_order_acq_rel))
+    if (detail::cold_configuration_sealed() || !published.load(std::memory_order_acquire) || inventory.state != ExtendedState::ready ||
+        inventory.devices != capabilities.size() || inventory.devices > snapshots.size() || iommu::domain_stats().ready ||
+        acs_attempted.exchange(true, std::memory_order_acq_rel))
         return false;
     // Complete this pass before the first write: no downstream requester may
     // remain active while an upstream boundary changes routing controls.

@@ -93,6 +93,7 @@ auto events() -> std::vector<Action> {
 
 void setup(size_t count, ker::mod::mm::cache_arch::Vendor vendor = ker::mod::mm::cache_arch::Vendor::intel) {
     runtime_ports::setup(count, vendor);
+    for (size_t i = 0; i < count && i < runtime_ports::cpus.size(); ++i) runtime_ports::cpus[i].msr[0xc0000080] = uint64_t{1} << 11;
     pending.store(0);
     now.store(1'000'000);
     clock_step.store(50'000);
@@ -166,3 +167,5 @@ void spin_pause() noexcept {
     if (maintenance_host::auto_progress.load()) maintenance_host::drain();
 }
 }  // namespace ker::mod::mm::cpu_maintenance::detail::platform
+
+#include "cpu_maintenance_controller_ports.inc"

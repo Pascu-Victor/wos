@@ -197,6 +197,7 @@ def main() -> int:
                  'dev/device_mapping_object.cpp', 'dev/device_mapping_object.hpp',
                  'syscalls_impl/vmem/sys_vmem.cpp', 'syscalls_impl/vmem/sys_vmem.hpp', 'platform/sys/syscall_preparation.hpp')
         watched = [KERN / p for p in paths] + [Path(__file__).resolve(), compiler,
+            UNIT / 'mmio_disabled_virt_ports.inc',
             UNIT / 'device_mapping_vm_common.inc', UNIT / 'device_mapping_vm_ports.inc', UNIT / 'device_mapping_vm_cases.inc',
             UNIT / 'file_mmap_registry_runtime_test.py', UNIT / 'native_lazy_file_fault_runtime_test.py']
         watched += sorted(p for p in OBJECT_SHIM.rglob('*') if p.is_file())
@@ -205,7 +206,8 @@ def main() -> int:
         result['actual_definitions'] = generate(scratch, args.control)
         result['compiled_plan_source'] = pin(scratch / 'plans.cpp')
         binary = scratch / 'vm'
-        argv = [str(compiler_driver), '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
+        argv = [str(compiler_driver), '-include', str(UNIT / 'mmio_disabled_virt_ports.inc'),
+                '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
                 '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer',
                 '-I', str(scratch / 'include'), '-I', str(OBJECT_SHIM), '-I', str(ROOT / 'tests/host/kern_shim'),
                 '-I', str(KERN), '-I', str(ROOT / 'modules'), str(scratch / 'vm.cpp'), str(scratch / 'ports.cpp'),

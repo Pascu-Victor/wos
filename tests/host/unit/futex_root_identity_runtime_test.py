@@ -746,6 +746,7 @@ def main() -> int:
                 raise ValueError("--cxx must resolve to one executable Host ELF compiler")
         watched = [
             selected,
+            Path(__file__).with_name("mmio_disabled_virt_ports.inc"),
             Path(__file__).resolve(),
             Path(__file__).with_name("nondevice_object_fixture.py"),
             compiler,
@@ -795,6 +796,7 @@ def main() -> int:
         source, binary, depfile = scratch / "harness.cpp", scratch / "futex-root-test", scratch / "dependencies.d"
         argv = [
             str(compiler),
+            "-include", str(Path(__file__).with_name("mmio_disabled_virt_ports.inc")),
             "-std=c++23",
             "-O1",
             "-g0",

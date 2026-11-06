@@ -257,7 +257,12 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     sys_power = SYS_POWER_CPP.read_text()
     mlibc_power = MLIBC_POWER_H.read_text()
     init_wrappers = INIT_WRAPPERS_CPP.read_text()
-    run_body = function_body(source, "run_finalizer")
+    run_body = function_body(source, "FinalizerExecution::run")
+    accepted = function_body(source, "begin_finalization")
+    require_tokens(function_body(source, "run_finalizer"), ["FinalizerExecution execution(action);", "execution.run();"],
+                   "only the actual accepted lexical owner runs the continuation")
+    require_order(accepted, "compare_exchange_weak(phase, ShutdownPhase::FINALIZING", "run_finalizer(action)",
+                  "successful actual-current acceptance precedes finalizer construction")
     require_tokens(
         source,
         [
@@ -297,7 +302,7 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     require_tokens(mlibc_power, ["static inline int64_t prepare_shutdown()", "ops::PREPARE"], "mlibc power prepare wrapper")
     forbid_tokens(source, ['log::warn("system shutdown finalizer starting action=%lu"'], "normal finalizer start is not a warning")
     for first, second, context in [
-        ("ShutdownPhase::FINALIZING", "teardown_processes()", "finalizer closes public admission before consumer stop"),
+        ("close_idle_thread_cpu_admission(*CURRENT)", "teardown_processes()", "accepted finalizer seals before consumer stop"),
         ("teardown_processes()", "wait_for_file_retirement()", "userspace retires while FILE providers remain alive"),
         ("wait_for_file_retirement()", "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)",
          "native GC and retirement executor join before generic provider stop"),
@@ -316,7 +321,13 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     ]:
         require_order(run_body, first, second, context)
 
-    entry = function_body(source, "begin_reboot_command")
+    entry_wrapper = function_body(source, "begin_reboot_command")
+    require_tokens(entry_wrapper, ["return begin_finalization(action);"], "authorized commands share actual-current finalizer admission")
+    entry = entry_wrapper + accepted
+    selftest = function_body(source, "selftest_shutdown")
+    require_tokens(selftest, ["begin_finalization(ShutdownAction::POWEROFF)", "panic_handler(", "halt_forever();"],
+                   "scheduled selftest bypasses credentials only, never actual finalizer admission")
+    forbid_tokens(selftest, ["g_phase.store", "g_action.store", "run_finalizer("], "selftest cannot manufacture accepted execution")
     require_order(entry, "authorize_current_power(subject)", "return -EWOULDBLOCK;", "authority precedes context admission")
     authority = function_body(source, "authorize_current_power")
     require_order(authority, "host_namespace_admission(task)", "Authority::POWER", "Host scope precedes credential authority")
@@ -341,6 +352,15 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
                   "completion IRQs are enabled while consumers and their providers drain")
     require_order(run_body, "close_idle_thread_cpu_admission(*CURRENT)", "teardown_processes()",
                   "accepted finalizer seals its sole caller before excluding that process")
+    require_tokens(run_body, ["attempt < 3", "e1000e_shutdown(controller)", "if (E1000_RET != -EAGAIN) break;"],
+                   "terminal CPU withdrawal retries only EAGAIN with a fixed three-call ceiling")
+    retry = run_body[run_body.index("for (unsigned attempt"):run_body.index("if (E1000_RET != 0)")]
+    require_order(retry, "e1000e_shutdown(controller)", "clear_current_finalizer_sched_state();",
+                  "every actual retry returns to safe finalizer state")
+    require_order(run_body, "e1000e_shutdown(controller)", "controller expires before CPU service is stopped",
+                  "the same accepted lexical controller survives withdrawal retries")
+    require_order(run_body, "controller expires before CPU service is stopped", "ShutdownPhase::CPU_QUIESCE",
+                  "controller authority expires before CPU halt")
     for guard, boundary in [("if (!CONSUMERS_DRAINED)", "wait_for_file_retirement()"),
                             ("if (FILE_DRAIN != 0)", "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)"),
                             ("if (count_shutdown_targets(", "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)"),
@@ -356,7 +376,11 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
 
     sched_init_body = function_body(init_wrappers, "sched_init")
     require_tokens(sched_init_body, ['cmdline_has_token(get_kernel_cmdline(), "--selftest")', "mod::power::selftest_poweroff();"], "KTEST selftest poweroff call")
-    require_order(sched_init_body, 'ker::test::run_all(cmdline_has_token(get_kernel_cmdline(), "--ahci-test-retire-only"));', "mod::power::selftest_poweroff();", "KTEST powers off only after the selftest runner returns")
+    full_suite = sched_init_body[sched_init_body.index('ker::test::run_all('):]
+    require_order(full_suite, 'ker::test::run_all(cmdline_has_token(get_kernel_cmdline(), "--ahci-test-retire-only"));',
+                  "mod::power::selftest_poweroff();", "full KTEST powers off only after the complete selftest runner returns")
+    require_tokens(sched_init_body, ["if (SAFE_MSR_ONLY)", "ker::test::run_safe_msr_selftest();"],
+                   "the separate exclusive MSR fixture retains its own early poweroff branch")
     require_order(sched_init_body, "mod::power::selftest_poweroff();", "hcf();", "KTEST hcf remains fallback after poweroff")
 
 

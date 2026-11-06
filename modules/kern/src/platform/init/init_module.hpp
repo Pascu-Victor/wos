@@ -4,6 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ker::mod::mm::cpu_maintenance::detail {
+class Controller;
+}
+
 namespace ker::init {
 
 // Boot phases - modules can only depend on modules in same or earlier phase
@@ -81,6 +85,7 @@ struct Dependency {
 
 // Function pointer for init (used at runtime only)
 using InitFn = void (*)();
+using ControllerInitFn = void (*)(const ker::mod::mm::cpu_maintenance::detail::Controller&);
 
 // Compile-time module metadata (no function pointers - for constexpr validation)
 struct ModuleMeta {
@@ -117,7 +122,22 @@ constexpr auto make_meta(const char* name, BootPhase phase, Deps... deps) {
 struct ModuleDesc {
     const char* name;
     BootPhase phase;
-    InitFn init_fn;
+    InitFn init_fn{};
+    ControllerInitFn controller_init_fn{};
 };
+
+template <size_t N>
+[[nodiscard]] constexpr auto valid_runtime_modules(const std::array<ModuleDesc, N>& modules) -> bool {
+    for (const auto& mod : modules) {
+        // Existing fixed-size phase arrays contain zero-filled tail entries.
+        if (mod.name == nullptr) {
+            if (mod.init_fn != nullptr || mod.controller_init_fn != nullptr) return false;
+            continue;
+        }
+        if ((mod.init_fn == nullptr) == (mod.controller_init_fn == nullptr)) return false;
+        if (mod.controller_init_fn != nullptr && mod.phase != BootPhase::PHASE_5_DRIVERS) return false;
+    }
+    return true;
+}
 
 }  // namespace ker::init

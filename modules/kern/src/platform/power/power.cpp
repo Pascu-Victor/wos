@@ -16,7 +16,10 @@
 #include <platform/acpi/power.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/cpu_maintenance_controller.hpp>
 #include <platform/mm/lifetime_retirement_executor.hpp>
+#include <platform/mm/mm.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -25,6 +28,24 @@
 #include <vfs/vfs.hpp>
 
 namespace ker::mod::power {
+[[noreturn]] void run_finalizer(ShutdownAction action);
+
+// Defined only beside the actual accepted nonreturning power continuation.
+class FinalizerExecution final {
+    friend class mm::cpu_maintenance::detail::Controller;
+    friend void run_finalizer(ShutdownAction action);
+    sched::KernelShutdownHold hold_;
+    ShutdownAction action_;
+    uint64_t lineage_{1};
+    bool live_{true};
+    bool sealed_{};
+    explicit FinalizerExecution(ShutdownAction action);
+    [[noreturn]] void run();
+    FinalizerExecution(const FinalizerExecution&) = delete;
+    FinalizerExecution(FinalizerExecution&&) = delete;
+    auto operator=(const FinalizerExecution&) -> FinalizerExecution& = delete;
+    auto operator=(FinalizerExecution&&) -> FinalizerExecution& = delete;
+};
 namespace {
 
 using log = ker::mod::dbg::logger<"power">;
@@ -39,6 +60,7 @@ constexpr uint64_t FILE_RETIREMENT_JOIN_SLICE_US = 100'000;
 
 std::atomic<ShutdownPhase> g_phase{ShutdownPhase::IDLE};
 std::atomic<ShutdownAction> g_action{ShutdownAction::NONE};
+std::atomic<bool> g_finalizer_issued{};
 
 auto command_to_action(uint64_t cmd, ShutdownAction& action) -> int {
     switch (cmd) {
@@ -224,94 +246,116 @@ void io_delay_loop() {
     halt_forever();
 }
 
+}  // namespace
+
+FinalizerExecution::FinalizerExecution(ShutdownAction action) : hold_(sched::hold_kernel_shutdown()), action_(action) {
+    if (g_phase.load(std::memory_order_acquire) != ShutdownPhase::FINALIZING || g_action.load(std::memory_order_acquire) != action ||
+        action == ShutdownAction::NONE || g_finalizer_issued.exchange(true, std::memory_order_acq_rel)) {
+        dbg::panic_handler("shutdown finalizer lacks accepted execution; providers retained");
+        halt_forever();
+    }
+}
+
 [[noreturn]] void run_finalizer(ShutdownAction action) {
-    auto const FINALIZER_HOLD = sched::hold_kernel_shutdown();
-    g_phase.store(ShutdownPhase::FINALIZING, std::memory_order_release);
+    FinalizerExecution execution(action);
+    execution.run();
+}
+
+[[noreturn]] void FinalizerExecution::run() {
     auto* const CURRENT = sched::get_current_task();
     if (CURRENT == nullptr || CURRENT->is_thread || !sched::resource::close_idle_thread_cpu_admission(*CURRENT)) {
         dbg::panic_handler("shutdown finalizer could not seal sole caller CPU admission; providers retained");
         halt_forever();
     }
-    log::info("system shutdown finalizer starting action=%lu", static_cast<unsigned long>(action));
+    log::info("system shutdown finalizer starting action=%lu", static_cast<unsigned long>(action_));
 
     // The power syscall enters with IF clear. Admission has established an
     // ordinary task with no preemption-disabled ownership; this finalizer
     // never returns, and its completion/retirement waits require IRQ progress.
     asm volatile("sti" ::: "memory");
+    sealed_ = true;
+    {
+        const mm::cpu_maintenance::detail::Controller controller(*this);
 
-    bool const CONSUMERS_DRAINED = teardown_processes();
-    clear_current_finalizer_sched_state();
-    if (!CONSUMERS_DRAINED) {
-        dbg::panic_handler("shutdown userspace consumers remain; providers retained");
-        halt_forever();
-    }
-    int const FILE_DRAIN = wait_for_file_retirement();
-    clear_current_finalizer_sched_state();
-    if (FILE_DRAIN != 0) {
-        log::error("shutdown native File retirement returned %d; providers retained", FILE_DRAIN);
-        dbg::panic_handler("shutdown native File retirement did not join; providers retained");
-        halt_forever();
-    }
-    // An already admitted construction may have published after the first
-    // census. Admission is now closed and native retirement has joined, so
-    // refuse any late consumer before requesting provider shutdown.
-    if (count_shutdown_targets(CURRENT->pid, current_process_pid(CURRENT)) != 0) {
-        dbg::panic_handler("shutdown late userspace consumers remain; providers retained");
-        halt_forever();
-    }
-
-    bool const KERNEL_THREADS_DRAINED = quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);
-    clear_current_finalizer_sched_state();
-    if (!KERNEL_THREADS_DRAINED) {
-        dbg::panic_handler("shutdown kernel workers remain; WKI/VFS/devices retained");
-        halt_forever();
-    }
-
-    ker::net::wki::wki_shutdown();
-    clear_current_finalizer_sched_state();
-
-    g_phase.store(ShutdownPhase::VFS_SYNC, std::memory_order_release);
-    int const SYNC_RET = ker::vfs::vfs_shutdown_sync();
-    clear_current_finalizer_sched_state();
-    if (SYNC_RET != 0) {
-        log::warn("shutdown vfs sync returned %d", SYNC_RET);
-    }
-
-    g_phase.store(ShutdownPhase::ROOT_UNMOUNT, std::memory_order_release);
-    int const UMOUNT_RET = ker::vfs::vfs_shutdown_unmount_all(current_root_path());
-    clear_current_finalizer_sched_state();
-    if (UMOUNT_RET != 0) {
-        log::warn("shutdown root/mount unmount returned %d; issuing final sync", UMOUNT_RET);
-        (void)ker::vfs::vfs_shutdown_sync();
+        bool const CONSUMERS_DRAINED = teardown_processes();
         clear_current_finalizer_sched_state();
-    }
+        if (!CONSUMERS_DRAINED) {
+            dbg::panic_handler("shutdown userspace consumers remain; providers retained");
+            halt_forever();
+        }
+        int const FILE_DRAIN = wait_for_file_retirement();
+        clear_current_finalizer_sched_state();
+        if (FILE_DRAIN != 0) {
+            log::error("shutdown native File retirement returned %d; providers retained", FILE_DRAIN);
+            dbg::panic_handler("shutdown native File retirement did not join; providers retained");
+            halt_forever();
+        }
+        // An already admitted construction may have published after the first
+        // census. Admission is now closed and native retirement has joined, so
+        // refuse any late consumer before requesting provider shutdown.
+        if (count_shutdown_targets(CURRENT->pid, current_process_pid(CURRENT)) != 0) {
+            dbg::panic_handler("shutdown late userspace consumers remain; providers retained");
+            halt_forever();
+        }
 
-    int const AHCI_RET = ker::dev::ahci::ahci_shutdown();
-    clear_current_finalizer_sched_state();
-    if (AHCI_RET != 0) log::warn("AHCI shutdown returned %d; unproven DMA backing retained", AHCI_RET);
+        bool const KERNEL_THREADS_DRAINED = quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);
+        clear_current_finalizer_sched_state();
+        if (!KERNEL_THREADS_DRAINED) {
+            dbg::panic_handler("shutdown kernel workers remain; WKI/VFS/devices retained");
+            halt_forever();
+        }
 
-    int const VIRTIO_RET = ker::dev::virtio::virtio_net_shutdown();
-    clear_current_finalizer_sched_state();
-    if (VIRTIO_RET != 0) log::warn("virtio shutdown returned %d; unproven DMA backing retained", VIRTIO_RET);
+        ker::net::wki::wki_shutdown();
+        clear_current_finalizer_sched_state();
 
-    int const E1000_RET = ker::dev::e1000e::e1000e_shutdown();
-    clear_current_finalizer_sched_state();
-    if (E1000_RET != 0) log::warn("e1000 shutdown returned %d; unproven DMA backing retained", E1000_RET);
+        g_phase.store(ShutdownPhase::VFS_SYNC, std::memory_order_release);
+        int const SYNC_RET = ker::vfs::vfs_shutdown_sync();
+        clear_current_finalizer_sched_state();
+        if (SYNC_RET != 0) {
+            log::warn("shutdown vfs sync returned %d", SYNC_RET);
+        }
 
-    int const IVSHMEM_RET = ker::dev::ivshmem::ivshmem_net_shutdown();
-    clear_current_finalizer_sched_state();
-    if (IVSHMEM_RET != 0) log::warn("ivshmem shutdown returned %d; callback/IRQ ownership retained", IVSHMEM_RET);
+        g_phase.store(ShutdownPhase::ROOT_UNMOUNT, std::memory_order_release);
+        int const UMOUNT_RET = ker::vfs::vfs_shutdown_unmount_all(current_root_path());
+        clear_current_finalizer_sched_state();
+        if (UMOUNT_RET != 0) {
+            log::warn("shutdown root/mount unmount returned %d; issuing final sync", UMOUNT_RET);
+            (void)ker::vfs::vfs_shutdown_sync();
+            clear_current_finalizer_sched_state();
+        }
 
-    int const XHCI_RET = ker::dev::usb::xhci_shutdown();
-    clear_current_finalizer_sched_state();
-    if (XHCI_RET != 0) log::warn("xHCI shutdown returned %d; unproven DMA backing retained", XHCI_RET);
+        int const AHCI_RET = ker::dev::ahci::ahci_shutdown();
+        clear_current_finalizer_sched_state();
+        if (AHCI_RET != 0) log::warn("AHCI shutdown returned %d; unproven DMA backing retained", AHCI_RET);
 
+        int const VIRTIO_RET = ker::dev::virtio::virtio_net_shutdown();
+        clear_current_finalizer_sched_state();
+        if (VIRTIO_RET != 0) log::warn("virtio shutdown returned %d; unproven DMA backing retained", VIRTIO_RET);
+
+        int E1000_RET = 0;
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            E1000_RET = ker::dev::e1000e::e1000e_shutdown(controller);
+            clear_current_finalizer_sched_state();
+            if (E1000_RET != -EAGAIN) break;
+        }
+        if (E1000_RET != 0) log::warn("e1000 shutdown returned %d; unproven DMA backing retained", E1000_RET);
+
+        int const IVSHMEM_RET = ker::dev::ivshmem::ivshmem_net_shutdown();
+        clear_current_finalizer_sched_state();
+        if (IVSHMEM_RET != 0) log::warn("ivshmem shutdown returned %d; callback/IRQ ownership retained", IVSHMEM_RET);
+
+        int const XHCI_RET = ker::dev::usb::xhci_shutdown();
+        clear_current_finalizer_sched_state();
+        if (XHCI_RET != 0) log::warn("xHCI shutdown returned %d; unproven DMA backing retained", XHCI_RET);
+
+    }  // controller expires before CPU service is stopped
+    live_ = false;
     g_phase.store(ShutdownPhase::CPU_QUIESCE, std::memory_order_release);
     clear_current_finalizer_sched_state();
     smt::halt_other_cores();
 
     g_phase.store(ShutdownPhase::PLATFORM_ACTION, std::memory_order_release);
-    switch (action) {
+    switch (action_) {
         case ShutdownAction::REBOOT:
             platform_reboot();
         case ShutdownAction::POWEROFF:
@@ -322,8 +366,6 @@ void io_delay_loop() {
             halt_forever();
     }
 }
-
-}  // namespace
 
 auto shutdown_in_progress() -> bool { return g_phase.load(std::memory_order_acquire) != ShutdownPhase::IDLE; }
 
@@ -358,27 +400,14 @@ auto prepare_shutdown(sched::task::Task* subject) -> int {
     return 0;
 }
 
-auto begin_reboot_command(sched::task::Task* subject, uint64_t cmd, bool current_subject) -> int {
-    ShutdownAction action = ShutdownAction::NONE;
-    int const PARSE_RET = command_to_action(cmd, action);
-    if (PARSE_RET < 0) {
-        return PARSE_RET;
-    }
-    // Invalid commands must not observe scheduler state, even before boot has
-    // established run queues. Diagnostic subjects never fall back to current.
-    if (current_subject) subject = sched::get_current_task();
-    int const AUTHORITY_RET = authorize_current_power(subject);
-    if (AUTHORITY_RET != 0) {
-        return AUTHORITY_RET;
-    }
-    if (action == ShutdownAction::NONE) {
-        return 0;
-    }
-
+auto begin_finalization(ShutdownAction action) -> int {
     // Do not enable IRQs or claim shutdown while a caller owns a locked or
     // incomplete scheduler transition. IF itself may be clear at syscall entry.
     auto* const CURRENT = sched::get_current_task();
     if (!sched::has_run_queues() || sched::preempt_count() != 0 || CURRENT == nullptr ||
+        CURRENT->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        CURRENT->exit_in_progress.load(std::memory_order_acquire) ||
+        (CURRENT->type != sched::task::TaskType::PROCESS && CURRENT->type != sched::task::TaskType::DAEMON) ||
         CURRENT->scheduler_transition_active.load(std::memory_order_acquire) || CURRENT->deferred_task_switch || CURRENT->wants_block) {
         return -EWOULDBLOCK;
     }
@@ -400,6 +429,26 @@ auto begin_reboot_command(sched::task::Task* subject, uint64_t cmd, bool current
     run_finalizer(action);
 }
 
+auto begin_reboot_command(sched::task::Task* subject, uint64_t cmd, bool current_subject) -> int {
+    ShutdownAction action = ShutdownAction::NONE;
+    int const PARSE_RET = command_to_action(cmd, action);
+    if (PARSE_RET < 0) {
+        return PARSE_RET;
+    }
+    // Invalid commands must not observe scheduler state, even before boot has
+    // established run queues. Diagnostic subjects never fall back to current.
+    if (current_subject) subject = sched::get_current_task();
+    int const AUTHORITY_RET = authorize_current_power(subject);
+    if (AUTHORITY_RET != 0) {
+        return AUTHORITY_RET;
+    }
+    if (action == ShutdownAction::NONE) {
+        return 0;
+    }
+
+    return begin_finalization(action);
+}
+
 }  // namespace
 
 auto prepare_shutdown() -> int { return prepare_shutdown(sched::get_current_task()); }
@@ -414,8 +463,10 @@ auto selftest_begin_reboot_for_subject(sched::task::Task* subject, uint64_t cmd)
 }
 
 [[noreturn]] void selftest_shutdown() {
-    g_action.store(ShutdownAction::POWEROFF, std::memory_order_release);
-    run_finalizer(ShutdownAction::POWEROFF);
+    int const result = begin_finalization(ShutdownAction::POWEROFF);
+    log::error("selftest shutdown admission refused %d; providers retained", result);
+    dbg::panic_handler("selftest shutdown lacks accepted finalizer");
+    halt_forever();
 }
 
 [[noreturn]] void selftest_poweroff() {
@@ -427,3 +478,38 @@ auto selftest_begin_reboot_for_subject(sched::task::Task* subject, uint64_t cmd)
 #endif
 
 }  // namespace ker::mod::power
+
+namespace ker::mod::mm::cpu_maintenance::detail {
+Controller::Controller(const ker::mod::power::FinalizerExecution& issuer) noexcept : origin_(Origin::finalizer), lineage_(issuer.lineage_) {
+    issuer_.finalizer = &issuer;
+    birth_status_ = validate_finalizer();
+}
+
+auto Controller::validate_finalizer() const noexcept -> Status {
+    if (!phys::can_wait_for_reclaim()) return Status::invalid_context;
+    auto* const current = sched::get_current_task();
+    if (current == nullptr || current->is_thread || current->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        current->exit_in_progress.load(std::memory_order_acquire) || !current->kernel_shutdown_ownership.held() ||
+        current->resource_cpu_threads.load(std::memory_order_acquire) != 0 ||
+        (current->type != sched::task::TaskType::PROCESS && current->type != sched::task::TaskType::DAEMON))
+        return Status::invalid_context;
+    uint64_t const top = current->context.syscall_kernel_stack;
+    if (top < KERNEL_STACK_SIZE) return Status::invalid_context;
+    uint64_t const base = top - KERNEL_STACK_SIZE;
+    auto const contains = [base, top](const void* pointer, size_t bytes) {
+        uint64_t const address = reinterpret_cast<uint64_t>(pointer);
+        return bytes <= top - base && address >= base && address <= top - bytes;
+    };
+    const auto* issuer = issuer_.finalizer;
+    if (!contains(this, sizeof(*this)) || !contains(issuer, sizeof(*issuer))) return Status::invalid_context;
+    auto const phase = power::g_phase.load(std::memory_order_acquire);
+    if (phase != power::ShutdownPhase::FINALIZING && phase != power::ShutdownPhase::PROCESS_TEARDOWN &&
+        phase != power::ShutdownPhase::VFS_SYNC && phase != power::ShutdownPhase::ROOT_UNMOUNT)
+        return Status::invalid_context;
+    if (lineage_ == 0 || issuer->lineage_ != lineage_ || !issuer->live_ || !issuer->sealed_ ||
+        issuer->action_ == power::ShutdownAction::NONE || power::g_action.load(std::memory_order_acquire) != issuer->action_ ||
+        !sched::interrupts_enabled() || sched::preempt_count() != 0 || sched::get_current_task() != current)
+        return Status::invalid_context;
+    return Status::ready;
+}
+}  // namespace ker::mod::mm::cpu_maintenance::detail

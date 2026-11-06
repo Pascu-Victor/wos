@@ -55,7 +55,7 @@ void hostname_init();
 // PHASE 5: Drivers
 void iommu_faults_init();
 void virtio_net_init();
-void e1000e_init();
+void e1000e_init(const ker::mod::mm::cpu_maintenance::detail::Controller&);
 void cdc_ether_init();
 void xhci_init();
 void ivshmem_init();
@@ -146,7 +146,7 @@ inline constexpr std::array<ModuleDesc, 3> PHASE_4_MODULES = {{
 inline constexpr std::array<ModuleDesc, 13> PHASE_5_MODULES = {{
     {.name = "iommu_faults", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::iommu_faults_init},   // depends: iommu, sched
     {.name = "virtio_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::virtio_net_init},       // depends: pci, net, smt
-    {.name = "e1000e", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::e1000e_init},               // depends: pci, net, smt
+    {.name = "e1000e", .phase = BootPhase::PHASE_5_DRIVERS, .controller_init_fn = fns::e1000e_init},    // depends: pci, net, smt
     {.name = "cdc_ether", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::cdc_ether_init},         // depends: pci, net, smt
     {.name = "xhci", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::xhci_init},                   // depends: pci, cdc_ether, smt
     {.name = "ivshmem", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::ivshmem_init},             // depends: pci, net, smt
@@ -177,5 +177,14 @@ inline constexpr std::array<ModuleDesc, 4> PHASE_6_MODULES = {{
 inline constexpr std::array<ModuleDesc, 1> PHASE_7_MODULES = {{
     {.name = "kernel_start", .phase = BootPhase::PHASE_7_KERNEL_START, .init_fn = fns::kernel_start},  // depends: sse, initramfs
 }};
+
+static_assert(valid_runtime_modules(PHASE_0_MODULES));
+static_assert(valid_runtime_modules(PHASE_1_MODULES));
+static_assert(valid_runtime_modules(PHASE_2_MODULES));
+static_assert(valid_runtime_modules(PHASE_3_MODULES));
+static_assert(valid_runtime_modules(PHASE_4_MODULES));
+static_assert(valid_runtime_modules(PHASE_5_MODULES));
+static_assert(valid_runtime_modules(PHASE_6_MODULES));
+static_assert(valid_runtime_modules(PHASE_7_MODULES));
 
 }  // namespace ker::init

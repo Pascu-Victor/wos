@@ -3,10 +3,41 @@
 #include <atomic>
 #include <utility>
 
+#include "cpu_maintenance_controller.hpp"
 #include "cpu_maintenance_platform.hpp"
 
 namespace ker::mod::mm::cpu_maintenance {
 namespace detail {
+// Stack-only dispatch; never placed in a Slot, Ticket or asynchronous handler.
+class ControllerCall {
+    const Controller* controller_{};
+    uint64_t saved_flags_{};
+    bool boot_{};
+
+   public:
+    ControllerCall() = default;
+    explicit ControllerCall(const Controller& controller)
+        : controller_(&controller), boot_(controller.origin_ == Controller::Origin::boot) {
+        if (boot_) saved_flags_ = platform::save_disable_interrupts();
+    }
+    ~ControllerCall() {
+        if (boot_) platform::restore_interrupts(saved_flags_);
+    }
+    ControllerCall(const ControllerCall&) = delete;
+    auto operator=(const ControllerCall&) -> ControllerCall& = delete;
+    [[nodiscard]] auto status() const -> Status {
+        if (controller_ != nullptr) return controller_->context_status();
+        return platform::controller_context_ready() ? Status::ready : Status::invalid_context;
+    }
+    [[nodiscard]] auto ready() const -> bool { return status() == Status::ready; }
+    [[nodiscard]] auto private_request() const -> bool { return controller_ != nullptr; }
+    void yield() const {
+        if (boot_)
+            platform::spin_pause();
+        else
+            platform::controller_yield();
+    }
+};
 namespace {
 constexpr uint64_t CLOSED = uint64_t{1} << 63;
 constexpr uint64_t MAX_READERS = CLOSED - 1;
@@ -44,6 +75,7 @@ struct Slot {
     std::atomic<CacheStatus> error{CacheStatus::ready};
     uint64_t id{};
     Kind kind{Kind::translations};
+    bool private_request{};
     mmio_cache::QualifiedUcRange range{};
     uint64_t targets{};
     std::array<uint32_t, CPU_CAPACITY> target_apic{};
@@ -93,6 +125,8 @@ class Runtime {
     std::atomic<uint8_t> initialization_{};
     std::atomic<uint64_t> expected_{};
     std::atomic<uint64_t> ready_{};
+    std::atomic<uint64_t> protection_ready_{};
+    std::atomic<CacheStatus> protection_error_{CacheStatus::ready};
     std::array<std::atomic<uint8_t>, CPU_CAPACITY> ready_state_{};
     std::array<std::atomic<uint32_t>, CPU_CAPACITY> apics_{};
     std::atomic<uint8_t> vector_{};
@@ -190,6 +224,16 @@ class Runtime {
         if (result != CacheStatus::ready) {
             row.status[logical].store(result, std::memory_order_release);
             return;
+        }
+        if (slot.private_request) {
+            auto const protection = platform::private_protection_status();
+            if (protection != CacheStatus::ready) {
+                row.status[logical].store(protection, std::memory_order_release);
+                CacheStatus empty_error = CacheStatus::ready;
+                (void)protection_error_.compare_exchange_strong(empty_error, protection, std::memory_order_acq_rel,
+                                                                std::memory_order_acquire);
+                return;
+            }
         }
         uint64_t const cr3 = platform::execute_local(phase);
         row.cr3[logical].store(cr3, std::memory_order_relaxed);
@@ -295,6 +339,14 @@ class Runtime {
         if (!mmio_cache::cpu_observation(logical, observed) || observed.status != CacheStatus::ready || observed.logical != logical ||
             observed.apic != apic)
             return Status::not_ready;
+        auto const protection = platform::private_protection_status();
+        if (protection == CacheStatus::ready)
+            protection_ready_.fetch_or(uint64_t{1} << logical, std::memory_order_release);
+        else {
+            protection_ready_.fetch_and(~(uint64_t{1} << logical), std::memory_order_release);
+            CacheStatus empty_error = CacheStatus::ready;
+            (void)protection_error_.compare_exchange_strong(empty_error, protection, std::memory_order_acq_rel, std::memory_order_acquire);
+        }
         uint8_t empty = 0;
         if (!ready_state_[logical].compare_exchange_strong(empty, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
             if (empty == 1) return Status::busy;
@@ -328,13 +380,53 @@ class Runtime {
         return value;
     }
 
-    auto prepare(mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output) -> Status {
-        if (!platform::controller_context_ready()) return Status::invalid_context;
+    auto protection_observation() const -> ProtectionObservation {
+        return {protection_ready_.load(std::memory_order_acquire), protection_error_.load(std::memory_order_acquire)};
+    }
+
+    auto private_readiness(uint64_t targets, const ControllerCall& call) const -> Status {
+        if (!call.private_request()) return Status::ready;
+        auto const protection = protection_observation();
+        if (protection.error != CacheStatus::ready) return Status::failed_retained;
+        return protection.ready_mask == targets ? Status::ready : Status::not_ready;
+    }
+
+    auto await_ready(uint64_t deadline, const ControllerCall& call) -> Status {
+        if (!call.ready()) return Status::invalid_context;
+        uint64_t now = 0;
+        if (!platform::clock_now_ns(now)) return Status::clock_unavailable;
+        for (size_t step = 0; step < WAIT_STEPS; ++step) {
+            if (!call.ready()) return Status::invalid_context;
+            auto const state = service_observation();
+            if (state.status != Status::ready && state.status != Status::not_ready && state.status != Status::busy) return state.status;
+            auto const cohort = mmio_cache::cohort_observation();
+            if (cohort.expected_mask != state.expected_mask || cohort.invalidated_mask != 0) return Status::failed_retained;
+            if (cohort.status != CacheStatus::ready && cohort.status != CacheStatus::pending) return Status::failed_retained;
+            auto const protection = private_readiness(state.expected_mask, call);
+            if (protection == Status::failed_retained) return protection;
+            if (state.status == Status::ready && cohort.status == CacheStatus::ready && cohort.terminal_mask == state.expected_mask &&
+                cohort.ready_mask == state.expected_mask && protection == Status::ready)
+                return Status::ready;
+            if (!platform::clock_now_ns(now)) return Status::clock_unavailable;
+            if (now >= deadline) return Status::not_ready;
+            service();
+            if ((step + 1) % YIELD_STEPS == 0)
+                call.yield();
+            else
+                platform::spin_pause();
+        }
+        return Status::not_ready;
+    }
+
+    auto prepare(mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output, const ControllerCall& call) -> Status {
+        if (!call.ready()) return Status::invalid_context;
         if (!output.empty()) return Status::output_not_empty;
         if (kind != Kind::translations && kind != Kind::translations_then_cache) return Status::invalid_kind;
         if (range.empty()) return Status::empty_range;
         auto const state = service_observation();
         if (state.status != Status::ready) return state.status;
+        auto const protection = private_readiness(state.expected_mask, call);
+        if (protection != Status::ready) return protection;
         auto const cohort = mmio_cache::cohort_observation();
         if (cohort.status != CacheStatus::ready || !cohort.sealed || cohort.incarnation != range.incarnation() ||
             cohort.expected_mask != state.expected_mask)
@@ -360,6 +452,7 @@ class Runtime {
         }
         slot.id = id;
         slot.kind = kind;
+        slot.private_request = call.private_request();
         slot.targets = state.expected_mask;
         slot.timed_out.store(false, std::memory_order_relaxed);
         slot.abandoned.store(false, std::memory_order_relaxed);
@@ -384,13 +477,15 @@ class Runtime {
         return Status::ready;
     }
 
-    auto publish(Ticket& ticket) -> Status {
-        if (!platform::controller_context_ready()) return Status::invalid_context;
+    auto publish(Ticket& ticket, const ControllerCall& call) -> Status {
+        if (!call.ready()) return Status::invalid_context;
         auto* slot = find(ticket);
         if (slot == nullptr) return Status::invalid_ticket;
         if (slot->phase.load(std::memory_order_acquire) != Phase::prepared) return Status::invalid_ticket;
         auto const state = service_observation();
         if (state.status != Status::ready) return state.status;
+        auto const protection = private_readiness(state.expected_mask, call);
+        if (protection != Status::ready) return protection;
         auto const cohort = mmio_cache::cohort_observation();
         if (cohort.status != CacheStatus::ready || !cohort.sealed || cohort.incarnation != slot->range.incarnation() ||
             cohort.expected_mask != state.expected_mask)
@@ -422,8 +517,8 @@ class Runtime {
         for (auto& slot : slots_) service_slot(slot, logical, apic);
     }
 
-    auto observe(const Ticket& ticket) -> Report {
-        if (!platform::controller_context_ready()) {
+    auto observe(const Ticket& ticket, const ControllerCall& call) -> Report {
+        if (!call.ready()) {
             Report value{};
             value.status = Status::invalid_context;
             return value;
@@ -431,8 +526,8 @@ class Runtime {
         return snapshot(ticket);
     }
 
-    auto wait(Ticket& ticket, uint64_t deadline) -> Report {
-        if (!platform::controller_context_ready()) return observe(ticket);
+    auto wait(Ticket& ticket, uint64_t deadline, const ControllerCall& call) -> Report {
+        if (!call.ready()) return observe(ticket, call);
         auto* slot = find(ticket);
         if (slot == nullptr) return {};
         auto phase = slot->phase.load(std::memory_order_acquire);
@@ -442,7 +537,7 @@ class Runtime {
         if (!platform::clock_now_ns(now)) return snapshot(ticket, Status::clock_unavailable);
         std::array<uint64_t, 2> next_retry{retry_deadline(now), retry_deadline(now)};
         for (size_t step = 0; step < WAIT_STEPS; ++step) {
-            if (!platform::controller_context_ready()) return snapshot(ticket, Status::invalid_context);
+            if (!call.ready()) return snapshot(ticket, Status::invalid_context);
             if (failed(*slot)) return snapshot(ticket, Status::failed_retained);
             if (!platform::clock_now_ns(now)) return snapshot(ticket, Status::clock_unavailable);
             if (now >= deadline) {
@@ -451,7 +546,7 @@ class Runtime {
             }
             service();
             if (failed(*slot)) return snapshot(ticket, Status::failed_retained);
-            if (!platform::controller_context_ready()) return snapshot(ticket, Status::invalid_context);
+            if (!call.ready()) return snapshot(ticket, Status::invalid_context);
             if (!platform::clock_now_ns(now)) return snapshot(ticket, Status::clock_unavailable);
             if (now >= deadline) {
                 slot->timed_out.store(true, std::memory_order_release);
@@ -479,7 +574,7 @@ class Runtime {
                 }
             }
             if ((step + 1) % YIELD_STEPS == 0)
-                platform::controller_yield();
+                call.yield();
             else
                 platform::spin_pause();
         }
@@ -487,8 +582,8 @@ class Runtime {
         return snapshot(ticket, Status::timeout_retained);
     }
 
-    auto release(Ticket& ticket) -> Status {
-        if (!platform::controller_context_ready()) return Status::invalid_context;
+    auto release(Ticket& ticket, const ControllerCall& call) -> Status {
+        if (!call.ready()) return Status::invalid_context;
         auto* slot = find(ticket);
         if (slot == nullptr) return Status::invalid_ticket;
         if (!reclaimable(*slot)) return Status::busy;
@@ -532,8 +627,8 @@ class Runtime {
     }
 
 #ifdef WOS_SELFTEST
-    auto defer(Ticket& ticket, Phase phase, size_t logical) -> Status {
-        if (!platform::controller_context_ready()) return Status::invalid_context;
+    auto defer(Ticket& ticket, Phase phase, size_t logical, const ControllerCall& call) -> Status {
+        if (!call.ready()) return Status::invalid_context;
         auto* slot = find(ticket);
         if (slot == nullptr) return Status::invalid_ticket;
         if (slot->phase.load(std::memory_order_acquire) != Phase::prepared || (phase != Phase::translations && phase != Phase::caches) ||
@@ -543,8 +638,8 @@ class Runtime {
         slot->defer[round_index(phase)].fetch_or(uint64_t{1} << logical, std::memory_order_release);
         return Status::ready;
     }
-    auto resume(Ticket& ticket, Phase phase) -> Status {
-        if (!platform::controller_context_ready()) return Status::invalid_context;
+    auto resume(Ticket& ticket, Phase phase, const ControllerCall& call) -> Status {
+        if (!call.ready()) return Status::invalid_context;
         auto* slot = find(ticket);
         if (slot == nullptr) return Status::invalid_ticket;
         if (phase != Phase::translations && phase != Phase::caches) return Status::invalid_configuration;
@@ -576,12 +671,25 @@ auto Ticket::operator=(Ticket&& other) noexcept -> Ticket& {
 }
 
 auto prepare(mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output) -> Status {
-    return detail::runtime.prepare(std::move(range), kind, output);
+    detail::ControllerCall call;
+    return detail::runtime.prepare(std::move(range), kind, output, call);
 }
-auto publish(Ticket& ticket) -> Status { return detail::runtime.publish(ticket); }
-auto observe(const Ticket& ticket) -> Report { return detail::runtime.observe(ticket); }
-auto wait_until(Ticket& ticket, uint64_t deadline) -> Report { return detail::runtime.wait(ticket, deadline); }
-auto release_complete(Ticket& ticket) -> Status { return detail::runtime.release(ticket); }
+auto publish(Ticket& ticket) -> Status {
+    detail::ControllerCall call;
+    return detail::runtime.publish(ticket, call);
+}
+auto observe(const Ticket& ticket) -> Report {
+    detail::ControllerCall call;
+    return detail::runtime.observe(ticket, call);
+}
+auto wait_until(Ticket& ticket, uint64_t deadline) -> Report {
+    detail::ControllerCall call;
+    return detail::runtime.wait(ticket, deadline, call);
+}
+auto release_complete(Ticket& ticket) -> Status {
+    detail::ControllerCall call;
+    return detail::runtime.release(ticket, call);
+}
 auto service_observation() -> ServiceObservation { return detail::runtime.service_observation(); }
 auto pool_stats() -> PoolStats { return detail::runtime.stats(); }
 auto status_name(Status status) -> const char* {
@@ -606,12 +714,54 @@ auto status_name(Status status) -> const char* {
     return index < names.size() ? names[index] : "invalid_status";
 }
 namespace detail {
+auto protection_observation() -> ProtectionObservation { return runtime.protection_observation(); }
+auto await_ready(const Controller& controller, uint64_t deadline) -> Status {
+    ControllerCall call(controller);
+    return runtime.await_ready(deadline, call);
+}
+auto prepare(const Controller& controller, mmio_cache::QualifiedUcRange&& range, Kind kind, Ticket& output) -> Status {
+    ControllerCall call(controller);
+    return runtime.prepare(std::move(range), kind, output, call);
+}
+auto publish(const Controller& controller, Ticket& ticket) -> Status {
+    ControllerCall call(controller);
+    return runtime.publish(ticket, call);
+}
+auto observe(const Controller& controller, const Ticket& ticket) -> Report {
+    ControllerCall call(controller);
+    return runtime.observe(ticket, call);
+}
+auto wait_until(const Controller& controller, Ticket& ticket, uint64_t deadline) -> Report {
+    ControllerCall call(controller);
+    return runtime.wait(ticket, deadline, call);
+}
+auto release_complete(const Controller& controller, Ticket& ticket) -> Status {
+    ControllerCall call(controller);
+    return runtime.release(ticket, call);
+}
+#ifdef WOS_SELFTEST
+auto diagnostic_defer(const Controller& controller, Ticket& ticket, Phase phase, size_t logical) -> Status {
+    ControllerCall call(controller);
+    return runtime.defer(ticket, phase, logical, call);
+}
+auto diagnostic_resume(const Controller& controller, Ticket& ticket, Phase phase) -> Status {
+    ControllerCall call(controller);
+    return runtime.resume(ticket, phase, call);
+}
+#endif
+
 auto initialize_boot(uint8_t vector) -> Status { return runtime.initialize(vector); }
 auto note_current_cpu_ready() -> Status { return runtime.ready_cpu(); }
 void service_current_cpu() noexcept { runtime.service(); }
 }  // namespace detail
 #ifdef WOS_SELFTEST
-auto diagnostic_defer(Ticket& ticket, Phase phase, size_t logical) -> Status { return detail::runtime.defer(ticket, phase, logical); }
-auto diagnostic_resume(Ticket& ticket, Phase phase) -> Status { return detail::runtime.resume(ticket, phase); }
+auto diagnostic_defer(Ticket& ticket, Phase phase, size_t logical) -> Status {
+    detail::ControllerCall call;
+    return detail::runtime.defer(ticket, phase, logical, call);
+}
+auto diagnostic_resume(Ticket& ticket, Phase phase) -> Status {
+    detail::ControllerCall call;
+    return detail::runtime.resume(ticket, phase, call);
+}
 #endif
 }  // namespace ker::mod::mm::cpu_maintenance

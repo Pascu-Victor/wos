@@ -754,7 +754,7 @@ void run(){
  std::printf("%s bootstrap_idle cases=%u assertions=%u failures=%u\n",failures?"FAIL":"PASS",cases,assertions,failures);
 }
 }
-int main(){try{fixture::run();cache_modifier_fixture::run();}catch(...){std::fprintf(stderr,"FAIL unexpected finite boundary escape\n");return 3;}return fixture::failures?1:0;}
+int main(){try{fixture::run();cache_modifier_fixture::run();e1000_modifier_fixture::run();}catch(...){std::fprintf(stderr,"FAIL unexpected finite boundary escape\n");return 3;}return fixture::failures?1:0;}
 '''
 
 
@@ -801,6 +801,62 @@ void run() {
         ++count;
     }
     std::printf("PASS cache_modifier_guard cases=%u actual_guard=1 ap_launch_port=1\n",count);
+}
+}
+'''
+
+
+E1000_MODIFIER_GUARD = r'''
+#include <string>
+namespace e1000_modifier_fixture {
+const char* command_line{};
+const char* panic_reason{};
+unsigned launches{};
+struct Panic {};
+struct Failure {};
+namespace mod::dbg {
+[[noreturn]] void panic_handler(const char* reason) { panic_reason=reason;throw Panic{}; }
+}
+auto get_kernel_cmdline() -> const char* { return command_line; }
+@ACTUAL_TOKEN_HELPER@
+void actual_guard() {
+@ACTUAL_DECLARATION@
+@ACTUAL_GUARD@
+    ++launches;
+}
+void run() {
+    const char* const required="e1000 MMIO diagnostic requires --selftest-e1000-mmio and --typed-pci-mmio";
+    const char* const conflict="conflicting scheduled e1000 MMIO diagnostic boot modes";
+    struct Case {const char* line;const char* reason;};
+    Case const cases[]{
+        {nullptr,nullptr},{"",nullptr},{"--typed-pci-mmio",nullptr},
+        {"--selftest-e1000-mmio",required},
+        {"--selftest-e1000-mmio-withdraw-retry",required},
+        {"--selftest-e1000-mmio-withdraw-retry --typed-pci-mmio",required},
+        {"--selftest-e1000-mmio --typed-pci-mmio",nullptr},
+        {"--selftest-e1000-mmio --typed-pci-mmio --selftest-e1000-mmio-withdraw-retry",nullptr},
+        {"--selftest-e1000-mmio=1 --typed-pci-mmio",nullptr},
+        {" \t--selftest-e1000-mmio\n--typed-pci-mmio ",nullptr},
+    };
+    unsigned count=0;
+    auto check=[&](const Case& c) {
+        command_line=c.line;panic_reason=nullptr;launches=0;bool rejected=false;
+        try { actual_guard(); } catch(Panic const&) { rejected=true; }
+        if(rejected!=(c.reason!=nullptr) || launches!=(c.reason?0U:1U) ||
+           (rejected && std::string_view{panic_reason}!=c.reason)) {
+            std::fprintf(stderr,"FAIL e1000_modifier_guard case=%u rejected=%u launches=%u\n",count,rejected,launches);
+            throw Failure{};
+        }
+        ++count;
+    };
+    for(auto const& c:cases) check(c);
+    for(auto flag:{"--selftest-cache-policy","--selftest-firmware","--selftest-anonymous-usercopy",
+                   "--selftest-numa-lifecycle-census","--selftest-numa-pressure","--selftest-compartment-lifecycle",
+                   "--selftest","--selftest-file-mapping","--selftest-binding-root","--selftest-device-mapping","--napi-irq-test"}) {
+        std::string line="--selftest-e1000-mmio --typed-pci-mmio ";line+=flag;
+        check({line.c_str(),conflict});
+    }
+    std::printf("PASS e1000_modifier_guard cases=%u actual_guard=1 ap_launch_port=1\n",count);
 }
 }
 '''
@@ -896,7 +952,19 @@ def generate(scheduler: str, context: str, assembly: str, control: str, init_sou
         bytes=len((declaration + guard).encode()), sha256=hashlib.sha256((declaration + guard).encode()).hexdigest())
     modifier = CACHE_MODIFIER_GUARD.replace('@ACTUAL_TOKEN_HELPER@', helper).replace(
         '@ACTUAL_DECLARATION@', declaration).replace('@ACTUAL_GUARD@', guard)
-    return text + ENDPOINTS + modifier + CASES, selected
+    e1000_declarations = []
+    for name in ('LIFECYCLE', 'NUMA_PRESSURE', 'NUMA_CENSUS', 'ANONYMOUS_USERCOPY', 'FIRMWARE', 'CACHE_POLICY'):
+        start = sched_init.index('bool const ' + name + ' =')
+        e1000_declarations.append(sched_init[start:sched_init.index(';', start) + 1])
+    e1000_start = sched_init.index('bool const E1000_MMIO =')
+    e1000_end = sched_init.index('    if (cmdline_has_token(get_kernel_cmdline(), "--selftest"))', e1000_start)
+    if e1000_end >= sched_init.index('mod::smt::start_smt('):
+        raise ValueError('actual e1000 mode guards must precede AP launch')
+    e1000_guard = sched_init[e1000_start:e1000_end]
+    selected['e1000-guard-declarations'] = dict(bytes=len(e1000_guard.encode()), sha256=hashlib.sha256(e1000_guard.encode()).hexdigest())
+    e1000 = E1000_MODIFIER_GUARD.replace('@ACTUAL_TOKEN_HELPER@', helper).replace(
+        '@ACTUAL_DECLARATION@', '\n'.join(e1000_declarations)).replace('@ACTUAL_GUARD@', e1000_guard)
+    return text + ENDPOINTS + modifier + e1000 + CASES, selected
 
 
 def main() -> int:
@@ -965,6 +1033,8 @@ def main() -> int:
             print(log[-32768:], end='')
             if not re.search(r'^PASS cache_modifier_guard cases=11 actual_guard=1 ap_launch_port=1$', log, re.M):
                 raise ValueError('actual cache modifier guard failed its independent pre-AP-launch matrix')
+            if not re.search(r'^PASS e1000_modifier_guard cases=21 actual_guard=1 ap_launch_port=1$', log, re.M):
+                raise ValueError('actual e1000 modifier guard failed its independent pre-AP-launch matrix')
             positive = row['exit'] == 0 and re.search(r'^PASS bootstrap_idle cases=29 assertions=\d+ failures=0$', log, re.M)
             if (control == 'current') != bool(positive):
                 raise ValueError(control + ': complete actual-body oracle did not distinguish expected behavior')

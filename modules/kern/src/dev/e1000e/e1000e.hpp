@@ -10,6 +10,7 @@
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
+#include <platform/mm/mmio_mapping.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::dev::e1000e {
@@ -121,7 +122,11 @@ struct E1000Device {
     ker::net::NetDevice netdev;  // embedded NetDevice (first member for casting)
     pci::PCIDevice* pci = nullptr;
     pci::DriverClaim driver_claim;
-    volatile uint32_t* mmio = nullptr;  // mapped BAR0
+    // Legacy controllers retain their original raw mapping. A selected cold
+    // 82574 never exports a pointer or falls back to this route.
+    volatile uint32_t* mmio = nullptr;
+    ker::mod::mm::mmio::Mapping registers;
+    bool typed_mmio = false;  // Immutable after the unpublished probe begins.
 
     // RX ring
     E1000RxDesc* rx_descs = nullptr;  // physically contiguous
@@ -137,7 +142,8 @@ struct E1000Device {
     std::array<managed::Buffer, NUM_RX_DESC> rx_dma{};
     std::array<managed::Buffer, NUM_TX_DESC> tx_dma{};
     dma::lifecycle::Admission admission{};
-    std::atomic<uint8_t> retirement{0};
+    enum class Retirement : uint8_t { live, in_progress, released, failed, withdrawal_pending, cold_failed };
+    std::atomic<Retirement> retirement{Retirement::live};
     bool irq_owned = false;
     bool published = false;
     bool rx_discarding = false;
@@ -151,7 +157,9 @@ struct E1000Device {
 
 // -- Driver entry point --------------------------------------------------
 void e1000e_init();
+void e1000e_init(const ker::mod::mm::cpu_maintenance::detail::Controller& controller);
 auto e1000e_shutdown() -> int;
+auto e1000e_shutdown(const ker::mod::mm::cpu_maintenance::detail::Controller& controller) -> int;
 #ifdef WOS_SELFTEST
 struct DmaTestResult {
     bool found = false, prepared = false, fail_prepare = false, withheld = false, release_supported = false;
@@ -163,6 +171,9 @@ struct DmaTestResult {
     dma::Stats before{}, mapped{}, after{};
 };
 auto e1000e_selftest() -> DmaTestResult;
+// Scheduled diagnostic exercises the actual typed consumer and joins every
+// helper before returning. The first retirement remains normal PID 1 shutdown.
+auto e1000e_mmio_runtime_check() -> bool;
 #endif
 
 }  // namespace ker::dev::e1000e

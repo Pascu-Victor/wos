@@ -9,7 +9,29 @@
 #include <platform/smt/smt.hpp>
 #include <platform/tsc/tsc.hpp>
 
+#include "cpu_maintenance_controller.hpp"
 #include "mmio_cache_platform.hpp"
+
+namespace ker::mod::mm::cpu_maintenance::detail {
+Controller::~Controller() {
+    origin_ = Origin::closed;
+    lineage_ = 0;
+}
+
+auto Controller::context_status() const noexcept -> Status {
+    if (birth_status_ != Status::ready) return birth_status_;
+    if (lineage_ == 0) return Status::invalid_context;
+    switch (origin_) {
+        case Origin::boot:
+            return validate_boot();
+        case Origin::finalizer:
+            return validate_finalizer();
+        case Origin::closed:
+            return Status::invalid_context;
+    }
+    return Status::invalid_context;
+}
+}  // namespace ker::mod::mm::cpu_maintenance::detail
 
 namespace ker::mod::mm::cpu_maintenance::detail::platform {
 namespace observed = mmio_cache::detail::platform;
@@ -22,6 +44,15 @@ void restore_interrupts(uint64_t saved_flags) { observed::restore_interrupts(sav
 auto current_root_is_kernel() -> bool {
     auto* const ROOT = virt::get_kernel_pagemap();
     return ROOT != nullptr && virt::active_pagemap_is(ROOT);
+}
+
+auto private_protection_status() noexcept -> mmio_cache::Status {
+    observed::CpuIo io;
+    if (!io.local_idt_ready()) return mmio_cache::Status::local_idt_unavailable;
+    uint64_t efer = 0;
+    if (!io.read_msr(0xc0000080, efer)) return mmio_cache::Status::read_fault;
+    if ((efer & (uint64_t{1} << 11)) == 0 || (io.read_cr0() & (uint64_t{1} << 16)) == 0) return mmio_cache::Status::unsupported_mode;
+    return mmio_cache::Status::ready;
 }
 
 auto execute_local(Phase phase) noexcept -> uint64_t {

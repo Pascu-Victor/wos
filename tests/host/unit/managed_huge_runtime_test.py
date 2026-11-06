@@ -56,7 +56,7 @@ def bounded(text: str, first: str, last: str) -> str:
 
 def compile_flags(row: dict, overlay: Path | None) -> list[str]:
     original = shlex.split(row["command"])
-    result = [original[0]]
+    result = [original[0], "-include", str(Path(__file__).with_name("mmio_disabled_virt_ports.inc"))]
     if overlay is not None:
         result.append(f"-I{overlay}")
     result.append("-DWOS_HOST_TEST=1")
@@ -789,7 +789,8 @@ def main() -> int:
         ]
         process_owner_path = support / "file_mmap_registry_runtime_test.py"
         selected = [
-            pin(path) for path in [Path(__file__), process_owner_path, module, factory, virt, header, fixture, prelude, cases, *libraries]
+            pin(path) for path in [Path(__file__), process_owner_path, module, factory, virt, header, fixture, prelude, cases, *libraries,
+                                  support / "mmio_disabled_virt_ports.inc"]
         ]
         owner_spec = importlib.util.spec_from_file_location("managed_huge_process_owner", process_owner_path)
         process_owner = importlib.util.module_from_spec(owner_spec)

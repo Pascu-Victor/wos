@@ -14,9 +14,11 @@ def order(name, *tokens):
 
 for forbidden in ('virt_to_phys', 'page_alloc(', 'page_free(', 'pci_enable_bus_master('):
     assert forbidden not in source, forbidden
-order('reset_device', 'reg_write(dev, REG_CTRL', 'sleep_us(2)', 'wait_clear(dev, REG_CTRL')
-order('init_device', 'pci_set_bus_master(pci_dev, false)', 'reset_device(dev)',
-      'configure_coherence(dev)', 'init_rx(dev)', 'init_tx(dev)', 'program_rings(dev)',
+order('reset_device', 'reg_write(dev, registers, REG_CTRL', 'sleep_us(2)', 'wait_clear(dev, registers, REG_CTRL')
+order('init_device', 'if (!TYPED && !pci::pci_set_bus_master(pci_dev, false))',
+      'map_cold_uc_82574(', 'pci_map_bar(', 'initialize_registers(dev, name)', 'retire_device(dev, controller)')
+order('initialize_registers', 'reset_device(dev, registers)',
+      'configure_coherence(dev, registers)', 'init_rx(dev)', 'init_tx(dev)', 'program_rings(dev, registers)',
       'pci_set_bus_master(pci_dev, true)', 'request_irq(', 'netdev_register(', 'RCTL_EN')
 order('process_rx_budget', 'RX_STATUS_DD', 'lfence', 'managed::rx_valid', '++processed',
       '.complete(dma_api', 'pkt_alloc_rx()', 'bind_rx', 'mfence', 'REG_RDT', 'netdev_rx')
@@ -25,11 +27,13 @@ order('e1000_start_xmit', 'CallbackGuard const GUARD', 'managed::tx_valid', 'loc
       'buffer.bind', 'buffer.expose', 'buffer.submission.address', 'mfence', 'REG_TDT')
 for callback, access in [('e1000_poll', 'process_rx_budget'), ('e1000_irq_handler', 'REG_ICR')]:
     order(callback, 'CallbackGuard const GUARD', '!GUARD', access)
-order('retire_device', 'hold_kernel_shutdown', 'compare_exchange_strong', 'lifecycle::retire', 'retirement.store')
+order('retire_device', 'MmioRetirementAccess::retire(dev, controller)')
+order('detail::MmioRetirementAccess::retire', 'hold_kernel_shutdown', 'compare_exchange_strong',
+      'RetirementBackend backend', 'lifecycle::retire', 'retirement.store', 'QuiescedMapping', '.withdraw(')
 assert 'delete dev' not in source
 for callback in ('process_rx_budget', 'process_tx', 'e1000_poll', 'e1000_irq_handler', 'e1000_start_xmit'):
     body = function_body(source, callback)
     assert 'allocate_streaming' not in body and 'dma::release' not in body
 power = (ROOT / 'modules/kern/src/platform/power/power.cpp').read_text()
-assert power.index('vfs_shutdown_unmount_all') < power.index('e1000e_shutdown()') < power.index('smt::halt_other_cores()')
+assert power.index('vfs_shutdown_unmount_all') < power.index('e1000e_shutdown(controller)') < power.index('smt::halt_other_cores()')
 print('e1000 managed address, completion, callback and terminal integration passed')

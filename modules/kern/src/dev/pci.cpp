@@ -4,18 +4,24 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <dev/dma/dma.hpp>
 #include <dev/iommu/domains.hpp>
+#include <dev/pci_aperture.hpp>
 #include <dev/pci_bar_probe.hpp>
 #include <dev/pci_boot_resource.hpp>
 #include <dev/pci_driver_claim.hpp>
 #include <dev/pci_extended.hpp>
+#include <dev/pci_mmio_private.hpp>
 #include <dev/pci_msix.hpp>
+#include <dev/pci_platform_apertures.hpp>
 #include <dev/pci_port_io.hpp>
 #include <dev/pci_resource.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/cpu_maintenance_controller.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/mmio_mapping_private.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
@@ -39,6 +45,8 @@ struct DeviceResources {
     resource::BootResource<PreparedMsix> msix{};
     std::atomic<bool> poisoned{false};
     bool activated = false;  // Protected by config_lock; one boot owner only.
+    bool irq_produced = false;
+    std::atomic<bool> dma_produced{false};
 };
 constinit std::array<DeviceResources, inventory_limits::FUNCTION_CAPACITY> resources{};
 int device_count = 0;
@@ -107,11 +115,21 @@ auto config_read32_unlocked(const PCIDevice& device, uint8_t offset) -> uint32_t
 auto config_read16_unlocked(const PCIDevice& device, uint8_t offset) -> uint16_t {
     return static_cast<uint16_t>(config_read32_unlocked(device, offset) >> ((offset & 2U) * 8U));
 }
+auto cold_write_allowed_unlocked(const PCIDevice&, uint8_t, size_t, uint32_t) -> bool;
+auto cold_dma_allowed(size_t) -> bool;
+auto cold_selected(size_t) -> bool;
+auto cold_closed_cleanup_unlocked(size_t index, uint16_t command) -> bool;
+void cold_close(size_t);
+void cold_note_command_unlocked(const PCIDevice&, uint8_t, size_t, uint32_t);
 void config_write32_unlocked(const PCIDevice& device, uint8_t offset, uint32_t value) {
+    if (!cold_write_allowed_unlocked(device, offset, 4, value)) return;
+    cold_note_command_unlocked(device, offset, 4, value);
     outl(PCI_CONFIG_ADDRESS, config_address(device.bus, device.slot, device.function, offset));
     outl(PCI_CONFIG_DATA, value);
 }
 void config_write16_unlocked(const PCIDevice& device, uint8_t offset, uint16_t value) {
+    if (!cold_write_allowed_unlocked(device, offset, 2, value)) return;
+    cold_note_command_unlocked(device, offset, 2, value);
     outl(PCI_CONFIG_ADDRESS, config_address(device.bus, device.slot, device.function, offset));
     outw(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 2U)), value);
 }
@@ -161,10 +179,11 @@ void close_driver_unlocked(size_t index, uint64_t epoch, bool retained) {
     auto& slot = driver_slots[index];
     auto const PHASE = slot.phase.load(std::memory_order_acquire);
     if (PHASE == DriverPhase::unclaimed || slot.epoch != epoch) return;
+    cold_close(index);
     slot.operations.fetch_or(DRIVER_CLOSED, std::memory_order_acq_rel);
     if (PHASE != DriverPhase::retained) slot.phase.store(retained ? DriverPhase::retained : DriverPhase::closed, std::memory_order_release);
 }
-auto resource_dma_allowed(size_t index) -> bool {
+auto resource_dma_health_allowed(size_t index) -> bool {
     auto const& record = resources[index];
     auto allowed = [](resource::BootState state) {
         return state != resource::BootState::preparing && state != resource::BootState::failed;
@@ -174,6 +193,7 @@ auto resource_dma_allowed(size_t index) -> bool {
         if (!allowed(record.sizes[i].state()) || !allowed(record.mappings[i].state())) return false;
     return true;
 }
+auto resource_dma_allowed(size_t index) -> bool { return cold_dma_allowed(index) && resource_dma_health_allowed(index); }
 auto resources_sealed(size_t index) -> bool {
     auto const& record = resources[index];
     if (record.msix.state() != resource::BootState::empty) return true;
@@ -211,14 +231,16 @@ auto bus_master_write_allowed(uint8_t bus, uint8_t slot, uint8_t func, uint32_t 
 // config_lock is held. Cleanup command RMW may preserve an existing BME bit,
 // but a closed claim must never make a fresh 0->1 transition. Old poison and
 // domain admission remain mandatory even for a preserving write.
-auto bus_master_transition_allowed_unlocked(uint8_t bus, uint8_t slot, uint8_t func, uint32_t value) -> bool {
-    if (!bus_master_write_allowed(bus, slot, func, value)) return false;
-    if ((value & PCI_COMMAND_BUS_MASTER) == 0) return true;
+auto bus_master_transition_allowed_unlocked(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, size_t width, uint32_t value) -> bool {
     for (int i = 0; i < device_count; ++i) {
         auto const& device = discovered_devices[static_cast<size_t>(i)];
-        if (device.bus == bus && device.slot == slot && device.function == func)
-            return driver_activation_allowed(static_cast<size_t>(i)) ||
-                   (config_read16_unlocked(device, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0;
+        if (device.bus != bus || device.slot != slot || device.function != func) continue;
+        uint16_t const PRIOR = config_read16_unlocked(device, PCI_COMMAND);
+        uint16_t const NEXT = aperture::project16(PRIOR, PCI_COMMAND, aperture::effective_offset(offset, width), width, value);
+        if ((NEXT & PCI_COMMAND_BUS_MASTER) == 0) return true;
+        if (bus_master_write_allowed(bus, slot, func, NEXT))
+            return driver_activation_allowed(static_cast<size_t>(i)) || (PRIOR & PCI_COMMAND_BUS_MASTER) != 0;
+        return cold_closed_cleanup_unlocked(static_cast<size_t>(i), NEXT);
     }
     return false;
 }
@@ -295,8 +317,19 @@ auto closed_irq_control_write_allowed_unlocked(uint8_t bus, uint8_t slot, uint8_
     }
     return next == 0;
 }
-void authorize_bus_master_write(uint8_t bus, uint8_t slot, uint8_t func, uint32_t value) {
+void authorize_bus_master_write(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, size_t width, uint32_t value) {
     if (bus_master_write_allowed(bus, slot, func, value)) return;
+    {
+        ConfigGuard const GUARD;
+        for (int i = 0; i < device_count; ++i) {
+            auto const& device = discovered_devices[static_cast<size_t>(i)];
+            if (device.bus != bus || device.slot != slot || device.function != func) continue;
+            uint16_t const PRIOR = config_read16_unlocked(device, PCI_COMMAND);
+            uint16_t const NEXT = aperture::project16(PRIOR, PCI_COMMAND, aperture::effective_offset(offset, width), width, value);
+            if (cold_closed_cleanup_unlocked(static_cast<size_t>(i), NEXT)) return;
+            break;
+        }
+    }
     mod::dbg::panic_handler("Raw PCI command write attempted bus mastering without a ready DMA domain");
     hcf();
 }
@@ -307,11 +340,13 @@ struct ConfigReader {
     auto read16(uint8_t offset) -> uint16_t { return config_read16_unlocked(*device, offset); }
     void write32(uint8_t offset, uint32_t value) { config_write32_unlocked(*device, offset, value); }
     void write16(uint8_t offset, uint16_t value) {
-        if (offset == PCI_COMMAND && !bus_master_transition_allowed_unlocked(device->bus, device->slot, device->function, value))
+        if (offset == PCI_COMMAND && !bus_master_transition_allowed_unlocked(device->bus, device->slot, device->function, offset, 2, value))
             value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
         config_write16_unlocked(*device, offset, value);
     }
 };
+#include "pci_cold_mmio.inc"
+
 void poison_unlocked(size_t index, uint8_t capability = 0) {
     resources[index].poisoned.store(true, std::memory_order_release);
     auto const& device = discovered_devices[index];
@@ -469,6 +504,314 @@ void scan_bus(uint8_t bus, uint16_t parent = NO_PARENT) {
 }
 }  // namespace
 
+void initialize_cold_mmio_inventory() {
+    struct ArenaSettlement {
+        ~ArenaSettlement() { mod::mm::mmio::detail::finish_boot_arena(); }
+    } settlement;
+    if (!mod::mm::mmio::enabled()) return;
+    ConfigGuard guard;
+    if (cold_attempted) return;
+    cold_attempted = true;
+    cold_inventory_status = ColdStatus::incomplete_inventory;
+    if (!enumerated || enumeration_error || published_device_count.load(std::memory_order_acquire) != static_cast<size_t>(device_count) ||
+        extended_inventory().readable != static_cast<size_t>(device_count))
+        return;
+    size_t host = SIZE_MAX, lpc = SIZE_MAX;
+    for (size_t i = 0; i < static_cast<size_t>(device_count); ++i) {
+        auto const& device = discovered_devices[i];
+        if (device.bus == 0 && device.slot == 0 && device.function == 0 && device.vendor_id == 0x8086 && device.device_id == 0x29c0)
+            host = i;
+        if (device.bus == 0 && device.slot == 31 && device.function == 0 && device.vendor_id == 0x8086 && device.device_id == 0x2918)
+            lpc = i;
+    }
+    cold_inventory_status = ColdStatus::unsupported_profile;
+    if (host == SIZE_MAX || lpc == SIZE_MAX) return;
+    // Only copy bytes under config_lock. Firmware validation and bounded native
+    // resource collection run before AP/driver publication, outside this lock.
+    for (size_t i : {host, lpc})
+        for (size_t word = 0; word < cold_rows[i].image.words.size(); ++word)
+            cold_rows[i].image.words[word] = config_read32_unlocked(discovered_devices[i], static_cast<uint8_t>(word * 4));
+    cold_platform_host = cold_rows[host].image;
+    cold_platform_lpc = cold_rows[lpc].image;
+    guard.release();
+    aperture::collect_platform(cold_platform, cold_platform_host, cold_platform_lpc);
+    ConfigGuard final;
+    if (!cold_platform.valid) return;
+    for (size_t word = 0; word < cold_platform_host.words.size(); ++word)
+        if (config_read32_unlocked(discovered_devices[host], static_cast<uint8_t>(word * 4)) != cold_platform_host.words[word] ||
+            config_read32_unlocked(discovered_devices[lpc], static_cast<uint8_t>(word * 4)) != cold_platform_lpc.words[word])
+            return;
+    for (size_t i = 0; i < static_cast<size_t>(device_count); ++i)
+        if (!cold_collect_row_unlocked(i)) return;
+    cold_inventory_generation = 1;  // One immutable BSP snapshot; never replaced.
+    cold_inventory_status = ColdStatus::ready;
+    cold_sealed.store(true, std::memory_order_release);
+    final.release();
+    log::info("typed MMIO inventory sealed functions=%d platform_ranges=%zu physical_bits=%u", device_count, cold_platform.count,
+              static_cast<unsigned>(cold_platform.physical_bits));
+}
+
+namespace detail {
+class ColdMmioAccess {
+    static auto matches_unlocked(const ColdFunctionClaim& cap) -> bool {
+        if (cap.function_index >= static_cast<size_t>(device_count) || cap.owner_id == 0 ||
+            cap.inventory_generation != cold_inventory_generation)
+            return false;
+        auto const& record = cold_records[cap.function_index];
+        if (!record.selected.load(std::memory_order_acquire) || record.id != cap.owner_id || record.epoch != cap.claim_epoch ||
+            record.bar0_physical != cap.bar0_physical || record.bar0_bytes != cap.bar0_bytes || record.span_count != cap.span_count)
+            return false;
+        for (size_t i = 0; i < record.span_count; ++i)
+            if (record.spans[i].start != cap.spans[i].start || record.spans[i].bytes != cap.spans[i].bytes) return false;
+        return true;
+    }
+    static auto operation_unlocked(size_t index, uint64_t epoch) -> DriverOperation {
+        auto& slot = driver_slots[index];
+        if (slot.epoch != epoch || slot.driver != DriverKind::e1000e || slot.phase.load(std::memory_order_acquire) != DriverPhase::open)
+            return {};
+        auto count = slot.operations.load(std::memory_order_acquire);
+        for (;;) {
+            if ((count & DRIVER_CLOSED) != 0 || count == DRIVER_OPERATIONS) return {};
+            if (slot.operations.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+                return DriverOperation{&discovered_devices[index]};
+        }
+    }
+    static auto activation_unlocked(const ColdFunctionClaim& cap) -> ColdStatus {
+        if (!matches_unlocked(cap)) return ColdStatus::invalid_claim;
+        auto const& record = cold_records[cap.function_index];
+        auto const& slot = driver_slots[cap.function_index];
+        if (record.stage != ColdStage::activated || record.dma_open.load(std::memory_order_acquire) || slot.epoch != cap.claim_epoch ||
+            slot.phase.load(std::memory_order_acquire) != DriverPhase::open ||
+            (slot.operations.load(std::memory_order_acquire) & DRIVER_CLOSED) != 0)
+            return ColdStatus::invalid_claim;
+        if (!cold_geometry_matches_unlocked(cap.function_index) || !cold_irq_disabled_unlocked(cap.function_index))
+            return ColdStatus::stale_geometry;
+        uint16_t const COMMAND = config_read16_unlocked(discovered_devices[cap.function_index], PCI_COMMAND);
+        return (COMMAND & (PCI_COMMAND_MEM_SPACE | PCI_COMMAND_BUS_MASTER | 1U | PCI_COMMAND_INT_DISABLE)) ==
+                       (PCI_COMMAND_MEM_SPACE | PCI_COMMAND_INT_DISABLE)
+                   ? ColdStatus::ready
+                   : ColdStatus::decode_readback;
+    }
+    static auto cap_for(size_t index) -> ColdFunctionClaim {
+        auto const& record = cold_records[index];
+        return ColdFunctionClaim{static_cast<uint16_t>(index), record.id,         record.epoch,      cold_inventory_generation,
+                                 record.bar0_physical,         record.bar0_bytes, record.span_count, record.spans};
+    }
+    static void inhibit_unlocked(size_t index) {
+        auto const& device = discovered_devices[index];
+        uint16_t const COMMAND = config_read16_unlocked(device, PCI_COMMAND);
+        ColdWriteScope const CLEANUP{index, ColdIntent::retirement};
+        config_write16_unlocked(device, PCI_COMMAND, static_cast<uint16_t>((COMMAND & ~7U) | PCI_COMMAND_INT_DISABLE));
+        (void)config_read16_unlocked(device, PCI_COMMAND);
+    }
+
+   public:
+    static auto validate(const ColdFunctionClaim& cap) -> ColdStatus {
+        ConfigGuard const GUARD;
+        return activation_unlocked(cap);
+    }
+    static auto disable(const ColdFunctionClaim& cap) -> ColdStatus {
+        ConfigGuard const GUARD;
+        if (!matches_unlocked(cap)) return ColdStatus::invalid_claim;
+        auto& record = cold_records[cap.function_index];
+        auto const& slot = driver_slots[cap.function_index];
+        if (record.stage != ColdStage::published && record.stage != ColdStage::retired) return ColdStatus::not_quiesced;
+        if (slot.epoch != cap.claim_epoch || slot.operations.load(std::memory_order_acquire) != DRIVER_CLOSED ||
+            record.dma_open.load(std::memory_order_acquire) || !cold_irq_disabled_unlocked(cap.function_index))
+            return ColdStatus::not_quiesced;
+        uint16_t const COMMAND = config_read16_unlocked(discovered_devices[cap.function_index], PCI_COMMAND);
+        if ((COMMAND & PCI_COMMAND_BUS_MASTER) != 0 || !cold_geometry_matches_unlocked(cap.function_index)) return ColdStatus::not_quiesced;
+        inhibit_unlocked(cap.function_index);
+        uint16_t const AFTER = config_read16_unlocked(discovered_devices[cap.function_index], PCI_COMMAND);
+        if ((AFTER & (7U | PCI_COMMAND_INT_DISABLE)) != PCI_COMMAND_INT_DISABLE) return ColdStatus::decode_readback;
+        record.stage = ColdStage::retired;
+        return ColdStatus::ready;
+    }
+    static auto map(const DriverClaim& claim, const mod::mm::cpu_maintenance::detail::Controller& controller,
+                    mod::mm::mmio::Mapping& output) -> ColdStatus {
+        if (!mod::mm::mmio::enabled()) return ColdStatus::disabled;
+        if (!output.empty()) return ColdStatus::output_not_empty;
+        if (controller.context_status() != mod::mm::cpu_maintenance::Status::ready) return ColdStatus::invalid_context;
+        auto const INDEX = published_device_index(claim.device());
+        if (!INDEX) return ColdStatus::invalid_claim;
+        size_t const index = *INDEX;
+        auto& record = cold_records[index];
+        DriverOperation operation;
+        {
+            ConfigGuard const GUARD;
+            if (cold_inventory_status != ColdStatus::ready || !cold_sealed.load(std::memory_order_acquire)) return cold_inventory_status;
+            auto const& device = discovered_devices[index];
+            if (device.vendor_id != 0x8086 || device.device_id != 0x10d3 || (device.header_type & 0x7fU) != 0 ||
+                cold_rows[index].image.read(0, 4) != 0x10d38086U || (cold_rows[index].image.read(0x0e, 1) & 0x7fU) != 0)
+                return ColdStatus::unsupported_profile;
+            operation = operation_unlocked(index, claim.epoch());
+            if (!operation) return ColdStatus::invalid_claim;
+            if (record.invoking) return ColdStatus::busy;
+            if (record.stage == ColdStage::published || record.stage == ColdStage::retired || record.stage == ColdStage::failed)
+                return ColdStatus::failed_retained;
+            if (record.stage == ColdStage::legacy) {
+                auto const& resource = resources[index];
+                if (resources_sealed(index) || resource.irq_produced || resource.dma_produced.load(std::memory_order_acquire))
+                    return ColdStatus::legacy_exposed;
+                if (!cold_geometry_matches_unlocked(index)) return ColdStatus::stale_geometry;
+                uint16_t const COMMAND = config_read16_unlocked(device, PCI_COMMAND);
+                if ((COMMAND & PCI_COMMAND_BUS_MASTER) != 0) return ColdStatus::initial_bme_active;
+                if (!cold_irq_disabled_unlocked(index)) return ColdStatus::irq_active;
+                auto const PM = cold_rows[index].capabilities.pm;
+                if (PM != 0 && (config_read16_unlocked(device, static_cast<uint8_t>(PM + 4)) & 3U) != 0)
+                    return ColdStatus::unsupported_profile;
+                if (cold_owner_id == UINT64_MAX) return ColdStatus::generation_exhausted;
+                record.id = ++cold_owner_id;
+                record.epoch = claim.epoch();
+                record.dma_open.store(false, std::memory_order_release);
+                record.selected.store(true, std::memory_order_release);
+                record.stage = ColdStage::preparing;
+                inhibit_unlocked(index);
+                if ((config_read16_unlocked(device, PCI_COMMAND) & (7U | PCI_COMMAND_INT_DISABLE)) != PCI_COMMAND_INT_DISABLE) {
+                    record.stage = ColdStage::failed;
+                    return ColdStatus::decode_readback;
+                }
+                ColdWriteScope const PROBE{index, ColdIntent::probe};
+                uint32_t const ROM = cold_rows[index].image.read(0x30, 4) & ~1U;
+                config_write32_unlocked(device, 0x30, ROM);
+                if (config_read32_unlocked(device, 0x30) != ROM) {
+                    record.stage = ColdStage::failed;
+                    return ColdStatus::decode_readback;
+                }
+            }
+            if (record.epoch != claim.epoch()) return ColdStatus::invalid_claim;
+            record.invoking = true;
+        }
+        struct Invocation {
+            ColdRecord& record;
+            ~Invocation() {
+                ConfigGuard const GUARD;
+                record.invoking = false;
+            }
+        } invocation{record};
+        // No config lock during either DMA registry access or CPU maintenance.
+        if (driver_slots[index].operations.load(std::memory_order_acquire) != 1) return ColdStatus::busy;
+        if (dma::stats(claim.device()).regions != 0) return ColdStatus::dma_present;
+        {
+            ConfigGuard const GUARD;
+            if (!driver_activation_allowed(index) || !cold_geometry_matches_unlocked(index) ||
+                resources[index].dma_produced.load(std::memory_order_acquire))
+                return ColdStatus::legacy_exposed;
+            if (!record.probed) {
+                ConfigReader reader{claim.device()};
+                ColdWriteScope const PROBE{index, ColdIntent::probe};
+                for (size_t bar = 0; bar < BAR_COUNT; ++bar) {
+                    auto const BAR = resource::decode_bar(claim.device()->bar, claim.device()->header_type, bar);
+                    if (!BAR.valid()) {
+                        record.stage = ColdStage::failed;
+                        return ColdStatus::bad_probe;
+                    }
+                    if (!BAR.memory()) continue;
+                    auto const SIZE = resource::probe_memory_bar(claim.device()->bar, claim.device()->header_type, bar, reader);
+                    if (!SIZE) {
+                        record.stage = ColdStage::failed;
+                        return ColdStatus::bad_probe;
+                    }
+                    if (*SIZE != 0) {
+                        auto const RANGE = aperture::rounded(BAR.address, *SIZE);
+                        if (BAR.address == 0 || !RANGE || RANGE->end() > (uint64_t{1} << cold_platform.physical_bits) ||
+                            (BAR.kind == resource::BarKind::memory32 && RANGE->end() > (uint64_t{1} << 32)) ||
+                            cold_excluded(index, *RANGE)) {
+                            record.stage = ColdStage::failed;
+                            return ColdStatus::foreign_overlap;
+                        }
+                        for (size_t i = 0; i < record.span_count; ++i)
+                            if (aperture::overlaps(*RANGE, {record.spans[i].start, record.spans[i].bytes})) {
+                                record.stage = ColdStage::failed;
+                                return ColdStatus::bad_probe;
+                            }
+                        record.spans[record.span_count++] = {RANGE->start, RANGE->bytes};
+                        if (bar == 0) {
+                            record.bar0_physical = BAR.address;
+                            record.bar0_bytes = *SIZE;
+                        }
+                    }
+                    if (BAR.kind == resource::BarKind::memory64) ++bar;
+                }
+                if (record.bar0_bytes < 0x5b04) {
+                    record.stage = ColdStage::failed;
+                    return ColdStatus::bad_probe;
+                }
+                record.probed = true;
+            }
+        }
+        auto status = record.prepared.empty() ? mod::mm::mmio::detail::prepare_from_pci(cap_for(index), controller, record.prepared)
+                                              : mod::mm::mmio::detail::resume_prepared(record.prepared, controller);
+        if (status != ColdStatus::ready) {
+            if (record.prepared.empty()) {
+                ConfigGuard const GUARD;
+                record.stage = ColdStage::failed;
+            }
+            return status;
+        }
+        {
+            ConfigGuard const GUARD;
+            if (!driver_activation_allowed(index) || !cold_geometry_matches_unlocked(index) || !cold_irq_disabled_unlocked(index))
+                return ColdStatus::invalid_claim;
+            auto const& device = discovered_devices[index];
+            uint16_t const COMMAND = config_read16_unlocked(device, PCI_COMMAND);
+            {
+                ColdWriteScope const ACTIVATION{index, ColdIntent::activation};
+                config_write16_unlocked(device, PCI_COMMAND,
+                                        static_cast<uint16_t>((COMMAND & ~7U) | PCI_COMMAND_MEM_SPACE | PCI_COMMAND_INT_DISABLE));
+            }
+            if ((config_read16_unlocked(device, PCI_COMMAND) & (7U | PCI_COMMAND_INT_DISABLE)) !=
+                (PCI_COMMAND_MEM_SPACE | PCI_COMMAND_INT_DISABLE)) {
+                inhibit_unlocked(index);
+                return ColdStatus::decode_readback;
+            }
+            record.stage = ColdStage::activated;
+        }
+        mod::mm::mmio::Mapping temporary;
+        status = mod::mm::mmio::detail::publish_from_pci(record.prepared, controller, temporary);
+        if (status != ColdStatus::ready) {
+            ConfigGuard const GUARD;
+            inhibit_unlocked(index);
+            record.stage = ColdStage::preparing;
+            return status;
+        }
+        {
+            ConfigGuard const GUARD;
+            auto cap = cap_for(index);
+            status = activation_unlocked(cap);
+            if (status != ColdStatus::ready) {
+                inhibit_unlocked(index);
+                record.stage = ColdStage::failed;
+                return status;
+            }
+            record.stage = ColdStage::published;
+            record.dma_open.store(true, std::memory_order_release);
+            output = std::move(temporary);
+        }
+        return ColdStatus::ready;
+    }
+};
+auto disable_cold_decode(const ColdFunctionClaim& cap) -> ColdStatus { return ColdMmioAccess::disable(cap); }
+auto validate_cold_activation(const ColdFunctionClaim& cap) -> ColdStatus { return ColdMmioAccess::validate(cap); }
+auto cold_configuration_sealed() noexcept -> bool { return cold_sealed.load(std::memory_order_acquire); }
+auto cold_inventory_allows_arena(uint64_t virtual_start, uint64_t bytes) noexcept -> bool {
+    if (!cold_sealed.load(std::memory_order_acquire)) return false;
+    aperture::Span const ARENA{virtual_start, bytes};
+    uint64_t const HHDM = mod::mm::addr::get_hhdm_offset();
+    for (size_t i = 0; i < cold_platform.count; ++i)
+        if (!aperture::hhdm_disjoint(cold_platform.spans[i], HHDM, ARENA)) return false;
+    for (size_t device = 0; device < static_cast<size_t>(device_count); ++device)
+        for (size_t i = 0; i < cold_rows[device].count; ++i)
+            if (!aperture::hhdm_disjoint(cold_rows[device].possible[i], HHDM, ARENA)) return false;
+    return true;
+}
+}  // namespace detail
+
+auto map_cold_uc_82574(const DriverClaim& claim, const mod::mm::cpu_maintenance::detail::Controller& controller,
+                       mod::mm::mmio::Mapping& output) -> mod::mm::mmio::Status {
+    return detail::ColdMmioAccess::map(claim, controller, output);
+}
+
 DriverClaim::~DriverClaim() { retain(); }
 DriverClaim::DriverClaim(DriverClaim&& other) noexcept
     : device_(std::exchange(other.device_, nullptr)), epoch_(std::exchange(other.epoch_, 0)) {}
@@ -527,14 +870,17 @@ auto try_claim_driver(PCIDevice* device, DriverKind kind) -> std::optional<Drive
 }
 auto try_dma_operation(const PCIDevice* device) -> DriverOperation {
     auto const INDEX = published_device_index(device);
-    if (!INDEX) return {};
+    if (!INDEX || !cold_dma_allowed(*INDEX)) return {};
     auto& slot = driver_slots[*INDEX];
     if (slot.phase.load(std::memory_order_acquire) == DriverPhase::unclaimed) return {};
     auto operations = slot.operations.load(std::memory_order_acquire);
     for (;;) {
         if ((operations & DRIVER_CLOSED) != 0 || operations == DRIVER_OPERATIONS) return {};
-        if (slot.operations.compare_exchange_weak(operations, operations + 1, std::memory_order_acq_rel, std::memory_order_acquire))
-            return DriverOperation{device};
+        if (slot.operations.compare_exchange_weak(operations, operations + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            DriverOperation operation{device};
+            if (!cold_dma_allowed(*INDEX)) return {};
+            return operation;
+        }
     }
 }
 auto begin_dma_allocation(const PCIDevice* device) -> DriverOperation {
@@ -546,11 +892,13 @@ auto begin_dma_allocation(const PCIDevice* device) -> DriverOperation {
             !reserve_driver_unlocked(*INDEX, DriverKind::diagnostic))
             return {};
     }
-    return try_dma_operation(device);
+    auto operation = try_dma_operation(device);
+    if (operation) resources[*INDEX].dma_produced.store(true, std::memory_order_release);
+    return operation;
 }
 auto driver_dma_admission_allowed(const PCIDevice* device) -> bool {
     auto const INDEX = published_device_index(device);
-    if (!INDEX) return false;
+    if (!INDEX || !cold_dma_allowed(*INDEX)) return false;
     auto const& slot = driver_slots[*INDEX];
     return slot.phase.load(std::memory_order_acquire) != DriverPhase::unclaimed &&
            (slot.operations.load(std::memory_order_acquire) & DRIVER_CLOSED) == 0;
@@ -590,14 +938,32 @@ auto pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -
 auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) -> void {
     if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return;
     authorize_bar_write(bus, slot, func, offset, 4);
-    if ((offset & 0xfcU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
+    if ((offset & 0xfcU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, offset, 4, value);
     ConfigGuard const GUARD;
     if (!bar_write_allowed(bus, slot, func, offset, 4)) return;
+    if (cold_sealed.load(std::memory_order_acquire)) {
+        const PCIDevice* target = nullptr;
+        for (int i = 0; i < device_count; ++i) {
+            auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+            if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+                target = &candidate;
+                break;
+            }
+        }
+        if (target == nullptr || !cold_write_allowed_unlocked(*target, offset, 4, value)) return;
+    }
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
-    if ((offset & 0xfcU) == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, value))
+    if ((offset & 0xfcU) == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, offset, 4, value))
         value = static_cast<uint32_t>(value & ~PCI_COMMAND_BUS_MASTER);
     value = preserve_closed_intx_mask_unlocked(bus, slot, func, offset & 0xfcU, 4, value);
     if (!closed_irq_control_write_allowed_unlocked(bus, slot, func, offset & 0xfcU, 4, value)) return;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+        if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+            cold_note_command_unlocked(candidate, offset, 4, value);
+            break;
+        }
+    }
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outl(PCI_CONFIG_DATA, value);
 }
@@ -606,14 +972,32 @@ auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) -> void {
     if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return;
     authorize_bar_write(bus, slot, func, offset, 2);
-    if ((offset & 0xfeU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
+    if ((offset & 0xfeU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, offset, 2, value);
     ConfigGuard const GUARD;
     if (!bar_write_allowed(bus, slot, func, offset, 2)) return;
+    if (cold_sealed.load(std::memory_order_acquire)) {
+        const PCIDevice* target = nullptr;
+        for (int i = 0; i < device_count; ++i) {
+            auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+            if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+                target = &candidate;
+                break;
+            }
+        }
+        if (target == nullptr || !cold_write_allowed_unlocked(*target, offset, 2, value)) return;
+    }
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
-    if ((offset & 0xfeU) == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, value))
+    if ((offset & 0xfeU) == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, offset, 2, value))
         value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
     value = static_cast<uint16_t>(preserve_closed_intx_mask_unlocked(bus, slot, func, offset & 0xfeU, 2, value));
     if (!closed_irq_control_write_allowed_unlocked(bus, slot, func, offset & 0xfeU, 2, value)) return;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+        if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+            cold_note_command_unlocked(candidate, offset, 2, value);
+            break;
+        }
+    }
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outw(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 2U)), value);
 }
@@ -622,14 +1006,32 @@ auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 auto pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value) -> void {
     if (slot >= PCI_SLOT_COUNT || func >= PCI_FUNCTION_COUNT) return;
     authorize_bar_write(bus, slot, func, offset, 1);
-    if (offset == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
+    if (offset == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, offset, 1, value);
     ConfigGuard const GUARD;
     if (!bar_write_allowed(bus, slot, func, offset, 1)) return;
+    if (cold_sealed.load(std::memory_order_acquire)) {
+        const PCIDevice* target = nullptr;
+        for (int i = 0; i < device_count; ++i) {
+            auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+            if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+                target = &candidate;
+                break;
+            }
+        }
+        if (target == nullptr || !cold_write_allowed_unlocked(*target, offset, 1, value)) return;
+    }
     // A unit may close after the pre-lock diagnostic check. Do not restore BME.
-    if (offset == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, value))
+    if (offset == PCI_COMMAND && !bus_master_transition_allowed_unlocked(bus, slot, func, offset, 1, value))
         value = static_cast<uint8_t>(value & ~PCI_COMMAND_BUS_MASTER);
     value = static_cast<uint8_t>(preserve_closed_intx_mask_unlocked(bus, slot, func, offset, 1, value));
     if (!closed_irq_control_write_allowed_unlocked(bus, slot, func, offset, 1, value)) return;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& candidate = discovered_devices[static_cast<size_t>(i)];
+        if (candidate.bus == bus && candidate.slot == slot && candidate.function == func) {
+            cold_note_command_unlocked(candidate, offset, 1, value);
+            break;
+        }
+    }
     outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outb(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 3U)), value);
 }
@@ -738,8 +1140,10 @@ auto pci_set_bus_master(PCIDevice* dev, bool enable) -> bool {
     outl(PCI_CONFIG_ADDRESS, config_address(dev->bus, dev->slot, dev->function, PCI_COMMAND));
     auto command = static_cast<uint16_t>(inl(PCI_CONFIG_DATA));
     command = enable ? static_cast<uint16_t>(command | PCI_COMMAND_BUS_MASTER) : static_cast<uint16_t>(command & ~PCI_COMMAND_BUS_MASTER);
-    outw(PCI_CONFIG_DATA, command);
-    return (static_cast<uint16_t>(inl(PCI_CONFIG_DATA)) & PCI_COMMAND_BUS_MASTER) == (enable ? PCI_COMMAND_BUS_MASTER : 0);
+    if (!cold_write_allowed_unlocked(*dev, PCI_COMMAND, 2, command)) return false;
+    if (enable) resources[*INDEX].dma_produced.store(true, std::memory_order_release);
+    config_write16_unlocked(*dev, PCI_COMMAND, command);
+    return (config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) == (enable ? PCI_COMMAND_BUS_MASTER : 0);
 }
 
 auto pci_enable_memory_space(PCIDevice* dev) -> void {
@@ -810,6 +1214,7 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int 
     // target_cpu is a logical CPU index; translate to APIC ID for the hardware.
     uint32_t const APIC_ID = *APIC;
     uint32_t const MSG_ADDR = 0xFEE00000U | (APIC_ID << 12);
+    resources[*INDEX].irq_produced = true;
     config_write32_unlocked(*dev, MSI_OFF + 4, MSG_ADDR);
 
     if (IS_64BIT) {
@@ -834,10 +1239,10 @@ auto pci_enable_msi(PCIDevice* dev, uint8_t vector, uint64_t target_cpu) -> int 
 
 auto pci_prepare_msix(PCIDevice* dev) -> int {
     auto const INDEX = device_index(dev);
-    if (!INDEX) return -1;
+    if (!INDEX || cold_selected(*INDEX)) return -1;
     auto& record = resources[*INDEX];
     ConfigGuard guard;
-    if (record.poisoned.load(std::memory_order_acquire)) return -1;
+    if (cold_selected(*INDEX) || record.poisoned.load(std::memory_order_acquire)) return -1;
     if (auto const* prepared = record.msix.get()) return prepared->present ? 0 : 1;
     if (!driver_activation_allowed(*INDEX)) return -1;
     auto operation = try_dma_operation(dev);
@@ -955,18 +1360,20 @@ auto pci_get_bar_size_checked(PCIDevice* dev, int bar_idx) -> std::optional<uint
     if (!INDEX || bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT) ||
         !resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx)).memory())
         return std::nullopt;
+    if (cold_selected(*INDEX)) return std::nullopt;
     auto& record = resources[*INDEX];
     auto& cache = record.sizes[static_cast<size_t>(bar_idx)];
     if (record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
     if (auto const* value = cache.get()) return *value;
     if (!driver_activation_allowed(*INDEX)) return std::nullopt;
     ConfigGuard const GUARD;
-    if (record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
+    if (cold_selected(*INDEX) || record.poisoned.load(std::memory_order_acquire)) return std::nullopt;
     if (auto const* value = cache.get()) return *value;
     if (!driver_activation_allowed(*INDEX)) return std::nullopt;
     if ((config_read16_unlocked(*dev, PCI_COMMAND) & PCI_COMMAND_BUS_MASTER) != 0) return std::nullopt;
     auto const* value = cache.prepare([&]() -> std::optional<uint64_t> {
         ConfigReader reader{dev};
+        ColdWriteScope const PROBE{*INDEX, ColdIntent::probe};
         auto const SIZE = resource::probe_memory_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx), reader);
         if (!SIZE) poison_unlocked(*INDEX);
         return SIZE;
@@ -979,12 +1386,13 @@ auto pci_get_bar_size(PCIDevice* dev, int bar_idx) -> uint64_t { return pci_get_
 auto pci_map_bar(PCIDevice* dev, int bar_idx) -> void* {
     auto const INDEX = device_index(dev);
     if (!INDEX || bar_idx < 0 || std::cmp_greater_equal(bar_idx, BAR_COUNT)) return nullptr;
+    if (cold_selected(*INDEX)) return nullptr;
     auto const BAR = resource::decode_bar(dev->bar, dev->header_type, static_cast<size_t>(bar_idx));
     if (!BAR.memory() || BAR.address == 0) return nullptr;
     auto& record = resources[*INDEX];
     auto& cache = record.mappings[static_cast<size_t>(bar_idx)];
     ConfigGuard guard;
-    if (record.poisoned.load(std::memory_order_acquire)) return nullptr;
+    if (cold_selected(*INDEX) || record.poisoned.load(std::memory_order_acquire)) return nullptr;
     if (auto const* value = cache.get()) return *value;
     if (!driver_activation_allowed(*INDEX)) return nullptr;
     auto operation = try_dma_operation(dev);

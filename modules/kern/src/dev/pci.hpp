@@ -7,7 +7,22 @@
 #include <optional>
 #include <platform/dbg/dbg.hpp>
 
+namespace ker::mod::mm::mmio {
+class Mapping;
+enum class Status : uint8_t;
+}  // namespace ker::mod::mm::mmio
+namespace ker::mod::mm::cpu_maintenance::detail {
+class Controller;
+}
+
 namespace ker::dev::pci {
+class DriverClaim;
+
+// Actual opt-in BSP hook after IOMMU/ACS/RMRR setup and before AHCI/APs.
+// Unsupported observations preserve ordinary boot and refuse typed mapping.
+void initialize_cold_mmio_inventory();
+[[nodiscard]] auto map_cold_uc_82574(const DriverClaim&, const ker::mod::mm::cpu_maintenance::detail::Controller&,
+                                     ker::mod::mm::mmio::Mapping& empty_output) -> ker::mod::mm::mmio::Status;
 
 // PCI Configuration Space Access
 // QEMU provides PCI via port I/O (0xCF8 and 0xCFC)

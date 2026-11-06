@@ -176,7 +176,116 @@ uncertain invalidation quarantines its backing. Old submissions can still comple
 and release after closure under existing retirement proofs. A drained operation
 gate proves software preparation ended. Hardware quiescence, IRQ retirement,
 releasable MMIO and reset authority require their own proofs; these boot claims
-do not grant any of them. Existing BAR and MSI-X aliases remain pinned.
+do not grant any of them. Existing legacy BAR and MSI-X aliases remain pinned;
+the opt-in typed register path below supplies separate mapping and retirement
+authority.
+
+## Opt-in cold UC register mappings
+
+`--typed-pci-mmio` selects the kernel-only cold register path for the actual
+Intel 82574/8086:10d3 consumer. The default legacy path remains available when
+this option is absent. A selected typed probe has no raw mapping fallback.
+`pci::map_cold_uc_82574(claim, controller, empty_mapping)` consumes facts from
+the actual exclusive driver claim and immutable hardware inventory; callers
+cannot adopt a supplied physical address or copied diagnostic report.
+
+The initial platform profile is a trusted, conforming, controlled q35-compatible
+deployment. It observes bounded MCFG, MADT including the full type5 address,
+HPET, FADT/GAS and discovered IOMMU/reserved ranges. HPET's fixed bank and
+FADT's byte-accessed GPE blocks have dedicated format checks; scalar GAS
+validation remains separate. Full-width EPBAR, MCHBAR, DMIBAR, PCIEXBAR, RCBA
+and the supported DRAM/remap/SMRAM configuration join these exclusions. Active
+opaque TSEG, integrated-graphics stolen allocations,
+unknown decoder geometry, incomplete topology and unsupported capabilities
+refuse typed admission. The QEMU profile uses the existing `vm.machine` value
+`q35,smm=off`; a successful firmware boot still requires qualification. The
+shared `vm.vga="none"` option removes the default VGA function for a controlled
+headless fixture. Default VGA resource uncertainty can legitimately refuse the
+NIC's typed mapping.
+
+The chipset geometry comes from the [Intel 316966-002 datasheet](https://www.intel.com/Assets/PDF/datasheet/316966.pdf)
+and the pinned [QEMU 11.1.3 q35 model](https://github.com/qemu/qemu/blob/v11.1.3/hw/pci-host/q35.c)
+and [ICH9 model](https://github.com/qemu/qemu/blob/v11.1.3/hw/isa/lpc_ich9.c).
+This restricted profile supplies no universal chipset or physical-GPU claim.
+Foreign BARs are never sized live. Their complete possible extents, ROMs and
+bridge forwarding windows are retained conservatively: an unknown ordinary
+zero32 BAR remains a possible [0,2GiB) decoder. The common conventional writer
+fence covers effective byte/word/dword writes, geometry and reset strobes;
+ECAM ACS preparation finishes before inventory sealing. Disabled decoders stay
+fenced, and a foreign MEM enable cannot change its immutable footprint.
+
+Before any driver-side BME clear, the factory requires observed BME0, disabled
+inherited MSI/MSI-X and no prior WOS register-map, IRQ or DMA producer. It closes
+new DMA admission while retaining its own counted operation, inhibits IO/MEM,
+masks INTx and holds ROM disabled with verified readback. It then requires all
+other operations drained and checks the actual DMA registry outside the config
+lock. Only this serialized transaction sizes every own memory BAR and verifies
+restoration.
+BAR0 must cover the consumer's highest register offset; assigned-positive zero
+addresses, overlap and malformed sizing fail. The sum of page-rounded own
+memory BARs is limited to 16 MiB; larger exact claims refuse capacity before
+physical reservation. This bounds the initial service and does not supply
+GPU-scale aperture mapping. Cold describes WOS CPU exposure; firmware usage
+and engine quiescence remain separate obligations.
+
+`platform/mm/mmio_mapping` begins bounded physical-exposure history during boot
+before generic mapping publication. After the complete PCI inventory, before
+AHCI, AP startup and Task roots, it creates the private shared PML4[505]
+bank only when platform/possible-HHDM extents leave that namespace available.
+Unsupported profiles leave ordinary boot available without creating that bank.
+All own memory spans become boot-persistent physical tombstones. Nonreserved
+boot memory, previous WOS exposure and present aliases refuse the cold path;
+the implementation preserves existing RESERVED direct mappings.
+
+The actual MM pin serialization protects the dedicated VA namespace, encoded
+incoming and displaced physical spans, and private page-table frames across
+legacy mutation and root-copy/free paths. Device pages receive no PMM ownership
+or generic frame decrement. Private table frames remain retained. Geometry,
+capacity or history uncertainty refuses new typed work before publication.
+
+Initial preparation retains a genuine qualified UC range and its original CPU
+maintenance ticket. Every configured ready CPU completes current-root TLB
+invalidation before the WBINVD round; both rounds revalidate actual state.
+Inherited PAT, MTRR/protected-range policy and NX/WP prerequisites remain
+mandatory. Supervisor RW/NX UC leaves publish only after exact completion and
+handler drain. PCI then verifies MEM activation before exposing the public
+Mapping and reopening DMA admission. No config/MM lock spans allocation or a
+CPU wait. A pending preparation retains the same private handle and ticket.
+
+The move-only `mmio::Mapping` supplies scoped, IRQ-safe `Borrow` objects rather
+than raw register pointers. `read32`/`write32` check generation, alignment and
+bounds. Existing borrows survive admission closure. Destruction closes and
+retains ownership; it never stops hardware or unmaps a live register window.
+The e1000 consumer carries these borrows through its actual callbacks and uses
+one unique terminal borrow after closing and draining normal readers.
+
+Retirement preserves the established 82574 master drain, interrupt masking,
+BME disable, callback/IRQ drain and DMA release order. A closed typed claim may
+mask INTx while preserving an already-live BME under the final config lock;
+this exception admits neither fresh BME nor new DMA. After the terminal borrow's
+last register access and destruction, the actual driver's private
+`QuiescedMapping` witness allows decode-off readback and PTE withdrawal. Only
+the original withdrawal ticket's exact all-CPU TLB completion and reader drain
+release the VA allocation. Physical tombstones and private tables stay pinned
+until reboot.
+Timeout preserves ownership and the original ticket; an accepted finalizer can
+retry without accessing BARs again or repeating hardware release.
+
+The public scheduled DAEMON maintenance API keeps its existing contract. Private
+nonmovable Controllers borrow authority synchronously from the actual phase5
+InitExecutor or the accepted power finalizer on its own kernel stack. Tickets,
+mappings and driver storage retain no Task or issuer back-reference. Boot calls
+preserve incoming IRQ state; finalizer retries stay in that accepted
+continuation, before other CPUs halt. Reset/rebind, physical storage return,
+hotplug, WC mappings and userspace BAR mappings remain outside this path.
+
+The maintained `--selftest-e1000-mmio` diagnostic exercises the actual typed
+consumer, scoped borrowers and network traffic, then asks PID1 to perform its
+normal shutdown. `--selftest-e1000-mmio-withdraw-retry` additionally withholds
+one real remote action and retries the same withdrawal ticket. Host fixtures
+link actual engines with finite hardware ports. These interfaces do not by
+themselves establish native or physical-GPU qualification; receipts must identify
+the frozen source, artifacts, actual CPU completion and guest shutdown.
 
 ## Immutable firmware service
 
@@ -287,10 +396,10 @@ streams the observed registers and restores incoming IRQ state. It does not
 refresh the snapshots. Snapshot consistency assumes conforming firmware/VMM
 behavior, including meaningful optional-register observations.
 
-Typed mappings will additionally require physical/BAR ownership, absent aliases
-and a completed all-CPU translation/cache-maintenance barrier. These CPU tokens
-provide none of those independent authorities. WC, active encrypted mappings and
-physical GPU qualification remain Goal41 work.
+The opt-in UC register mapper combines these CPU tokens with independently
+issued PCI ownership, absent aliases and the actual completed all-CPU barrier.
+CPU tokens alone grant none of those other authorities. WC, active encrypted
+mappings and physical GPU qualification remain Goal41 work.
 
 `platform/mm/cpu_maintenance` provides a separate scheduled CPU-maintenance
 rendezvous. A private move-only ticket retains a genuine qualified UC range in
@@ -312,12 +421,12 @@ until reboot. Completion requires exact per-CPU generations, closed reader
 admission and drained handler tails before metadata reuse.
 
 Copied completion reports grant no PTE, alias, BAR or storage-release authority.
-A future typed mapper must retain its actual physical ownership, withdrawn
-translations and mutation exclusion across maintenance. Scheduled CPU actions
-with existing mappings do not prove a safe cache-type transition. Bootstrap and
-process-controlled consumers need their own reviewed lifetime integration;
-phase-5 driver startup and the legacy synchronous shootdowns keep their current
-behavior. Physical GPU qualification remains separate.
+The typed UC mapper retains its actual physical ownership, withdrawn translations
+and mutation exclusion across maintenance. Scheduled CPU actions with existing
+mappings alone do not prove a safe cache-type transition. The private bootstrap
+and accepted-finalizer Controllers provide the scoped integration described
+above; legacy synchronous shootdowns keep their existing behavior. Physical
+GPU qualification remains separate.
 
 Bootstrap preserves each framebuffer page's incoming PAT selector when replacing
 Limine's page tables. It verifies the inherited supervisor translation and
@@ -441,12 +550,14 @@ firmware engines quiescent. Modern virtio now explicitly inhibits inherited BME
 before cold BAR preparation, then requires transport reset before admitting new
 queue DMA. Global firmware handoff and AHCI/virtio bootstrap ownership still need
 device-specific treatment. Existing xHCI/virtio activation relies on halted or
-not-DRIVER_OK device state before handler publication. Large apertures still map
-in proportion to their 4 KiB page count; bounded/on-demand mapping remains open.
+not-DRIVER_OK device state before handler publication. Large legacy apertures
+still map in proportion to their 4 KiB page count.
+GPU-scale and on-demand aperture mapping remain open; the opt-in cold register
+service has the 16 MiB admission bound described above.
 
 The shared 256-function capacity now covers PCI, ECAM and IOMMU ownership
 metadata with bounded traversal; it does not add resource/reset authority.
-Vendor firmware catalogs, aperture/doorbell
+Vendor firmware catalogs, GPU-scale aperture/doorbell and userspace BAR
 mappings, WC architecture policy, charged revocable user-page pins, GPU-scale SG,
 AMD-Vi and interrupt remapping also remain open. Existing Intel DMA strict mode
 does not provide MSI isolation. Reuse the current MM binding/root/TLB lifetime

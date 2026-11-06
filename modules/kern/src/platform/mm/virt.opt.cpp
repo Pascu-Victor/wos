@@ -31,6 +31,8 @@
 #include <platform/mm/cpu_maintenance.hpp>
 #include <platform/mm/lifetime_retirement_executor.hpp>
 #include <platform/mm/mmio_cache.hpp>
+#include <platform/mm/mmio_mapping_platform.hpp>
+#include <platform/mm/mmio_mapping_private.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/numa_root_reserve.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -107,6 +109,40 @@ using log = ker::mod::dbg::logger<"virt">;
 constexpr uint64_t LARGE_PAGE_2M_BYTES = paging::PAGE_SIZE * paging::PAGE_TABLE_ENTRIES;
 constexpr uint64_t LARGE_PAGE_1G_BYTES = LARGE_PAGE_2M_BYTES * paging::PAGE_TABLE_ENTRIES;
 constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
+
+// Selected once while the actual BSP builds its first root. The default path
+// keeps the old walkers free of calls into the optional MMIO registry.
+std::atomic<bool> typed_mmio_guards{};
+std::atomic<bool> typed_mmio_boot_building{};
+
+[[gnu::always_inline]] auto typed_mmio_table_allowed(const PageTable* table) noexcept -> bool {
+    return !typed_mmio_guards.load(std::memory_order_relaxed) || mmio::detail::generic_table_allowed(table);
+}
+
+void require_ordinary_page_table(const PageTable* table) noexcept {
+    if (!typed_mmio_table_allowed(table)) __builtin_trap();
+}
+
+void require_ordinary_virtual_range(const PageTable* root, uint64_t address, uint64_t bytes) noexcept {
+    if (typed_mmio_guards.load(std::memory_order_relaxed) && !mmio::detail::generic_virtual_allowed(root, address, bytes)) __builtin_trap();
+}
+void require_ordinary_mapping(const PageTable* root, uint64_t address, uint64_t physical, uint64_t bytes, uint64_t flags) noexcept {
+    if (typed_mmio_guards.load(std::memory_order_relaxed) && !mmio::detail::record_generic_mapping(root, address, physical, bytes, flags))
+        __builtin_trap();
+}
+void require_ordinary_leaf_locked(const PageTable* table, uint64_t address, uint64_t old_raw, uint64_t new_raw,
+                                  unsigned level = 1) noexcept {
+    if (typed_mmio_guards.load(std::memory_order_relaxed) &&
+        !mmio::detail::generic_leaf_allowed_locked(table, address, old_raw, new_raw, level))
+        __builtin_trap();
+}
+auto ordinary_physical_access(uint64_t physical, uint64_t bytes) noexcept -> bool {
+    return !typed_mmio_guards.load(std::memory_order_relaxed) || mmio::detail::record_generic_physical_access(physical, bytes);
+}
+auto ordinary_page_range_bytes(uint64_t pages) noexcept -> uint64_t {
+    if (pages == 0 || pages > UINT64_MAX / paging::PAGE_SIZE) __builtin_trap();
+    return pages * paging::PAGE_SIZE;
+}
 
 // All objects passed from this excluded TU into the instrumented allocator
 // start their lifetime only after their exact storage is addressable. In
@@ -2389,6 +2425,7 @@ auto finish_anonymous_pagein(AnonymousPageinOperation& operation) -> AnonymousPa
                 uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
                 uint64_t const PADDR = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(page)));
                 uint64_t const RAW = (mapping->original_raw & ~PTE_FRAME_MASK) | (PADDR & PTE_FRAME_MASK) | paging::PAGE_PRESENT;
+                require_ordinary_leaf_locked(mapping->pagemap, mapping->vaddr, pte_raw(*entry), RAW);
                 *entry = pte_from_raw(RAW);
                 owned_frame_track_fresh_normal_mapping(mapping->pagemap, mapping->vaddr, PADDR, RAW);
                 user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
@@ -2675,6 +2712,7 @@ auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t cursor, Anon
     PageTableEntry* entry = range_current ? leaf_entry(PAGEMAP, VADDR) : nullptr;
     if (entry != nullptr && entry->present != 0 && entry->user != 0 && (pte_raw(*entry) & paging::PAGE_SHARED) == 0U &&
         find_anonymous_swap_mapping_locked(PAGEMAP, VADDR) == nullptr) {
+        require_ordinary_leaf_locked(PAGEMAP, VADDR, pte_raw(*entry), pte_raw(*entry));
         if (entry->accessed != 0) {
             entry->accessed = 0;
             aged = true;
@@ -2807,6 +2845,7 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
             (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
                 reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(candidate.frame))) &&
             find_anonymous_swap_mapping_locked(candidate.pagemap, candidate.vaddr) == nullptr) {
+            require_ordinary_leaf_locked(candidate.pagemap, candidate.vaddr, pte_raw(*entry), pte_raw(*entry));
             mapping->original_raw = pte_raw(*entry);
             mapping->frozen_raw = mapping->original_raw;
             if ((mapping->frozen_raw & paging::PAGE_WRITE) != 0U) {
@@ -2856,6 +2895,7 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
         bool const SAME_FRAME = entry != nullptr && entry->present != 0 && pte_raw(*entry) == mapping->frozen_raw &&
                                 (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
                                     reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(candidate.frame)));
+        if (SAME_FRAME) require_ordinary_leaf_locked(candidate.pagemap, candidate.vaddr, pte_raw(*entry), pte_raw(*entry));
         bool const ADMITTED = anonymous_pageout_permitted_locked(candidate);
         if (result == 0 && SAME_FRAME && !mapping->cancelled && ADMITTED) {
             owned_frame_untrack_leaf(candidate.pagemap, candidate.vaddr, *entry);
@@ -3338,6 +3378,8 @@ struct PreparedSwapForkAccess {
         return result;
     }
     static auto commit(PreparedAnonymousSwapFork& plan, PageTable* source, PageTable* destination) -> int {
+        require_ordinary_page_table(source);
+        require_ordinary_page_table(destination);
         uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
         int const result = validate_locked(plan, source, destination, true);
         if (result != 0) {
@@ -3359,8 +3401,13 @@ struct PreparedSwapForkAccess {
             if ((raw & paging::PAGE_WRITE) != 0U || (raw & paging::PAGE_COW) != 0U) {
                 raw &= ~paging::PAGE_WRITE;
                 raw |= paging::PAGE_COW;
+                uint64_t const PIN = user_mapping_pin_lock.lock_irqsave();
+                auto* entry = leaf_entry(source, selected->vaddr);
+                if (entry == nullptr) __builtin_trap();
+                require_ordinary_leaf_locked(source, selected->vaddr, pte_raw(*entry), anonymous_swap_marker_raw(raw));
                 selected->original_raw = raw;
-                *leaf_entry(source, selected->vaddr) = pte_from_raw(anonymous_swap_marker_raw(raw));
+                *entry = pte_from_raw(anonymous_swap_marker_raw(raw));
+                user_mapping_pin_lock.unlock_irqrestore(PIN);
             }
             *child = *selected;
             child->pagemap = destination;
@@ -3374,7 +3421,14 @@ struct PreparedSwapForkAccess {
             child->frame = nullptr;
             child->cancelled = false;
             if (child->object != nullptr) ++child->object->mapping_refs;
-            *leaf_entry(destination, child->vaddr) = pte_from_raw(anonymous_swap_marker_raw(raw));
+            {
+                uint64_t const PIN = user_mapping_pin_lock.lock_irqsave();
+                auto* entry = leaf_entry(destination, child->vaddr);
+                if (entry == nullptr) __builtin_trap();
+                require_ordinary_leaf_locked(destination, child->vaddr, pte_raw(*entry), anonymous_swap_marker_raw(raw));
+                *entry = pte_from_raw(anonymous_swap_marker_raw(raw));
+                user_mapping_pin_lock.unlock_irqrestore(PIN);
+            }
             insert_anonymous_swap_mapping_locked(child);
             plan.storage_->rows[adopted++] = nullptr;
             if (child->state == AnonymousSwapRuntimeState::SWAPPED) anonymous_swap_add(anonymous_swap_stats.swapped_pages);
@@ -3402,6 +3456,8 @@ auto materialize_issued_native_file_fault(const LazyFileFaultWork& taken, size_t
 #endif
 
 auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
+    require_ordinary_page_table(src);
+    require_ordinary_page_table(dst);
     uint64_t last_vaddr = 0;
     bool have_last = false;
     for (;;) {
@@ -3433,11 +3489,15 @@ auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
                 if ((raw & paging::PAGE_WRITE) != 0U || (raw & paging::PAGE_COW) != 0U) {
                     raw &= ~paging::PAGE_WRITE;
                     raw |= paging::PAGE_COW;
+                    uint64_t const PIN = user_mapping_pin_lock.lock_irqsave();
+                    auto* parent_entry = leaf_entry(src, source->vaddr);
+                    require_ordinary_leaf_locked(src, source->vaddr, parent_entry != nullptr ? pte_raw(*parent_entry) : 0,
+                                                 anonymous_swap_marker_raw(raw));
                     source->original_raw = raw;
-                    if (auto* parent_entry = leaf_entry(src, source->vaddr);
-                        parent_entry != nullptr && parent_entry->present == 0 && is_reserved_leaf(*parent_entry)) {
+                    if (parent_entry != nullptr && parent_entry->present == 0 && is_reserved_leaf(*parent_entry)) {
                         *parent_entry = pte_from_raw(anonymous_swap_marker_raw(raw));
                     }
+                    user_mapping_pin_lock.unlock_irqrestore(PIN);
                 }
 
                 *child = *source;
@@ -3454,10 +3514,13 @@ auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
                 if (child->object != nullptr) {
                     ++child->object->mapping_refs;
                 }
+                uint64_t const PIN = user_mapping_pin_lock.lock_irqsave();
                 if (auto* child_entry = leaf_entry(dst, child->vaddr);
                     child_entry != nullptr && child_entry->present == 0 && is_reserved_leaf(*child_entry)) {
+                    require_ordinary_leaf_locked(dst, child->vaddr, pte_raw(*child_entry), anonymous_swap_marker_raw(raw));
                     *child_entry = pte_from_raw(anonymous_swap_marker_raw(raw));
                 }
+                user_mapping_pin_lock.unlock_irqrestore(PIN);
                 insert_anonymous_swap_mapping_locked(child);
                 if (child->state == AnonymousSwapRuntimeState::SWAPPED) {
                     anonymous_swap_add(anonymous_swap_stats.swapped_pages);
@@ -4058,6 +4121,7 @@ void tlb_shootdown_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] ga
 }
 
 void zero_page_table_for_pool(PageTable* table) {
+    require_ordinary_page_table(table);
     uint64_t saved_cr3 = 0;
     if (kernel_pagemap != nullptr) {
         auto const KERNEL_CR3 = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(kernel_pagemap)));
@@ -4117,6 +4181,7 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
         return nullptr;
     }
 
+    require_ordinary_page_table(pool.pages[pool.count - 1]);
 #ifdef WOS_SELFTEST
     bool const TRACKED = page_table_pool_proof_begin_locked();
 #endif
@@ -4161,6 +4226,9 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
     if (table == nullptr) {
         return true;
     }
+
+    // Refusing insertion must not fall through to a physical free at callers.
+    require_ordinary_page_table(table);
 
     if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) {
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
@@ -4264,6 +4332,7 @@ auto alloc_zeroed_page_table(bool may_fail = false
 
     // Clear the private HHDM page before kind tagging or hierarchy publication,
     // keeping the current pagemap instead of switching CR3 solely to zero it.
+    require_ordinary_page_table(table);
     std::memset(table, 0, paging::PAGE_SIZE);
     (void)phys::page_mark_kind(table, PageKind::PAGE_TABLE);
 #ifdef WOS_SELFTEST
@@ -4371,6 +4440,7 @@ auto capture_root_reserve_locality() -> RootReserveLocality {
 }
 
 auto return_root_to_emergency_reserve(PageTable* root) -> bool {
+    require_ordinary_page_table(root);
     auto const RETURNED = numa::root_reserve::try_return(root, zero_page_table_for_pool);
     if (RETURNED == numa::root_reserve::ReturnResult::CORRUPT) dbg::panic_handler("corrupt emergency root return");
     return RETURNED == numa::root_reserve::ReturnResult::RETURNED;
@@ -4852,9 +4922,18 @@ void owned_frame_purge_pagemap(PageTable* pagemap) {
 
 auto index_of(const uint64_t VADDR, const int OFFSET) -> uint64_t { return VADDR >> (12 + (9 * (OFFSET - 1))) & 0x1FF; }
 
-auto entry_at(PageTable* table, size_t index) -> PageTableEntry& { return table->entries[index]; }
+auto entry_at(PageTable* table, size_t index) -> PageTableEntry& {
+    require_ordinary_page_table(table);
+    if (typed_mmio_guards.load(std::memory_order_relaxed) && index >= paging::PAGE_TABLE_ENTRIES) __builtin_trap();
+    return table->entries[index];
+}
 
-auto entry_at(const PageTable* table, size_t index) -> const PageTableEntry& { return table->entries[index]; }
+auto entry_at(const PageTable* table, size_t index) -> const PageTableEntry& {
+    if (typed_mmio_guards.load(std::memory_order_relaxed) &&
+        (table == nullptr || (reinterpret_cast<uint64_t>(table) & (paging::PAGE_SIZE - 1)) != 0 || index >= paging::PAGE_TABLE_ENTRIES))
+        __builtin_trap();
+    return table->entries[index];
+}
 
 auto is_aligned_to(uint64_t value, uint64_t alignment) -> bool { return (value & (alignment - 1)) == 0; }
 
@@ -4890,6 +4969,7 @@ class MutableUserEntrySlot {
         auto const base = reinterpret_cast<uintptr_t>(table);
         if (table == nullptr || (base & (paging::PAGE_SIZE - 1)) != 0 || index >= paging::PAGE_TABLE_ENTRIES || empty.word_ != nullptr)
             return false;
+        if (!typed_mmio_table_allowed(table)) return false;
         auto const address = base + index * sizeof(uint64_t);
         if ((address & (alignof(uint64_t) - 1)) != 0) return false;
         empty.word_ = reinterpret_cast<uint64_t*>(address);
@@ -5861,6 +5941,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
 #endif
 
     PageTable* const PAGEMAP = task->pagemap;
+    require_ordinary_virtual_range(PAGEMAP, page_align_down(vaddr), paging::PAGE_SIZE);
     uint64_t const VADDR = vaddr;
     uint64_t const IDX4 = index_of(VADDR, 4);
     uint64_t const IDX3 = index_of(VADDR, 3);
@@ -5937,6 +6018,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
         };
         raw = pte_raw(pte);
+        require_ordinary_leaf_locked(pml1, page_align_down(VADDR), raw, raw);
         if ((raw & paging::PAGE_USER) == 0U || paging::shared_write_restricted(raw)) {
             unlock_initial();
             return UserWriteFaultStatus::NOT_WRITABLE;
@@ -6012,6 +6094,10 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
     }
 
     if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
+        if (!ordinary_physical_access(old_phys, paging::PAGE_SIZE) ||
+            !ordinary_physical_access(reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page))),
+                                      paging::PAGE_SIZE))
+            __builtin_trap();
         std::memcpy(new_page, old_virt, paging::PAGE_SIZE);
     }
 
@@ -6047,6 +6133,8 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
                     paddr_t const CURRENT_PHYS = pte.present ? (pte.frame << paging::PAGE_SHIFT) : 0;
                     if ((raw_now & (paging::PAGE_USER | paging::PAGE_COW)) == (paging::PAGE_USER | paging::PAGE_COW) &&
                         !paging::shared_write_restricted(raw_now) && CURRENT_PHYS == old_phys) {
+                        uint64_t const NEXT_RAW = ((raw_now & ~paging::PAGE_COW) | paging::PAGE_WRITE) & ~(0xFFFFFFFFFFULL << 12);
+                        require_ordinary_leaf_locked(pml1, page_align_down(VADDR), raw_now, NEXT_RAW | (NEW_PHYS & ~0xFFFULL));
                         final_path_promoted = promote_user_write_path(pml4e, pml3e, pml2e);
                         raw_now &= ~paging::PAGE_COW;
                         raw_now |= paging::PAGE_WRITE;
@@ -6412,6 +6500,16 @@ void refresh_kernel_mappings(PageTable* page_table) {
     if (page_table == nullptr || kernel_pagemap == nullptr || page_table == kernel_pagemap) {
         return;
     }
+    require_ordinary_page_table(page_table);
+    require_ordinary_page_table(kernel_pagemap);
+    bool const TYPED = typed_mmio_guards.load(std::memory_order_relaxed);
+    uint64_t const PIN = TYPED ? user_mapping_pin_lock.lock_irqsave() : 0;
+    if (TYPED) {
+        // Only an actual registered root may receive the shared top prefix.
+        // PAGE_TABLE kind alone also describes ordinary lower-level tables.
+        auto const* control = find_user_root_control_locked(page_table);
+        if (control == nullptr || control->serial == 0) __builtin_trap();
+    }
 
 #ifdef WOS_SELFTEST
     selftest_require_mutable_pagemap_root(page_table, "refresh-kernel-mappings");
@@ -6424,6 +6522,7 @@ void refresh_kernel_mappings(PageTable* page_table) {
             task_entry = kernel_entry;
         }
     }
+    if (TYPED) user_mapping_pin_lock.unlock_irqrestore(PIN);
 }
 
 auto range_valid(Range range) -> bool { return range.start < range.end; }
@@ -6471,7 +6570,7 @@ struct MappingPermissions {
 
 auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
     MappingPermissions result{.present = true, .writable = true, .executable = true, .user = true};
-    PageTable* table = root;
+    const PageTable* table = root;
     for (int level = 4; level >= 1; --level) {
         if (table == nullptr) {
             return {};
@@ -6498,7 +6597,7 @@ auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
             return result;
         }
         if (entry.pagesize != 0) return {};  // A PML4 entry cannot be a large leaf.
-        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+        table = reinterpret_cast<const PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
     }
     return {};
 }
@@ -6521,15 +6620,22 @@ auto map_2m_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t f
         return false;
     }
 
+    require_ordinary_mapping(page_table, vaddr, paddr, LARGE_PAGE_2M_BYTES, flags);
+
     PageTable* pml3 = advance_page_table(page_table, index_of(vaddr, 4), table_flags_for_leaf(flags));
     PageTable* pml2 = advance_page_table(pml3, index_of(vaddr, 3), table_flags_for_leaf(flags));
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry& entry = entry_at(pml2, index_of(vaddr, 2));
     if (entry.present != 0 && entry.pagesize == 0) {
+        user_mapping_pin_lock.unlock_irqrestore(pin);
         return false;
     }
 
-    entry = paging::create_page_table_entry(paddr, flags);
-    entry.pagesize = 1;
+    auto incoming = paging::create_page_table_entry(paddr, flags);
+    incoming.pagesize = 1;
+    require_ordinary_leaf_locked(pml2, vaddr, pte_raw(entry), pte_raw(incoming), 2);
+    entry = incoming;
+    user_mapping_pin_lock.unlock_irqrestore(pin);
     return true;
 }
 
@@ -6599,6 +6705,8 @@ auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags, b
     if (!range_valid(range)) {
         return stats;
     }
+    require_ordinary_mapping(page_table, reinterpret_cast<uint64_t>(addr::get_virt_pointer(range.start)), range.start,
+                             range.end - range.start, flags);
 
     PageMapBatch batch{};
     init_page_map_batch(&batch, page_table, flags);
@@ -6662,6 +6770,10 @@ auto inherited_framebuffer_page(PageTable* inherited, uint64_t physical) -> Mapp
 auto map_boot_framebuffer_range(PageTable* target, PageTable* inherited, Range range, uint64_t flags) -> BootDirectMapStats {
     BootDirectMapStats stats{};
     if (!range_valid(range)) return stats;
+    require_ordinary_virtual_range(target, reinterpret_cast<uint64_t>(addr::get_virt_pointer(range.start)), range.end - range.start);
+    if (typed_mmio_guards.load(std::memory_order_relaxed) &&
+        !mmio::detail::record_boot_physical_range(range.start, range.end - range.start))
+        __builtin_trap();
     PageMapBatch batch{};
     init_page_map_batch(&batch, target, flags);
     for (uint64_t physical = range.start; physical < range.end; physical += paging::PAGE_SIZE) {
@@ -7523,6 +7635,7 @@ void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, voi
                                      SelftestRootReleaseOutput* output = nullptr
 #endif
 ) {
+    require_ordinary_page_table(pagemap);
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_root_epoch);
     CurrentRootSemanticOperation const current_root_operation;
@@ -10060,6 +10173,9 @@ void init_pagemap() {
         hcf();
     }
     log::info("kernel pagemap allocated at %x", kernel_pagemap);
+    typed_mmio_boot_building.store(true, std::memory_order_release);
+    mmio::detail::begin_boot_history();
+    typed_mmio_guards.store(mmio::enabled(), std::memory_order_release);
     for (size_t i = 0; i < memmap_response->entry_count; i++) {
         auto* entry = memmap_response->entries[i];
         const char* type_str = [&]() -> const char* {
@@ -10302,6 +10418,7 @@ void init_pagemap() {
     direct_map_selftest_ready = true;
     selftest_audit_boot_direct_map_boundaries("post-cr3-switch");
 #endif
+    typed_mmio_boot_building.store(false, std::memory_order_release);
 }
 
 auto audit_kernel_protections() -> KernelProtectionAudit {
@@ -10367,6 +10484,52 @@ namespace {
 
 // advance page table by level pages
 auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted) -> paging::PageTable* {
+    if (typed_mmio_guards.load(std::memory_order_relaxed)) {
+        // A claim and every ordinary ancestor publication share the leaf pin.
+        // Allocate a possible loser outside pin; never carry the pin into PMM.
+        PageTable* spare = nullptr;
+        for (;;) {
+            uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+            auto& slot = entry_at(page_table, level);
+            auto entry = slot;
+            if (entry.present != 0) {
+                if (entry.pagesize != 0) __builtin_trap();
+                auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+                require_ordinary_page_table(child);
+                bool changed = false;
+                if ((flags & paging::PAGE_WRITE) != 0 && !entry.writable) {
+                    entry.writable = 1;
+                    changed = true;
+                }
+                if ((flags & paging::PAGE_USER) != 0 && !entry.user) {
+                    entry.user = 1;
+                    changed = true;
+                }
+                if ((flags & paging::PAGE_NX) == 0 && entry.no_execute) {
+                    entry.no_execute = 0;
+                    changed = true;
+                }
+                if (changed) slot = entry;
+                user_mapping_pin_lock.unlock_irqrestore(pin);
+                if (spare != nullptr && !try_release_page_table_to_pool(spare, {__builtin_return_address(0), 0})) phys::page_free(spare);
+                if (changed) {
+                    if (promoted != nullptr) *promoted = true;
+                    wrcr3(rdcr3());
+                }
+                return child;
+            }
+            if (spare != nullptr) {
+                require_ordinary_page_table(spare);
+                auto const physical = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(spare)));
+                slot = paging::create_page_table_entry(physical, flags);
+                user_mapping_pin_lock.unlock_irqrestore(pin);
+                return spare;
+            }
+            user_mapping_pin_lock.unlock_irqrestore(pin);
+            spare = alloc_zeroed_page_table();
+            if (spare == nullptr) hcf();
+        }
+    }
     PageTableEntry entry = entry_at(page_table, level);
     if (entry.present) {
         if (entry.pagesize != 0) {
@@ -10439,6 +10602,7 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     selftest_require_mutable_pagemap_root(page_table, "map-page", VADDR);
 #endif
 
+    require_ordinary_mapping(page_table, VADDR, PADDR, paging::PAGE_SIZE, FLAGS);
     if (kernel_hhdm_2m_mapping_matches(page_table, VADDR, PADDR, FLAGS)) return;
 
     // PageTable* table = pageTable;
@@ -10460,10 +10624,12 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry& entry = entry_at(pml1, index_of(VADDR, 1));
     old_entry = entry;
+    auto const incoming = paging::create_page_table_leaf_4k(PADDR, FLAGS);
+    require_ordinary_leaf_locked(pml1, VADDR, pte_raw(old_entry), pte_raw(incoming));
     replaced_translation = old_entry.present != 0 || is_reserved_leaf(old_entry);
     replaced_present_frame = old_entry.present != 0 && (static_cast<paddr_t>(old_entry.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(page_table, VADDR, old_entry);
-    entry = paging::create_page_table_leaf_4k(PADDR, FLAGS);
+    entry = incoming;
     owned_frame_track_private_mapping(page_table, VADDR, PADDR, FLAGS);
     user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
 
@@ -10506,6 +10672,7 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
         hcf();
     }
 
+    require_ordinary_mapping(batch->root, VADDR, PADDR, paging::PAGE_SIZE, FLAGS);
     if (kernel_hhdm_2m_mapping_matches(batch->root, VADDR, PADDR, FLAGS)) return;
 
     uint64_t const IDX4 = index_of(VADDR, 4);
@@ -10534,9 +10701,11 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
     uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry& entry = entry_at(batch->pml1, index_of(VADDR, 1));
     old_entry = entry;
+    auto const incoming = paging::create_page_table_leaf_4k(PADDR, FLAGS);
+    require_ordinary_leaf_locked(batch->pml1, VADDR, pte_raw(old_entry), pte_raw(incoming));
     replaced_present_frame = old_entry.present != 0 && (static_cast<paddr_t>(old_entry.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(batch->root, VADDR, entry);
-    entry = paging::create_page_table_leaf_4k(PADDR, FLAGS);
+    entry = incoming;
     owned_frame_track_private_mapping(batch->root, VADDR, PADDR, FLAGS);
     user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
     batch->dirty = true;
@@ -10565,6 +10734,9 @@ void map_same_page_range(PageTable* page_table, const vaddr_t VADDR, const paddr
     if (PAGE_COUNT == 0) {
         return;
     }
+    if (typed_mmio_guards.load(std::memory_order_relaxed))
+        require_ordinary_virtual_range(page_table, VADDR, ordinary_page_range_bytes(PAGE_COUNT));
+    require_ordinary_mapping(page_table, VADDR, PADDR, paging::PAGE_SIZE, FLAGS);
 
     uint64_t const LAST_PAGE = PAGE_COUNT - 1;
     if (LAST_PAGE > UINT64_MAX / paging::PAGE_SIZE || VADDR > UINT64_MAX - (LAST_PAGE * paging::PAGE_SIZE)) {
@@ -10596,6 +10768,8 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
     if (PAGE_COUNT == 0) {
         return;
     }
+    if (typed_mmio_guards.load(std::memory_order_relaxed))
+        require_ordinary_virtual_range(page_table, VADDR, ordinary_page_range_bytes(PAGE_COUNT));
 
     uint64_t const LAST_PAGE = PAGE_COUNT - 1;
     if (LAST_PAGE > UINT64_MAX / paging::PAGE_SIZE || VADDR > UINT64_MAX - (LAST_PAGE * paging::PAGE_SIZE)) {
@@ -10622,6 +10796,7 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
             vaddr_t const CURRENT_VADDR = BATCH_VADDR + (batch_page * paging::PAGE_SIZE);
             PageTableEntry& entry = entry_at(pml1, FIRST_LEAF + batch_page);
             uint64_t const OLD_RAW = pte_raw(entry);
+            require_ordinary_leaf_locked(pml1, CURRENT_VADDR, OLD_RAW, paging::PAGE_RESERVED);
             if (OLD_RAW == paging::PAGE_RESERVED) {
                 continue;
             }
@@ -10702,6 +10877,7 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     selftest_require_mutable_pagemap_root(page_table, "unify-page-flags", vaddr);
 #endif
 
+    require_ordinary_virtual_range(page_table, page_align_down(vaddr), paging::PAGE_SIZE);
     PageTable* table = page_table;
     bool path_promoted = false;
     for (int i = 4; i > 1; i--) {
@@ -10724,31 +10900,28 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
 
     auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
     uint64_t const OLD_RAW = *raw_entry;
+    // Validate backing before any reference query or permission promotion.
+    require_ordinary_leaf_locked(table, page_align_down(vaddr), OLD_RAW, OLD_RAW);
     bool const PRIVATE_WRITE = (flags & (paging::PAGE_USER | paging::PAGE_WRITE)) == (paging::PAGE_USER | paging::PAGE_WRITE) &&
                                (OLD_RAW & paging::PAGE_SHARED) == 0U;
     bool const IS_COW = PRIVATE_WRITE && ((OLD_RAW & paging::PAGE_COW) != 0U ||
                                           phys::page_ref_get(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT)) > 1U);
     // COW authorizes an admitted private write. READ/NONE revoke it; granting
     // WRITE to a cached or fork-aliased frame defers the write to the resolver.
-    *raw_entry = IS_COW ? (OLD_RAW | paging::PAGE_COW) : (OLD_RAW & ~paging::PAGE_COW);
+    auto incoming = pte_from_raw(IS_COW ? (OLD_RAW | paging::PAGE_COW) : (OLD_RAW & ~paging::PAGE_COW));
 
     // Update page table entry flags
-    entry.present = (flags & paging::PAGE_PRESENT) != 0U ? 1 : 0;
+    incoming.present = (flags & paging::PAGE_PRESENT) != 0U ? 1 : 0;
     // COW pages must stay read-only even when mprotect(PROT_WRITE) runs; the
     // write fault is what creates the private writable page.
-    entry.writable = ((flags & paging::PAGE_WRITE) != 0U && !IS_COW && !paging::shared_write_restricted(OLD_RAW)) ? 1 : 0;
-    entry.user = (flags & paging::PAGE_USER) != 0U ? 1 : 0;
-    entry.no_execute = (flags & paging::PAGE_NX) != 0U ? 1 : 0;
+    incoming.writable = ((flags & paging::PAGE_WRITE) != 0U && !IS_COW && !paging::shared_write_restricted(OLD_RAW)) ? 1 : 0;
+    incoming.user = (flags & paging::PAGE_USER) != 0U ? 1 : 0;
+    incoming.no_execute = (flags & paging::PAGE_NX) != 0U ? 1 : 0;
 
-    constexpr uint64_t NX_BIT_POSITION = 63ULL;
-    if ((flags & paging::PAGE_NX) != 0U) {
-        *raw_entry |= (1ULL << NX_BIT_POSITION);  // Set NX bit
-    } else {
-        *raw_entry &= ~(1ULL << NX_BIT_POSITION);  // Clear NX bit
-    }
-
+    uint64_t const NEW_RAW = pte_raw(incoming);
+    require_ordinary_leaf_locked(table, page_align_down(vaddr), OLD_RAW, NEW_RAW);
+    entry = incoming;
     owned_frame_refresh_leaf(page_table, vaddr, entry);
-    uint64_t const NEW_RAW = *raw_entry;
     user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
 
     if (NEW_RAW != OLD_RAW || path_promoted) {
@@ -10756,6 +10929,7 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     }
 
 #ifdef ELF_DEBUG
+    constexpr uint64_t NX_BIT_POSITION = 63ULL;
     if (vaddr >= 0x501000 && vaddr < 0x580000) {
         log::debug("unify_page_flags: vaddr=0x%x, flags=0x%x, entry_after=0x%x, nx=%d present=%d", vaddr, flags, NEW_RAW,
                    static_cast<int>((NEW_RAW >> NX_BIT_POSITION) & 1U), static_cast<int>((NEW_RAW & paging::PAGE_PRESENT) != 0U));
@@ -10775,9 +10949,13 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
 #endif
 
     vaddr = page_align_down(vaddr);
+    require_ordinary_virtual_range(page_table, vaddr, paging::PAGE_SIZE);
     AnonymousSwapObject* object_to_release = nullptr;
     AnonymousSwapMapping* mapping_to_delete = nullptr;
     uint64_t const COW_LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+    uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    PageTableEntry* entry = leaf_entry(page_table, vaddr);
+    if (entry != nullptr) require_ordinary_leaf_locked(page_table, vaddr, pte_raw(*entry), 0);
     auto* swap_mapping = find_anonymous_swap_mapping_locked(page_table, vaddr);
     if (swap_mapping != nullptr) {
         swap_mapping->cancelled = true;
@@ -10793,8 +10971,6 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
         }
     }
 
-    uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
-    PageTableEntry* entry = leaf_entry(page_table, vaddr);
     if (entry == nullptr) {
         user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         cow_pte_lock.unlock_irqrestore(COW_LOCK_FLAGS);
@@ -10838,6 +11014,7 @@ auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t 
         return false;
     }
     vaddr = page_align_down(vaddr);
+    require_ordinary_virtual_range(page_table, vaddr, paging::PAGE_SIZE);
     uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
     auto* mapping = find_anonymous_swap_mapping_locked(page_table, vaddr);
     if (mapping == nullptr || mapping->state == AnonymousSwapRuntimeState::PAGEOUT) {
@@ -10851,13 +11028,14 @@ auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t 
         updated |= paging::PAGE_COW;
         updated &= ~paging::PAGE_WRITE;
     }
-    mapping->original_raw = updated;
+    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry* entry = leaf_entry(page_table, vaddr);
+    require_ordinary_leaf_locked(page_table, vaddr, entry != nullptr ? pte_raw(*entry) : 0, anonymous_swap_marker_raw(updated));
+    mapping->original_raw = updated;
     if (entry != nullptr && entry->present == 0 && is_reserved_leaf(*entry)) {
-        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
         *entry = pte_from_raw(anonymous_swap_marker_raw(updated));
-        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
     }
+    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
     cow_pte_lock.unlock_irqrestore(COW_FLAGS);
     return true;
 }
@@ -10890,15 +11068,21 @@ auto release_kernel_vmap_mappings(vaddr_t start, size_t page_count) -> bool {
     if (kernel_pagemap == nullptr || page_count == 0) {
         return false;
     }
+    if (page_count > UINT64_MAX / paging::PAGE_SIZE) return false;
+    require_ordinary_virtual_range(kernel_pagemap, start, page_count * paging::PAGE_SIZE);
 
     // Validate the complete range before mutating it so a bad size or double
     // free cannot leave a partially torn-down allocation.
     for (size_t page = 0; page < page_count; ++page) {
         vaddr_t const VADDR = start + (page * paging::PAGE_SIZE);
+        uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
         PageTableEntry* entry = leaf_entry(kernel_pagemap, VADDR);
         if (entry == nullptr || entry->present == 0 || entry->frame == 0) {
+            user_mapping_pin_lock.unlock_irqrestore(pin);
             return false;
         }
+        require_ordinary_leaf_locked(kernel_pagemap, VADDR, pte_raw(*entry), 0);
+        user_mapping_pin_lock.unlock_irqrestore(pin);
     }
 
     // Buffer-cache vmap allocations are at most 2 MiB, but keep teardown
@@ -10909,13 +11093,17 @@ auto release_kernel_vmap_mappings(vaddr_t start, size_t page_count) -> bool {
     size_t released = 0;
     while (released < page_count) {
         size_t const BATCH = std::min(RELEASE_BATCH_PAGES, page_count - released);
+        uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
         for (size_t page = 0; page < BATCH; ++page) {
             vaddr_t const VADDR = start + ((released + page) * paging::PAGE_SIZE);
             PageTableEntry* entry = leaf_entry(kernel_pagemap, VADDR);
+            if (entry == nullptr || entry->present == 0 || entry->frame == 0) __builtin_trap();
+            require_ordinary_leaf_locked(kernel_pagemap, VADDR, pte_raw(*entry), 0);
             uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
             frames.at(page) = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS_ADDR));
             *entry = paging::purge_page_table_entry();
         }
+        user_mapping_pin_lock.unlock_irqrestore(pin);
 
         shootdown_shared_kernel_mappings();
         for (size_t page = 0; page < BATCH; ++page) {
@@ -11234,6 +11422,10 @@ void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offs
         hcf();
     }
 
+    if (typed_mmio_guards.load(std::memory_order_relaxed)) {
+        if (offset > UINT64_MAX - end) __builtin_trap();
+        require_ordinary_mapping(page_table, start + offset, start, end - start, flags);
+    }
     while (start != end) {
         map_page(page_table, start + offset, start, flags);
         start += paging::PAGE_SIZE;
@@ -11902,6 +12094,7 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (!ordinary_physical_access(PHYS_ADDR, paging::PAGE_SIZE)) __builtin_trap();
         int const LEVEL_SHIFT = 12 + (9 * (frame.level - 1));
         uint64_t const ENTRY_VADDR = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << LEVEL_SHIFT);
         if (frame.level > 1 && entry.pagesize != 0) {
@@ -12020,6 +12213,7 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
 
         if (frame.level > 1 && entry.pagesize != 0) dbg::panic_handler("page-table teardown encountered unretired PS ownership");
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (!ordinary_physical_access(PHYS_ADDR, paging::PAGE_SIZE)) __builtin_trap();
         if (PHYS_ADDR == 0) {
             continue;
         }
@@ -12249,6 +12443,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (!ordinary_physical_access(PHYS_ADDR, paging::PAGE_SIZE)) __builtin_trap();
         const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
         if (level > 1 && entry.pagesize != 0) {
             if (!destroy_managed_leaf(root, level, ENTRY_VADDR, managed_cursor, true))
@@ -12371,6 +12566,7 @@ void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page
 
         if (level > 1 && entry.pagesize != 0) dbg::panic_handler("raw page-table teardown encountered unretired PS ownership");
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (!ordinary_physical_access(PHYS_ADDR, paging::PAGE_SIZE)) __builtin_trap();
         if (PHYS_ADDR == 0) {
             continue;
         }
@@ -12415,6 +12611,7 @@ auto prepare_destroy_user_space_budget_state() -> DestroyUserSpaceBudgetState* {
 auto begin_prepared_destroy_user_space(DestroyUserSpaceBudgetState& state, PageTable* pagemap, uint64_t owner_pid, const char* owner_name,
                                        const char* reason, bool wait_for_gate) -> bool {
     if (pagemap == nullptr || state.pagemap != nullptr || state.access_gate_index != USER_PAGEMAP_ACCESS_GATE_NONE) return false;
+    require_ordinary_page_table(pagemap);
     size_t const GATE = wait_for_gate ? begin_user_pagemap_exclusive(pagemap) : try_begin_user_pagemap_exclusive(pagemap);
     if (GATE == USER_PAGEMAP_ACCESS_GATE_NONE) return false;
     state.access_gate_index = GATE;
@@ -12556,6 +12753,7 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     }
     DestroyManagedCursorStorage cursor_storage;
     auto& managed_cursor = cursor_storage.get();
+    require_ordinary_page_table(pagemap);
     UserPagemapExclusiveScope teardown_scope(pagemap);
     purge_anonymous_swap_mappings(pagemap);
     owned_frame_purge_pagemap(pagemap);
@@ -12666,6 +12864,8 @@ auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_
                                      const UserPagemapExclusiveScope& exclusive, bool require_4k,
                                      PreparedAnonymousSwapFork* prepared_swap = nullptr, int* prepared_error = nullptr,
                                      bool device_bindings_prepared = false) -> bool {
+    require_ordinary_page_table(src);
+    require_ordinary_page_table(dst);
     if (!exclusive.owns(src)) return false;
     {
         uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
@@ -12693,7 +12893,7 @@ auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_
         if (!src_pml4e.present) {
             continue;
         }
-        if (require_4k && src_pml4e.pagesize != 0) {
+        if ((require_4k || typed_mmio_guards.load(std::memory_order_relaxed)) && src_pml4e.pagesize != 0) {
             flush_pagemap_after_update(src, 0, true);
             return false;
         }
@@ -12719,7 +12919,7 @@ auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_
             }
 
             // Strict placed callers never interpret an unknown 1GiB leaf as a table.
-            if ((placement != nullptr || require_4k) && src_pml3e.pagesize != 0) {
+            if ((placement != nullptr || require_4k || typed_mmio_guards.load(std::memory_order_relaxed)) && src_pml3e.pagesize != 0) {
                 flush_pagemap_after_update(src, 0, true);
                 return false;
             }
@@ -12742,7 +12942,7 @@ auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_
                     continue;
                 }
                 if (src_pml2e.pagesize) {
-                    if (placement != nullptr || require_4k) {
+                    if (placement != nullptr || require_4k || typed_mmio_guards.load(std::memory_order_relaxed)) {
                         flush_pagemap_after_update(src, 0, true);
                         return false;
                     }
@@ -12829,6 +13029,10 @@ auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_
 
                     paddr_t const DATA_PHYS = src_pml1e.frame << paging::PAGE_SHIFT;
                     void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
+                    if (!ordinary_physical_access(DATA_PHYS, paging::PAGE_SIZE)) {
+                        flush_pagemap_after_update(src, 0, true);
+                        return false;
+                    }
 
                     if (EAGER_COPY_WRITABLE_PRIVATE && IS_WRITABLE_PRIVATE) {
                         void* child_page = nullptr;
@@ -14195,3 +14399,79 @@ auto VmAccess::attach_fork(PreparedFork& plan, sched::task::Task& actor, sched::
 }
 }  // namespace detail
 }  // namespace ker::mod::mm::device_vm
+
+namespace ker::mod::mm::mmio::detail::platform {
+auto lock_pin() noexcept -> uint64_t { return virt::user_mapping_pin_lock.lock_irqsave(); }
+void unlock_pin(uint64_t flags) noexcept { virt::user_mapping_pin_lock.unlock_irqrestore(flags); }
+auto boot_root_building() noexcept -> bool { return virt::typed_mmio_boot_building.load(std::memory_order_acquire); }
+auto pre_task_boot_context() noexcept -> bool {
+    if (smt::has_cpu_data() || sched::has_run_queues() || virt::kernel_pagemap == nullptr) return false;
+    uint64_t physical = 0;
+    if (!table_physical(virt::kernel_pagemap, physical) || (rdcr3() & virt::PTE_FRAME_MASK) != physical) return false;
+    uint64_t const flags = lock_pin();
+    bool const empty = virt::user_root_control_active_roots == 0;
+    unlock_pin(flags);
+    return empty;
+}
+auto command_line() noexcept -> const char* { return init::get_kernel_cmdline(); }
+auto boot_memory_map() noexcept -> const limine_memmap_response* { return mm::boot_memory_map(); }
+auto kernel_root() noexcept -> paging::PageTable* { return virt::kernel_pagemap; }
+auto hhdm_offset() noexcept -> uint64_t { return addr::get_hhdm_offset(); }
+auto nx_ready() noexcept -> bool { return virt::kernel_nx_supported && cpu::nx_enabled() && cpu::write_protect_enabled(); }
+auto arena_layout_safe(uint64_t start, uint64_t bytes) noexcept -> bool {
+    if (bytes == 0 || bytes > UINT64_MAX - start || start < 0xffff800000000000ULL) return false;
+    uint64_t const end = start + bytes;
+    auto disjoint = [start, end](uint64_t other_start, uint64_t other_end) {
+        return other_start < other_end && (end <= other_start || other_end <= start);
+    };
+    if (!disjoint(virt::KERNEL_VMAP_BASE, virt::KERNEL_VMAP_BASE + virt::KERNEL_VMAP_MAX_BYTES) ||
+        !disjoint(mm::GUARDED_KERNEL_STACK_ARENA_BASE, mm::GUARDED_KERNEL_STACK_ARENA_END) ||
+        !disjoint(reinterpret_cast<uint64_t>(__kernel_image_start), reinterpret_cast<uint64_t>(__kernel_end)) ||
+        !disjoint(wos::abi::KERNEL_DEBUG_METADATA_ADDRESS, wos::abi::KERNEL_DEBUG_METADATA_ADDRESS + paging::PAGE_SIZE))
+        return false;
+#ifdef WOS_KASAN
+    if (!disjoint(kasan::SHADOW_REGION_BASE, kasan::SHADOW_REGION_END)) return false;
+#endif
+    return true;
+}
+auto table_physical(const paging::PageTable* table, uint64_t& output) noexcept -> bool {
+    uint64_t const address = reinterpret_cast<uint64_t>(table);
+    uint64_t const hhdm = addr::get_hhdm_offset();
+    constexpr uint64_t BANK_BASE = 0xfffffc8000000000ULL, BANK_END = 0xfffffd0000000000ULL;
+    if (table == nullptr || (address & (paging::PAGE_SIZE - 1)) != 0 || address < hhdm || (address >= BANK_BASE && address < BANK_END))
+        return false;
+    uint64_t const physical = address - hhdm;
+    if ((physical & ~virt::PTE_FRAME_MASK) != 0) return false;
+    output = physical;
+    return true;
+}
+auto table_virtual(uint64_t physical) noexcept -> paging::PageTable* {
+    uint64_t const hhdm = addr::get_hhdm_offset();
+    if ((physical & ~virt::PTE_FRAME_MASK) != 0 || physical > UINT64_MAX - hhdm) return nullptr;
+    return reinterpret_cast<paging::PageTable*>(hhdm + physical);
+}
+auto table_frame_valid(uint64_t physical) noexcept -> bool {
+    auto* const table = table_virtual(physical);
+    return table != nullptr && phys::page_kind_get(table) == PageKind::PAGE_TABLE && phys::page_ref_get(table) == 1U;
+}
+auto allocate_zeroed_table() noexcept -> paging::PageTable* { return virt::alloc_zeroed_page_table(true); }
+void release_unpublished_table(paging::PageTable* table) noexcept {
+    if (table == nullptr) return;
+    virt::require_ordinary_page_table(table);
+    if (!virt::try_release_page_table_to_pool(table, {__builtin_return_address(0), 0})) phys::page_free(table);
+}
+auto ensure_table_addressable(paging::PageTable* table) noexcept -> bool {
+    uint64_t physical = 0;
+    if (!table_physical(table, physical)) return false;
+    uint64_t const address = reinterpret_cast<uint64_t>(table);
+    auto observed = virt::mapping_permissions(virt::kernel_pagemap, address);
+    if (!observed.present) {
+        virt::map_page(virt::kernel_pagemap, address, physical, virt::kernel_data_page_flags());
+        observed = virt::mapping_permissions(virt::kernel_pagemap, address);
+    }
+    return observed.present && observed.physical == physical && observed.writable && !observed.user && !observed.executable;
+}
+void reload_current_root() noexcept { wrcr3(rdcr3()); }
+auto read_register32(uint64_t address) noexcept -> uint32_t { return *reinterpret_cast<volatile uint32_t*>(address); }
+void write_register32(uint64_t address, uint32_t value) noexcept { *reinterpret_cast<volatile uint32_t*>(address) = value; }
+}  // namespace ker::mod::mm::mmio::detail::platform

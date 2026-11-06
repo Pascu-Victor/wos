@@ -209,6 +209,57 @@ TEST(PciEcam, ReadsRelevantControlsWithoutChangingConfiguration) {
     EXPECT_EQ(c.bytes, BEFORE);
     EXPECT_TRUE(c.bounded);
 }
+
+TEST(PciEcam, ColdProfileObservesMsiMsixAndPmWithoutChangingLegacyValidity) {
+    Config config;
+    put(config.bytes, 0x40, 0x6010, 2);
+    put(config.bytes, 0x60, 0x7005, 2);
+    put(config.bytes, 0x70, 0x8011, 2);
+    put(config.bytes, 0x80, 1, 2);
+    auto const BEFORE = config.bytes;
+    auto result = config.inspect();
+    ASSERT_TRUE(result.valid());
+    EXPECT_TRUE(result.cold_profile);
+    EXPECT_EQ(result.pcie, 0x40);
+    EXPECT_EQ(result.msi, 0x60);
+    EXPECT_EQ(result.msix, 0x70);
+    EXPECT_EQ(result.pm, 0x80);
+    EXPECT_EQ(config.bytes, BEFORE);
+    put(config.bytes, 0x80, 0x9001, 2);
+    put(config.bytes, 0x90, 1, 2);
+    EXPECT_TRUE(config.inspect().valid());
+    EXPECT_FALSE(config.inspect().cold_profile);
+}
+
+TEST(PciEcam, UnmodeledConventionalDecodersRefuseOnlyColdProfile) {
+    for (uint16_t kind : {uint16_t{9}, uint16_t{0x14}, uint16_t{0x0e}, uint16_t{0x12}}) {
+        Config config;
+        put(config.bytes, 0x40, kind, 2);
+        auto const BEFORE = config.bytes;
+        auto result = config.inspect();
+        EXPECT_TRUE(result.valid()) << kind;
+        EXPECT_FALSE(result.cold_profile) << kind;
+        EXPECT_EQ(config.bytes, BEFORE);
+    }
+}
+
+TEST(PciEcam, UnmodeledExtendedDecodersStayObservedButCannotQualifyColdMapping) {
+    for (uint16_t kind : {uint16_t{0x0e}, uint16_t{0x10}, uint16_t{0x15}, uint16_t{0x1b}}) {
+        Config config;
+        config.cap(0x100, kind);
+        auto const BEFORE = config.bytes;
+        auto result = config.inspect();
+        EXPECT_TRUE(result.valid()) << kind;
+        EXPECT_FALSE(result.cold_profile) << kind;
+        EXPECT_EQ(config.bytes, BEFORE);
+    }
+    Config supported;
+    supported.cap(0x100, 1, 0x140);
+    supported.cap(0x140, 3, 0x160);
+    supported.cap(0x160, 0x0d);
+    ASSERT_TRUE(supported.inspect().valid());
+    EXPECT_TRUE(supported.inspect().cold_profile);
+}
 TEST(PciEcam, RejectsIdentityMismatchBeforeFollowingDevicePointers) {
     for (size_t at : {size_t{0}, size_t{2}, size_t{14}}) {
         Config c;

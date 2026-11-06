@@ -21,6 +21,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/kernel_image.hpp>
+#include <platform/mm/mmio_mapping_private.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -117,10 +118,15 @@ static auto pte_raw(const mm::paging::PageTableEntry& entry) -> uint64_t {
 }
 
 static auto sync_shadow_pml4_to_current(mm::addr::vaddr_t shadow_vaddr, mm::paging::PageTable* kernel_pml4) -> bool {
+    if (shadow_vaddr < SHADOW_REGION_BASE || shadow_vaddr >= SHADOW_REGION_END) __builtin_trap();
+    if (!mm::mmio::detail::generic_table_allowed(kernel_pml4)) __builtin_trap();
     auto const KPHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(kernel_pml4)));
     uint64_t const CUR_CR3 = rdcr3();
     if (CUR_CR3 != KPHYS) {
         auto* cur_pml4 = reinterpret_cast<mm::paging::PageTable*>(mm::addr::get_virt_pointer(static_cast<mm::addr::paddr_t>(CUR_CR3)));
+        // Only the ordinary active root may receive this shadow-only prefix.
+        // Never interpret a private MMIO child as a root through raw CR3 bits.
+        if (!mm::mmio::detail::generic_table_allowed(cur_pml4)) __builtin_trap();
         size_t const PML4_IDX = (shadow_vaddr >> 39) & 0x1FF;
         if (pte_raw(cur_pml4->entries[PML4_IDX]) != pte_raw(kernel_pml4->entries[PML4_IDX])) {
             cur_pml4->entries[PML4_IDX] = kernel_pml4->entries[PML4_IDX];

@@ -2,6 +2,7 @@
 
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/cache_policy.hpp>
+#include <platform/mm/cpu_maintenance.hpp>
 #include <platform/mm/managed_huge.hpp>
 #include <platform/mm/mmio_cache.hpp>
 #include <platform/mm/numa_alloc.hpp>
@@ -1232,6 +1233,7 @@ __attribute__((no_stack_protector)) void start_smt(boot::HandoverModules& module
     // Keep the early inherited PAT observation independent of this late,
     // optional-policy capture. Refusal leaves ordinary WB boot available.
     (void)mm::mmio_cache::capture_boot_cpu(0);
+    (void)mm::cpu_maintenance::detail::note_current_cpu_ready();
 
     // BSP will participate in the atomic counter via cpuParamInit-style logic
     // We need to call the same logic here for BSP

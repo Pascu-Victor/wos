@@ -23,6 +23,8 @@
 #include <utility>
 #include <vector>
 
+#include "pci_legacy_mmio_ports.inc"
+
 namespace pci_runtime {
 namespace pci = ker::dev::pci;
 thread_local unsigned lock_depth = 0;

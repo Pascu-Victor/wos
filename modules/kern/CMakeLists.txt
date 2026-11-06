@@ -376,6 +376,9 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         # Persistent CPU maintenance is serviced from raw allocator/MM/IRQ waits.
         src/platform/mm/cpu_maintenance.cpp
         src/platform/mm/cpu_maintenance_platform.cpp
+        # Typed MMIO history starts before IDT/GS; its register borrows also
+        # execute inside real IRQ/NAPI callbacks under existing lifetime gates.
+        src/platform/mm/mmio_mapping.cpp
         src/platform/asm/tlb.cpp
         src/util/hcf.hpp
         # Synchronization primitives — called from excluded early-boot code
@@ -402,7 +405,7 @@ set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/asm/cpu_safe_msr.cp
     APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
 foreach(src IN ITEMS mtrr_policy.cpp mmio_cache.cpp mmio_cache_platform.cpp
                      mmio_cache_model.cpp mmio_cache_amd.cpp mmio_cache_protected.cpp
-                     cpu_maintenance.cpp cpu_maintenance_platform.cpp)
+                     cpu_maintenance.cpp cpu_maintenance_platform.cpp mmio_mapping.cpp)
     set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mm/${src}
         APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
 endforeach()

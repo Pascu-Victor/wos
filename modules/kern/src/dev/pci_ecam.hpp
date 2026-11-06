@@ -96,6 +96,10 @@ struct Capabilities {
     uint32_t device_capability = 0;
     uint16_t extended_count = 0;
     uint8_t pcie_type = 0xff, pcie_version = 0;
+    // Additive cold-MMIO profile observation. Legacy IOMMU capability validity
+    // remains unchanged; unmodeled decoders refuse only the opt-in owner path.
+    bool cold_profile = true;
+    uint16_t pm = 0, msi = 0, msix = 0;
     [[nodiscard]] auto valid() const -> bool { return error == CapabilityError::none; }
 };
 // Reader returns optional values, performs aligned bounded function-page reads,
@@ -124,6 +128,15 @@ template <typename Reader>
         if (!CAP) return fail(CapabilityError::inaccessible);
         uint8_t const KIND = *CAP & 255U;
         if (KIND == 0 || KIND == 255) return fail(CapabilityError::malformed);
+        if (KIND == 1 || KIND == 5 || KIND == 0x11) {
+            uint16_t& saved = KIND == 1 ? result.pm : KIND == 5 ? result.msi : result.msix;
+            if (saved != 0)
+                result.cold_profile = false;
+            else
+                saved = offset;
+        } else if (KIND != 3 && KIND != 0x10 && !(KIND == 0x12 && vendor == 0x8086 && device == 0x2922)) {
+            result.cold_profile = false;
+        }
         if (KIND == 0x10) {
             if (result.pcie != 0 || offset > 0xf4) return fail(CapabilityError::malformed);
             result.pcie = offset;
@@ -162,6 +175,10 @@ template <typename Reader>
         uint16_t const KIND = *CAP & 0xffffU;
         if (KIND == 0 || KIND == 0xffff || ((*CAP >> 16U) & 15U) == 0) return fail(CapabilityError::malformed);
         ++result.extended_count;
+        // AER/DSN have no new CPU memory aperture. ACS routing is sealed by
+        // the actual preactivation transaction. Other forms need a separate
+        // complete decoder profile (including EA/ReBAR/VF activation).
+        if (KIND != 1 && KIND != 3 && KIND != 0x0d) result.cold_profile = false;
         uint16_t* position = nullptr;
         uint16_t* control = nullptr;
         uint16_t control_offset = 0;

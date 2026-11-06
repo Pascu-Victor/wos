@@ -28,6 +28,10 @@
 // Link the complete production PCI, ECAM collector and IOMMU discovery TUs.
 // Only firmware/config/CPU/MMIO and not-yet-published domain state are ports.
 // No test reset or replacement collector/ownership algorithm is provided.
+#define PCI_LEGACY_ACTUAL_EXTENDED
+#define PCI_LEGACY_NO_DMA_ENGINE
+#include "pci_legacy_mmio_ports.inc"
+
 namespace pci_inventory_runtime {
 namespace pci = ker::dev::pci;
 namespace iommu = ker::dev::iommu;

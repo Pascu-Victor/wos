@@ -15,6 +15,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/cpu_maintenance_controller.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -27,6 +28,17 @@
 namespace ker::dev::e1000e {
 
 using log = ker::mod::dbg::logger<"e1000e">;
+namespace mmio = ker::mod::mm::mmio;
+using Controller = ker::mod::mm::cpu_maintenance::detail::Controller;
+
+namespace detail {
+// This class is defined only in the actual consumer translation unit. Its
+// method executes the hardware lifecycle before issuing the private witness.
+class MmioRetirementAccess {
+   public:
+    static auto retire(E1000Device* dev, const Controller* controller) -> int;
+};
+}  // namespace detail
 
 namespace {
 
@@ -88,13 +100,23 @@ auto allow_allocation() -> bool {
 class CallbackGuard {
     ker::mod::sched::KernelShutdownHold shutdown_{ker::mod::sched::hold_kernel_shutdown()};
     dma::lifecycle::Guard callback_;
+    mmio::Borrow registers_;
+    bool admitted_ = false;
 
    public:
-    explicit CallbackGuard(E1000Device* dev) : callback_(dev->admission) {}
-    explicit operator bool() const { return static_cast<bool>(callback_); }
+    explicit CallbackGuard(E1000Device* dev) : callback_(dev->admission) {
+        if (!callback_) return;
+        if (dev->typed_mmio) {
+            registers_ = dev->registers.borrow();
+            if (!registers_.valid()) return;
+        }
+        admitted_ = true;
+    }
+    explicit operator bool() const { return admitted_; }
+    [[nodiscard]] auto registers() const -> const mmio::Borrow& { return registers_; }
 };
 
-auto retire_device(E1000Device* dev) -> int;
+auto retire_device(E1000Device* dev, const Controller* controller = nullptr) -> int;
 
 // Supported PCI device IDs (vendor = 0x8086)
 struct DeviceID {
@@ -111,23 +133,32 @@ constexpr std::array<DeviceID, 5> SUPPORTED_DEVICES = {{
 }};
 
 // -- MMIO access ---------------------------------------------------------
-inline auto reg_read(E1000Device* dev, uint32_t offset) -> uint32_t { return dev->mmio[offset / 4]; }
+inline auto reg_read(E1000Device* dev, const mmio::Borrow& registers, uint32_t offset) -> uint32_t {
+    return dev->typed_mmio ? registers.read32(offset) : dev->mmio[offset / 4];
+}
 
-inline void reg_write(E1000Device* dev, uint32_t offset, uint32_t value) { dev->mmio[offset / 4] = value; }
+inline void reg_write(E1000Device* dev, const mmio::Borrow& registers, uint32_t offset, uint32_t value) {
+    if (dev->typed_mmio)
+        registers.write32(offset, value);
+    else
+        dev->mmio[offset / 4] = value;
+}
 
 // A failed DMA transition closes software admission immediately. Teardown runs
 // later in task context; IRQ/NAPI never unmap or free DMA backing.
-void fail_io(E1000Device* dev) {
+void fail_io(E1000Device* dev, const mmio::Borrow& registers) {
     dev->admission.close();
-    reg_write(dev, REG_IMC, UINT32_MAX);
-    (void)reg_read(dev, REG_STATUS);
+    dev->driver_claim.close_data_admission();
+    if (dev->typed_mmio) dev->registers.close();
+    reg_write(dev, registers, REG_IMC, UINT32_MAX);
+    (void)reg_read(dev, registers, REG_STATUS);
     (void)pci::pci_set_bus_master(dev->pci, false);
 }
 
-auto wait_clear(E1000Device* dev, uint32_t reg, uint32_t mask, uint64_t timeout_ms) -> bool {
+auto wait_clear(E1000Device* dev, const mmio::Borrow& registers, uint32_t reg, uint32_t mask, uint64_t timeout_ms) -> bool {
     auto const START = ker::mod::time::get_ms();
     for (size_t n = 0; n < 10'000'000; ++n) {
-        auto const VALUE = reg_read(dev, reg);
+        auto const VALUE = reg_read(dev, registers, reg);
         if (VALUE != UINT32_MAX && (VALUE & mask) == 0) return true;
         if (ker::mod::time::get_ms() - START >= timeout_ms) break;
         asm volatile("pause" ::: "memory");
@@ -135,22 +166,22 @@ auto wait_clear(E1000Device* dev, uint32_t reg, uint32_t mask, uint64_t timeout_
     return false;
 }
 
-auto reset_device(E1000Device* dev) -> bool {
-    reg_write(dev, REG_IMC, UINT32_MAX);
-    reg_write(dev, REG_RCTL, 0);
-    reg_write(dev, REG_TCTL, 0);
-    (void)reg_read(dev, REG_STATUS);
-    reg_write(dev, REG_CTRL, reg_read(dev, REG_CTRL) | CTRL_RST);
+auto reset_device(E1000Device* dev, const mmio::Borrow& registers) -> bool {
+    reg_write(dev, registers, REG_IMC, UINT32_MAX);
+    reg_write(dev, registers, REG_RCTL, 0);
+    reg_write(dev, registers, REG_TCTL, 0);
+    (void)reg_read(dev, registers, REG_STATUS);
+    reg_write(dev, registers, REG_CTRL, reg_read(dev, registers, REG_CTRL) | CTRL_RST);
     // 8254x CTRL.RST: allow at least ~1 us before any further device access.
     // Use two HPET microseconds to cover the counter's sampling phase.
     ker::mod::time::sleep_us(2);
-    bool const RESET = wait_clear(dev, REG_CTRL, CTRL_RST, 100);
-    reg_write(dev, REG_IMC, UINT32_MAX);
-    (void)reg_read(dev, REG_ICR);
+    bool const RESET = wait_clear(dev, registers, REG_CTRL, CTRL_RST, 100);
+    reg_write(dev, registers, REG_IMC, UINT32_MAX);
+    (void)reg_read(dev, registers, REG_ICR);
     return RESET;
 }
 
-auto configure_coherence(E1000Device* dev) -> bool {
+auto configure_coherence(E1000Device* dev, const mmio::Borrow& registers) -> bool {
     auto* p = dev->pci;
     uint8_t const CAP = pci::pci_find_capability(p, 0x10);  // PCI Express.
     if (CAP == 0) return p->device_id == 0x100e;            // Conventional snooped PCI.
@@ -163,21 +194,21 @@ auto configure_coherence(E1000Device* dev) -> bool {
     if ((pci::pci_config_read16(p->bus, p->slot, p->function, OFFSET) & 0x0810U) != 0) return false;
     if (p->device_id == 0x10d3) {
         // 82574 GCR: six No-Snoop clients off; required initialization bit 22.
-        reg_write(dev, 0x5b00, (reg_read(dev, 0x5b00) & ~0x3fU) | (1U << 22));
-        if ((reg_read(dev, 0x5b00) & 0x3fU) != 0) return false;
+        reg_write(dev, registers, 0x5b00, (reg_read(dev, registers, 0x5b00) & ~0x3fU) | (1U << 22));
+        if ((reg_read(dev, registers, 0x5b00) & 0x3fU) != 0) return false;
     }
     return true;
 }
 
 // -- EEPROM read ---------------------------------------------------------
-auto eeprom_read(E1000Device* dev, uint8_t addr) -> uint16_t {
+auto eeprom_read(E1000Device* dev, const mmio::Borrow& registers, uint8_t addr) -> uint16_t {
     // Write address and start bit
-    reg_write(dev, REG_EERD, (static_cast<uint32_t>(addr) << 8) | EERD_START);
+    reg_write(dev, registers, REG_EERD, (static_cast<uint32_t>(addr) << 8) | EERD_START);
 
     // Poll for completion
     uint32_t val = 0;
     for (int i = 0; i < 10000; i++) {
-        val = reg_read(dev, REG_EERD);
+        val = reg_read(dev, registers, REG_EERD);
         if ((val & EERD_DONE) != 0) {
             return static_cast<uint16_t>(val >> 16);
         }
@@ -187,10 +218,10 @@ auto eeprom_read(E1000Device* dev, uint8_t addr) -> uint16_t {
 }
 
 // -- Read MAC address ----------------------------------------------------
-void read_mac(E1000Device* dev) {
+void read_mac(E1000Device* dev, const mmio::Borrow& registers) {
     // Try reading from RAL/RAH first (already programmed by EEPROM autoload)
-    uint32_t const RAL = reg_read(dev, REG_RAL);
-    uint32_t const RAH = reg_read(dev, REG_RAH);
+    uint32_t const RAL = reg_read(dev, registers, REG_RAL);
+    uint32_t const RAH = reg_read(dev, registers, REG_RAH);
 
     if (RAL != 0 || (RAH & 0xFFFF) != 0) {
         dev->netdev.mac.at(0) = static_cast<uint8_t>(RAL);
@@ -203,9 +234,9 @@ void read_mac(E1000Device* dev) {
     }
 
     // Fallback: read from EEPROM
-    uint16_t const W0 = eeprom_read(dev, 0);
-    uint16_t const W1 = eeprom_read(dev, 1);
-    uint16_t const W2 = eeprom_read(dev, 2);
+    uint16_t const W0 = eeprom_read(dev, registers, 0);
+    uint16_t const W1 = eeprom_read(dev, registers, 1);
+    uint16_t const W2 = eeprom_read(dev, registers, 2);
 
     dev->netdev.mac.at(0) = static_cast<uint8_t>(W0);
     dev->netdev.mac.at(1) = static_cast<uint8_t>(W0 >> 8);
@@ -265,28 +296,28 @@ auto init_tx(E1000Device* dev) -> bool {
     return true;
 }
 
-void program_rings(E1000Device* dev) {
+void program_rings(E1000Device* dev, const mmio::Borrow& registers) {
     (void)dev->rx_ring.expose();
     (void)dev->tx_ring.expose();
     for (auto& buffer : dev->rx_dma) (void)buffer.expose();
     uint64_t const RX = dev->rx_ring.submission.address;
     uint64_t const TX = dev->tx_ring.submission.address;
-    reg_write(dev, REG_RDBAL, static_cast<uint32_t>(RX));
-    reg_write(dev, REG_RDBAH, static_cast<uint32_t>(RX >> 32));
-    reg_write(dev, REG_RDLEN, NUM_RX_DESC * sizeof(E1000RxDesc));
-    reg_write(dev, REG_RDH, 0);
-    reg_write(dev, REG_RDT, NUM_RX_DESC - 1);
-    reg_write(dev, REG_TDBAL, static_cast<uint32_t>(TX));
-    reg_write(dev, REG_TDBAH, static_cast<uint32_t>(TX >> 32));
-    reg_write(dev, REG_TDLEN, NUM_TX_DESC * sizeof(E1000TxDesc));
-    reg_write(dev, REG_TDH, 0);
-    reg_write(dev, REG_TDT, 0);
-    reg_write(dev, REG_TIPG, (6U << 20) | (8U << 10) | 10U);
+    reg_write(dev, registers, REG_RDBAL, static_cast<uint32_t>(RX));
+    reg_write(dev, registers, REG_RDBAH, static_cast<uint32_t>(RX >> 32));
+    reg_write(dev, registers, REG_RDLEN, NUM_RX_DESC * sizeof(E1000RxDesc));
+    reg_write(dev, registers, REG_RDH, 0);
+    reg_write(dev, registers, REG_RDT, NUM_RX_DESC - 1);
+    reg_write(dev, registers, REG_TDBAL, static_cast<uint32_t>(TX));
+    reg_write(dev, registers, REG_TDBAH, static_cast<uint32_t>(TX >> 32));
+    reg_write(dev, registers, REG_TDLEN, NUM_TX_DESC * sizeof(E1000TxDesc));
+    reg_write(dev, registers, REG_TDH, 0);
+    reg_write(dev, registers, REG_TDT, 0);
+    reg_write(dev, registers, REG_TIPG, (6U << 20) | (8U << 10) | 10U);
     asm volatile("mfence" ::: "memory");
-    (void)reg_read(dev, REG_STATUS);
+    (void)reg_read(dev, registers, REG_STATUS);
 }
 
-int process_rx_budget(E1000Device* dev, int budget) {
+int process_rx_budget(E1000Device* dev, const mmio::Borrow& registers, int budget) {
     int processed = 0;
     while (processed < budget && !dev->admission.closed()) {
         uint16_t const IDX = dev->rx_tail;
@@ -300,7 +331,7 @@ int process_rx_budget(E1000Device* dev, int budget) {
         ++processed;  // Drops and fragments also consume the bounded budget.
         auto* pkt = dev->rx_bufs[IDX];
         if (pkt == nullptr || !dev->rx_dma[IDX].complete(dma_api, VALID ? LENGTH : 0)) {
-            fail_io(dev);
+            fail_io(dev, registers);
             break;
         }
         // Obtain the replacement BEFORE transferring the old owner. On pool
@@ -310,11 +341,11 @@ int process_rx_budget(E1000Device* dev, int budget) {
         dev->rx_bufs[IDX] = repost;
         if (!bind_rx(dev, IDX, repost) || !dev->rx_dma[IDX].expose()) {
             if (replacement != nullptr) ker::net::pkt_free(pkt);
-            fail_io(dev);
+            fail_io(dev, registers);
             break;
         }
         asm volatile("mfence" ::: "memory");
-        reg_write(dev, REG_RDT, IDX);
+        reg_write(dev, registers, REG_RDT, IDX);
         dev->rx_tail = (IDX + 1) % NUM_RX_DESC;
         if (replacement != nullptr) {
             pkt->data = pkt->storage.data();
@@ -332,13 +363,13 @@ int process_rx_budget(E1000Device* dev, int budget) {
     return processed;
 }
 
-void process_tx(E1000Device* dev) {
+void process_tx(E1000Device* dev, const mmio::Borrow& registers) {
     for (size_t i = 0; i < NUM_TX_DESC; ++i) {
         volatile auto* desc = &dev->tx_descs[i];
         if (dev->tx_bufs[i] == nullptr || (desc->status & TX_STATUS_DD) == 0) continue;
         asm volatile("lfence" ::: "memory");
         if (!dev->tx_dma[i].complete(dma_api, 0)) {
-            fail_io(dev);
+            fail_io(dev, registers);
             return;
         }
         auto* pkt = dev->tx_bufs[i];
@@ -353,17 +384,18 @@ int e1000_poll(ker::net::NapiStruct* napi, int budget, ker::net::NapiPollSource 
     auto* dev = reinterpret_cast<E1000Device*>(napi->dev);
     CallbackGuard const GUARD(dev);
     if (!GUARD) return 0;
+    auto const& registers = GUARD.registers();
     int processed = 0;
 
     // TX reclamation is done lazily in start_xmit when the ring is full.
     // NAPI poll is the sole consumer of RX (mutual exclusion via NAPI CAS).
-    processed = process_rx_budget(dev, budget);
+    processed = process_rx_budget(dev, registers, budget);
 
     // If we processed less than budget, we're done - re-enable IRQs
     if (processed < budget && !dev->admission.closed()) {
         ker::net::napi_complete(napi);
         // Re-enable interrupts
-        reg_write(dev, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
+        reg_write(dev, registers, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
     }
 
     return processed;
@@ -378,9 +410,10 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
 
     CallbackGuard const GUARD(dev);
     if (!GUARD) return;
+    auto const& registers = GUARD.registers();
 
     // Read and acknowledge interrupt cause (auto-clears on read)
-    uint32_t const ICR = reg_read(dev, REG_ICR);
+    uint32_t const ICR = reg_read(dev, registers, REG_ICR);
     if (ICR == 0) {
         return;  // Not our interrupt
     }
@@ -390,7 +423,7 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
 #endif
     // Handle link status change immediately (doesn't need deferral)
     if ((ICR & ICR_LSC) != 0) {
-        uint32_t const STATUS = reg_read(dev, REG_STATUS);
+        uint32_t const STATUS = reg_read(dev, registers, REG_STATUS);
         if ((STATUS & 0x02) != 0) {
             log::info("link up");
         } else {
@@ -401,7 +434,7 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
     // For RX/TX, disable interrupts and schedule NAPI poll
     if ((ICR & (ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_TXDW | ICR_TXQE)) != 0) {
         // Disable interrupts until poll completes
-        reg_write(dev, REG_IMC, 0xFFFFFFFF);
+        reg_write(dev, registers, REG_IMC, 0xFFFFFFFF);
 
         // Schedule NAPI poll - all real work happens in worker thread
         ker::net::napi_schedule(&dev->napi, ker::net::NapiScheduleSource::IRQ);
@@ -427,6 +460,8 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
         return !GUARD ? -ENODEV : -EINVAL;
     }
 
+    auto const& registers = GUARD.registers();
+
     // Use lock_irqsave to prevent preemption while holding the lock.
     // Without this, a DAEMON task holding the plain lock can be preempted,
     // and a non-preemptible PROCESS task on the same CPU will spin forever.
@@ -440,7 +475,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
     // Packet owners remain until DD reclamation, conservatively bounding space.
     if (dev->tx_bufs.at(IDX) != nullptr || dev->tx_bufs.at(NEXT) != nullptr) {
         // TX ring full - try to reclaim
-        process_tx(dev);
+        process_tx(dev, registers);
         if (dev->tx_bufs.at(IDX) != nullptr || dev->tx_bufs.at(NEXT) != nullptr) {
             dev->tx_lock.unlock_irqrestore(TXFLAGS);
             ker::net::pkt_free(pkt);
@@ -475,7 +510,7 @@ int e1000_start_xmit(ker::net::NetDevice* ndev, ker::net::PacketBuffer* pkt) {
 
     // Notify hardware only after all descriptor stores and DMA synchronization.
     asm volatile("mfence" ::: "memory");
-    reg_write(dev, REG_TDT, dev->tx_tail);
+    reg_write(dev, registers, REG_TDT, dev->tx_tail);
 
     ndev->tx_packets++;
     ndev->tx_bytes += pkt->len;
@@ -507,12 +542,12 @@ auto find_device_name(uint16_t device_id) -> const char* {
     return nullptr;
 }
 
-auto mask_interrupts(E1000Device* dev) -> bool {
+auto mask_interrupts(E1000Device* dev, const mmio::Borrow& registers) -> bool {
     bool masked = true;
-    if (dev->mmio != nullptr) {
-        reg_write(dev, REG_IMC, UINT32_MAX);
-        (void)reg_read(dev, REG_STATUS);
-        masked = reg_read(dev, REG_IMS) == 0;
+    if (dev->typed_mmio || dev->mmio != nullptr) {
+        reg_write(dev, registers, REG_IMC, UINT32_MAX);
+        (void)reg_read(dev, registers, REG_STATUS);
+        masked = reg_read(dev, registers, REG_IMS) == 0;
     }
     auto* p = dev->pci;
     auto read = [p](uint8_t offset) { return pci::pci_config_read16(p->bus, p->slot, p->function, offset); };
@@ -535,21 +570,21 @@ auto mask_interrupts(E1000Device* dev) -> bool {
     return (read(pci::PCI_COMMAND) & pci::PCI_COMMAND_INT_DISABLE) != 0 && masked;
 }
 
-auto stop_dma(E1000Device* dev) -> bool {
-    if (dev->mmio == nullptr) return false;
-    reg_write(dev, REG_RCTL, reg_read(dev, REG_RCTL) & ~RCTL_EN);
-    reg_write(dev, REG_TCTL, reg_read(dev, REG_TCTL) & ~TCTL_EN);
-    (void)reg_read(dev, REG_STATUS);
+auto stop_dma(E1000Device* dev, const mmio::Borrow& registers) -> bool {
+    if (!dev->typed_mmio && dev->mmio == nullptr) return false;
+    reg_write(dev, registers, REG_RCTL, reg_read(dev, registers, REG_RCTL) & ~RCTL_EN);
+    reg_write(dev, registers, REG_TCTL, reg_read(dev, registers, REG_TCTL) & ~TCTL_EN);
+    (void)reg_read(dev, registers, REG_STATUS);
     if (dev->pci->device_id != 0x10d3) {
         // Per-model release proof still needs qualification. Stop/reset but
         // never infer drained PCI transactions from reset or BME readback alone.
-        (void)reset_device(dev);
+        (void)reset_device(dev, registers);
         return false;
     }
     // 82574 datasheet 3.1.3.10: block new requests and drain pending requests
     // before disabling BME. Do not reset afterward: reset reopens this gate.
-    reg_write(dev, REG_CTRL, reg_read(dev, REG_CTRL) | (1U << 2));
-    return wait_clear(dev, REG_STATUS, 1U << 19, 100);
+    reg_write(dev, registers, REG_CTRL, reg_read(dev, registers, REG_CTRL) | (1U << 2));
+    return wait_clear(dev, registers, REG_STATUS, 1U << 19, 100);
 }
 
 auto retire_buffers(E1000Device* dev, bool quiesced) -> bool {
@@ -579,21 +614,30 @@ auto retire_buffers(E1000Device* dev, bool quiesced) -> bool {
 
 struct RetirementBackend {
     E1000Device* dev;
+    mmio::Borrow registers{};
     bool stopped = false, masked = false, bme_off = false;
     void close_admission() {
         dev->admission.close();
         dev->driver_claim.close_data_admission();
+        if (dev->typed_mmio) dev->registers.close();
+    }
+    auto acquire_terminal_if_drained() -> bool {
+        if (!dev->admission.drained() || !dev->driver_claim.operations_drained()) return false;
+        if (!dev->typed_mmio) return true;
+        if (!dev->registers.borrows_drained()) return false;
+        registers = dev->registers.terminal_borrow();
+        return registers.valid();
     }
     auto drain_readers() -> bool {
         auto const START = ker::mod::time::get_ms();
         for (size_t n = 0; n < 10'000'000 && ker::mod::time::get_ms() - START < 5000; ++n) {
-            if (dev->admission.drained() && dev->driver_claim.operations_drained()) return true;
+            if (acquire_terminal_if_drained()) return true;
             if (ker::mod::sched::can_query_current_task())
                 ker::mod::sched::kern_yield();
             else
                 asm volatile("pause" ::: "memory");
         }
-        return dev->admission.drained() && dev->driver_claim.operations_drained();
+        return acquire_terminal_if_drained();
     }
     void unpublish() {
         if (dev->published) {
@@ -605,11 +649,11 @@ struct RetirementBackend {
         dev->napi.state.store(ker::net::NapiState::DISABLED, std::memory_order_release);
         dev->napi.has_work.store(false, std::memory_order_release);
     }
-    auto mask_interrupts() -> bool { return masked = e1000e::mask_interrupts(dev); }
+    auto mask_interrupts() -> bool { return masked = e1000e::mask_interrupts(dev, registers); }
     // The shared lifecycle calls this hook 'reset'; e1000e uses a master drain
     // handshake which deliberately remains asserted instead of reopening it.
     auto reset() -> bool {
-        stopped = stop_dma(dev);
+        stopped = stop_dma(dev, registers);
 #ifdef WOS_SELFTEST
         if (test_withhold) return false;
 #endif
@@ -626,89 +670,63 @@ struct RetirementBackend {
     auto release() -> bool { return retire_buffers(dev, true) && dma::stats(dev->pci).regions == 0; }
 };
 
-auto retire_device(E1000Device* dev) -> int {
-    auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
-    uint8_t expected = 0;
-    if (!dev->retirement.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
-        return expected == 2 ? 0 : (expected == 1 ? -EBUSY : -EIO);
-    auto const BEFORE = dma::stats(dev->pci);
-    RetirementBackend backend{dev};
-    auto const RESULT = dma::lifecycle::retire(backend);
-    auto const AFTER = dma::stats(dev->pci);
-    dev->retirement.store(RESULT == dma::lifecycle::Result::released ? 2 : 3, std::memory_order_release);
-    log::info("DMA retirement id=0x%x result=%u stopped=%u masked=%u bme_off=%u irq_drained=%u regions=%zu->%zu pages=%zu->%zu q=%zu",
-              dev->pci->device_id, static_cast<unsigned>(RESULT), backend.stopped, backend.masked, backend.bme_off, !dev->irq_owned,
-              BEFORE.regions, AFTER.regions, BEFORE.backing_pages, AFTER.backing_pages, AFTER.quarantined);
-    return RESULT == dma::lifecycle::Result::released ? 0 : -EIO;
-}
+auto retire_device(E1000Device* dev, const Controller* controller) -> int { return detail::MmioRetirementAccess::retire(dev, controller); }
 
-// Published objects have kernel lifetime, including failed probes with an IRQ
-// reader or NAPI snapshot. Never reuse a retired PCI device in this boot.
-void init_device(pci::PCIDevice* pci_dev, const char* name) {
-    if (shutdown_started.load(std::memory_order_acquire) || device_count >= MAX_E1000_DEVICES) return;
-    for (size_t i = 0; i < device_count; ++i)
-        if (devices[i]->pci == pci_dev) return;
-    auto claim = pci::try_claim_driver(pci_dev, pci::DriverKind::e1000e);
-    if (!claim) return;
-    if (!pci::pci_set_bus_master(pci_dev, false)) return;
-    auto* dev = new (std::nothrow) E1000Device{};
-    if (dev == nullptr) return;
-    dev->pci = pci_dev;
-    dev->driver_claim = std::move(*claim);
-    devices[device_count++] = dev;
-    pci::pci_enable_memory_space(pci_dev);
-    dev->mmio = static_cast<volatile uint32_t*>(pci::pci_map_bar(pci_dev, 0));
-    if (dev->mmio == nullptr || !reset_device(dev) || !configure_coherence(dev)) {
-        (void)retire_device(dev);
-        return;
+// The probe borrow dies on every return, before init_device may retire.
+auto initialize_registers(E1000Device* dev, const char* name) -> bool {
+    auto* pci_dev = dev->pci;
+    mmio::Borrow registers;
+    if (dev->typed_mmio) {
+        registers = dev->registers.borrow();
+        if (!registers.valid()) return false;
+    } else if (dev->mmio == nullptr) {
+        return false;
     }
+    if (!reset_device(dev, registers) || !configure_coherence(dev, registers)) return false;
 
     // Disable interrupt moderation/coalescing for low-latency VM-to-VM traffic.
-    reg_write(dev, REG_ITR, 0);
-    reg_write(dev, REG_RDTR, 0);
-    reg_write(dev, REG_RADV, 0);
-    reg_write(dev, REG_TIDV, 0);
-    reg_write(dev, REG_TADV, 0);
+    reg_write(dev, registers, REG_ITR, 0);
+    reg_write(dev, registers, REG_RDTR, 0);
+    reg_write(dev, registers, REG_RADV, 0);
+    reg_write(dev, registers, REG_TIDV, 0);
+    reg_write(dev, registers, REG_TADV, 0);
 
     // Set link up
-    uint32_t ctrl = reg_read(dev, REG_CTRL);
+    uint32_t ctrl = reg_read(dev, registers, REG_CTRL);
     ctrl |= CTRL_SLU;
     ctrl &= ~CTRL_PHY_RST;
-    reg_write(dev, REG_CTRL, ctrl);
+    reg_write(dev, registers, REG_CTRL, ctrl);
 
     // Read MAC address
-    read_mac(dev);
+    read_mac(dev, registers);
 
     // Clear multicast table array
     for (int i = 0; i < 128; i++) {
-        reg_write(dev, REG_MTA + static_cast<uint32_t>(i * 4), 0);
+        reg_write(dev, registers, REG_MTA + static_cast<uint32_t>(i * 4), 0);
     }
 
     // Program MAC into RAL/RAH
     uint32_t const RAL = static_cast<uint32_t>(dev->netdev.mac.at(0)) | (static_cast<uint32_t>(dev->netdev.mac.at(1)) << 8) |
                          (static_cast<uint32_t>(dev->netdev.mac.at(2)) << 16) | (static_cast<uint32_t>(dev->netdev.mac.at(3)) << 24);
     uint32_t const RAH = static_cast<uint32_t>(dev->netdev.mac.at(4)) | (static_cast<uint32_t>(dev->netdev.mac.at(5)) << 8) | RAH_AV;
-    reg_write(dev, REG_RAL, RAL);
-    reg_write(dev, REG_RAH, RAH);
+    reg_write(dev, registers, REG_RAL, RAL);
+    reg_write(dev, registers, REG_RAH, RAH);
 
     // Initialize RX and TX rings
     ker::net::pkt_pool_reserve_for_rx_descriptors(NUM_RX_DESC);
     if (!init_rx(dev) || !init_tx(dev)) {
-        (void)retire_device(dev);
-        return;
+        return false;
     }
-    program_rings(dev);
+    program_rings(dev, registers);
     if (!pci::pci_set_bus_master(pci_dev, true)) {
-        (void)retire_device(dev);
-        return;
+        return false;
     }
 
     // Set up interrupt
     uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
         log::error("failed to allocate IRQ vector");
-        (void)retire_device(dev);
-        return;
+        return false;
     }
 
     dev->irq_vector = vector;
@@ -724,16 +742,14 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
         dev->irq_vector = vector;
         dev->irq_owned = false;
         if (pci_dev->interrupt_line == 0 || pci_dev->interrupt_line >= 16) {
-            (void)retire_device(dev);
-            return;
+            return false;
         }
         ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);
     }
 
     ker::net::napi_init(&dev->napi, &dev->netdev, e1000_poll, 64);
     if (ker::mod::gates::request_irq(vector, e1000_irq_handler, dev, "e1000e") != 0) {
-        (void)retire_device(dev);
-        return;
+        return false;
     }
     dev->irq_owned = true;
 
@@ -746,8 +762,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
 
     // Register with network stack
     if (ker::net::netdev_register(&dev->netdev) != 0) {
-        (void)retire_device(dev);
-        return;
+        return false;
     }
     dev->published = true;
 
@@ -758,8 +773,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     {
         ker::net::napi_enable(&dev->napi);
         if (dev->napi.worker == nullptr) {
-            (void)retire_device(dev);
-            return;
+            return false;
         }
     }
     if (MSI_RESULT != 0) {
@@ -768,22 +782,70 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
         pci::pci_config_write16(pci_dev->bus, pci_dev->slot, pci_dev->function, pci::PCI_COMMAND, command);
     }
 
-    reg_write(dev, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC);
-    reg_write(dev, REG_TCTL, TCTL_EN | TCTL_PSP | (15U << TCTL_CT_SHIFT) | (64U << TCTL_COLD_SHIFT));
+    reg_write(dev, registers, REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC);
+    reg_write(dev, registers, REG_TCTL, TCTL_EN | TCTL_PSP | (15U << TCTL_CT_SHIFT) | (64U << TCTL_COLD_SHIFT));
 
     // Clear any pending interrupts before enabling them
-    (void)reg_read(dev, REG_ICR);
+    (void)reg_read(dev, registers, REG_ICR);
 
     // Enable interrupts: RX timer, RX overrun, link status change, TX done
 #ifdef WOS_SELFTEST
     if (!test_probing)
 #endif
-        reg_write(dev, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
+        reg_write(dev, registers, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_RXO | ICR_LSC | ICR_TXDW);
 
     log::info("%s initialized, MAC=%02x:%02x:%02x:%02x:%02x:%02x, IRQ=%d (%s) napi", name, dev->netdev.mac.at(0), dev->netdev.mac.at(1),
               dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4), dev->netdev.mac.at(5), dev->irq_vector,
               MSI_RESULT == 0 ? "MSI" : "legacy");
+    return true;
 }
+
+// Published objects have kernel lifetime, including failed probes with an IRQ
+// reader or NAPI snapshot. Never reuse a retired PCI device in this boot.
+void init_device(pci::PCIDevice* pci_dev, const char* name, const Controller* controller = nullptr) {
+    if (shutdown_started.load(std::memory_order_acquire) || device_count >= MAX_E1000_DEVICES) return;
+    for (size_t i = 0; i < device_count; ++i)
+        if (devices[i]->pci == pci_dev) return;
+    bool const TYPED = mmio::enabled() && pci_dev->device_id == 0x10d3;
+    if (TYPED && controller == nullptr) {
+        log::error("cold UC probe requires the actual init controller");
+        return;
+    }
+    auto claim = pci::try_claim_driver(pci_dev, pci::DriverKind::e1000e);
+    if (!claim) return;
+    // Preserve the original legacy route. The typed factory must observe the
+    // initial firmware BME state before any driver-side command write.
+    if (!TYPED && !pci::pci_set_bus_master(pci_dev, false)) return;
+    auto* dev = new (std::nothrow) E1000Device{};
+    if (dev == nullptr) return;
+    dev->pci = pci_dev;
+    dev->typed_mmio = TYPED;
+    dev->driver_claim = std::move(*claim);
+    devices[device_count++] = dev;
+    if (TYPED) {
+        auto* actor = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+        log::info("MMIO_BOOT_PROBE device=%x controller=1 task_present=%u actor_pid=%llu actor_type=%u if=%u", pci_dev->device_id,
+                  actor != nullptr, actor != nullptr ? actor->pid : UINT64_MAX,
+                  actor != nullptr ? static_cast<unsigned>(actor->type) : UINT32_MAX, ker::mod::sched::interrupts_enabled());
+        auto const STATUS = pci::map_cold_uc_82574(dev->driver_claim, *controller, dev->registers);
+        if (STATUS != mmio::Status::ready) {
+            // Private PCI preparation retains any physical/cache obligations.
+            // No public mapping or register view exists and no raw fallback is
+            // allowed, so this is not a hardware-quiescence continuation.
+            dev->admission.close();
+            dev->driver_claim.close_data_admission();
+            dev->registers.close();
+            dev->retirement.store(E1000Device::Retirement::cold_failed, std::memory_order_release);
+            log::error("cold UC probe retained id=0x%x status=%s", pci_dev->device_id, mmio::status_name(STATUS));
+            return;
+        }
+    } else {
+        pci::pci_enable_memory_space(pci_dev);
+        dev->mmio = static_cast<volatile uint32_t*>(pci::pci_map_bar(pci_dev, 0));
+    }
+    if (!initialize_registers(dev, name)) (void)retire_device(dev, controller);
+}
+
 #ifdef WOS_SELFTEST
 uint8_t test_packet_byte(size_t offset, size_t bytes, bool reply) {
     if (offset < 6) return 0xff;
@@ -826,9 +888,10 @@ void test_packets(E1000Device* dev) {
         for (size_t n = 0; n < 100'000'000 && ker::mod::time::get_ms() - START < 5000; ++n) {
             CallbackGuard const GUARD(dev);
             if (!GUARD) return;
-            (void)process_rx_budget(dev, 64);
+            auto const& registers = GUARD.registers();
+            (void)process_rx_budget(dev, registers, 64);
             auto const FLAGS = dev->tx_lock.lock_irqsave();
-            process_tx(dev);
+            process_tx(dev, registers);
             dev->tx_lock.unlock_irqrestore(FLAGS);
             if (test_result->echoes == expected_echoes) break;
             asm volatile("pause" ::: "memory");
@@ -883,7 +946,7 @@ auto live_wait(Predicate predicate, uint64_t timeout_ms = 10000) -> bool {
     return true;
 }
 
-void selftest_live_sender() {
+void selftest_live_sender_body() {
     auto* dev = live_test.device.load(std::memory_order_acquire);
     live_test.sender_cpu.store(ker::mod::cpu::current_cpu(), std::memory_order_release);
     for (size_t n = 0; n < 20000 && !live_test.stop_sender.load(std::memory_order_acquire); ++n) {
@@ -897,11 +960,17 @@ void selftest_live_sender() {
     }
 }
 
-void selftest_live_holder() {
+[[noreturn]] void selftest_live_sender() {
+    selftest_live_sender_body();
+    ker::mod::sched::exit_current_kernel_thread();
+}
+
+void selftest_live_holder_body() {
     auto* dev = live_test.device.load(std::memory_order_acquire);
     {
         CallbackGuard const GUARD(dev);
         if (!GUARD) return;
+        if (dev->typed_mmio && reg_read(dev, GUARD.registers(), REG_STATUS) == UINT32_MAX) return;
         live_test.holder_entered.store(true, std::memory_order_release);
         uint64_t const DEADLINE = (ker::mod::time::get_ms() + 20000);
         while (!live_test.release_holder.load(std::memory_order_acquire) && ker::mod::time::get_ms() < DEADLINE) {
@@ -917,18 +986,48 @@ void selftest_live_holder() {
     live_test.holder_returned_after_exit_point.store(true, std::memory_order_release);
 }
 
-void selftest_live_retirer() {
+[[noreturn]] void selftest_live_holder() {
+    selftest_live_holder_body();
+    ker::mod::sched::exit_current_kernel_thread();
+}
+
+void selftest_live_retirer_body() {
     auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
     live_test.retire_started.store(true, std::memory_order_release);
     live_test.retirement_result.store(e1000e_shutdown(), std::memory_order_release);
     live_test.retire_done.store(true, std::memory_order_release);
 }
 
+[[noreturn]] void selftest_live_retirer() {
+    selftest_live_retirer_body();
+    ker::mod::sched::exit_current_kernel_thread();
+}
+
+void discard_unpublished_helper(ker::mod::sched::task::Task* task) {
+    using Task = ker::mod::sched::task::Task;
+    if (!task->scheduler_published.load(std::memory_order_acquire) && task->ref_count.load(std::memory_order_acquire) == 1 &&
+        task->sched_queue == Task::sched_queue::NONE && task->heap_index == -1 && task->sched_next == nullptr) {
+        ker::mod::sched::task::destroy_unpublished_user_thread(task);
+        return;
+    }
+    // PID/active publication rollback can leave an already admitted observer.
+    // Keep the initial owner until reboot instead of deleting a borrowed Task.
+    log::error("selftest helper retains uncertain unpublished lifetime pid=%lu refs=%u", task->pid,
+               task->ref_count.load(std::memory_order_acquire));
+}
+
 auto live_post(const char* name, void (*entry)(), uint64_t cpu) -> ker::mod::sched::task::Task* {
     auto* task = ker::mod::sched::task::Task::create_kernel_thread(name, entry);
     if (task == nullptr) return nullptr;
-    if (!task->try_acquire()) return nullptr;
-    ker::mod::sched::post_task_pinned_cpu(cpu, task);
+    if (!task->try_acquire()) {
+        discard_unpublished_helper(task);
+        return nullptr;
+    }
+    if (!ker::mod::sched::post_task_pinned_cpu(cpu, task)) {
+        task->release();
+        discard_unpublished_helper(task);
+        return nullptr;
+    }
     return task;  // Caller owns a reference, including after cooperative exit.
 }
 
@@ -1125,7 +1224,147 @@ void selftest_live_start(E1000Device* dev) {
 
 }  // namespace
 
+auto detail::MmioRetirementAccess::retire(E1000Device* dev, const Controller* controller) -> int {
+    auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+    if (controller != nullptr && controller->context_status() != ker::mod::mm::cpu_maintenance::Status::ready) return -EWOULDBLOCK;
+    using Retirement = E1000Device::Retirement;
+    auto expected = Retirement::live;
+    bool retry = false;
+    if (!dev->retirement.compare_exchange_strong(expected, Retirement::in_progress, std::memory_order_acq_rel)) {
+        if (expected != Retirement::withdrawal_pending)
+            return expected == Retirement::released ? 0 : (expected == Retirement::in_progress ? -EBUSY : -EIO);
+        if (!dev->retirement.compare_exchange_strong(expected, Retirement::in_progress, std::memory_order_acq_rel)) return -EBUSY;
+        retry = true;
+    }
+    if (!retry) {
+        auto const BEFORE = dma::stats(dev->pci);
+        bool hardware_released = false;
+        {
+            // The unique terminal view survives the last register read AND
+            // actual IRQ/DMA cleanup. Its destructor precedes witness issue.
+            RetirementBackend backend{dev};
+            auto const RESULT = dma::lifecycle::retire(backend);
+            auto const AFTER = dma::stats(dev->pci);
+            hardware_released = RESULT == dma::lifecycle::Result::released && backend.stopped && backend.masked && backend.bme_off &&
+                                !dev->irq_owned && dev->admission.drained() && dev->driver_claim.operations_drained() && AFTER.regions == 0;
+            log::info(
+                "DMA retirement id=0x%x result=%u stopped=%u masked=%u bme_off=%u irq_drained=%u regions=%zu->%zu pages=%zu->%zu q=%zu",
+                dev->pci->device_id, static_cast<unsigned>(RESULT), backend.stopped, backend.masked, backend.bme_off, !dev->irq_owned,
+                BEFORE.regions, AFTER.regions, BEFORE.backing_pages, AFTER.backing_pages, AFTER.quarantined);
+        }
+        if (!hardware_released) {
+            dev->retirement.store(Retirement::failed, std::memory_order_release);
+            return -EIO;
+        }
+        if (!dev->typed_mmio) {
+            dev->retirement.store(Retirement::released, std::memory_order_release);
+            return 0;
+        }
+    }
+    // Retry reaches only this continuation: the prior real lifecycle already
+    // released DMA backing. It never touches a BAR, repeats stop, or rebuilds a
+    // maintenance ticket. Mapping owns the original withdrawal transaction.
+    if (!dev->typed_mmio || dev->registers.empty() || !dev->admission.drained() || !dev->driver_claim.operations_drained() ||
+        !dev->registers.borrows_drained() || dev->irq_owned || dma::stats(dev->pci).regions != 0) {
+        dev->retirement.store(Retirement::failed, std::memory_order_release);
+        return -EIO;
+    }
+    auto const BEFORE_WITHDRAWAL = dev->registers.report();
+    if (BEFORE_WITHDRAWAL.terminal_active) {
+        dev->retirement.store(Retirement::withdrawal_pending, std::memory_order_release);
+        return -EAGAIN;
+    }
+    auto* actor = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    log::info("MMIO hardware released id=%llu retry=%u controller=%u actor_pid=%llu actor_type=%u terminal=0 readers=%llu ticket=%llu",
+              BEFORE_WITHDRAWAL.id, retry, controller != nullptr, actor != nullptr ? actor->pid : UINT64_MAX,
+              actor != nullptr ? static_cast<unsigned>(actor->type) : UINT32_MAX, BEFORE_WITHDRAWAL.normal_readers,
+              BEFORE_WITHDRAWAL.withdrawal_ticket);
+    mmio::QuiescedMapping const QUIESCED(dev->registers);
+    auto const STATUS = controller != nullptr ? dev->registers.withdraw(*controller, QUIESCED) : dev->registers.withdraw(QUIESCED);
+    auto const REPORT = dev->registers.report();
+    bool const COMPLETE = STATUS == mmio::Status::complete;
+    dev->retirement.store(COMPLETE ? Retirement::released : Retirement::withdrawal_pending, std::memory_order_release);
+    log::info("MMIO retirement id=%llu retry=%u status=%s phase=%u ticket=%llu readers=%llu terminal=%u closed=%u timed_out=%u", REPORT.id,
+              retry, mmio::status_name(STATUS), static_cast<unsigned>(REPORT.phase), REPORT.withdrawal_ticket, REPORT.normal_readers,
+              REPORT.terminal_active, REPORT.admission_closed, REPORT.timed_out_ever);
+    if (COMPLETE) return 0;
+    return STATUS == mmio::Status::failed_retained || STATUS == mmio::Status::bad_hierarchy || STATUS == mmio::Status::decode_readback
+               ? -EIO
+               : -EAGAIN;
+}
+
 #ifdef WOS_SELFTEST
+auto e1000e_mmio_runtime_check() -> bool {
+    namespace sched = ker::mod::sched;
+    using TaskState = sched::task::TaskState;
+    auto const HOLD = sched::hold_kernel_shutdown();
+    if (!mmio::enabled() || !ker::mod::mm::phys::can_wait_for_reclaim() || ker::mod::smt::get_core_count() < 4 ||
+        test_flag("--e1000-test-live"))
+        return false;
+    E1000Device* dev = nullptr;
+    for (size_t i = 0; i < device_count; ++i) {
+        if (!devices[i]->typed_mmio) continue;
+        if (dev != nullptr) return false;
+        dev = devices[i];
+    }
+    if (dev == nullptr || dev->pci->device_id != 0x10d3 || !dev->published || dev->napi.worker == nullptr || dev->mmio != nullptr ||
+        dev->retirement.load(std::memory_order_acquire) != E1000Device::Retirement::live)
+        return false;
+    auto const MAPPED = dev->registers.report();
+    auto const DMA = dma::stats(dev->pci);
+    if (MAPPED.phase != mmio::Phase::active || MAPPED.id == 0 || MAPPED.initial_ticket == 0 || MAPPED.bytes < 0x5b04 ||
+        MAPPED.admission_closed || MAPPED.terminal_active || DMA.regions != 514 || DMA.streaming != 512)
+        return false;
+    uint32_t status = UINT32_MAX;
+    {
+        auto borrow = dev->registers.borrow();
+        if (!borrow.valid()) return false;
+        mmio::Borrow moved{std::move(borrow)};
+        if (borrow.valid() || !moved.valid()) return false;
+        status = moved.read32(REG_STATUS);
+        moved.reset();
+        if (moved.valid() || status == UINT32_MAX) return false;
+    }
+    E1000Device* expected = nullptr;
+    if (!live_test.device.compare_exchange_strong(expected, dev, std::memory_order_acq_rel)) return false;
+    auto* sender = live_post("mmio_live_tx", selftest_live_sender, 1);
+    auto* holder = live_post("mmio_live_borrow", selftest_live_holder, 2);
+    bool const ENTERED =
+        sender != nullptr && holder != nullptr && live_wait([] {
+            return live_test.holder_entered.load(std::memory_order_acquire) && live_test.small.load(std::memory_order_acquire) >= 160 &&
+                   live_test.large.load(std::memory_order_acquire) >= 160 && live_test.worker_rx.load(std::memory_order_acquire) != 0 &&
+                   live_test.irqs.load(std::memory_order_acquire) != 0;
+        });
+    auto const HELD = dev->registers.report();
+    bool const COUNTED = ENTERED && HELD.id == MAPPED.id && HELD.phase == mmio::Phase::active && HELD.normal_readers != 0 &&
+                         !HELD.admission_closed && !HELD.terminal_active;
+    live_test.stop_sender.store(true, std::memory_order_release);
+    live_test.release_holder.store(true, std::memory_order_release);
+    bool const JOINED = sender != nullptr && holder != nullptr && live_wait([sender, holder] {
+                            return sender->state.load(std::memory_order_acquire) == TaskState::DEAD &&
+                                   holder->state.load(std::memory_order_acquire) == TaskState::DEAD;
+                        });
+    // A failed bounded join preserves Task refs and device storage. It cannot
+    // fall through to a shutdown claiming the helpers released their borrows.
+    if (!JOINED) return false;
+    sender->release();
+    holder->release();
+    auto const FINAL = dev->registers.report();
+    auto const TX_CPU = live_test.sender_cpu.load(std::memory_order_acquire);
+    auto const RX_CPUS = live_test.receive_cpus.load(std::memory_order_acquire);
+    bool const OK = COUNTED && live_test.holder_released.load(std::memory_order_acquire) && live_test.bad.load() == 0 && TX_CPU < 64 &&
+                    (RX_CPUS & ~(uint64_t{1} << TX_CPU)) != 0 && FINAL.id == MAPPED.id && FINAL.phase == mmio::Phase::active &&
+                    !FINAL.admission_closed && !FINAL.terminal_active &&
+                    dev->retirement.load(std::memory_order_acquire) == E1000Device::Retirement::live;
+    log::info(
+        "E1000_MMIO_RUNTIME %s id=%llu pa=%llx va=%llx bytes=%llu initial_ticket=%llu status=%x raw_export=0 helpers_joined=%u "
+        "held_readers=%llu rx64=%llu rx1514=%llu worker_rx=%llu irq=%llu tx_cpu=%llu rx_cpus=%llx regions=%zu first_retirement_pending=1",
+        OK ? "PASS" : "FAIL", MAPPED.id, MAPPED.physical, MAPPED.virtual_base, MAPPED.bytes, MAPPED.initial_ticket, status, JOINED,
+        HELD.normal_readers, live_test.small.load(), live_test.large.load(), live_test.worker_rx.load(), live_test.irqs.load(), TX_CPU,
+        RX_CPUS, DMA.regions);
+    return OK;
+}
+
 auto e1000e_selftest() -> DmaTestResult {
     DmaTestResult result;
     auto* pci_dev = pci::pci_find_by_class(pci::PCI_CLASS_NETWORK, pci::PCI_SUBCLASS_ETHERNET);
@@ -1175,18 +1414,19 @@ auto e1000e_selftest() -> DmaTestResult {
 }
 #endif
 
-auto e1000e_shutdown() -> int {
+namespace {
+auto shutdown_devices(const Controller* controller) -> int {
     if (ker::mod::sched::can_query_current_task() && !ker::mod::mm::phys::can_wait_for_reclaim()) return -EWOULDBLOCK;
     shutdown_started.store(true, std::memory_order_release);
     int result = 0;
     for (size_t i = 0; i < device_count; ++i) {
-        int const RET = retire_device(devices[i]);
+        int const RET = retire_device(devices[i], controller);
         if (RET != 0) result = RET;
     }
     return result;
 }
 
-void e1000e_init() {
+void initialize_devices(const Controller* controller) {
     // Scan all PCI devices for supported Intel NICs
     size_t const COUNT = pci::pci_device_count();
     for (size_t i = 0; i < COUNT; i++) {
@@ -1203,7 +1443,7 @@ void e1000e_init() {
         const char* name = find_device_name(dev->device_id);
         if (name != nullptr) {
             log::info("found %s (device 0x%x) at %d:%d.%d", name, dev->device_id, dev->bus, dev->slot, dev->function);
-            init_device(dev, name);
+            init_device(dev, name, controller);
         }
     }
 
@@ -1214,5 +1454,11 @@ void e1000e_init() {
     if (device_count != 0 && test_flag("--e1000-test-live")) selftest_live_start(devices[0]);
 #endif
 }
+}  // namespace
+
+auto e1000e_shutdown() -> int { return shutdown_devices(nullptr); }
+auto e1000e_shutdown(const Controller& controller) -> int { return shutdown_devices(&controller); }
+void e1000e_init() { initialize_devices(nullptr); }
+void e1000e_init(const Controller& controller) { initialize_devices(&controller); }
 
 }  // namespace ker::dev::e1000e

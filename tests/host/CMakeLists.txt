@@ -13,6 +13,11 @@ wos_add_fuzz_target(pci_ecam_fuzz
 wos_add_unit_test(pci_ecam_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_ecam_test.cpp
 )
+wos_add_unit_test(pci_aperture_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_aperture_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/pci_platform_apertures.cpp
+)
+target_compile_options(pci_aperture_test PRIVATE -UNDEBUG)
 wos_add_unit_test(pci_resource_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_resource_test.cpp
 )
@@ -101,6 +106,17 @@ add_test(NAME cpu_maintenance_runtime
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/cpu_maintenance_runtime_test.py
         --compiler ${CMAKE_CXX_COMPILER})
 set_tests_properties(cpu_maintenance_runtime PROPERTIES LABELS "host;unit;integration" TIMEOUT 180)
+add_test(NAME mmio_mapping_runtime
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_mapping_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR})
+set_tests_properties(mmio_mapping_runtime PROPERTIES LABELS "host;unit;integration" TIMEOUT 240)
+foreach(control IN ITEMS remove-writer-preflight remove-bank-table-veto remove-table-supervisor-check)
+    string(REPLACE "-" "_" control_name "${control}")
+    add_test(NAME mmio_mapping_${control_name}
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_mapping_runtime_test.py
+            --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR} --control ${control})
+    set_tests_properties(mmio_mapping_${control_name} PROPERTIES LABELS "host;unit;integration" TIMEOUT 240)
+endforeach()
 wos_add_unit_test(file_binding_snapshot_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim/retirement_port.cpp

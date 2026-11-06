@@ -57,6 +57,7 @@
 #include <test/binding_root_runtime_ktest.hpp>
 #include <test/cache_policy_runtime_ktest.hpp>
 #include <test/device_mapping_vm_ktest.hpp>
+#include <test/e1000_mmio_runtime_ktest.hpp>
 #include <test/firmware_runtime_ktest.hpp>
 #endif
 
@@ -65,6 +66,8 @@
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
 #endif
+#include <platform/mm/cpu_maintenance_platform.hpp>
+#include <platform/mm/mmio_cache_platform.hpp>
 #include <platform/ntp/ntp.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/pic/pic.hpp>
@@ -79,6 +82,7 @@
 #include <vfs/initramfs.hpp>
 #include <vfs/vfs.hpp>
 
+#include "init_executor.hpp"
 #include "init_registry.hpp"
 #include "limine_requests.hpp"
 #ifdef WOS_SELFTEST
@@ -208,6 +212,7 @@ void iommu_init() {
     dev::iommu::initialize_domains(cmdline_has_token(get_kernel_cmdline(), "--iommu-off"),
                                    cmdline_has_token(get_kernel_cmdline(), "--iommu-strict"),
                                    cmdline_has_token(get_kernel_cmdline(), "--iommu-translated"));
+    dev::pci::initialize_cold_mmio_inventory();
 }
 
 void console_init() { dev::console::console_init(); }
@@ -244,7 +249,7 @@ void iommu_faults_init() { dev::iommu::start_fault_worker(); }
 
 void virtio_net_init() { dev::virtio::virtio_net_init(); }
 
-void e1000e_init() { dev::e1000e::e1000e_init(); }
+void e1000e_init(const mod::mm::cpu_maintenance::detail::Controller& controller) { dev::e1000e::e1000e_init(controller); }
 
 void cdc_ether_init() { dev::usb::cdc_ether_init(); }
 
@@ -414,6 +419,18 @@ void sched_init() {
         (cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
         mod::dbg::panic_handler("conflicting scheduled lifecycle diagnostic boot modes");
     if (LIFECYCLE) ker::test::lifecycle60::enable_boot_capture(true);
+    bool const E1000_MMIO = cmdline_has_token(get_kernel_cmdline(), "--selftest-e1000-mmio");
+    bool const TYPED_MMIO = cmdline_has_token(get_kernel_cmdline(), "--typed-pci-mmio");
+    if ((E1000_MMIO && !TYPED_MMIO) ||
+        (cmdline_has_token(get_kernel_cmdline(), "--selftest-e1000-mmio-withdraw-retry") && (!E1000_MMIO || !TYPED_MMIO)))
+        mod::dbg::panic_handler("e1000 MMIO diagnostic requires --selftest-e1000-mmio and --typed-pci-mmio");
+    if (E1000_MMIO &&
+        (CACHE_POLICY || FIRMWARE || ANONYMOUS_USERCOPY || NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE ||
+         cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") ||
+         cmdline_has_token(get_kernel_cmdline(), "--selftest-binding-root") ||
+         cmdline_has_token(get_kernel_cmdline(), "--selftest-device-mapping") ||
+         cmdline_has_token(get_kernel_cmdline(), "--napi-irq-test")))
+        mod::dbg::panic_handler("conflicting scheduled e1000 MMIO diagnostic boot modes");
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest")) {
         mod::smt::park_secondary_cpus_for_selftest();
         if (UNMATCHED_MSR) {
@@ -479,6 +496,9 @@ void kernel_start() {
         mod::dbg::panic_handler("unable to post scheduled binding root selftest");
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-policy") && !ker::test::start_cache_policy_runtime_selftest())
         mod::dbg::panic_handler("unable to post scheduled cache policy selftest");
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-e1000-mmio") && cmdline_has_token(get_kernel_cmdline(), "--typed-pci-mmio") &&
+        !ker::test::start_e1000_mmio_runtime_selftest())
+        mod::dbg::panic_handler("unable to post scheduled e1000 MMIO selftest");
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-firmware") && !ker::test::start_firmware_runtime_selftest())
         mod::dbg::panic_handler("unable to post scheduled firmware selftest");
 #endif
@@ -503,3 +523,29 @@ void kernel_start() {
 }
 
 }  // namespace ker::init::fns
+
+namespace ker::mod::mm::cpu_maintenance::detail {
+Controller::Controller(const ker::init::InitExecutor& issuer) noexcept : origin_(Origin::boot), lineage_(issuer.lineage_) {
+    issuer_.boot = &issuer;
+    birth_status_ = validate_boot();
+}
+
+auto Controller::validate_boot() const noexcept -> Status {
+    uint64_t const flags = platform::save_disable_interrupts();
+    struct RestoreInterrupts {
+        uint64_t flags;
+        ~RestoreInterrupts() { platform::restore_interrupts(flags); }
+    } restore{flags};
+    uint32_t apic = UINT32_MAX;
+    if (mmio_cache::detail::platform::verify_boot_cpu(0, apic) != mmio_cache::Status::ready || !platform::current_root_is_kernel() ||
+        sched::can_query_current_task())
+        return Status::invalid_context;
+    const auto* issuer = issuer_.boot;
+    if (issuer == nullptr || lineage_ == 0 || issuer->lineage_ != lineage_ || !issuer->live_ || !issuer->scheduler_setup_complete_ ||
+        issuer->phase_ != ker::init::BootPhase::PHASE_5_DRIVERS)
+        return Status::invalid_context;
+    auto const service = service_observation();
+    if (service.vector == 0 || service.expected_mask == 0) return Status::unconfigured;
+    return Status::ready;
+}
+}  // namespace ker::mod::mm::cpu_maintenance::detail

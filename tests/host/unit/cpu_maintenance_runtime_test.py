@@ -4,6 +4,9 @@
 No host CR3/MSR/cache instruction executes. Original production sources are
 pinned and unchanged. Explicit compile copies add two approved pause calls,
 narrow private limits, or inject a stale ACK for paired negative controls.
+Native issuer bodies use finite scheduler/device endpoints and the real host
+stack: ASan fake use-after-return stacks are disabled, while ASan bounds/heap
+checks and UBSan remain enabled. No kernel Task or controller setter is added.
 """
 from __future__ import annotations
 
@@ -40,6 +43,101 @@ def replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new, 1)
 
 
+def actual_definition(source: str, signature: str, semicolon: bool = False) -> str:
+    if source.count(signature) != 1:
+        raise ValueError(f'actual controller definition must be unique: {signature}')
+    start = source.index(signature)
+    brace = source.index('{', start)
+    depth = 1
+    end = brace + 1
+    while depth and end < len(source):
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    if depth or (semicolon and source[end:end + 1] != ';'):
+        raise ValueError(f'unterminated actual controller definition: {signature}')
+    return source[start:end + int(semicolon)] + '\n'
+
+
+def controller_definitions() -> tuple[str, list[Path]]:
+    platform = KERN / 'platform/mm/cpu_maintenance_platform.cpp'
+    wrappers = KERN / 'platform/init/init_wrappers.cpp'
+    power = KERN / 'platform/power/power.cpp'
+    registry = KERN / 'platform/init/init_registry.hpp'
+    host_scope = KERN / 'platform/security/compartment_host.hpp'
+    native, boot, finalizer = platform.read_text(), wrappers.read_text(), power.read_text()
+    fragments = ['#pragma once\n#include <abi/callnums/power.h>\n',
+                 'namespace ker::mod::mm::cpu_maintenance::detail {\n']
+    for signature in ('Controller::~Controller()', 'auto Controller::context_status() const noexcept -> Status',
+                      'Controller::Controller(const ker::init::InitExecutor& issuer) noexcept',
+                      'auto Controller::validate_boot() const noexcept -> Status'):
+        fragments.append(actual_definition(native if signature in native else boot, signature))
+    fragments += ['}\nnamespace ker::mod::power {\n',
+                  '[[noreturn]] void run_finalizer(ShutdownAction action);\n',
+                  actual_definition(finalizer, 'class FinalizerExecution final', True),
+                  'namespace {\n']
+    for declaration in ('std::atomic<ShutdownPhase> g_phase', 'std::atomic<ShutdownAction> g_action',
+                        'std::atomic<bool> g_finalizer_issued'):
+        start = finalizer.index(declaration)
+        fragments.append(finalizer[start:finalizer.index(';', start) + 1] + '\n')
+    fragments += [actual_definition(finalizer, 'auto command_to_action('), '}\n',
+                  '}\nnamespace ker::mod::security::compartment {\n',
+                  actual_definition(host_scope.read_text(), '[[nodiscard]] inline auto host_namespace_admission('),
+                  '}\nnamespace ker::mod::power {\nnamespace {\n',
+                  actual_definition(finalizer, 'auto authorize_current_power('), '}\n']
+    for signature in ('FinalizerExecution::FinalizerExecution(ShutdownAction action)',
+                      '[[noreturn]] void run_finalizer(ShutdownAction action) {',
+                      '[[noreturn]] void FinalizerExecution::run()'):
+        value = actual_definition(finalizer, signature)
+        if signature.endswith('::run()'):
+            value = replace_once(value, 'asm volatile("sti" ::: "memory");', 'controller_host::enable_irq();')
+            call = 'E1000_RET = ker::dev::e1000e::e1000e_shutdown(controller);'
+            value = replace_once(value, call, call + '\n#ifdef WOS_HOST_ACTUAL_E1000\n'
+                                 'controller_host::after_actual_retirement(controller, E1000_RET);\n#endif\n')
+        fragments.append(value)
+    for signature in ('auto shutdown_in_progress()', 'auto shutdown_phase()'):
+        fragments.append(actual_definition(finalizer, signature))
+    fragments.append('namespace {\n')
+    for signature in ('auto begin_finalization(', 'auto begin_reboot_command(sched::task::Task* subject,'):
+        fragments.append(actual_definition(finalizer, signature))
+    fragments.append('}\n')
+    for signature in ('auto begin_reboot_command(uint64_t cmd)', 'auto selftest_begin_reboot_for_subject(',
+                      '[[noreturn]] void selftest_shutdown()'):
+        fragments.append(actual_definition(finalizer, signature))
+    fragments.append('}\nnamespace ker::mod::mm::cpu_maintenance::detail {\n')
+    for signature in ('Controller::Controller(const ker::mod::power::FinalizerExecution& issuer) noexcept',
+                      'auto Controller::validate_finalizer() const noexcept -> Status'):
+        fragments.append(actual_definition(finalizer, signature))
+    fragments += ['}\nnamespace ker::mod::mm::cpu_maintenance::detail::platform {\n',
+                  'namespace observed = mmio_cache::detail::platform;\n',
+                  actual_definition(native, 'auto private_protection_status() noexcept -> mmio_cache::Status'),
+                  '}\nnamespace ker::init::fns {\n']
+    for name in re.findall(r'^void ([a-zA-Z0-9_]+)\(\);', registry.read_text(), re.M):
+        body = 'controller_host::finished();' if name == 'kernel_start' else f'controller_host::module("{name}");'
+        fragments.append(f'void {name}() {{ {body} }}\n')
+    wrapper = actual_definition(boot, 'void e1000e_init(const mod::mm::cpu_maintenance::detail::Controller& controller)')
+    call = 'dev::e1000e::e1000e_init(controller);'
+    wrapper = replace_once(wrapper, call, call + '\n#ifdef WOS_HOST_ACTUAL_E1000\n'
+                           'controller_host::after_actual_boot_driver(controller);\n#endif\n')
+    fragments += [wrapper, '}\n']
+    return ''.join(fragments), [platform, wrappers, power, registry, host_scope,
+                               UNIT / 'cpu_maintenance_controller_ports.inc']
+
+
+def controller_controls(source: str) -> dict[str, str]:
+    stack = 'if (!contains(this, sizeof(*this)) || !contains(issuer, sizeof(*issuer)))'
+    boot = 'mmio_cache::detail::platform::verify_boot_cpu(0, apic) != mmio_cache::Status::ready'
+    phase_start = source.index('    if (phase != power::ShutdownPhase::FINALIZING')
+    phase_end = source.index('return Status::invalid_context;', phase_start)
+    phase = source[phase_start:phase_end]
+    bad_phase = replace_once(phase, 'if (', 'if (false && (')
+    bad_phase = replace_once(bad_phase, 'power::ShutdownPhase::ROOT_UNMOUNT)', 'power::ShutdownPhase::ROOT_UNMOUNT))')
+    return {
+        'control-controller-stack': replace_once(source, stack, 'if (false && (!contains(this, sizeof(*this)) || !contains(issuer, sizeof(*issuer))))'),
+        'control-controller-boot-identity': replace_once(source, boot, '((void)apic, false)'),
+        'control-controller-phase': replace_once(source, phase, bad_phase),
+    }
+
+
 def copies(source: str) -> dict[str, tuple[str, str, bool]]:
     finite = replace_once(source, "constexpr size_t WAIT_STEPS = 1'000'000;", 'constexpr size_t WAIT_STEPS = 4096;')
     finite = replace_once(finite, 'constexpr uint64_t MAX_READERS = CLOSED - 1;', 'constexpr uint64_t MAX_READERS = 1;')
@@ -65,6 +163,9 @@ def copies(source: str) -> dict[str, tuple[str, str, bool]]:
         'control-reader-hold-removed': (no_reader, 'CpuMaintenance.HookAfterAckReaderTailBlocksCompletionAndSlotReuse', True),
         'control-phase-barrier-removed': (no_phase, 'CpuMaintenance.GeneralTlbDeferralCannotStartCacheAndExplicitSameIdRetryPreservesTimeoutHistory', True),
         'control-exact-id-removed': (no_id, 'CpuMaintenance.InjectedStaleCompletedIdCannotAdvanceTheRealRequest', True),
+        'control-controller-stack': (source, 'CpuMaintenance.GeneralPrivateActualProcessFinalizerSealsDrainsAndRevalidatesCurrentStackAndPhase', True),
+        'control-controller-phase': (source, 'CpuMaintenance.GeneralPrivateActualProcessFinalizerSealsDrainsAndRevalidatesCurrentStackAndPhase', True),
+        'control-controller-boot-identity': (source, 'CpuMaintenance.GeneralPrivateActualBootIssuerKeepsBothIncomingIrqStatesAndSameTicketRetry', True),
     }
 
 
@@ -119,7 +220,7 @@ def main() -> int:
     deadline = time.monotonic() + OVERALL_SECONDS
     result = dict(pass_=False, commands=[], variants=[], sources_held=False,
                   scratch_removed=False, real_protocol_and_18b_tus=True,
-                  host_instruction_ports_only=True, native_cpu_cache_proof=False,
+                  host_instruction_ports_only=True, native_cpu_cache_proof=False, asan_fake_stack=False,
                   whole_budget_seconds=OVERALL_SECONDS)
     scratch = None
     groups: list[int] = []
@@ -136,7 +237,8 @@ def main() -> int:
         libs = [args.host_build / 'lib/libgtest_main.a', args.host_build / 'lib/libgtest.a']
         gtest_include, cmake_pins, compile_row = gtest_context(args.host_build)
         result['gtest_context'] = dict(include=str(gtest_include), compile_row=compile_row, pins=cmake_pins)
-        watched = [Path(__file__).resolve(), CORE, CASES, PORTS, TOKEN_PORTS, compiler,
+        controllers, controller_inputs = controller_definitions()
+        watched = [*controller_inputs, Path(__file__).resolve(), CORE, CASES, PORTS, TOKEN_PORTS, compiler,
                    UNIT / 'file_mmap_registry_runtime_test.py', *COMMON, *libs,
                    *(Path(item['path']) for item in cmake_pins)]
         before = [pin(p) for p in watched]
@@ -148,13 +250,22 @@ def main() -> int:
         boundary = 'namespace {\nnamespace cache = ker::mod::mm::mmio_cache;'
         if prefix_source.count(boundary) != 1:
             raise ValueError('maintained finite18b port prefix boundary changed')
+        (scratch / 'cpu_maintenance_controllers_generated.hpp').write_text(controllers)
+        controller_case_sources = {}
+        for name, value in controller_controls(controllers).items():
+            header = scratch / (name + '-controllers.hpp')
+            header.write_text(value)
+            cases = scratch / (name + '-cases.cpp')
+            cases.write_text('#define WOS_MAINTENANCE_CONTROLLERS_HEADER "' + header.name + '"\n'
+                             '#include "' + str(CASES) + '"\n')
+            controller_case_sources[name + '-cases'] = cases
         prefix = scratch / 'mmio_cache_runtime_ports_generated.hpp'
         prefix.write_text(prefix_source[:prefix_source.index(boundary)])
         hooks = scratch / 'host_hook_declarations.hpp'
         hooks.write_text('#include <cstddef>\n#include <cstdint>\nnamespace maintenance_host {\n'
                          'void before_join(void*);\nvoid after_ack(void*, uint64_t, size_t);\n}\n')
         flags = [str(driver), '-std=c++23', '-O1', '-g0', '-pipe', '-pthread', '-Wall', '-Wextra', '-Werror',
-                 '-DWOS_SELFTEST=1', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                 '-DWOS_SELFTEST=1', '-fsanitize=address,undefined', '-fsanitize-address-use-after-return=never', '-fno-sanitize-recover=all',
                  '-isystem', str(gtest_include),
                  '-fno-omit-frame-pointer', '-I', str(scratch), '-I', str(UNIT), '-I', str(KERN),
                  '-I', str(KERN / 'platform/mm'), '-I', str(ROOT / 'modules'), '-include', str(hooks)]
@@ -166,8 +277,8 @@ def main() -> int:
             sources[name] = p
             result['variants'].append(dict(name=name, source=pin(p), compile_copy=source != CORE.read_text(),
                                            injected_stale_ack='stale' in name or 'exact-id' in name,
-                                           negative_control=variants[name][2]))
-        units = [(p.stem, p) for p in COMMON] + [('cases', CASES)] + list(sources.items())
+                                           negative_control=variants[name][2], actual_controller_fault=name.startswith('control-controller-')))
+        units = [(p.stem, p) for p in COMMON] + [('cases', CASES)] + list(controller_case_sources.items()) + list(sources.items())
         dependencies: dict[str, Path] = {}
         for name, source in units:
             dep = scratch / (name + '.discovered.d')
@@ -199,11 +310,11 @@ def main() -> int:
             if any(item['path'] not in dependencies for item in actual):
                 raise ValueError(f'compiled undeclared input: {name}')
             objects[name] = obj
-        common_objects = [str(objects[p.stem]) for p in COMMON] + [str(objects['cases'])]
+        common_objects = [str(objects[p.stem]) for p in COMMON]
         for name, (_, test_filter, control) in variants.items():
             binary = scratch / (name + '.bin')
             row = command([str(driver), '-pthread', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
-                           *common_objects, str(objects[name]), *map(str, libs), '-o', str(binary)],
+                           *common_objects, str(objects.get(name + '-cases', objects['cases'])), str(objects[name]), *map(str, libs), '-o', str(binary)],
                           scratch / (name + '-link.log'), scratch, deadline, groups)
             result['commands'].append(row)
             if row['exit'] != 0:

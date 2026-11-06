@@ -11,6 +11,8 @@ namespace ker::mod::mm::cpu_maintenance::detail::platform {
 [[nodiscard]] auto save_disable_interrupts() -> uint64_t;
 void restore_interrupts(uint64_t saved_flags);
 [[nodiscard]] auto current_root_is_kernel() -> bool;
+// IRQ-excluded native NXE/WP observation for private MMIO requests only.
+[[nodiscard]] auto private_protection_status() noexcept -> mmio_cache::Status;
 // Caller holds IRQ exclusion and has just revalidated its real range. Returns
 // actual current CR3 as diagnostics after executing the requested local action.
 [[nodiscard]] auto execute_local(Phase phase) noexcept -> uint64_t;
