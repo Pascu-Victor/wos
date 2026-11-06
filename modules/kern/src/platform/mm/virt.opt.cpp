@@ -10486,105 +10486,61 @@ namespace {
 
 // advance page table by level pages
 auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted) -> paging::PageTable* {
-    if (typed_mmio_guards.load(std::memory_order_relaxed)) {
-        // A claim and every ordinary ancestor publication share the leaf pin.
-        // Allocate a possible loser outside pin; never carry the pin into PMM.
-        PageTable* spare = nullptr;
-        for (;;) {
-            uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
-            auto& slot = entry_at(page_table, level);
-            auto entry = slot;
-            if (entry.present != 0) {
-                if (entry.pagesize != 0) __builtin_trap();
-                auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
-                require_ordinary_page_table(child);
-                bool changed = false;
-                if ((flags & paging::PAGE_WRITE) != 0 && !entry.writable) {
-                    entry.writable = 1;
-                    changed = true;
-                }
-                if ((flags & paging::PAGE_USER) != 0 && !entry.user) {
-                    entry.user = 1;
-                    changed = true;
-                }
-                if ((flags & paging::PAGE_NX) == 0 && entry.no_execute) {
-                    entry.no_execute = 0;
-                    changed = true;
-                }
-                if (changed) {
-                    mmio::detail::note_topology_publication_locked();
-                    slot = entry;
-                }
+    // Ordinary and typed writers share the same ancestor publication boundary.
+    // Allocation and loser return stay outside PIN; a rival's child wins.
+    PageTable* spare = nullptr;
+    for (;;) {
+        uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+        auto& slot = entry_at(page_table, level);
+        auto entry = slot;
+        if (entry.present != 0) {
+            if (entry.pagesize != 0) {
                 user_mapping_pin_lock.unlock_irqrestore(pin);
-                if (spare != nullptr && !try_release_page_table_to_pool(spare, {__builtin_return_address(0), 0})) phys::page_free(spare);
-                if (changed) {
-                    if (promoted != nullptr) *promoted = true;
-                    wrcr3(rdcr3());
-                }
-                return child;
+                dbg::panic_handler("4K page-table mutator encountered an unsplit large leaf");
+                __builtin_trap();
             }
-            if (spare != nullptr) {
-                require_ordinary_page_table(spare);
-                auto const physical = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(spare)));
-                mmio::detail::note_topology_publication_locked();
-                slot = paging::create_page_table_entry(physical, flags);
-                user_mapping_pin_lock.unlock_irqrestore(pin);
-                return spare;
+            auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+            require_ordinary_page_table(child);
+            bool changed = false;
+            if ((flags & paging::PAGE_WRITE) != 0 && !entry.writable) {
+                entry.writable = 1;
+                changed = true;
+            }
+            if ((flags & paging::PAGE_USER) != 0 && !entry.user) {
+                entry.user = 1;
+                changed = true;
+            }
+            if ((flags & paging::PAGE_NX) == 0 && entry.no_execute) {
+                entry.no_execute = 0;
+                changed = true;
+            }
+            if (changed) {
+                if (typed_mmio_guards.load(std::memory_order_relaxed)) mmio::detail::note_topology_publication_locked();
+                slot = entry;
             }
             user_mapping_pin_lock.unlock_irqrestore(pin);
-            spare = alloc_zeroed_page_table();
-            if (spare == nullptr) hcf();
-        }
-    }
-    PageTableEntry entry = entry_at(page_table, level);
-    if (entry.present) {
-        if (entry.pagesize != 0) {
-            dbg::panic_handler("4K page-table mutator encountered an unsplit large leaf");
-            __builtin_trap();
-        }
-        bool changed = false;
-        if (((flags & paging::PAGE_WRITE) != 0U) && !entry.writable) {
-            entry.writable = 1;
-            changed = true;
-        }
-        if (((flags & paging::PAGE_USER) != 0U) && !entry.user) {
-            entry.user = 1;
-            changed = true;
-        }
-
-        // Only clear NX bit if we are mapping executable code.
-        // Never set NX bit on intermediate entries as it affects all children.
-        if (((flags & paging::PAGE_NX) == 0U) && entry.no_execute) {
-            entry.no_execute = 0;
-            auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
-            constexpr uint64_t NX_MASK = ~(1ULL << 63);
-            *raw_entry &= NX_MASK;  // Clear NX bit
-            changed = true;
-        }
-
-        if (changed) {
-            entry_at(page_table, level) = entry;
-            if (promoted != nullptr) {
-                *promoted = true;
+            if (spare != nullptr && !try_release_page_table_to_pool(spare, {__builtin_return_address(0), 0})) phys::page_free(spare);
+            if (changed) {
+                if (promoted != nullptr) *promoted = true;
+                wrcr3(rdcr3());
             }
-            // Force full TLB flush
-            wrcr3(rdcr3());
+            return child;
         }
-
-        return reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+        if (spare != nullptr) {
+            require_ordinary_page_table(spare);
+            auto const physical = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(spare)));
+            if (typed_mmio_guards.load(std::memory_order_relaxed)) mmio::detail::note_topology_publication_locked();
+            slot = paging::create_page_table_entry(physical, flags);
+            user_mapping_pin_lock.unlock_irqrestore(pin);
+            return spare;
+        }
+        user_mapping_pin_lock.unlock_irqrestore(pin);
+        spare = alloc_zeroed_page_table();
+        if (spare == nullptr) {
+            log::critical("init: failed to allocate kernel page table in advance_page_table");
+            hcf();
+        }
     }
-
-    auto* page_table_virt = alloc_zeroed_page_table();
-    if (page_table_virt == nullptr) {
-        // PANIC!
-        log::critical("init: failed to allocate kernel page table in advance_page_table");
-        hcf();
-    }
-
-    auto page_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(page_table_virt)));
-
-    entry_at(page_table, level) = paging::create_page_table_entry(page_phys, flags);
-    return page_table_virt;
 }
 
 }  // namespace

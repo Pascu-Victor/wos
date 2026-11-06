@@ -315,6 +315,17 @@ auto rdcr3()->uint64_t{return 0;}
 void wrcr3(uint64_t){host_mixed::ordinary_boundary();++host_protect::cr3_writes;}
 void owned_frame_refresh_leaf(PageTable*,vaddr_t,const PageTableEntry&){}
 ''']
+        out.append(d("platform/mm/virt.opt.cpp", "struct PageTableReleaseOrigin {"))
+        out.append(r'''
+// This finite fixture has no page-table cache. A refused return leaves the
+// live table owned by the actual caller, whose unchanged fallback frees it.
+auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin) -> bool {
+ EXPECT_EQ(pin_depth,0U);
+ if(table==nullptr)return true;
+ EXPECT_EQ(std::count(table_live.begin(),table_live.end(),table),1);
+ return false;
+}
+''')
         for anchor in ("auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted) -> paging::PageTable* {", "auto is_page_write_restricted(",
                        "auto protect_anonymous_swap_page(", "void unify_page_flags("):
             out.append(d("platform/mm/virt.opt.cpp", anchor))

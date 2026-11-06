@@ -841,6 +841,11 @@ add_test(NAME resource_pin_runtime_test
         --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR}
 )
 set_tests_properties(resource_pin_runtime_test PROPERTIES LABELS "host;unit;runtime" TIMEOUT 310)
+add_test(NAME ancestor_publication_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/ancestor_publication_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(ancestor_publication_runtime_test PROPERTIES LABELS "host;unit;runtime" TIMEOUT 130)
 wos_add_unit_test(job_control_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/job_control_model_test.cpp
 )
