@@ -12,11 +12,13 @@
 #include <platform/sched/file_growth.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
+#include <platform/sched/resource_pin.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/time/time.hpp>
 #include <test/ktest.hpp>
+#include <utility>
 #include <vfs/advisory.hpp>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/file.hpp>
@@ -46,6 +48,124 @@ KTEST(Resource, ServiceObservationMergePreservesLocalDenials) {
 }
 KTEST(Resource, RemotePolicyIsValidatedBeforeFetch) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_resource_context_before_fetch());
+}
+
+KTEST(Resource, PinChargesKeepCanonicalLimitsAndRefundHistory) {
+    namespace resource = ker::mod::sched::resource;
+    constexpr unsigned MEMLOCK = static_cast<unsigned>(resource::Id::MEMLOCK);
+    constexpr uint64_t PAGE = 4096;
+    auto const BEFORE = resource::pin_accounting_snapshot();
+    {
+        // Unpublished metadata subjects are sufficient for quota accounting.
+        // These charges do not pin pages or grant VM/device permission.
+        Task process{};
+        process.type = ker::mod::sched::task::TaskType::PROCESS;
+        KEXPECT_EQ(process.resources.set(MEMLOCK, {3 * PAGE, 5 * PAGE}, true, Task::FD_TABLE_SIZE), 0);
+        resource::PinCharge first, second, denied;
+        KREQUIRE_TRUE(resource::reserve_pin_charge(process, 2 * PAGE, first) == 0);
+        KREQUIRE_TRUE(resource::reserve_pin_charge(process, PAGE, second) == 0);
+        KEXPECT_FALSE(first.closed());
+        KEXPECT_EQ(resource::reserve_pin_charge(process, PAGE, denied), -ENOMEM);
+        KEXPECT_FALSE(static_cast<bool>(denied));
+        KEXPECT_EQ(process.resources.set(MEMLOCK, {PAGE, 5 * PAGE}, false, Task::FD_TABLE_SIZE), 0);
+        resource::PinCharge moved(std::move(first));
+        KEXPECT_FALSE(static_cast<bool>(first));
+        KEXPECT_EQ(moved.bytes(), 2 * PAGE);
+        moved.reset();
+        auto flags = process.resource_lock.lock_irqsave();
+        resource::refresh_pin_usage_locked(process);
+        process.resource_lock.unlock_irqrestore(flags);
+        KEXPECT_EQ(process.resources.entries[MEMLOCK].current, PAGE);
+        KEXPECT_EQ(resource::reserve_pin_charge(process, PAGE, denied), -ENOMEM);
+        second.reset();
+        KEXPECT_EQ(resource::reserve_pin_charge(process, PAGE, denied), 0);
+        flags = process.resource_lock.lock_irqsave();
+        resource::refresh_pin_usage_locked(process);
+        process.resource_lock.unlock_irqrestore(flags);
+        KEXPECT_EQ(process.resources.entries[MEMLOCK].peak, 3 * PAGE);
+        KEXPECT_EQ(process.resources.entries[MEMLOCK].denied, 2);
+        KEXPECT_EQ(process.resources.entries[MEMLOCK].reason, resource::Denial::SOFT_LIMIT);
+        KEXPECT_EQ(process.ref_count.load(), 1);
+    }
+    auto const AFTER = resource::pin_accounting_snapshot();
+    KEXPECT_EQ(AFTER.current_bytes, BEFORE.current_bytes);
+    KEXPECT_EQ(AFTER.closed_bytes, BEFORE.closed_bytes);
+    KEXPECT_EQ(AFTER.charges, BEFORE.charges);
+    KEXPECT_EQ(AFTER.free_accounts, BEFORE.free_accounts);
+}
+
+KTEST(Resource, ThreadForkAndExecUseRealIndependentPinAccountOwnership) {
+    namespace resource = ker::mod::sched::resource;
+    constexpr unsigned MEMLOCK = static_cast<unsigned>(resource::Id::MEMLOCK);
+    constexpr uint64_t PAGE = 4096;
+    auto const BEFORE = resource::pin_accounting_snapshot();
+    {
+        Task process{};
+        process.type = ker::mod::sched::task::TaskType::PROCESS;
+        process.pid = 0x7B90;
+        Task thread{};
+        thread.type = process.type;
+        thread.is_thread = true;
+        thread.owner_pid = process.pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(thread, process));
+        KEXPECT_EQ(process.resources.set(MEMLOCK, {4 * PAGE, 8 * PAGE}, true, Task::FD_TABLE_SIZE), 0);
+        thread.resources.entries[MEMLOCK].limit = {0, 0};
+        resource::PinCharge parent_charge, child_charge, after_exec;
+        KREQUIRE_TRUE(resource::reserve_pin_charge(thread, PAGE, parent_charge) == 0);
+        KEXPECT_EQ(thread.resources.entries[MEMLOCK].current, 0);
+        KEXPECT_EQ(process.resources.entries[MEMLOCK].current, PAGE);
+        Task child{};
+        child.type = process.type;
+        KREQUIRE_TRUE(resource::inherit(child, thread));
+        KEXPECT_EQ(child.resources.entries[MEMLOCK].limit.soft, 4 * PAGE);
+        KEXPECT_EQ(child.resources.entries[MEMLOCK].current, 0);
+        KEXPECT_EQ(resource::reserve_pin_charge(child, PAGE, child_charge), 0);
+        {
+            resource::ExecAdmission exec;
+            KREQUIRE_TRUE(exec.begin(thread));
+            KEXPECT_EQ(resource::reserve_pin_charge(process, PAGE, after_exec), -ESRCH);
+            KEXPECT_FALSE(parent_charge.closed());
+        }
+        KEXPECT_EQ(resource::reserve_pin_charge(process, PAGE, after_exec), 0);
+        thread.resource_owner.finish_cpu();
+        KEXPECT_FALSE(parent_charge.closed());
+        // This helper closes the entire canonical process even when invoked
+        // by a thread; ordinary thread-only retirement does not call it.
+        KEXPECT_TRUE(resource::close_thread_cpu_admission(thread));
+        KEXPECT_TRUE(parent_charge.closed());
+        KEXPECT_TRUE(after_exec.closed());
+        KEXPECT_FALSE(child_charge.closed());
+    }
+    auto const AFTER = resource::pin_accounting_snapshot();
+    KEXPECT_EQ(AFTER.current_bytes, BEFORE.current_bytes);
+    KEXPECT_EQ(AFTER.closed_bytes, BEFORE.closed_bytes);
+    KEXPECT_EQ(AFTER.charges, BEFORE.charges);
+    KEXPECT_EQ(AFTER.free_accounts, BEFORE.free_accounts);
+}
+
+KTEST(Resource, PinRefundOutlivesItsCanonicalTaskWithoutRetainingMetadata) {
+    namespace resource = ker::mod::sched::resource;
+    constexpr uint64_t PAGE = 4096;
+    auto const BEFORE = resource::pin_accounting_snapshot();
+    resource::PinCharge orphan;
+    {
+        Task process{};
+        process.type = ker::mod::sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(resource::reserve_pin_charge(process, PAGE, orphan) == 0);
+        KEXPECT_EQ(process.ref_count.load(), 1);
+    }
+    KEXPECT_TRUE(orphan.closed());
+    auto const ORPHANED = resource::pin_accounting_snapshot();
+    KEXPECT_EQ(ORPHANED.current_bytes, BEFORE.current_bytes + PAGE);
+    KEXPECT_EQ(ORPHANED.closed_bytes, BEFORE.closed_bytes + PAGE);
+    KEXPECT_EQ(ORPHANED.closed_accounts, BEFORE.closed_accounts + 1);
+    orphan.reset();
+    orphan.reset();
+    auto const AFTER = resource::pin_accounting_snapshot();
+    KEXPECT_EQ(AFTER.current_bytes, BEFORE.current_bytes);
+    KEXPECT_EQ(AFTER.closed_bytes, BEFORE.closed_bytes);
+    KEXPECT_EQ(AFTER.charges, BEFORE.charges);
+    KEXPECT_EQ(AFTER.free_accounts, BEFORE.free_accounts);
 }
 
 KTEST(Resource, ReceiverPopulationAdmissionBeforeTaskConstruction) {

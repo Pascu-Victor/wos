@@ -11,7 +11,8 @@ Threads use the process owner's policy. Fork/clone/spawn snapshot policy under
 the owner's resource lock; exec preserves it. Usage and denial observations are
 not copied into a new process. Lowering a soft limit does not revoke existing
 resources or already admitted operations. Raising a hard limit requires an
-effective UID of zero; soft must not exceed hard. NOFILE cannot exceed WOS's
+RESOURCE_LIMIT authority with host namespace admission; soft must not exceed
+hard. NOFILE cannot exceed WOS's
 physical 256-entry descriptor table even for root.
 
 ## Implemented enforcement
@@ -96,6 +97,28 @@ physical 256-entry descriptor table even for root.
   peak is its observed high-water population, while policy and denial counters
   belong to the process owner. Failed pthread creation frees the unpublished
   TCB/TLS and automatic stack, preserving caller-owned explicit stacks.
+
+## Pin-accounting foundation
+
+MEMLOCK uses the existing resource ID 8 and unchanged version-1 layouts and
+default limits. Kernel pin-charge reservations use the canonical process limit;
+threads share that process account. A move-only charge survives process close
+and destruction, so retained backing can remain charged through quarantine.
+Refunds need no Task or page-table reference. Exec retains the account, and fork
+inherits limits into fresh accounting. Lowering the limit preserves existing
+charges and restricts further reservations.
+
+The independent account records current bytes. The process resource state keeps
+limits, peaks and denial history, including imported remote observations. Limit
+queries, procfs and WKI exports refresh current usage before copying it. The
+global accounting snapshot includes closed accounts and their outstanding bytes.
+Account metadata has 4,096 slots; exhaustion refuses admission. Idle accounts
+reserve no retirement work and do not prevent shutdown.
+
+This is quota ownership, not a page pin or DMA permission. The MEMLOCK procfs row
+remains marked `pending` until the VM registration and hardware-facing producers
+are connected. It does not implement `mlock`, arbitrary user-pointer DMA,
+scatter/gather mappings or GPU access.
 
 Init service budgets and persistent accounting are implemented; see
 [the init manifest](init_supervisor.md) for syntax and restart semantics.

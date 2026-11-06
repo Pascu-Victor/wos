@@ -9,6 +9,7 @@
 #include <platform/ktime/process_timer.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/resource_model.hpp>
+#include <platform/sched/resource_pin.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/compartment_host.hpp>
@@ -58,6 +59,7 @@ auto close_thread_cpu_admission(task::Task& subject) -> bool {
     if (owner == nullptr) return false;
     uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
     owner->resource_cpu_admission_closed = true;
+    close_pin_account_locked(*owner);
     owner->resource_lock.unlock_irqrestore(FLAGS);
     return true;
 }
@@ -188,6 +190,7 @@ auto close_idle_thread_cpu_admission(task::Task& owner) -> bool {
     bool const IDLE = owner.resource_cpu_threads.load(std::memory_order_acquire) == 0 && !owner.resource_exec_admission_closed;
     if (IDLE) {
         owner.resource_cpu_admission_closed = true;
+        close_pin_account_locked(owner);
     }
     owner.resource_lock.unlock_irqrestore(FLAGS);
     return IDLE;
@@ -333,6 +336,7 @@ auto limit_for_subject(task::Task* caller, uint64_t resource, uint64_t address, 
         if (set) {
             result = process->resources.set(static_cast<unsigned>(resource), value, ALLOW_RAISE, task::Task::FD_TABLE_SIZE);
         }
+        if (resource == static_cast<unsigned>(Id::MEMLOCK)) refresh_pin_usage_locked(*process);
         snapshot = process->resources.entries[resource];
         process->resource_lock.unlock_irqrestore(FLAGS);
         if (IS_FD) {

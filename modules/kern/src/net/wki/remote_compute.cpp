@@ -42,6 +42,7 @@
 #include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/resource.hpp>
+#include <platform/sched/resource_pin.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
@@ -3607,6 +3608,7 @@ void destroy_unpublished_remote_process(ker::mod::sched::task::Task* owner, ker:
     if (task != nullptr) {
         if (failure_observations != nullptr) {
             uint64_t const FLAGS = task->resource_lock.lock_irqsave();
+            ker::mod::sched::resource::refresh_pin_usage_locked(*task);
             *failure_observations = task->resources;
             task->resource_lock.unlock_irqrestore(FLAGS);
         }
@@ -4648,6 +4650,7 @@ auto snapshot_task_resources(ker::mod::sched::task::Task* task, TaskResourceSnap
     ker::mod::sched::resource::Owner owner(task);
     if (owner.get() == nullptr) return false;
     uint64_t const FLAGS = owner.get()->resource_lock.lock_irqsave();
+    ker::mod::sched::resource::refresh_pin_usage_locked(*owner.get());
     record = resource_contract::snapshot(owner.get()->resources);
     owner.get()->resource_lock.unlock_irqrestore(FLAGS);
     if (inherit_children) {
@@ -10853,6 +10856,7 @@ void wki_remote_compute_check_completions() {
             if (rt.resource_contract && task != nullptr) {
                 resources.emplace();
                 uint64_t const FLAGS = task->resource_lock.lock_irqsave();
+                ker::mod::sched::resource::refresh_pin_usage_locked(*task);
                 *resources = resource_contract::snapshot(task->resources);
                 task->resource_lock.unlock_irqrestore(FLAGS);
                 // Exit and retired thread CPU contributions make reaped-child totals

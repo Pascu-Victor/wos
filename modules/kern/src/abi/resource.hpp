@@ -7,7 +7,7 @@ inline constexpr uint64_t VERSION = 1;
 inline constexpr uint64_t INFINITY_VALUE = UINT64_MAX;
 inline constexpr unsigned COUNT = 16;
 // Selectors match the existing WOS libc RLIMIT_* ABI.
-enum class Id : uint32_t { CPU = 0, FSIZE = 1, DATA = 2, STACK = 3, CORE = 4, RSS = 5, NPROC = 6, NOFILE = 7, AS = 9 };
+enum class Id : uint32_t { CPU = 0, FSIZE = 1, DATA = 2, STACK = 3, CORE = 4, RSS = 5, NPROC = 6, NOFILE = 7, MEMLOCK = 8, AS = 9 };
 
 struct Limit {
     uint64_t soft = INFINITY_VALUE;

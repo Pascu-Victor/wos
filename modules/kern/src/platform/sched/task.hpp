@@ -36,6 +36,7 @@ struct NativeDebtSnapshot;
 #include <platform/sched/preemption_diagnostics.hpp>
 #include <platform/sched/resource_lifetime.hpp>
 #include <platform/sched/resource_model.hpp>
+#include <platform/sched/resource_pin.hpp>
 #include <platform/sched/resource_process.hpp>
 #include <platform/sched/service_resource.hpp>
 #include <platform/sched/session.hpp>
@@ -1542,6 +1543,10 @@ struct Task {
     // Absolute data tail: preserve every preceding Task/assembly member offset.
     // Only this executor mutates these stack-backed policy recovery nodes.
     ker::syscall::vmem::PendingMremapPsPolicy* pending_mremap_ps_policies{};
+
+    // Append to preserve all preceding Task/assembly offsets. Independent
+    // charges outlive this Task; destruction touches only the static account.
+    resource::PinAccountOwner pin_account;
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

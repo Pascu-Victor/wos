@@ -199,9 +199,9 @@ KTEST(TaskPlacementScalar, DefaultsAndExactLayout) {
     const Task& view = *task;
 
     // Keep the original scalar/assembly offsets after appending per-Task
-    // memory policy and executor-local mremap recovery. Task is not standard-
-    // layout: inspect the live bytes instead of adding offsetof warnings.
-    KEXPECT_EQ(sizeof(Task), size_t{16256});
+    // memory policy, mremap recovery and independent pin accounting. Task is
+    // not standard-layout: inspect live bytes instead of adding offsetof warnings.
+    KEXPECT_EQ(sizeof(Task), size_t{16280});
     KEXPECT_EQ(alignof(Task), size_t{8});
     KEXPECT_EQ(member_offset(view, view.cpu), size_t{48});
     KEXPECT_EQ(member_offset(view, view.domain_mask), size_t{56});
@@ -216,6 +216,10 @@ KTEST(TaskPlacementScalar, DefaultsAndExactLayout) {
     KEXPECT_EQ(sizeof(view.pending_mremap_ps_policies), size_t{8});
     KEXPECT_TRUE(view.pending_mremap_ps_policies == nullptr);
     expect_member_alignment(view.pending_mremap_ps_policies);
+    KEXPECT_EQ(member_offset(view, view.pin_account), size_t{16256});
+    KEXPECT_EQ(sizeof(view.pin_account), size_t{24});
+    KEXPECT_EQ(member_offset(view, view.pin_account) % alignof(decltype(Task::pin_account)), size_t{0});
+    KEXPECT_EQ(member_offset(view, view.pin_account) + sizeof(view.pin_account), sizeof(Task));
     KEXPECT_EQ(sizeof(view.cpu), size_t{8});
     KEXPECT_EQ(sizeof(view.domain_mask), size_t{8});
     KEXPECT_EQ(sizeof(view.domain_id), size_t{4});

@@ -40,6 +40,7 @@
 #include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
+#include <platform/sched/resource_pin.hpp>
 #include <platform/sched/resource_process.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/authorization.hpp>
@@ -6889,6 +6890,7 @@ auto procfs_read_limits(const ker::mod::security::Snapshot& credentials, uint64_
         auto& fd = process->resources.entries[static_cast<unsigned>(Id::NOFILE)];
         fd.current = process->fd_table.size() + process->fd_table.reserved_count();
         fd.peak = std::max(fd.peak, fd.current);
+        refresh_pin_usage_locked(*process);
         snapshot = process->resources.entries;
         process->resource_lock.unlock_irqrestore(FLAGS);
         process->fd_table_lock.unlock_irqrestore(FD_FLAGS);
@@ -6925,13 +6927,14 @@ auto procfs_read_limits(const ker::mod::security::Snapshot& credentials, uint64_
             const char* units;
             bool enforced;
         };
-        constexpr std::array<Row, 7> ROWS{{
+        constexpr std::array<Row, 8> ROWS{{
             {Id::CPU, "CPU", "seconds", true},
             {Id::FSIZE, "FSIZE", "bytes", true},
             {Id::STACK, "STACK", "bytes", true},
             {Id::CORE, "CORE", "bytes", true},
             {Id::NPROC, "NPROC", "tasks", true},
             {Id::NOFILE, "NOFILE", "descriptors", true},
+            {Id::MEMLOCK, "MEMLOCK", "bytes", false},
             {Id::AS, "AS", "bytes", true},
         }};
         append("Resource Soft Hard Current Peak Denied Reason Units Enforcement\n");

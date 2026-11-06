@@ -836,6 +836,11 @@ set_tests_properties(credential_policy_audit_test PROPERTIES LABELS "host;source
 wos_add_unit_test(resource_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/resource_model_test.cpp
 )
+add_test(NAME resource_pin_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/resource_pin_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(resource_pin_runtime_test PROPERTIES LABELS "host;unit;runtime" TIMEOUT 310)
 wos_add_unit_test(job_control_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/job_control_model_test.cpp
 )

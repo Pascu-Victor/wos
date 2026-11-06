@@ -635,10 +635,16 @@ child windows as described above.
 The shared 256-function capacity now covers PCI, ECAM and IOMMU ownership
 metadata with bounded traversal; it does not add resource/reset authority.
 Vendor firmware catalogs, GPU-scale aperture/doorbell and userspace BAR
-mappings, WC architecture policy, charged revocable user-page pins, GPU-scale SG,
+mappings, WC aperture roles and producer fencing, charged revocable user-page pins, GPU-scale SG,
 AMD-Vi and interrupt remapping also remain open. Existing Intel DMA strict mode
 does not provide MSI isolation. Reuse the current MM binding/root/TLB lifetime
 contracts when adding device mappings.
+
+The MEMLOCK accounting foundation provides independently retained quota charges
+with canonical process limits and history. Closed charges survive Task/root
+destruction without keeping a Task or page-table reader lease. It grants no page
+or device permission; real VM registration, mutation/revocation hooks, owned
+SG/IOVA mappings and hardware retirement must supply those separate lifetimes.
 
 Physical qualification needs named AMD and NVIDIA fixtures. The local AMD GPU
 is the active host display and is preserved. Inventory is not WOS runtime proof.
