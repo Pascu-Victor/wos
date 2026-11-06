@@ -36,6 +36,13 @@ WOS enables these supported ACS controls once during BSP boot, while every bus
 master is disabled, and verifies readback before publishing any translation.
 Discovery snapshots remain observations of the original firmware state.
 
+PCI, ECAM and IOMMU ledgers share an explicit 256-function/512-requester boot
+capacity. Traversal is iterative and growing preparation arrays use private BSP
+scratch. Incomplete inventory refuses hardware preparation; compatibility
+fallback does not establish isolation. Firmware-region membership remains a
+separate 64-bit mask and reserved-map output stays bounded to 512 rows. See
+[PCI inventory limits and ownership](gpu_platform.md#bounded-pci-inventory).
+
 Conventional/PCIe-to-PCI aliases, shared groups, unqualified boundaries, enabled
 Phantom/ARI/ATS/PRI/PASID/SR-IOV requester modes and unsupported virtio DMA devices
 refuse strict admission. This conservative subset does not support every PCIe

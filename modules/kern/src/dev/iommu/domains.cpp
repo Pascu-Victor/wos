@@ -52,6 +52,18 @@ groups::Result grouping{};
 std::array<reserved::Mapping, reserved::MAX_MAPPINGS> firmware_mappings{};
 reserved::Plan firmware_plan{};
 std::array<std::atomic<bool>, scopes::MAX_DEVICES> platform_dma_ready{};
+// One serialized BSP initialization attempt owns these default-initialized
+// inputs. No borrowed span escapes preparation, and runtime domains retain
+// copied entries only. Keep the growing arrays off the Limine bootstrap stack;
+// never reset this whole aggregate through a large temporary at runtime.
+struct DomainBootScratch {
+    std::array<scopes::Device, scopes::MAX_DEVICES> topology{};
+    std::array<groups::Evidence, scopes::MAX_DEVICES> evidence{};
+    std::array<pci::ecam::Capabilities, scopes::MAX_DEVICES> strict_capabilities{};
+    std::array<vtd::Entry, scopes::MAX_DEVICES> entries{};
+    std::array<bool, scopes::MAX_DEVICES> was_master{};
+};
+constinit DomainBootScratch boot_scratch{};
 auto invalidate_unit(void* context) -> bool;
 struct Translation {
     std::array<vtd::TableRecord, 512> records{};
@@ -330,9 +342,9 @@ auto prepare(const Discovery& inventory, size_t cache_line, bool translated, boo
     if (inventory.vendor != FirmwareVendor::intel || inventory.state != DiscoveryState::discovered || !inventory.ownership.valid() ||
         !pci::pci_enumeration_complete())
         return false;
-    std::array<scopes::Device, scopes::MAX_DEVICES> topology{};
-    std::array<groups::Evidence, scopes::MAX_DEVICES> evidence{};
-    std::array<pci::ecam::Capabilities, scopes::MAX_DEVICES> strict_capabilities{};
+    auto& topology = boot_scratch.topology;
+    auto& evidence = boot_scratch.evidence;
+    auto& strict_capabilities = boot_scratch.strict_capabilities;
     if (strict && !pci::enable_strict_acs(std::span{strict_capabilities}.first(stats.devices))) return false;
     for (size_t i = 0; i < stats.devices; ++i) {
         auto const* device = pci::pci_get_device(i);
@@ -388,7 +400,7 @@ auto prepare(const Discovery& inventory, size_t cache_line, bool translated, boo
     }
     std::array<uint32_t, MAX_UNITS> next_id{};
     next_id.fill(1);  // DID zero is reserved on caching-mode hardware.
-    std::array<vtd::Entry, scopes::MAX_DEVICES> entries{};
+    auto& entries = boot_scratch.entries;
     for (size_t i = 0; i < stats.devices; ++i) {
         size_t const GROUP = grouping.owners[i];
         if (GROUP != i) {
@@ -496,7 +508,7 @@ void initialize_domains(bool disabled, bool strict, bool translated) {
         publish_fallback("explicit --iommu-off");
         return;
     }
-    std::array<bool, scopes::MAX_DEVICES> was_master{};
+    auto& was_master = boot_scratch.was_master;
     for (size_t i = 0; i < stats.devices; ++i) {
         auto* device = pci::pci_get_device(i);
         was_master[i] =

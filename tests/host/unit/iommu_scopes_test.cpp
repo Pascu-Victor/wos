@@ -143,7 +143,7 @@ TEST(IommuScopes, RejectsUnownedIncompleteAndUnsupportedInventories) {
     unknown.unit(true);
     unknown.bytes.insert(unknown.bytes.end(), {9, 0, 4, 0});
     expect_failure(unknown.qualify(topology()), scopes::Error::unsupported);
-    std::array<scopes::Device, 65> too_many{};
+    std::array<scopes::Device, scopes::MAX_DEVICES + 1> too_many{};
     expect_failure(table.qualify(too_many), scopes::Error::limit);
 }
 
@@ -187,7 +187,9 @@ TEST(IommuScopes, BoundsReservedRegionMaskAndRejectsMalformedTable) {
 }
 
 TEST(IommuScopes, ResolvesMaximumDepthAndDoesNotConfuseSiblingFunctions) {
-    std::array<scopes::Device, scopes::MAX_DEVICES> nodes{};
+    // Preserve the original64-hop path case. A DMAR scope's length is uint8,
+    // independently of the larger PCI function inventory capacity.
+    std::array<scopes::Device, 64> nodes{};
     Bytes path{1, static_cast<uint8_t>(6 + 2 * nodes.size()), 0, 0, 0, 0};
     for (size_t i = 0; i < nodes.size(); ++i) {
         bool const BRIDGE = i + 1 < nodes.size();
@@ -215,4 +217,48 @@ TEST(IommuScopes, ResolvesMaximumDepthAndDoesNotConfuseSiblingFunctions) {
     ASSERT_TRUE(SIBLINGS.valid());
     EXPECT_EQ(SIBLINGS.devices[0].unit, 1);
     EXPECT_EQ(SIBLINGS.devices[1].unit, 0);
+}
+
+TEST(IommuScopes, SharedCapacityAdmitsSixtyFiveAndFinalIndexWithIndependentScopeLengthBound) {
+    for (size_t count : {size_t{65}, scopes::MAX_DEVICES}) {
+        std::vector<scopes::Device> nodes(count);
+        for (size_t i = 0; i < count; ++i) {
+            bool const BRIDGE = i + 1 < count;
+            nodes[i] = {.bus = static_cast<uint8_t>(i),
+                        .slot = 1,
+                        .header = static_cast<uint8_t>(BRIDGE),
+                        .parent = i == 0 ? scopes::NONE : static_cast<uint16_t>(i - 1),
+                        .secondary = BRIDGE ? static_cast<uint8_t>(i + 1) : uint8_t{0},
+                        .subordinate = BRIDGE ? static_cast<uint8_t>(count - 1) : uint8_t{0}};
+        }
+        Table all;
+        all.unit(true);
+        auto const RESULT = all.qualify(nodes);
+        ASSERT_TRUE(RESULT.valid());
+        EXPECT_EQ(RESULT.device_count, count);
+        EXPECT_EQ(RESULT.devices[count - 1].unit, 0);
+        EXPECT_EQ(nodes.back().parent, count - 2);
+        expect_failure(all.qualify(nodes, false), scopes::Error::incomplete);
+    }
+
+    constexpr size_t PATH_DEVICES = (UINT8_MAX - 6) / 2;  // 124 hops,254 bytes.
+    std::array<scopes::Device, PATH_DEVICES> path_nodes{};
+    Bytes path{1, static_cast<uint8_t>(6 + 2 * PATH_DEVICES), 0, 0, 0, 0};
+    for (size_t i = 0; i < path_nodes.size(); ++i) {
+        bool const BRIDGE = i + 1 < path_nodes.size();
+        path_nodes[i] = {.bus = static_cast<uint8_t>(i),
+                         .slot = 1,
+                         .header = static_cast<uint8_t>(BRIDGE),
+                         .parent = i == 0 ? scopes::NONE : static_cast<uint16_t>(i - 1),
+                         .secondary = BRIDGE ? static_cast<uint8_t>(i + 1) : uint8_t{0},
+                         .subordinate = BRIDGE ? static_cast<uint8_t>(PATH_DEVICES - 1) : uint8_t{0}};
+        path.insert(path.end(), {1, 0});
+    }
+    Table longest;
+    longest.unit(false, path);
+    longest.unit(true);
+    auto const RESULT = longest.qualify(path_nodes);
+    ASSERT_TRUE(RESULT.valid());
+    EXPECT_EQ(RESULT.devices[PATH_DEVICES - 1].unit, 0);
+    EXPECT_EQ(RESULT.devices[PATH_DEVICES - 2].unit, 1);
 }

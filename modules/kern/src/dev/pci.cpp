@@ -26,8 +26,7 @@ namespace ker::dev::pci {
 using log = ker::mod::dbg::logger<"pci">;
 
 namespace {
-constexpr int MAX_PCI_DEVICES = 64;
-std::array<PCIDevice, MAX_PCI_DEVICES> discovered_devices = {};
+std::array<PCIDevice, inventory_limits::FUNCTION_CAPACITY> discovered_devices = {};
 struct PreparedMsix {
     bool present = false;
     msix::Layout layout{};
@@ -40,11 +39,23 @@ struct DeviceResources {
     std::atomic<bool> poisoned{false};
     bool activated = false;  // Protected by config_lock; one boot owner only.
 };
-constinit std::array<DeviceResources, MAX_PCI_DEVICES> resources{};
+constinit std::array<DeviceResources, inventory_limits::FUNCTION_CAPACITY> resources{};
 int device_count = 0;
 bool enumerated = false;
 bool enumeration_error = false;
-std::array<bool, 256> visited_buses{};
+InventoryError first_enumeration_error = InventoryError::none;
+uint32_t enumeration_reasons = 0;
+std::array<bool, inventory_limits::BUS_CAPACITY> visited_buses{};
+struct BusCursor {
+    uint16_t parent;
+    uint8_t bus;
+    uint8_t slot;
+    uint8_t next_function;
+};
+static_assert(sizeof(BusCursor) <= 8);
+// BSP-only traversal storage, never exposed to runtime consumers. Deep bridge
+// chains retain cursors here instead of growing the Limine boot call stack.
+constinit std::array<BusCursor, inventory_limits::BUS_CAPACITY> scan_stack{};
 mod::sys::Spinlock config_lock{};
 struct ConfigGuard {
     uint64_t flags = config_lock.lock_irqsave();
@@ -185,16 +196,25 @@ struct TableReader {
     void inhibit() { poison_unlocked(index, prepared.layout.capability); }
 };
 
-void scan_bus(uint8_t bus, uint16_t parent = NO_PARENT);
+void record_enumeration_error(InventoryError error) {
+    enumeration_error = true;
+    enumeration_reasons |= static_cast<uint32_t>(error);
+    if (first_enumeration_error == InventoryError::none) first_enumeration_error = error;
+}
 
-void scan_function(uint8_t bus, uint8_t slot, uint8_t func, uint16_t parent) {
+struct DownstreamBus {
+    uint8_t bus;
+    uint16_t parent;
+};
+
+auto scan_function(uint8_t bus, uint8_t slot, uint8_t func, uint16_t parent) -> std::optional<DownstreamBus> {
     uint16_t const VENDOR = pci_config_read16(bus, slot, func, PCI_VENDOR_ID);
     if (VENDOR == 0xFFFF) {
-        return;
+        return std::nullopt;
     }
-    if (device_count >= MAX_PCI_DEVICES) {
-        enumeration_error = true;
-        return;
+    if (std::cmp_greater_equal(device_count, discovered_devices.size())) {
+        record_enumeration_error(InventoryError::function_capacity);
+        return std::nullopt;
     }
 
     auto* dev = &discovered_devices.at(static_cast<size_t>(device_count));
@@ -227,52 +247,79 @@ void scan_function(uint8_t bus, uint8_t slot, uint8_t func, uint16_t parent) {
 
     device_count++;
 
-    // If this is a PCI-to-PCI bridge, scan the secondary bus
+    // Return the secondary bus only after this bridge's stable registry entry
+    // is complete. The iterative caller descends before scanning its siblings.
     if ((dev->header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
         uint32_t const BUSES = pci_config_read32(bus, slot, func, 0x18);
         auto const PRIMARY = static_cast<uint8_t>(BUSES);
         dev->secondary_bus = static_cast<uint8_t>(BUSES >> 8);
         dev->subordinate_bus = static_cast<uint8_t>(BUSES >> 16);
         if (dev->secondary_bus == 0 && dev->subordinate_bus == 0) {
-            return;  // Unconfigured bridge: no downstream bus to enumerate.
+            return std::nullopt;  // Unconfigured bridge: no downstream bus.
         }
         if (PRIMARY != bus || dev->secondary_bus == 0 || dev->secondary_bus == bus || dev->subordinate_bus < dev->secondary_bus ||
             (parent != NO_PARENT && (dev->secondary_bus < discovered_devices[parent].secondary_bus ||
                                      dev->subordinate_bus > discovered_devices[parent].subordinate_bus))) {
-            enumeration_error = true;
-            return;
+            record_enumeration_error(InventoryError::bridge_topology);
+            return std::nullopt;
         }
-        scan_bus(dev->secondary_bus, static_cast<uint16_t>(device_count - 1));
+        return DownstreamBus{dev->secondary_bus, static_cast<uint16_t>(device_count - 1)};
     }
+    return std::nullopt;
 }
 
-void scan_slot(uint8_t bus, uint8_t slot, uint16_t parent) {
-    uint16_t const VENDOR = pci_config_read16(bus, slot, 0, PCI_VENDOR_ID);
-    if (VENDOR == 0xFFFF) {
+void enter_bus(uint8_t bus, uint16_t parent, size_t& depth) {
+    if (visited_buses[bus]) {
+        record_enumeration_error(InventoryError::bus_revisit);
         return;
     }
-
-    scan_function(bus, slot, 0, parent);
-
-    // Check for multi-function device
-    uint8_t const HEADER_TYPE = pci_config_read8(bus, slot, 0, PCI_HEADER_TYPE);
-    if ((HEADER_TYPE & PCI_HEADER_TYPE_MULTI_FUNC) != 0) {
-        for (uint8_t func = 1; func < PCI_FUNCTION_COUNT; func++) {
-            if (pci_config_read16(bus, slot, func, PCI_VENDOR_ID) != 0xFFFF) {
-                scan_function(bus, slot, func, parent);
-            }
-        }
-    }
-}
-
-void scan_bus(uint8_t bus, uint16_t parent) {
-    if (visited_buses[bus]) {
-        enumeration_error = true;
+    if (depth >= scan_stack.size()) {
+        record_enumeration_error(InventoryError::traversal_capacity);
         return;
     }
     visited_buses[bus] = true;
-    for (uint8_t slot = 0; slot < PCI_SLOT_COUNT; slot++) {
-        scan_slot(bus, slot, parent);
+    scan_stack[depth++] = BusCursor{parent, bus, 0, 0};
+}
+
+void scan_bus(uint8_t bus, uint16_t parent = NO_PARENT) {
+    size_t depth = 0;
+    enter_bus(bus, parent, depth);
+    while (depth != 0) {
+        auto& cursor = scan_stack[depth - 1];
+        if (cursor.slot >= PCI_SLOT_COUNT) {
+            --depth;
+            continue;
+        }
+        std::optional<DownstreamBus> downstream;
+        if (cursor.next_function == 0) {
+            if (pci_config_read16(cursor.bus, cursor.slot, 0, PCI_VENDOR_ID) == 0xffff) {
+                ++cursor.slot;  // An absent function0 suppresses all siblings.
+                continue;
+            }
+            cursor.next_function = 1;
+            downstream = scan_function(cursor.bus, cursor.slot, 0, cursor.parent);
+        } else {
+            if (cursor.next_function == 1) {
+                // Match the old recursive scan_slot: inspect multifunction
+                // only after function0's entire bridge subtree has returned.
+                uint8_t const HEADER = pci_config_read8(cursor.bus, cursor.slot, 0, PCI_HEADER_TYPE);
+                if ((HEADER & PCI_HEADER_TYPE_MULTI_FUNC) == 0) {
+                    ++cursor.slot;
+                    cursor.next_function = 0;
+                    continue;
+                }
+            }
+            if (cursor.next_function >= PCI_FUNCTION_COUNT) {
+                ++cursor.slot;
+                cursor.next_function = 0;
+                continue;
+            }
+            uint8_t const FUNCTION = cursor.next_function++;
+            if (pci_config_read16(cursor.bus, cursor.slot, FUNCTION, PCI_VENDOR_ID) != 0xffff)
+                downstream = scan_function(cursor.bus, cursor.slot, FUNCTION, cursor.parent);
+        }
+        // The parent cursor already points past this function before descent.
+        if (downstream) enter_bus(downstream->bus, downstream->parent, depth);
     }
 }
 }  // namespace
@@ -347,6 +394,8 @@ auto pci_enumerate_all() -> int {
 
     device_count = 0;
     enumeration_error = false;
+    first_enumeration_error = InventoryError::none;
+    enumeration_reasons = 0;
     visited_buses.fill(false);
 
     // Check if host bridge is multi-function (multiple root buses)
@@ -363,7 +412,9 @@ auto pci_enumerate_all() -> int {
 
     enumerated = true;
 
-    log::info("found %d devices (topology complete=%u)", device_count, static_cast<unsigned>(!enumeration_error));
+    log::info("found %d devices (topology complete=%u) capacity=%zu first_error=%u reasons=0x%x", device_count,
+              static_cast<unsigned>(!enumeration_error), inventory_limits::FUNCTION_CAPACITY,
+              static_cast<unsigned>(first_enumeration_error), enumeration_reasons);
     for (int i = 0; i < device_count; i++) {
         auto* d = &discovered_devices.at(static_cast<size_t>(i));
         log::debug("%d:%d.%d vendor=%x device=%x class=%x:%x prog_if=%x", static_cast<int>(d->bus), static_cast<int>(d->slot),
@@ -385,6 +436,16 @@ auto pci_get_device(size_t idx) -> PCIDevice* {
 auto pci_device_count() -> size_t { return static_cast<size_t>(device_count); }
 
 auto pci_enumeration_complete() -> bool { return enumerated && !enumeration_error; }
+
+auto pci_inventory_status() -> InventoryStatus {
+    if (!enumerated) return {};
+    return {.stored_count = static_cast<size_t>(device_count),
+            .capacity = inventory_limits::FUNCTION_CAPACITY,
+            .enumerated = true,
+            .complete = !enumeration_error,
+            .first_error = first_enumeration_error,
+            .reason_mask = enumeration_reasons};
+}
 
 auto pci_find_by_class(uint8_t cls, uint8_t sub) -> PCIDevice* {
     if (!enumerated) {

@@ -4,13 +4,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <dev/iommu/dmar.hpp>
+#include <dev/pci_inventory_limits.hpp>
 #include <span>
 
 namespace ker::dev::iommu::scopes {
 
-constexpr size_t MAX_DEVICES = 64;
+constexpr size_t MAX_DEVICES = pci::inventory_limits::FUNCTION_CAPACITY;
 constexpr size_t MAX_REGIONS = 64;
 constexpr uint16_t NONE = UINT16_MAX;
+static_assert(MAX_DEVICES < NONE);
+// Firmware-region membership is independent of the PCI function inventory.
+static_assert(MAX_REGIONS == sizeof(uint64_t) * 8);
 
 struct Device {
     uint16_t segment = 0;

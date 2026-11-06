@@ -51,6 +51,44 @@ fallback; requested translated/strict operation inhibits known PCI requesters
 and refuses boot because the AMD-Vi backend is unavailable. Synthetic table
 tests establish parsing/refusal behavior, not physical AMD hardware support.
 
+## Bounded PCI inventory
+
+`dev/pci_inventory_limits.hpp` supplies one 256-function capacity for the
+nonmoving PCI identities/resources, ECAM snapshots and IOMMU ownership/domain
+ledgers. Requester storage derives 512 slots, allowing each function's original
+RID plus a bridge alias before deduplication. Registry indices/parents remain
+16-bit; a source RID of 0xffff is still a valid BDF encoding. The supported
+enumerator remains segment zero with its existing host-bridge root heuristic;
+MCFG parsing does not imply discovery of every segment/root on a machine.
+
+Bridge descent uses a fixed 256-bus cursor array in private boot storage instead
+of recursion on Limine's 64 KiB bootstrap stack. It preserves preorder, parent
+identity, absent-function0 suppression and the order of multifunction siblings
+after function0's complete subtree. Visited-bus, invalid bridge and capacity
+failures remain explicit. Repeated enumeration keeps the same exact pointers
+and retained BAR/MSI-X cells without additional configuration access.
+
+`pci_inventory_status()` returns stored count, capacity, enumeration/completeness,
+first error and accumulated reason bits. Before serialized boot publication it
+returns an unenumerated value. A stored prefix is not a required-total estimate:
+an omitted bridge can hide an entire subtree. Incomplete inventory cannot supply
+qualified ECAM/requester ownership or hardware DMA preparation; compatibility
+software fallback remains explicitly nonisolating.
+
+Growing domain preparation arrays use private constant-initialized BSP scratch,
+not a large stack temporary. No scratch span becomes runtime ownership. The
+always-resident function metadata grows by about 3.11 MiB; boot scratch and
+exclusion storage add separate bounded costs. Full native frame/section audits
+and controlled fixtures qualify a build, rather than assuming the 512 KiB task
+stack is available during early boot.
+
+Independent limits remain explicit: 64 firmware-region membership bits, 16
+IOMMU units, 32 MCFG windows and 512 output reserved mappings. The 4096-row MMIO
+exclusion scratch is checked against all platform rows plus seven per function;
+overflow refuses the whole plan. A larger registry does not guarantee sufficient
+hardware domain IDs, translation-table records or reserved-map output capacity,
+and does not add hotplug, releasable resource claims or companion/reset authority.
+
 ## PCI resource validation
 
 `dev/pci_resource.hpp` interprets complete Type0/Type1 BAR arrays. A 64-bit BAR

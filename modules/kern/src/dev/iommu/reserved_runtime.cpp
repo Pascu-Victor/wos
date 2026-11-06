@@ -2,6 +2,7 @@
 
 #include <dev/pci.hpp>
 #include <dev/pci_ecam.hpp>
+#include <dev/pci_inventory_limits.hpp>
 #include <platform/acpi/acpi.hpp>
 #include <platform/acpi/madt/madt.hpp>
 #include <platform/asm/msr.hpp>
@@ -9,6 +10,12 @@
 
 namespace ker::dev::iommu::reserved {
 namespace {
+// Two legacy/chipset ranges, MSR APIC, MADT LAPIC and HPET; then every
+// possible IOAPIC, MCFG window, IOMMU register range and PCI aperture.
+// Endpoints contribute at most six BARs plus ROM; bridges at most five rows.
+constexpr size_t MAX_PLATFORM_EXCLUSIONS = 5 + mod::acpi::madt::MADT_PARSED_ENTRY_CAPACITY + pci::ecam::MAX_WINDOWS + MAX_UNITS;
+constexpr size_t MAX_PCI_EXCLUSIONS_PER_FUNCTION = 7;
+static_assert(MAX_EXCLUSIONS >= MAX_PLATFORM_EXCLUSIONS + MAX_PCI_EXCLUSIONS_PER_FUNCTION * pci::inventory_limits::FUNCTION_CAPACITY);
 // Boot-only scratch storage, not kernel-stack arrays.
 std::array<Memory, MAX_MEMORY_REGIONS> memory{};
 std::array<Exclusion, MAX_EXCLUSIONS> exclusions{};

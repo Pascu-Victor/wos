@@ -8,7 +8,9 @@
 
 namespace ker::dev::iommu::reserved {
 constexpr size_t MAX_MEMORY_REGIONS = 4096;
-constexpr size_t MAX_EXCLUSIONS = 512;
+// Static boot scratch; reserved_runtime checks this against the complete
+// platform and shared PCI inventory aperture bounds.
+constexpr size_t MAX_EXCLUSIONS = 4096;
 enum class Kind : uint8_t { protected_memory, firmware_reserved, acpi_nvs };
 struct Memory {
     uint64_t base = 0, bytes = 0;

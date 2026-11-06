@@ -13,8 +13,7 @@
 namespace ker::dev::pci {
 namespace {
 using log = mod::dbg::logger<"pci-ecam">;
-constexpr size_t MAX_DEVICES = 64;
-std::array<ExtendedConfig, MAX_DEVICES> snapshots{};
+std::array<ExtendedConfig, inventory_limits::FUNCTION_CAPACITY> snapshots{};
 ExtendedInventory inventory{};
 std::atomic<bool> published{false};
 std::atomic<bool> acs_attempted{false};
@@ -47,7 +46,7 @@ struct Reader {
 };
 void collect() {
     inventory.devices = pci_device_count();
-    if (!pci_enumeration_complete() || inventory.devices > MAX_DEVICES) return;
+    if (!pci_enumeration_complete() || inventory.devices > snapshots.size()) return;
     auto const FOUND = mod::acpi::find_table_bounded("MCFG");
     if (!FOUND.valid()) {
         inventory.state = FOUND.error == mod::acpi::bounded::Error::not_found ? ExtendedState::unavailable : ExtendedState::firmware_error;

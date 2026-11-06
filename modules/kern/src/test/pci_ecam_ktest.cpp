@@ -5,6 +5,18 @@
 
 KTEST(PciEcam, RetainedSnapshotMatchesLegacyIdentityAndCapabilityHeader) {
     namespace pci = ker::dev::pci;
+    auto const STATUS = pci::pci_inventory_status();
+    KEXPECT_TRUE(STATUS.enumerated);
+    KEXPECT_EQ(STATUS.capacity, pci::inventory_limits::FUNCTION_CAPACITY);
+    KEXPECT_EQ(STATUS.stored_count, pci::pci_device_count());
+    KEXPECT_EQ(STATUS.complete, pci::pci_enumeration_complete());
+    if (STATUS.complete) {
+        KEXPECT_EQ(STATUS.first_error, pci::InventoryError::none);
+        KEXPECT_EQ(STATUS.reason_mask, uint32_t{0});
+    } else {
+        KEXPECT_NE(STATUS.first_error, pci::InventoryError::none);
+        KEXPECT_NE(STATUS.reason_mask, uint32_t{0});
+    }
     auto const INVENTORY = pci::extended_inventory();
     KEXPECT_EQ(INVENTORY.devices, pci::pci_device_count());
     KEXPECT_NULL(pci::extended_config(nullptr));

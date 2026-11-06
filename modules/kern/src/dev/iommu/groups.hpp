@@ -6,7 +6,8 @@
 #include <span>
 
 namespace ker::dev::iommu::groups {
-constexpr size_t MAX_REQUESTERS = scopes::MAX_DEVICES * 2;
+constexpr size_t MAX_REQUESTERS = pci::inventory_limits::REQUESTER_CAPACITY;
+static_assert(MAX_REQUESTERS == scopes::MAX_DEVICES * 2);
 constexpr uint16_t NONE = scopes::NONE;
 enum class Error : uint8_t { none, incomplete, topology, capability, requester_mode, unit, limit, isolation_boundary, shared_domain };
 enum Reason : uint8_t { bridge_alias = 1, acs_missing = 2, multifunction = 4 };

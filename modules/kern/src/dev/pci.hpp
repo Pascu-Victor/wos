@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <dev/pci_inventory_limits.hpp>
 #include <optional>
 #include <platform/dbg/dbg.hpp>
 
@@ -92,6 +93,16 @@ struct PCIDevice {
     uint8_t subordinate_bus = 0;
 };
 
+enum class InventoryError : uint32_t { none = 0, function_capacity = 1, bridge_topology = 2, bus_revisit = 4, traversal_capacity = 8 };
+struct InventoryStatus {
+    size_t stored_count = 0;
+    size_t capacity = inventory_limits::FUNCTION_CAPACITY;
+    bool enumerated = false;
+    bool complete = false;
+    InventoryError first_error = InventoryError::none;
+    uint32_t reason_mask = 0;
+};
+
 // Read from PCI configuration space
 auto pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint32_t;
 auto pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint16_t;
@@ -111,6 +122,10 @@ auto pci_device_count() -> size_t;
 // False if enumeration truncated or bridge topology was inconsistent. DMA
 // admission must not treat a partial registry as the complete requester set.
 auto pci_enumeration_complete() -> bool;
+// Immutable copy after serialized boot enumeration; before publication returns
+// an unenumerated status without partial identity/count authority. Omitted
+// subtrees are not counted, so stored_count is never a required-total estimate.
+[[nodiscard]] auto pci_inventory_status() -> InventoryStatus;
 
 // Find devices by class/subclass or vendor/device
 auto pci_find_by_class(uint8_t cls, uint8_t sub) -> PCIDevice*;

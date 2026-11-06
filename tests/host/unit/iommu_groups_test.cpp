@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <dev/iommu/groups.hpp>
 #include <vector>
 
@@ -158,9 +160,81 @@ TEST(IommuGroups, InvalidTopologyAndCapacityRefuseWithBoundedMaximumSupported) {
     ASSERT_TRUE(result.valid());
     EXPECT_EQ(result.count, 64);
     EXPECT_EQ(result.requester_count, 64);
-    devices.push_back({});
+    devices.push_back({.bus = 64, .slot = 1});
     evidence.push_back(cap(9));
+    result = run(devices, evidence);
+    ASSERT_TRUE(result.valid());
+    EXPECT_EQ(result.count, 65);
+    EXPECT_EQ(result.requester_count, 65);
+    devices.resize(scopes::MAX_DEVICES + 1);
+    evidence.resize(scopes::MAX_DEVICES + 1, cap(9));
     EXPECT_EQ(groups::qualify(devices, evidence, {}).error, groups::Error::limit);
+}
+
+TEST(IommuGroups, FullSharedCapacityPreservesFinalCanonicalIndexAndMemberCount) {
+    std::vector<Device> devices;
+    std::vector<Evidence> evidence;
+    for (size_t i = 0; i < scopes::MAX_DEVICES; ++i) {
+        devices.push_back({.slot = static_cast<uint8_t>(i / 8), .function = static_cast<uint8_t>(i % 8)});
+        evidence.push_back(cap(9));
+    }
+    auto independent = run(devices, evidence);
+    ASSERT_TRUE(independent.valid());
+    EXPECT_EQ(independent.count, scopes::MAX_DEVICES);
+    EXPECT_EQ(independent.requester_count, scopes::MAX_DEVICES);
+    EXPECT_EQ(independent.owners[255], 255);
+    auto strict = groups::qualify(devices, evidence, owners(devices.size()), true);
+    ASSERT_TRUE(strict.valid());
+    EXPECT_EQ(strict.owners[255], 255);
+    EXPECT_EQ(strict.requesters[255].device, 255);
+
+    // Every child shares the conventional bridge's visibility. Count remains
+    // 256 even though a member count no longer fits in an8-bit field.
+    devices.clear();
+    evidence.clear();
+    devices.push_back({.header = 1, .secondary = 1, .subordinate = 1});
+    evidence.push_back({.readable = true});
+    for (size_t i = 1; i < scopes::MAX_DEVICES; ++i) {
+        devices.push_back(
+            {.bus = 1, .slot = static_cast<uint8_t>((i - 1) / 8), .function = static_cast<uint8_t>((i - 1) % 8), .parent = 0});
+        evidence.push_back({.readable = true});
+    }
+    auto const SHARED = run(devices, evidence);
+    ASSERT_TRUE(SHARED.valid());
+    EXPECT_EQ(SHARED.count, 1);
+    EXPECT_EQ(std::count(SHARED.owners.begin(), SHARED.owners.end(), uint16_t{0}), scopes::MAX_DEVICES);
+    EXPECT_EQ(SHARED.requester_count, scopes::MAX_DEVICES);
+}
+
+TEST(IommuGroups, DeepAliasChainKeepsFiveHundredElevenDistinctRequestersWithinSharedCapacity) {
+    std::vector<Device> devices;
+    std::vector<Evidence> evidence;
+    for (size_t i = 0; i < scopes::MAX_DEVICES; ++i) {
+        bool const BRIDGE = i + 1 < scopes::MAX_DEVICES;
+        devices.push_back({.bus = static_cast<uint8_t>(i),
+                           .slot = static_cast<uint8_t>(i == 0 ? 0 : 1),
+                           .header = static_cast<uint8_t>(BRIDGE),
+                           .parent = i == 0 ? scopes::NONE : static_cast<uint16_t>(i - 1),
+                           .secondary = BRIDGE ? static_cast<uint8_t>(i + 1) : uint8_t{0},
+                           .subordinate = BRIDGE ? uint8_t{255} : uint8_t{0}});
+        evidence.push_back(BRIDGE ? cap(7) : cap(0));
+    }
+    auto const RESULT = run(devices, evidence);
+    ASSERT_TRUE(RESULT.valid());
+    EXPECT_EQ(RESULT.count, 1);
+    EXPECT_EQ(RESULT.requester_count, groups::MAX_REQUESTERS - 1);
+    EXPECT_EQ(RESULT.owners[255], 0);
+    std::array<bool, UINT16_MAX + size_t{1}> used{};
+    size_t aliases = 0;
+    for (size_t i = 0; i < RESULT.requester_count; ++i) {
+        auto const& requester = RESULT.requesters[i];
+        EXPECT_FALSE(used[requester.sid]);
+        used[requester.sid] = true;
+        EXPECT_EQ(requester.owner, 0);
+        aliases += requester.alias;
+    }
+    EXPECT_EQ(aliases, 255);
+    EXPECT_EQ(groups::qualify(devices, evidence, owners(devices.size()), true).error, groups::Error::isolation_boundary);
 }
 }  // namespace
 
