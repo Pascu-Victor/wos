@@ -120,7 +120,27 @@ is `ON`, CMake intentionally forces `WOS_PHYS_ALLOC_CALLER_STATS=ON` and
 
 ## Runtime Kernel Command-Line Diagnostics
 
-These diagnostics are compiled into normal kernels but stay disabled unless
+With `WOS_SELFTEST=ON`, `--selftest` includes known-PAT and invalid-MSR recovery
+tests on an MSR/PAT/x2APIC-capable fixture. The invalid read targets the write-only
+x2APIC SELF_IPI register (0x83f), after checking the actual APIC_BASE mode. It must
+fault and preserve its output with IF both clear and set, restoring the caller's
+IF before assertions. The read sends no IPI. This architectural fault avoids
+relying on a VMM's configurable treatment of unknown MSRs; it does not establish
+that such a VMM reports optional-register absence correctly.
+`--selftest --selftest-safe-msr-only` runs just these same two tests and powers off.
+`--selftest --selftest-safe-msr-unmatched` instead runs a destructive negative
+fixture before the suite: a separate `RDMSR 0x83f` must reach ordinary kernel
+#GP(0) handling at `wos_selftest_unmatched_msr_fault_site`. It deliberately halts;
+UD2/#UD, a prerequisite panic or normal suite completion is a failed
+qualification. Use an isolated rootless `wos-ktest --no-setup` topology, retain
+the small serial log and stop/clean that exact owned instance afterward.
+Do not combine either modifier with `--selftest-stack-canary-fail`, each other
+or scheduled diagnostic modes. These tests grant no MSR-write or physical-device
+authority. The fault rule is documented in
+[Intel SDM Table 13-6 and section 13.12.11](https://cdrdv2-public.intel.com/929359/253668-093-sdm-vol-3a.pdf#page=470)
+and [AMD APM volume 2, section 16.15](https://docs.amd.com/api/khub/documents/LNBl5evreogi0r25VIFF2g/content#page=758).
+
+The diagnostics in the table below are compiled into normal kernels but stay disabled unless
 the boot command line contains the exact token.
 
 | Token | Location | What it does | Downsides |

@@ -329,4 +329,11 @@ void load_idt() {
 
 auto is_idt_ready() -> bool { return __atomic_load_n(&idt_ready_state, __ATOMIC_ACQUIRE) == IDT_READY; }
 
+[[gnu::no_stack_protector]] auto kernel_idt_loaded_on_current_cpu() -> bool {
+    if (!is_idt_ready()) return false;
+    IdtPtr current{};
+    __asm__ volatile("sidt %0" : "=m"(current) : : "memory");
+    return current.base == idt_ptr.base && current.limit == idt_ptr.limit;
+}
+
 }  // namespace ker::mod::desc::idt

@@ -270,7 +270,10 @@ def main() -> int:
     result = dict(pass_=False, commands=[], scratch_removed=False, hardware_IDTR_IRQ_AP_qualified=False,
                   hardware_reset_cause_qualified=False, whole_budget_seconds=90)
     try:
-        compiler = Path(args.cxx).resolve(strict=True)
+        # clang++ may resolve to clang-N; retain argv[0]'s C++ driver selection
+        # while pinning the actual executable independently below.
+        compiler = Path(args.cxx).absolute()
+        compiler_binary = compiler.resolve(strict=True)
         if not compiler.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError('--cxx must name an executable compiler ELF')
         with compiler.open('rb') as executable:
@@ -278,7 +281,7 @@ def main() -> int:
                 raise ValueError('--cxx must name an executable compiler ELF')
         subreaper()
         watched = [SOURCE, HEADER, GDT, Path(__file__).resolve(),
-                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler]
+                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler_binary]
         before = [pin(path) for path in watched]
         result['sources_before'] = before
         scratch = Path(tempfile.mkdtemp(prefix='wos-idt-once-', dir='/tmp'))

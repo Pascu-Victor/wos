@@ -224,6 +224,23 @@ File retirement providers while it returns to userspace. Provider retirement
 belongs after consumer quiescence in the nonreturning finalizer; firmware hashes
 or a successful lifetime test cannot substitute for that ordering.
 
+## Optional CPU register reads
+
+`platform/asm/cpu_safe_msr.hpp` provides `try_read_msr()` for optional cache-policy
+registers. It requires CPUID.MSR and verifies the current CPU's installed WOS
+IDTR before probing. Only #GP(0) at the single dedicated kernel `RDMSR` site
+recovers; failure returns false without changing the output. Interrupt entry
+edits the actual saved return RIP. Unrelated kernel faults and userspace faults
+retain their normal handling. The probe/fixup and local-IDTR check avoid
+sanitizer, coverage and GS stack-canary dependencies in early boot.
+
+This primitive does not qualify MTRRs, AMD cache overrides, MMIO cache types or
+physical resources. Those checks and the ordered all-CPU TLB/cache operations
+remain prerequisites for releasable UC/WC mappings. Existing mandatory MSR
+helpers and their callers are unchanged.
+The API cannot detect a VMM silently accepting an unknown register with a zero
+result; future cache qualification must retain its platform and semantic checks.
+
 ## Inherited cache policy and device mappings
 
 Bootstrap preserves each framebuffer page's incoming PAT selector when replacing

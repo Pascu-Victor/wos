@@ -4,6 +4,7 @@ extern iterrupt_handler
 extern wos_user_interrupt_save_fpu
 extern wos_user_interrupt_restore_fpu
 extern wos_smap_active
+extern wos_try_recover_msr_frame
 
 %include "platform/asm/helpers.asm"
 
@@ -28,9 +29,24 @@ __idt_isr_handler:
     jnz .outer_entry
 
     pushq
+    ; WOS_SAFE_MSR_KERNEL_HOOK_BEGIN
+    ; GPRegs is 120 bytes; pass the actual hardware return frame. R12 has
+    ; already been saved by pushq and is callee-preserved across the C++ call.
+    cmp qword [rsp + 120], 13
+    jne .kernel_dispatch
+    mov r12, rsp
+    lea rdi, [rsp + 120]
+    and rsp, -16
+    call wos_try_recover_msr_frame
+    mov rsp, r12
+    test al, al
+    jnz .kernel_return
+.kernel_dispatch:
+    ; WOS_SAFE_MSR_KERNEL_HOOK_END
     mov rdi, rsp
     call iterrupt_handler
 
+.kernel_return:
     popq
     add rsp, 16
     iretq

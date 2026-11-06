@@ -216,6 +216,11 @@ wos_add_fuzz_target(block_request_model_fuzz
 # ---------------------------------------------------------------------------
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_program(WOS_HOST_NASM_EXECUTABLE NAMES nasm REQUIRED)
+add_test(NAME safe_msr_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/safe_msr_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --nasm ${WOS_HOST_NASM_EXECUTABLE})
+set_tests_properties(safe_msr_runtime_test PROPERTIES LABELS "host;unit;runtime" TIMEOUT 90)
 add_test(NAME owned_command_runtime_test
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/owned_command_runtime_test.py
 )

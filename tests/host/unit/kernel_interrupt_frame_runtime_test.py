@@ -173,6 +173,11 @@ extern "C" void fixture_commit(uint64_t actual){
 }
 extern "C" void fixture_generic(void* data,uint64_t actual){fixture::entry_hook(data,actual,false);}
 extern "C" void fixture_timer(void* data,uint64_t actual){fixture::entry_hook(data,actual,true);}
+// These existing frame cases enter vectors0/14/32 only. The new exact-MSR
+// endpoint is covered by safe_msr_runtime_test and must never be reached here.
+extern "C" bool wos_try_recover_msr_frame(ker::mod::gates::InterruptFrame*){
+ fixture::fail("MSR recovery reached from unrelated interrupt-frame case");
+}
 extern "C" [[noreturn]] void fixture_unexpected(){fixture::fail("user-only FPU endpoint reached from fake-kernel entry");}
 int main(int argc,char** argv){
  unsigned short cs,ss;asm volatile("mov %%cs,%0; mov %%ss,%1":"=r"(cs),"=r"(ss));
@@ -826,7 +831,10 @@ def main() -> int:
     try:
         for s in handlers: signal.signal(s,interrupted)
         resource.setrlimit(resource.RLIMIT_CORE,(0,0))
-        cxx=Path(args.cxx).resolve(strict=True); nasm=Path(args.nasm).resolve(strict=True)
+        # Preserve clang++'s driver spelling; its resolved ELF may be clang-N,
+        # whose argv[0] selects the C driver and omits the C++ runtime.
+        cxx=Path(args.cxx).absolute(); cxx_binary=cxx.resolve(strict=True)
+        nasm=Path(args.nasm).resolve(strict=True)
         for tool in (cxx,nasm):
             if not tool.is_file() or not os.access(tool,os.X_OK): raise ValueError("single executable tool path required")
             with tool.open("rb") as f:
@@ -836,7 +844,7 @@ def main() -> int:
             if evidence.parent.resolve(strict=True)!=evidence.parent or os.path.lexists(evidence):
                 raise ValueError("fresh evidence directory with canonical existing parent required")
             evidence.mkdir(mode=0o700)
-        watched=[Path(__file__).resolve(),CONTEXT,GATES,HELPERS,CPU_HEADER,GATES_HEADER,TASK_HEADER,FRAME_CLASS,cxx,nasm]
+        watched=[Path(__file__).resolve(),CONTEXT,GATES,HELPERS,CPU_HEADER,GATES_HEADER,TASK_HEADER,FRAME_CLASS,cxx_binary,nasm]
         before=[pin(p) for p in watched]; result["source_before"]=before
         subreaper(); scratch=Path(tempfile.mkdtemp(prefix="wos-interrupt-frame-",dir="/tmp"))
         s=scratch.stat(); scratch_identity=(s.st_dev,s.st_ino,s.st_uid)

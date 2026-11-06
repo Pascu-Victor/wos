@@ -83,10 +83,12 @@
 #include "limine_requests.hpp"
 #ifdef WOS_SELFTEST
 #include <cstring>
+#include <platform/asm/cpu_safe_msr.hpp>
 #include <platform/power/power.hpp>
 #include <test/file_mapping_lifetime_runtime_ktest.hpp>
 #include <test/ktest.hpp>
 #include <test/numa_pressure_runtime_ktest.hpp>
+#include <test/safe_msr_ktest.hpp>
 #endif
 
 namespace ker::init::fns {
@@ -376,6 +378,14 @@ void sched_init() {
     bool const ANONYMOUS_USERCOPY = cmdline_has_token(get_kernel_cmdline(), "--selftest-anonymous-usercopy");
     bool const FIRMWARE = cmdline_has_token(get_kernel_cmdline(), "--selftest-firmware");
     bool const CACHE_POLICY = cmdline_has_token(get_kernel_cmdline(), "--selftest-cache-policy");
+    bool const UNMATCHED_MSR = cmdline_has_token(get_kernel_cmdline(), "--selftest-safe-msr-unmatched");
+    bool const SAFE_MSR_ONLY = cmdline_has_token(get_kernel_cmdline(), "--selftest-safe-msr-only");
+    if (SAFE_MSR_ONLY && (!cmdline_has_token(get_kernel_cmdline(), "--selftest") || UNMATCHED_MSR ||
+                          cmdline_has_token(get_kernel_cmdline(), "--selftest-stack-canary-fail")))
+        mod::dbg::panic_handler("focused MSR fixture requires exclusive --selftest boot");
+    if (UNMATCHED_MSR &&
+        (!cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-stack-canary-fail")))
+        mod::dbg::panic_handler("unmatched MSR fixture requires exclusive --selftest boot");
     if (CACHE_POLICY &&
         (FIRMWARE || ANONYMOUS_USERCOPY || NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE ||
          cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") ||
@@ -403,6 +413,23 @@ void sched_init() {
     if (LIFECYCLE) ker::test::lifecycle60::enable_boot_capture(true);
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest")) {
         mod::smt::park_secondary_cpus_for_selftest();
+        if (UNMATCHED_MSR) {
+            mod::cpu::CpuidContext features{};
+            features.function = 1;
+            mod::cpu::cpuid(&features);
+            uint64_t apic_base = 0;
+            if ((static_cast<uint32_t>(features.edx) & CPUID_FEAT_EDX_MSR) == 0 ||
+                (static_cast<uint32_t>(features.ecx) & (uint32_t{1} << 21)) == 0 || !mod::desc::idt::kernel_idt_loaded_on_current_cpu() ||
+                !mod::cpu::try_read_msr(IA32_APIC_BASE, apic_base) || (apic_base & (uint64_t{3} << 10)) != (uint64_t{3} << 10))
+                mod::dbg::panic_handler("unmatched MSR fixture prerequisites unavailable");
+            mod::dbg::logger<"safe_msr">::info("unmatched RDMSR fixture begin; ordinary #GP(0) required");
+            mod::cpu::selftest_unmatched_msr_fault();
+        }
+        if (SAFE_MSR_ONLY) {
+            ker::test::run_safe_msr_selftest();
+            mod::power::selftest_poweroff();
+            hcf();
+        }
         if (cmdline_has_token(get_kernel_cmdline(), "--selftest-stack-canary-fail")) {
             mod::cpu::selftest_corrupt_stack_canary();
         }

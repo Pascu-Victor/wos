@@ -365,6 +365,7 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         src/platform/smt/smt.cpp
         # Low-level CPU/ASM helpers called from exception paths
         src/platform/asm/cpu.cpp
+        src/platform/asm/cpu_safe_msr.cpp
         src/platform/asm/tlb.cpp
         src/util/hcf.hpp
         # Synchronization primitives — called from excluded early-boot code
@@ -384,6 +385,11 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         )
     endforeach()
 endif()
+
+# The optional MSR probe and its #GP fixup may run before GS canary setup.
+# Keep the explicit early-runtime exception local to this translation unit.
+set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/asm/cpu_safe_msr.cpp
+    APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
 
 if(WOS_KASAN)
     # The diagnostic walks PMM side metadata while holding every allocator

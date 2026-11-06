@@ -38,6 +38,8 @@ void idt_init();
 void load_idt();
 
 [[nodiscard]] auto is_idt_ready() -> bool;
+// A global ready table does not prove that an AP has loaded its local IDTR.
+[[nodiscard]] auto kernel_idt_loaded_on_current_cpu() -> bool;
 
 extern "C" {
 #define ISR(n) void isr##n(void)
