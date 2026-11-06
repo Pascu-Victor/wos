@@ -292,7 +292,13 @@ mandatory PID 1 integration invariants and require live evidence:
   verified process group.
 - Spawn success and `execve` success are distinct. A bounded close-on-exec
   result channel first carries session readiness, then child setup/exec errno;
-  EOF resolves exec success only after session admission. PID 1 processes this
+  EOF resolves exec success only after session admission. An exact-generation
+  stop before admission closes ACK without releasing the child to exec; queued
+  readiness is consumed while the report channel remains owned until a typed
+  cancellation or actual EOF arrives. This resolves as `EXEC_FAILED/ECANCELED`
+  with an informational cancellation message, then follows the existing
+  exit/output/quiescence path. Genuine setup failures, malformed reports and
+  cancellation without that stop witness remain errors. PID 1 processes this
   channel before reaping each tick. Missing, duplicate or invalid readiness fails
   startup. The ACK writer is nonblocking and retains a read endpoint until its
   one-byte write completes, preventing SIGPIPE if the child dies concurrently. Exit status 127 is not

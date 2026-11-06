@@ -68,6 +68,7 @@ enum class ChildFailureStage : int32_t {
     EXEC = 5,
     IDENTITY = 6,
     SESSION_READY = 7,
+    SESSION_CANCELLED = 8,
 };
 
 struct ExecFailureReport {
@@ -84,6 +85,7 @@ struct RuntimeService {
     int exec_report_fd{-1};
     std::array<int, 2> session_ack{-1, -1};
     bool session_admitted{};
+    bool session_cancel_requested{};
     int output_fd{-1};
     NetworkProbe probe{};
     std::array<char, OUTPUT_LINE_BYTES> output_line{};
@@ -353,6 +355,9 @@ void await_session_admission(int report_fd, int ack_fd) {
         received = ::read(ack_fd, &acknowledgement, sizeof(acknowledgement));
     }
     (void)::close(ack_fd);
+    if (received == 0) {
+        report_child_failure(report_fd, ChildFailureStage::SESSION_CANCELLED, ECANCELED);
+    }
     if (received != 1 || acknowledgement != 'A') {
         report_child_failure(report_fd, ChildFailureStage::PROCESS_GROUP, received < 0 ? errno : EIO);
     }
@@ -588,6 +593,12 @@ void process_exec_report(uint8_t service, uint64_t now_ms) {
     }
 
     if (std::cmp_equal(READ, sizeof(report)) && report.stage == ChildFailureStage::SESSION_READY && report.error == 0) {
+        if (slot.session_cancel_requested && !slot.session_admitted) {
+            // An exact-generation stop already closed ACK. Consume a queued
+            // READY without admitting it; retain this reader until the child's
+            // cancellation report or actual exit closes the handshake.
+            return;
+        }
         bool const VALID = !slot.session_admitted && !slot.leader_reaped && slot.pid > 1 && slot.session_ack.at(PIPE_READ) >= 0 &&
                            slot.session_ack.at(PIPE_WRITE) >= 0 && ker::process::getsid(slot.pid) == slot.pid &&
                            ker::process::getpgid(slot.pid) == slot.pid;
@@ -609,7 +620,16 @@ void process_exec_report(uint8_t service, uint64_t now_ms) {
         .service = service,
         .generation = slot.generation,
     };
-    if (READ == 0 && slot.session_admitted) {
+    bool const CANCELLED = !slot.session_admitted && slot.session_cancel_requested &&
+                           (READ == 0 || (std::cmp_equal(READ, sizeof(report)) && report.stage == ChildFailureStage::SESSION_CANCELLED &&
+                                          report.error == ECANCELED));
+    if (CANCELLED) {
+        event.kind = SupervisorEventKind::EXEC_FAILED;
+        slot.last_error = ECANCELED;
+        event.detail = ECANCELED;
+        init_log::info("init supervisor: %s child setup cancelled before session admission",
+                       runtime.manifest.services.at(service).name.c_str());
+    } else if (READ == 0 && slot.session_admitted) {
         event.kind = SupervisorEventKind::EXEC_SUCCEEDED;
         slot.last_error = 0;
     } else {
@@ -640,6 +660,7 @@ void signal_service_group(const SupervisorAction& action, int signal) {
 
     if (!slot.session_admitted) {
         // The child cannot exec until ACK; no service descendants exist yet.
+        slot.session_cancel_requested = true;
         close_session_ack(slot.session_ack);
         if (!slot.leader_reaped && slot.pid > 1) {
             (void)ker::process::kill(slot.pid, signal);
@@ -915,6 +936,8 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         slot.pid = PID;
         slot.pgid = -1;
         slot.generation = generation;
+        slot.session_admitted = false;
+        slot.session_cancel_requested = false;
         slot.exec_report_fd = -1;
         slot.output_fd = -1;
         slot.output_line_length = 0;
@@ -946,6 +969,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     slot.pgid = PID;
     slot.session_ack = session_ack;
     slot.session_admitted = false;
+    slot.session_cancel_requested = false;
     slot.generation = generation;
     slot.exec_report_fd = exec_pipe.at(PIPE_READ);
     exec_pipe.at(PIPE_READ) = -1;
