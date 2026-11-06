@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute actual shootdown init/online guards with controlled CPU/vector seams.
+"""Execute actual shootdown init/online guards with CPU/vector/cache ports.
 
 Panic is caught only in the Host harness to inspect unchanged publication state.
 This tests boot admission ordering/idempotence, not interrupt delivery or SMP.
@@ -55,6 +55,7 @@ def extract(source, token, semicolon=False):
 PREFIX = r'''
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -73,6 +74,19 @@ uint8_t allocation_result=0;
 PageTable sentinel;
 namespace smt { uint64_t get_core_count(){return cores;}bool has_cpu_data(){return cpu_data_available;} }
 namespace cpu { uint64_t current_cpu(){return cpu_index;} }
+namespace mmio_cache {
+enum class Status : uint8_t { ready, unsupported_mode };
+Status configuration_result = Status::ready;
+unsigned configurations = 0;
+size_t last_topology = SIZE_MAX;
+bool configured_before_vector = true;
+auto configure_boot_cohort(size_t count) -> Status {
+    ++configurations;
+    last_topology = count;
+    configured_before_vector = configured_before_vector && allocations == 0 && registrations == 0;
+    return configuration_result;
+}
+}
 bool cpu_slot_valid(uint64_t n){return n<64;}
 void tlb_shootdown_handler(){}
 namespace gates {
@@ -87,22 +101,28 @@ void expect(bool ok,const char* label){++checks;if(!ok){++failures;std::fprintf(
 '''
 
 TESTS = r'''
-void reset(uint64_t n,uint8_t result){
+void reset(uint64_t n,uint8_t result,mmio_cache::Status policy=mmio_cache::Status::ready){
     cores=n;allocation_result=result;cpu_index=0;cpu_data_available=false;
     allocations=registrations=warnings=0;tlb_shootdown_vector=0;tlb_shootdown_init_attempted=false;
+    mmio_cache::configuration_result=policy;mmio_cache::configurations=0;
+    mmio_cache::last_topology=SIZE_MAX;mmio_cache::configured_before_vector=true;
     for(size_t i=0;i<64;++i){tlb_active_pagemaps[i]=&sentinel;tlb_shootdown_cpu_online[i]=0;}
 }
 template<class F>bool panics(F f){try{f();return false;}catch(std::runtime_error const&){return true;}}
 void unchanged(){for(size_t i=0;i<64;++i){expect(tlb_active_pagemaps[i].load()==&sentinel,"no active-root store before fatal refusal");expect(tlb_shootdown_cpu_online[i].load()==0,"no online-bit store before fatal refusal");}}
 void init_matrix(){
-    for(uint64_t count:{0U,1U,2U,8U,64U})for(uint8_t result:{0U,0x51U}){
-        reset(count,result);bool should_panic=count>1 && result==0;
-        expect(panics([]{init_tlb_shootdown();})==should_panic,"published SMP count rejects allocation0 even before cpu_data exists");
-        expect(allocations==1 && tlb_shootdown_init_attempted.load(),"single actual init attempt records allocator call");
-        expect(registrations==(result?1U:0U),"only actual nonzero vector installs a handler");
-        expect(tlb_shootdown_vector==result,"published vector is actual allocator result");
-        expect(warnings==((!result && !should_panic)?1U:0U),"only genuine UP/unknown-early failure keeps warning continuation");
-        unchanged();
+    for(auto policy:{mmio_cache::Status::ready,mmio_cache::Status::unsupported_mode}){
+        for(uint64_t count:{0U,1U,2U,8U,64U})for(uint8_t result:{0U,0x51U}){
+            reset(count,result,policy);bool should_panic=count>1 && result==0;
+            expect(panics([]{init_tlb_shootdown();})==should_panic,"published SMP count rejects allocation0 even before cpu_data exists");
+            expect(mmio_cache::configurations==1 && mmio_cache::last_topology==count,"actual init configures exact topology once for either cache-policy result");
+            expect(mmio_cache::configured_before_vector,"cache observation is configured before vector publication");
+            expect(allocations==1 && tlb_shootdown_init_attempted.load(),"single actual init attempt records allocator call");
+            expect(registrations==(result?1U:0U),"only actual nonzero vector installs a handler");
+            expect(tlb_shootdown_vector==result,"published vector is actual allocator result");
+            expect(warnings==((!result && !should_panic)?1U:0U),"only genuine UP/unknown-early failure keeps warning continuation");
+            unchanged();
+        }
     }
 }
 void online_matrix(){
@@ -118,20 +138,26 @@ void online_matrix(){
             for(size_t i=0;i<64;++i)if(i!=cpu)expect(tlb_shootdown_cpu_online[i].load()==0,"unrelated CPU online state unchanged");
         }
         expect(allocations==0 && registrations==0,"online gate does not fabricate or allocate readiness");
+        expect(mmio_cache::configurations==0,"online gate does not reconfigure the cache cohort");
     }
     reset(8,0);cpu_index=64;expect(!panics([]{note_tlb_shootdown_cpu_online();}),"existing invalid-slot refusal retained");unchanged();
 }
 void idempotence(){
-    reset(8,0x51);expect(!panics([]{init_tlb_shootdown();}),"successful SMP init");allocation_result=0;
-    expect(!panics([]{init_tlb_shootdown();}),"successful repeated init stays idempotent");
-    expect(allocations==1 && registrations==1 && tlb_shootdown_vector==0x51,"repeat never loses working vector");
-    reset(1,0);expect(!panics([]{init_tlb_shootdown();}),"actual early/UP allocation failure may continue");
-    cores=8;allocation_result=0x51;expect(!panics([]{init_tlb_shootdown();}),"attempted guard does not invent retry");
-    expect(allocations==1 && registrations==0 && tlb_shootdown_vector==0,"early failed attempt remains truthfully unavailable");
-    expect(panics([]{note_tlb_shootdown_cpu_online();}),"final online boundary catches early failed attempt");unchanged();
-    reset(8,0);expect(panics([]{init_tlb_shootdown();}),"SMP failure is fatal first attempt");
-    allocation_result=0x51;expect(!panics([]{init_tlb_shootdown();}),"test-only caught panic preserves existing attempted behavior");
-    cpu_index=1;expect(panics([]{note_tlb_shootdown_cpu_online();}),"AP cannot bypass prior fatal attempt after catch seam");unchanged();
+    for(auto policy:{mmio_cache::Status::ready,mmio_cache::Status::unsupported_mode}){
+        reset(8,0x51,policy);expect(!panics([]{init_tlb_shootdown();}),"successful SMP init");allocation_result=0;
+        expect(!panics([]{init_tlb_shootdown();}),"successful repeated init stays idempotent");
+        expect(allocations==1 && registrations==1 && tlb_shootdown_vector==0x51,"repeat never loses working vector");
+        expect(mmio_cache::configurations==1 && mmio_cache::last_topology==8,"successful init and repeat configure cache exactly once");
+        reset(1,0,policy);expect(!panics([]{init_tlb_shootdown();}),"actual early/UP allocation failure may continue");
+        cores=8;allocation_result=0x51;expect(!panics([]{init_tlb_shootdown();}),"attempted guard does not invent retry");
+        expect(allocations==1 && registrations==0 && tlb_shootdown_vector==0,"early failed attempt remains truthfully unavailable");
+        expect(mmio_cache::configurations==1 && mmio_cache::last_topology==1,"failed UP init retains its original single cache configuration");
+        expect(panics([]{note_tlb_shootdown_cpu_online();}),"final online boundary catches early failed attempt");unchanged();
+        reset(8,0,policy);expect(panics([]{init_tlb_shootdown();}),"SMP failure is fatal first attempt");
+        allocation_result=0x51;expect(!panics([]{init_tlb_shootdown();}),"test-only caught panic preserves existing attempted behavior");
+        cpu_index=1;expect(panics([]{note_tlb_shootdown_cpu_online();}),"AP cannot bypass prior fatal attempt after catch seam");unchanged();
+        expect(mmio_cache::configurations==1 && mmio_cache::last_topology==8,"caught SMP panic cannot repeat cache configuration");
+    }
 }
 int run(){init_matrix();online_matrix();idempotence();std::printf("checks=%u failures=%u\n",checks,failures);return failures?3:0;}
 }

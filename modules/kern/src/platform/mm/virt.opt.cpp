@@ -29,6 +29,7 @@
 #include <platform/mm/cache_bits.hpp>
 #include <platform/mm/cache_policy.hpp>
 #include <platform/mm/lifetime_retirement_executor.hpp>
+#include <platform/mm/mmio_cache.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/numa_root_reserve.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -6706,6 +6707,10 @@ void init_tlb_shootdown() {
     if (!tlb_shootdown_init_attempted.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return;
     }
+
+    // Configuration precedes AP launch. Optional policy refusal must not change
+    // the existing shared-TLB service or ordinary kernel boot behavior.
+    (void)mmio_cache::configure_boot_cohort(static_cast<size_t>(smt::get_core_count()));
 
     tlb_shootdown_vector = gates::allocate_vector();
     if (tlb_shootdown_vector != 0) {

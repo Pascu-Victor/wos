@@ -120,6 +120,21 @@ is `ON`, CMake intentionally forces `WOS_PHYS_ALLOC_CALLER_STATS=ON` and
 
 ## Runtime Kernel Command-Line Diagnostics
 
+With `WOS_SELFTEST=ON`, `--selftest-cache-policy` uses an ordinary scheduled
+worker to inspect actual BSP/AP PAT and later cache-state reports. Its
+`MMIO_CACHE_RUNTIME PASS` requires every configured CPU ready and at least one
+privately qualified UC interval; candidate physical addresses are queried as
+metadata. The worker checks token moves, local hardware revalidation, immutable
+reports and normal PID1 shutdown. It performs no mapping or cache flush.
+
+For the explicit unsupported-machine control, use that base flag together with
+`--selftest-cache-state-refusal` and a VM CPU model with MTRR disabled (for
+example `host,migratable=no,+invtsc,-mtrr`). The distinct `REFUSAL_PASS` requires
+terminal `missing_features` reports, zero ready CPUs and zero range tokens while
+normal root mounting and PID1 shutdown still work. This is refusal evidence,
+separate from a positive UC qualification. Use the isolated rootless
+`wos-ktest --no-setup` workflow and exact-owned image cleanup for both profiles.
+
 With `WOS_SELFTEST=ON`, `--selftest` includes known-PAT and invalid-MSR recovery
 tests on an MSR/PAT/x2APIC-capable fixture. The invalid read targets the write-only
 x2APIC SELF_IPI register (0x83f), after checking the actual APIC_BASE mode. It must

@@ -366,6 +366,13 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         # Low-level CPU/ASM helpers called from exception paths
         src/platform/asm/cpu.cpp
         src/platform/asm/cpu_safe_msr.cpp
+        # Once-published cache observations and decoders run during CPU startup.
+        src/platform/mm/mtrr_policy.cpp
+        src/platform/mm/mmio_cache.cpp
+        src/platform/mm/mmio_cache_platform.cpp
+        src/platform/mm/mmio_cache_model.cpp
+        src/platform/mm/mmio_cache_amd.cpp
+        src/platform/mm/mmio_cache_protected.cpp
         src/platform/asm/tlb.cpp
         src/util/hcf.hpp
         # Synchronization primitives — called from excluded early-boot code
@@ -390,6 +397,11 @@ endif()
 # Keep the explicit early-runtime exception local to this translation unit.
 set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/asm/cpu_safe_msr.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
+foreach(src IN ITEMS mtrr_policy.cpp mmio_cache.cpp mmio_cache_platform.cpp
+                     mmio_cache_model.cpp mmio_cache_amd.cpp mmio_cache_protected.cpp)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mm/${src}
+        APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
+endforeach()
 
 if(WOS_KASAN)
     # The diagnostic walks PMM side metadata while holding every allocator

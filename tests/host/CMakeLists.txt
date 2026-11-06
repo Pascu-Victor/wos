@@ -60,6 +60,43 @@ wos_add_unit_test(cache_pte_test
 wos_add_unit_test(cache_policy_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/cache_policy_test.cpp
 )
+wos_add_unit_test(mtrr_policy_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mtrr_policy_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/mtrr_policy.cpp
+)
+wos_add_unit_test(mmio_cache_amd_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_cache_amd_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/mtrr_policy.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_model.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_amd.cpp
+)
+wos_add_unit_test(mmio_cache_protected_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_cache_protected_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/mmio_cache_protected.cpp
+)
+wos_add_unit_test(mmio_cache_observation_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_cache_observation_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/mtrr_policy.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_model.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_amd.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_protected.cpp
+)
+wos_add_unit_test(mmio_cache_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_cache_model_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/mtrr_policy.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_model.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_amd.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_protected.cpp
+)
+wos_add_unit_test(mmio_cache_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_cache_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/mtrr_policy.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_model.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_amd.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache_protected.cpp
+                 ${WOS_KERN_SRC}/platform/mm/mmio_cache.cpp
+)
+set_tests_properties(mmio_cache_runtime_test PROPERTIES TIMEOUT 60)
 wos_add_unit_test(file_binding_snapshot_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim/retirement_port.cpp

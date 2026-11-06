@@ -243,6 +243,42 @@ result; future cache qualification must retain its platform and semantic checks.
 
 ## Inherited cache policy and device mappings
 
+`platform/mm/mmio_cache` separately captures later CPU state after the local
+IDT, GS and x2APIC are installed. Each configured CPU publishes one immutable
+terminal observation. Actual GS/APIC identity is checked under a bounded IRQ
+guard; unsupported state leaves ordinary boot available. The inherited early
+PAT observations keep their existing role.
+
+The qualifier resolves fixed/variable/default MTRRs over finite physical
+interval boundaries and compares accessible cache policy, full PAT values and
+protected exclusions across the CPU cohort. Current documented register layouts
+cover eight AMD and ten Intel variable pairs; larger enabled counts require a
+proven index map and are refused before probing. Inactive fields stay dormant.
+Intel PAT-UC composition and AMD's distinct CD result are handled separately.
+AMD SYS_CFG, IORR and TOP_MEM routing are checked independently of MTRR enable;
+TOM2 force-WB changes the default after explicit variable-range selection.
+
+Intel SMRR/SEAMRR and AMD SMM intervals are excluded before ordinary type
+composition. AMD SMM controls use the generic APM layout or the explicitly
+selected Family17h 00h–2fh profile. Unobservable/model-specific PRMRR/EPC state,
+unprofiled extensions, active encrypted-address geometry and unsupported cache
+modes return named refusals. The source/layout provenance is
+[Intel SDM 093](https://cdrdv2-public.intel.com/929363/335592-093-sdm-vol-4.pdf),
+[AMD APM 3.46](https://docs.amd.com/api/khub/documents/LNBl5evreogi0r25VIFF2g/content),
+and the scoped [Family17h OSRR 3.03](https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/56255_OSRR.pdf).
+
+Only the actual captured cohort can mint a private `QualifiedUcRange` for exact
+page-rounded bounds. Partial/mismatched cohorts cannot seal; duplicate capture
+and detected hardware drift invalidate admission permanently. Local validation
+streams the observed registers and restores incoming IRQ state. It does not
+refresh the snapshots. Snapshot consistency assumes conforming firmware/VMM
+behavior, including meaningful optional-register observations.
+
+Typed mappings will additionally require physical/BAR ownership, absent aliases
+and a completed all-CPU translation/cache-maintenance barrier. These CPU tokens
+provide none of those independent authorities. WC, active encrypted mappings and
+physical GPU qualification remain Goal41 work.
+
 Bootstrap preserves each framebuffer page's incoming PAT selector when replacing
 Limine's page tables. It verifies the inherited supervisor translation and
 physical address, converts large-leaf PAT bit 12 to 4 KiB leaf bit 7, and audits

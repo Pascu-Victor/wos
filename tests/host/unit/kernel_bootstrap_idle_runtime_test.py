@@ -847,15 +847,20 @@ def main() -> int:
                   whole_budget_seconds=90, hardware_reset_cause_qualified=False)
     try:
         source = args.scheduler_source.resolve(strict=True)
-        compiler = Path(args.cxx).resolve(strict=True)
-        if not compiler.is_file() or not os.access(compiler, os.X_OK):
+        # Preserve clang++/g++ in argv[0]: resolving a clang++ symlink to
+        # clang selects the C driver at link time. Pin the actual ELF separately.
+        compiler = Path(os.path.abspath(args.cxx))
+        compiler_elf = compiler.resolve(strict=True)
+        if not compiler_elf.is_file() or not os.access(compiler, os.X_OK):
             raise ValueError('--cxx must name one executable compiler ELF')
-        with compiler.open('rb') as executable:
+        with compiler_elf.open('rb') as executable:
             if executable.read(4) != b'\x7fELF':
                 raise ValueError('--cxx must name one executable compiler ELF')
+        result['compiler_argv'] = str(compiler)
+        result['compiler_resolved_elf'] = pin(compiler_elf)
         subreaper()
         watched = [source, CONTEXT, ASM, *HEADERS, Path(__file__).resolve(),
-                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler]
+                   ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler, compiler_elf]
         before = [pin(path) for path in watched]
         result['sources_before'] = before
         scratch = Path(tempfile.mkdtemp(prefix='wos-bootstrap-idle-', dir='/tmp'))

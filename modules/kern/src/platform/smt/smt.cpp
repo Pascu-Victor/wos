@@ -3,6 +3,7 @@
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/cache_policy.hpp>
 #include <platform/mm/managed_huge.hpp>
+#include <platform/mm/mmio_cache.hpp>
 #include <platform/mm/numa_alloc.hpp>
 
 #ifdef WOS_SELFTEST
@@ -492,6 +493,10 @@ __attribute__((no_stack_protector)) void cpu_param_init(uint64_t cpu_no, uint64_
     uint64_t const IDLE_STACK_TOP = allocate_kernel_stack_top("ap-idle-stack");
     auto* idle_task = new sched::task::Task("idle", 0, 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
     sched::post_task(idle_task);
+
+    // This CPU now has its real GS, local IDT/APIC and final boot features.
+    // Unsupported policy is a terminal observation, not a normal boot failure.
+    (void)mm::mmio_cache::capture_boot_cpu(static_cast<size_t>(cpu_no));
 
     // Atomically increment the counter of initialized CPUs
     // If we're the last CPU, enable per-CPU allocations globally
@@ -1223,6 +1228,10 @@ __attribute__((no_stack_protector)) void start_smt(boot::HandoverModules& module
     uint64_t const IDLE_STACK_TOP = allocate_kernel_stack_top("bsp-idle-stack");
     auto* idle_task = new sched::task::Task("idle", 0, 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
     sched::post_task(idle_task);
+
+    // Keep the early inherited PAT observation independent of this late,
+    // optional-policy capture. Refusal leaves ordinary WB boot available.
+    (void)mm::mmio_cache::capture_boot_cpu(0);
 
     // BSP will participate in the atomic counter via cpuParamInit-style logic
     // We need to call the same logic here for BSP

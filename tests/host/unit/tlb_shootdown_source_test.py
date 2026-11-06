@@ -239,10 +239,14 @@ def require_flush_helper_reaches_remote_cpus(source: str) -> None:
 def require_mapping_mutations_use_shootdown(source: str) -> None:
     map_body = function_body(source, "map_page")
     map_order = [
+        "auto const TABLE_FLAGS = table_flags_for_leaf(FLAGS)",
+        "pml3 = advance_page_table(page_table, index_of(VADDR, 4), TABLE_FLAGS, &path_promoted)",
+        "pml2 = advance_page_table(pml3, index_of(VADDR, 3), TABLE_FLAGS, &path_promoted)",
+        "pml1 = advance_page_table(pml2, index_of(VADDR, 2), TABLE_FLAGS, &path_promoted)",
         "uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave()",
         "old_entry = entry",
         "replaced_translation = old_entry.present != 0 || is_reserved_leaf(old_entry)",
-        "entry = paging::create_page_table_entry(PADDR, FLAGS)",
+        "entry = paging::create_page_table_leaf_4k(PADDR, FLAGS)",
         "user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS)",
         "invalidate_local_tlb_if_current(page_table, VADDR, path_promoted)",
         "if (path_promoted || replaced_translation)",
@@ -313,8 +317,13 @@ def require_mapping_mutations_use_shootdown(source: str) -> None:
              "UserPagemapExclusiveScopesource_usercopy_scope(source,source_owner);",
              "if(source_owner!=nullptr&&!source_usercopy_scope.owns(source))returnrefuse(Site::SourceAuthority,-EAGAIN);",
              "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
+             "if(device_fork!=nullptr&&!device_fork->empty()){",
+             "if(private_child==nullptr)returnrefuse(Site::SourceAuthority,-EOPNOTSUPP);",
+             "intconstATTACHED=device_fork->attach_before_copy(actor,*private_child,child,publication);",
+             "if(ATTACHED!=0)returnrefuse(Site::SourceAuthority,ATTACHED);",
              "sched::PreemptGuardconstCOW_PREEMPT;",
-             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)",
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,"
+             "prepared_swap,&prepared_error,device_fork!=nullptr&&!device_fork->empty())",
              "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);",
              "returnrefuse(Site::CowWalk,prepared_error!=0?prepared_error:-ENOMEM);"]
     cursor = 0
