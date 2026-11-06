@@ -422,6 +422,7 @@ void sched_init() {
     bool const E1000_MMIO = cmdline_has_token(get_kernel_cmdline(), "--selftest-e1000-mmio");
     bool const TYPED_MMIO = cmdline_has_token(get_kernel_cmdline(), "--typed-pci-mmio");
     if ((E1000_MMIO && !TYPED_MMIO) ||
+        (cmdline_has_token(get_kernel_cmdline(), "--selftest-e1000-mmio-admission-steps") && (!E1000_MMIO || !TYPED_MMIO)) ||
         (cmdline_has_token(get_kernel_cmdline(), "--selftest-e1000-mmio-withdraw-retry") && (!E1000_MMIO || !TYPED_MMIO)))
         mod::dbg::panic_handler("e1000 MMIO diagnostic requires --selftest-e1000-mmio and --typed-pci-mmio");
     if (E1000_MMIO &&

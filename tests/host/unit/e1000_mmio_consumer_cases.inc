@@ -3,16 +3,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 
 namespace e1000_host {
 namespace driver = ker::dev::e1000e;
 namespace dma = ker::dev::dma;
 namespace mapping = ker::mod::mm::mmio;
 namespace pci = ker::dev::pci;
-inline constexpr std::array<std::string_view, 10> consumer_cases{
-    "consumer_success",          "consumer_held_callback",    "consumer_probe_packet_failure", "consumer_probe_irq_failure",
-    "consumer_stop_failure",     "consumer_mask_failure",     "consumer_initial_bme_refusal",  "consumer_withdrawal_retry",
-    "consumer_observed_profile", "consumer_second_view_retry"};
+inline constexpr std::array<std::string_view, 11> consumer_cases{
+    "consumer_success",          "consumer_held_callback",     "consumer_probe_packet_failure", "consumer_probe_irq_failure",
+    "consumer_stop_failure",     "consumer_mask_failure",      "consumer_initial_bme_refusal",  "consumer_withdrawal_retry",
+    "consumer_observed_profile", "consumer_second_view_retry", "consumer_completed_va_reuse"};
+inline constexpr uint64_t REUSE_BAR0 = 0x82060000, REUSE_BAR1 = 0x82080000;
+inline std::optional<pci::DriverClaim> reuse_claim;
+inline bool reuse_complete{};
 inline size_t assertions{}, final_observations{};
 inline std::string_view selected_case;
 inline driver::E1000Device* device{};
@@ -228,6 +232,113 @@ void exercise_normal_callbacks() {
     expect(device->tx_bufs[0] == nullptr, "actual completion consumes the DMA submission before packet release");
 }
 
+void preclaim_reuse_function(const controller_host::cm::detail::Controller&) {
+    expect(!reuse_claim.has_value(), "second function has no preexisting test claim");
+    pci::PCIDevice* second = nullptr;
+    for (size_t i = 0; i < pci::pci_device_count(); ++i) {
+        auto* candidate = pci::pci_get_device(i);
+        if (candidate != nullptr && candidate->bus == 0 && candidate->slot == 5 && candidate->function == 0) second = candidate;
+    }
+    expect(second != nullptr && second->vendor_id == 0x8086 && second->device_id == 0x10d3 &&
+               second->class_code == pci::PCI_CLASS_NETWORK && second->subclass_code == pci::PCI_SUBCLASS_ETHERNET,
+           "second real enumerated function keeps its ordinary NIC identity");
+    reuse_claim = pci::try_claim_driver(second, pci::DriverKind::e1000e);
+    expect(reuse_claim.has_value(), "actual exclusive ledger grants the second function's retained claim before normal init");
+}
+
+auto reused_leaf_raw(uint64_t address) -> uint64_t {
+    auto* table = mmio_host::root;
+    for (unsigned level = 4; level != 0; --level) {
+        expect(table != nullptr, "actual reused leaf has a real retained hierarchy");
+        uint64_t const raw = mmio_host::raw(table, (address >> (12 + 9 * (level - 1))) & 511);
+        expect((raw & 1U) != 0, "actual reused owner leaf remains present");
+        if (level == 1) return raw;
+        expect((raw & 128U) == 0, "actual reused child uses the retained four-level 4-KiB hierarchy");
+        auto found = mmio_host::tables.find(raw & mmio_host::FRAME);
+        expect(found != mmio_host::tables.end(), "actual reused hierarchy resolves only known finite table backing");
+        table = found->second;
+    }
+    std::abort();
+}
+
+void observe_boot_va_reuse(const controller_host::cm::detail::Controller& controller) {
+    expect(driver::device_count == 1 && reuse_claim.has_value(), "ordinary driver initializes only the unclaimed first function");
+    auto* first = driver::devices[0];
+    expect(first != nullptr && first->pci == pci_cold_host::selected_device() && first->typed_mmio && first->mmio == nullptr,
+           "failed probe retains the genuine first driver and typed mapping");
+    auto const old = first->registers.report();
+    expect(first->retirement.load() == driver::E1000Device::Retirement::withdrawal_pending && !first->published && !first->irq_owned &&
+               dma::stats(first->pci).regions == 0 && packets.empty() && old.phase == mapping::Phase::withdrawal_pending &&
+               old.admission_closed && old.normal_readers == 0 && !old.terminal_active && old.view_count == 2,
+           "real failed-probe hardware retirement leaves only a closed CPU-withdrawal continuation");
+    expect(old.views[0].phase == mapping::Phase::complete && old.views[0].withdrawal_ticket != 0 && !old.views[0].timed_out_ever &&
+               old.views[1].phase == mapping::Phase::withdrawal_pending && old.views[1].withdrawal_ticket != 0 &&
+               old.views[1].timed_out_ever,
+           "actual first child completed before second-child timeout and VA reuse");
+    expect(mmio_host::translate(old.views[0].virtual_base) == UINT64_MAX,
+           "old first-child leaf is genuinely absent before another function adopts its VA");
+    auto const effects_before = register_effects.size();
+    auto const reads_before = mmio_host::register_reads;
+    auto const writes_before = mmio_host::register_writes;
+    auto const allocations_before = mmio_host::dma_allocs;
+    auto const frees_before = mmio_host::dma_frees;
+    auto const irq_drains_before = irq_drains;
+    maintenance_host::pause_remote_after_ipis.store(UINT_MAX);
+    maintenance_host::auto_progress.store(true);
+    mapping::Mapping replacement;
+    std::array<mapping::ViewRequest, 1> const request{{{0, 0, 4096}}};
+    expect(pci::map_cold_uc_82574(*reuse_claim, controller, request, replacement) == mapping::Status::ready,
+           "same genuine BootController maps the separately claimed function through the actual PCI factory");
+    auto const fresh = replacement.report();
+    expect(fresh.phase == mapping::Phase::active && fresh.id != 0 && fresh.id != old.id && fresh.view_count == 1 &&
+               fresh.views[0].bar == 0 && fresh.views[0].bar_offset == 0 && fresh.views[0].bytes == 4096 &&
+               fresh.views[0].physical == REUSE_BAR0 && fresh.views[0].virtual_base == old.views[0].virtual_base &&
+               reuse_claim->device() != first->driver_claim.device() && reuse_claim->epoch() != first->driver_claim.epoch(),
+           "actual allocator reuses the completed child VA for a distinct genuine function and generation");
+    expect(mmio_host::translate(fresh.views[0].virtual_base) == REUSE_BAR0, "actual reused PTE names the second function's physical BAR");
+    auto const new_leaf = reused_leaf_raw(fresh.views[0].virtual_base);
+    expect(register_effects.size() == effects_before && mmio_host::register_reads == reads_before &&
+               mmio_host::register_writes == writes_before && mmio_host::dma_allocs == allocations_before &&
+               mmio_host::dma_frees == frees_before && irq_drains == irq_drains_before,
+           "second function preparation performs no register, DMA or IRQ hardware operation");
+    auto const result = driver::retire_device(first, &controller);
+    expect(result == 0 && first->retirement.load() == driver::E1000Device::Retirement::released &&
+               replacement.report().phase == mapping::Phase::active && replacement.report().id == fresh.id &&
+               mmio_host::translate(fresh.views[0].virtual_base) == REUSE_BAR0 && reused_leaf_raw(fresh.views[0].virtual_base) == new_leaf,
+           "completed-child retry preserves the actual newer function mapping");
+    auto const completed = first->registers.report();
+    expect(completed.id == old.id && completed.phase == mapping::Phase::complete && completed.view_count == old.view_count &&
+               completed.views[0].withdrawal_ticket == old.views[0].withdrawal_ticket &&
+               completed.views[1].withdrawal_ticket == old.views[1].withdrawal_ticket,
+           "actual old retry completes only its original generation and withdrawal tickets");
+    for (uint64_t offset = 0; offset < completed.views[1].bytes; offset += 4096)
+        expect(mmio_host::translate(completed.views[1].virtual_base + offset) == UINT64_MAX,
+               "old second-child leaves remain withdrawn after the original ticket completes");
+    expect(register_effects.size() == effects_before && mmio_host::register_reads == reads_before &&
+               mmio_host::register_writes == writes_before && mmio_host::dma_allocs == allocations_before &&
+               mmio_host::dma_frees == frees_before && irq_drains == irq_drains_before,
+           "actual old retry never repeats hardware retirement or accesses the separately owned function");
+    expect(!first->registers.borrow().valid() && !first->registers.terminal_borrow().valid(),
+           "old reports cannot reopen access to a historical VA after generation change");
+    {
+        auto retained = replacement.borrow();
+        expect(retained.valid(), "new actual affine Borrow retains its new generation without issuing an instruction");
+    }
+    replacement.close();
+    expect(replacement.report().phase == mapping::Phase::closed && !replacement.borrow().valid() &&
+               mmio_host::translate(fresh.views[0].virtual_base) == REUSE_BAR0 &&
+               !mapping::detail::record_generic_physical_access(pci_cold_host::BAR0, 4096) &&
+               !mapping::detail::record_generic_physical_access(REUSE_BAR0, 4096),
+           "both genuine physical owners remain retained without inventing second hardware quiescence");
+    reuse_claim.reset();
+    reuse_complete = true;
+    std::printf("MMIO_VA_REUSE_HOST old_mapping=%llu new_mapping=%llu va=%llx physical=%llx old_ticket0=%llu old_ticket1=%llu\n",
+                static_cast<unsigned long long>(old.id), static_cast<unsigned long long>(fresh.id),
+                static_cast<unsigned long long>(fresh.virtual_base), static_cast<unsigned long long>(fresh.physical),
+                static_cast<unsigned long long>(old.views[0].withdrawal_ticket),
+                static_cast<unsigned long long>(old.views[1].withdrawal_ticket));
+}
+
 // Shared runner first initializes actual boot/cache/MM/PCI sources (without
 // calling an issuer). The retry case's immutable command line must also include
 // --selftest-e1000-mmio-withdraw-retry before actual MM boot initialization.
@@ -244,6 +355,19 @@ void run_consumer_case(std::string_view name) {
     pci_cold_host::registers[driver::REG_RAL / 4] = 0x33221102;
     pci_cold_host::registers[driver::REG_RAH / 4] = 0x5544 | driver::RAH_AV;
     pci_cold_host::registers[driver::REG_STATUS / 4] = 2;
+    if (name == "consumer_completed_va_reuse") {
+        packet_budget = 3;
+        controller_host::before_boot_callback = preclaim_reuse_function;
+        auto const rounds_before_second_withdrawal = 2 * driver::REGISTER_VIEWS.size() + 1;
+        maintenance_host::pause_remote_after_ipis.store(
+            static_cast<unsigned>(rounds_before_second_withdrawal * runtime_ports::configured.load() + 1));
+        expect(controller_host::with_actual_boot_controller(observe_boot_va_reuse),
+               "actual canonical boot failure and CPU-only retry demonstrate another function's VA reuse");
+        controller_host::before_boot_callback = nullptr;
+        expect(reuse_complete && !reuse_claim.has_value() && final_observations == 0,
+               "canonical reuse case retains its new owner and never invents a scheduled finalizer");
+        return;
+    }
     expect(controller_host::with_actual_boot_controller(observe_boot), "actual one-shot InitExecutor invokes the production consumer");
     if (name == "consumer_probe_packet_failure" || name == "consumer_probe_irq_failure" || name == "consumer_initial_bme_refusal") {
         expect(final_observations == 0, "failed probe did not invent an accepted finalizer");

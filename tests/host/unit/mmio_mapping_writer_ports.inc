@@ -31,6 +31,44 @@ struct Lock {
     auto lock_irqsave() -> uint64_t { return mmio::detail::platform::lock_pin(); }
     void unlock_irqrestore(uint64_t flags) { mmio::detail::platform::unlock_pin(flags); }
 } user_mapping_pin_lock;
+inline std::mutex cow_mutex;
+inline unsigned cow_depth{};
+struct CowLock {
+    auto lock_irqsave() -> uint64_t {
+        assert(cow_depth == 0 && mmio_host::pin_depth == 0 && pci_cold_host::config_depth == 0);
+        uint64_t const flags = runtime_ports::flags;
+        runtime_ports::flags &= ~runtime_ports::IF;
+        cow_mutex.lock();
+        ++cow_depth;
+        return flags;
+    }
+    void unlock_irqrestore(uint64_t flags) {
+        assert(cow_depth == 1 && mmio_host::pin_depth == 0);
+        --cow_depth;
+        cow_mutex.unlock();
+        runtime_ports::flags = flags;
+    }
+} cow_pte_lock;
+// Explicit absent-swap endpoint for the actual ordinary unmap body. No swap
+// registry or active mapping is fabricated; every nonnull operation aborts.
+enum class AnonymousSwapRuntimeState : uint8_t { PAGEOUT, SWAPPED, PAGEIN, FAILED };
+struct AnonymousSwapObject {};
+struct AnonymousSwapMapping {
+    bool cancelled{}, pagein_queued{};
+    AnonymousSwapRuntimeState state{AnonymousSwapRuntimeState::PAGEOUT};
+};
+struct {
+    std::atomic<uint64_t> swapped_pages{};
+} anonymous_swap_stats;
+auto find_anonymous_swap_mapping_locked(PageTable*, uint64_t) -> AnonymousSwapMapping* {
+    assert(cow_depth == 1 && mmio_host::pin_depth == 1);
+    return nullptr;
+}
+void remove_anonymous_swap_mapping_locked(AnonymousSwapMapping*) { std::abort(); }
+auto detach_anonymous_swap_object_locked(AnonymousSwapMapping*) -> AnonymousSwapObject* { std::abort(); }
+void release_anonymous_swap_object(AnonymousSwapObject* object) {
+    assert(object == nullptr && cow_depth == 0 && mmio_host::pin_depth == 0);
+}
 namespace addr {
 auto get_hhdm_offset() -> uint64_t { return 0xffff800000000000ULL; }
 auto get_virt_pointer(uint64_t physical) -> uint64_t* {
@@ -95,7 +133,7 @@ void drop_present_leaf_ref(const PageTableEntry&) {
     ++refs;
     effect('R');
 }
-auto is_reserved_leaf(const PageTableEntry& entry) -> bool { return !entry.present && entry.available; }
+auto is_reserved_leaf(const PageTableEntry& entry) -> bool;
 struct Range {
     uint64_t start{}, end{};
 };

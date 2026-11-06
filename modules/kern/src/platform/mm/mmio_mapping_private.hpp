@@ -51,5 +51,8 @@ void finish_boot_arena() noexcept;
 [[nodiscard]] auto generic_leaf_allowed_locked(const paging::PageTable* destination_table, uint64_t virtual_address, uint64_t old_raw,
                                                uint64_t new_raw, unsigned leaf_level) noexcept -> bool;
 [[nodiscard]] auto generic_root_allowed_locked(const paging::PageTable*) noexcept -> bool;
+// Conservative publication observation only. Caller owns the actual native
+// leaf PIN through this hook and its topology/root store; no permission issued.
+void note_topology_publication_locked() noexcept;
 
 }  // namespace ker::mod::mm::mmio::detail

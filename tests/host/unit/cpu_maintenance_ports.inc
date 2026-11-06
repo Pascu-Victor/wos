@@ -29,6 +29,7 @@ std::atomic<bool> clock_available{true};
 std::atomic<bool> auto_progress{true};
 std::atomic<unsigned> ipis{}, pauses{}, yields{};
 std::atomic<unsigned> pause_remote_after_ipis{UINT_MAX};
+std::atomic<unsigned> resume_remote_after_pauses{UINT_MAX};
 std::atomic<bool> nested_service{};
 std::atomic<bool> pre_armed{}, pre_entered{}, pre_release{};
 std::atomic<bool> post_armed{}, post_entered{}, post_release{};
@@ -104,6 +105,7 @@ void setup(size_t count, ker::mod::mm::cache_arch::Vendor vendor = ker::mod::mm:
     auto_progress.store(true);
     ipis.store(0);
     pause_remote_after_ipis.store(UINT_MAX);
+    resume_remote_after_pauses.store(UINT_MAX);
     pauses.store(0);
     yields.store(0);
     nested_service.store(false);
@@ -168,7 +170,11 @@ void controller_yield() {
     std::this_thread::yield();
 }
 void spin_pause() noexcept {
-    maintenance_host::pauses.fetch_add(1);
+    auto const PAUSES = maintenance_host::pauses.fetch_add(1) + 1;
+    if (PAUSES >= maintenance_host::resume_remote_after_pauses.load()) {
+        maintenance_host::pause_remote_after_ipis.store(UINT_MAX);
+        maintenance_host::auto_progress.store(true);
+    }
     if (maintenance_host::auto_progress.load()) maintenance_host::drain();
 }
 }  // namespace ker::mod::mm::cpu_maintenance::detail::platform

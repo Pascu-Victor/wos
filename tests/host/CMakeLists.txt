@@ -110,13 +110,18 @@ add_test(NAME mmio_mapping_runtime
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_mapping_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR})
 set_tests_properties(mmio_mapping_runtime PROPERTIES LABELS "host;unit;integration" TIMEOUT 240)
-foreach(control IN ITEMS remove-writer-preflight remove-bank-table-veto remove-table-supervisor-check)
+foreach(control IN ITEMS remove-writer-preflight remove-bank-table-veto remove-table-supervisor-check remove-completed-child-skip
+                         remove-leaf-publication-epoch)
     string(REPLACE "-" "_" control_name "${control}")
     add_test(NAME mmio_mapping_${control_name}
         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_mapping_runtime_test.py
             --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR} --control ${control})
     set_tests_properties(mmio_mapping_${control_name} PROPERTIES LABELS "host;unit;integration" TIMEOUT 240)
 endforeach()
+add_test(NAME mmio_mapping_finite_epoch_saturation
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/mmio_mapping_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --host-build ${CMAKE_BINARY_DIR} --finite-epoch-limit --case engine_large_epoch_saturation)
+set_tests_properties(mmio_mapping_finite_epoch_saturation PROPERTIES LABELS "host;unit;integration;finite-profile" TIMEOUT 240)
 wos_add_unit_test(file_binding_snapshot_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_binding_snapshot_shim/retirement_port.cpp

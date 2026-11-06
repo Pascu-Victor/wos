@@ -52,7 +52,18 @@ enum class Status : uint8_t {
     clock_unavailable,
 };
 
-enum class Phase : uint8_t { empty, reserved, cache_pending, leaves_ready, active, closed, withdrawal_pending, complete, retained };
+enum class Phase : uint8_t {
+    empty,
+    reserved,
+    cache_pending,
+    leaves_ready,
+    active,
+    closed,
+    withdrawal_pending,
+    complete,
+    retained,
+    physical_pending = 9
+};
 
 inline constexpr size_t VIEW_CAPACITY = 8;
 
@@ -93,6 +104,7 @@ struct Report {
     bool timed_out_ever{};
     size_t view_count{};
     std::array<ViewReport, VIEW_CAPACITY> views{};
+    uint64_t resource_steps{}, resource_visits{}, resource_restarts{}, resource_epoch{}, resource_root_frame{};
 };
 
 class Borrow {

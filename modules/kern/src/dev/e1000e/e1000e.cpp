@@ -16,6 +16,7 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/cpu_maintenance_controller.hpp>
+#include <platform/mm/cpu_maintenance_platform.hpp>
 #include <platform/mm/phys.hpp>
 #ifdef WOS_SELFTEST
 #include <platform/mm/addr.hpp>
@@ -823,6 +824,44 @@ auto initialize_registers(E1000Device* dev, const char* name) -> bool {
     return true;
 }
 
+auto prepare_register_views(E1000Device* dev, const Controller& controller) -> mmio::Status {
+    namespace platform = ker::mod::mm::cpu_maintenance::detail::platform;
+    constexpr uint64_t NEXT_CALL_BUDGET_NS = 5'000'000'000;
+    constexpr unsigned MAX_CALLS = 131072;
+    uint64_t started = 0;
+    if (!platform::clock_now_ns(started) || started > UINT64_MAX - NEXT_CALL_BUDGET_NS) return mmio::Status::clock_unavailable;
+    uint64_t const DEADLINE = started + NEXT_CALL_BUDGET_NS;
+    uint64_t previous = started;
+    auto status = mmio::Status::pending_retained;
+    unsigned calls = 0;
+    for (; calls < MAX_CALLS;) {
+        uint64_t now = 0;
+        if (!platform::clock_now_ns(now) || now < previous) {
+            status = mmio::Status::clock_unavailable;
+            break;
+        }
+        previous = now;
+        if (now >= DEADLINE) break;
+        ++calls;
+        status = pci::map_cold_uc_82574(dev->driver_claim, controller, REGISTER_VIEWS, dev->registers);
+        // Ready has already activated and published the mapping. A deadline
+        // cannot retrospectively turn that into an unexposed cold failure.
+        if (status != mmio::Status::pending_retained) break;
+        if (!platform::clock_now_ns(now) || now < previous) {
+            status = mmio::Status::clock_unavailable;
+            break;
+        }
+        previous = now;
+        if (now >= DEADLINE) break;
+        // The actual call's ConfigGuard, operation and MM PIN scopes have all
+        // ended. Keep the same affine claim/plan/controller for the next step.
+        asm volatile("pause" ::: "memory");
+    }
+    log::info("MMIO_BOOT_PREPARE attempts=%u status=%s exhausted=%u", calls, mmio::status_name(status),
+              status == mmio::Status::pending_retained ? 1U : 0U);
+    return status;
+}
+
 // Published objects have kernel lifetime, including failed probes with an IRQ
 // reader or NAPI snapshot. Never reuse a retired PCI device in this boot.
 void init_device(pci::PCIDevice* pci_dev, const char* name, const Controller* controller = nullptr) {
@@ -850,7 +889,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name, const Controller* co
         log::info("MMIO_BOOT_PROBE device=%x controller=1 task_present=%u actor_pid=%llu actor_type=%u if=%u", pci_dev->device_id,
                   actor != nullptr, actor != nullptr ? actor->pid : UINT64_MAX,
                   actor != nullptr ? static_cast<unsigned>(actor->type) : UINT32_MAX, ker::mod::sched::interrupts_enabled());
-        auto const STATUS = pci::map_cold_uc_82574(dev->driver_claim, *controller, REGISTER_VIEWS, dev->registers);
+        auto const STATUS = prepare_register_views(dev, *controller);
         if (STATUS != mmio::Status::ready) {
             // Private PCI preparation retains any physical/cache obligations.
             // No public mapping or register view exists and no raw fallback is
@@ -1336,7 +1375,9 @@ auto e1000e_mmio_runtime_check() -> bool {
     auto const MAPPED = dev->registers.report();
     auto const DMA = dma::stats(dev->pci);
     if (MAPPED.phase != mmio::Phase::active || MAPPED.id == 0 || MAPPED.initial_ticket == 0 || MAPPED.view_count != REGISTER_VIEWS.size() ||
-        MAPPED.admission_closed || MAPPED.terminal_active || DMA.regions != 514 || DMA.streaming != 512)
+        MAPPED.admission_closed || MAPPED.terminal_active || DMA.regions != 514 || DMA.streaming != 512 ||
+        MAPPED.resource_visits < MAPPED.physical_spans || MAPPED.resource_epoch == 0 || MAPPED.resource_root_frame == 0 ||
+        (test_flag("--selftest-e1000-mmio-admission-steps") && MAPPED.resource_steps < MAPPED.physical_spans))
         return false;
     for (size_t i = 0; i < REGISTER_VIEWS.size(); ++i) {
         auto const& request = REGISTER_VIEWS[i];
@@ -1417,10 +1458,12 @@ auto e1000e_mmio_runtime_check() -> bool {
     log::info(
         "E1000_MMIO_RUNTIME %s id=%llu pa=%llx va=%llx bytes=%llu initial_ticket=%llu status=%x raw_export=0 helpers_joined=%u "
         "held_readers=%llu rx64=%llu rx1514=%llu worker_rx=%llu irq=%llu tx_cpu=%llu rx_cpus=%llx regions=%zu first_retirement_pending=1 "
-        "views=%zu sparse_pages=5 hhdm_gap_absent=1 hhdm_tail_absent=1 secondary_gcr=%x",
+        "views=%zu sparse_pages=5 hhdm_gap_absent=1 hhdm_tail_absent=1 secondary_gcr=%x resource_steps=%llu resource_visits=%llu "
+        "resource_restarts=%llu resource_epoch=%llu resource_root=%llx",
         OK ? "PASS" : "FAIL", MAPPED.id, MAPPED.physical, MAPPED.virtual_base, MAPPED.bytes, MAPPED.initial_ticket, status, JOINED,
         HELD.normal_readers, live_test.small.load(), live_test.large.load(), live_test.worker_rx.load(), live_test.irqs.load(), TX_CPU,
-        RX_CPUS, DMA.regions, MAPPED.view_count, secondary_gcr);
+        RX_CPUS, DMA.regions, MAPPED.view_count, secondary_gcr, MAPPED.resource_steps, MAPPED.resource_visits, MAPPED.resource_restarts,
+        MAPPED.resource_epoch, MAPPED.resource_root_frame);
     return OK;
 }
 

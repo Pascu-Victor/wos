@@ -33,7 +33,13 @@ NAMES = ['engine_private_fences', 'engine_budget_refusal', 'engine_native_writer
          'engine_view_bounds', 'engine_invalid_view_plans', 'engine_legacy_view_default', 'engine_cross_bar_views', 'engine_view_prepare_resume',
          'consumer_success', 'consumer_held_callback', 'consumer_probe_packet_failure',
          'consumer_probe_irq_failure', 'consumer_stop_failure', 'consumer_mask_failure',
-         'consumer_initial_bme_refusal', 'consumer_withdrawal_retry', 'consumer_observed_profile', 'consumer_second_view_retry']
+         'consumer_initial_bme_refusal', 'consumer_withdrawal_retry', 'consumer_observed_profile', 'consumer_second_view_retry',
+         'consumer_completed_va_reuse', 'engine_large_sparse', 'engine_large_fragmented', 'engine_large_late_alias',
+         'engine_large_transient_alias', 'engine_large_device_history', 'engine_large_transient_device',
+         'engine_large_history_overflow', 'engine_large_root_drift', 'consumer_admission_steps',
+         'consumer_admission_fragmented', 'consumer_admission_deadline', 'consumer_admission_cpu_retry',
+         'consumer_admission_clock_unavailable', 'consumer_admission_clock_overflow', 'consumer_admission_clock_regression']
+FINITE_NAMES = ['engine_large_epoch_saturation']
 SOURCES = COMMON + [KERN / relative for relative in
     ('platform/mm/paging.opt.cpp', 'platform/mm/cache_policy.cpp', 'platform/mm/cpu_maintenance.cpp', 'platform/mm/mmio_mapping.cpp', 'dev/pci.cpp', 'dev/pci_extended.cpp',
      'dev/pci_platform_apertures.cpp', 'dev/dma/dma.cpp')]
@@ -44,9 +50,13 @@ def main() -> int:
     parser.add_argument('--cxx', default='/usr/bin/clang++')
     parser.add_argument('--host-build', type=Path, default=ROOT / 'build_tests')
     parser.add_argument('--evidence-dir', type=Path)
-    parser.add_argument('--case', action='append', choices=NAMES)
-    parser.add_argument('--control', choices=['remove-writer-preflight', 'remove-bank-table-veto', 'remove-table-supervisor-check'])
+    parser.add_argument('--case', action='append', choices=NAMES + FINITE_NAMES)
+    parser.add_argument('--finite-epoch-limit', action='store_true', help='compile-copy actual saturation helper limit128; no epoch setter')
+    parser.add_argument('--control', choices=['remove-writer-preflight', 'remove-bank-table-veto', 'remove-table-supervisor-check',
+                                            'remove-completed-child-skip', 'remove-leaf-publication-epoch'])
     args = parser.parse_args()
+    if args.finite_epoch_limit != (args.case == FINITE_NAMES) or (args.finite_epoch_limit and args.control):
+        parser.error('--finite-epoch-limit requires exactly --case engine_large_epoch_saturation and no negative control')
     deadline = time.monotonic() + 180
     scratch = None
     groups = []
@@ -79,6 +89,7 @@ def main() -> int:
         result['actual_consumer_definitions'] = actual_definitions
         watched = [Path(__file__).resolve(), CASES, PORTS, *SOURCES, *controller_inputs, *consumer_inputs, *writer_inputs, UNIT / 'mmio_mapping_writer_fixture.py',
                    UNIT / 'cpu_maintenance_runtime_test.py', UNIT / 'cpu_maintenance_ports.inc',
+                   UNIT / 'file_mmap_registry_runtime_test.py',
                    UNIT / 'cpu_maintenance_controller_ports.inc', UNIT / 'mmio_cache_runtime_test.cpp',
                    UNIT / 'pci_cold_fixture.hpp', UNIT / 'e1000_mmio_consumer_fixture.py',
                    UNIT / 'e1000_mmio_consumer_ports.inc', UNIT / 'e1000_mmio_consumer_cases.inc', compiler,
@@ -110,20 +121,38 @@ def main() -> int:
                  '-I', str(SHIM), '-I', str(ROOT / 'tests/host/kern_shim'), '-I', str(scratch), '-I', str(UNIT),
                  '-isystem', str(gtest_include), '-I', str(KERN), '-I', str(KERN / 'platform/mm'), '-I', str(ROOT / 'modules')]
         units = SOURCES + [CASES]
-        if args.control in ('remove-bank-table-veto', 'remove-table-supervisor-check'):
+        if args.finite_epoch_limit or args.control in ('remove-bank-table-veto', 'remove-table-supervisor-check', 'remove-completed-child-skip',
+                                                      'remove-leaf-publication-epoch'):
             original = KERN / 'platform/mm/mmio_mapping.cpp'
             text = original.read_text()
-            anchor = ('auto generic_table(const Table* table)' if args.control == 'remove-bank-table-veto'
-                      else 'auto register_table_locked(Table* table, uint64_t physical)')
+            if args.finite_epoch_limit:
+                anchor = 'void advance_epoch_locked()'
+                old, replacement = 'UINT64_MAX', 'uint64_t{128}'
+            elif args.control == 'remove-leaf-publication-epoch':
+                anchor = 'auto generic_leaf(const Table* table,'
+                old, replacement = 'advance_epoch_locked();', '(void)0;'
+            elif args.control == 'remove-completed-child-skip':
+                anchor = 'auto withdraw(uint16_t slot, uint64_t id, const Controller* scope, const QuiescedMapping& proof)'
+                old = 'if (view.phase.load(std::memory_order_acquire) == Phase::complete) continue;'
+                replacement = 'if (false && view.phase.load(std::memory_order_acquire) == Phase::complete) continue;'
+            elif args.control == 'remove-bank-table-veto':
+                anchor = 'auto generic_table(const Table* table)'
+                old = 'if (ADDRESS >= BANK_BASE && ADDRESS < BANK_END)'
+                replacement = 'if (false && ADDRESS >= BANK_BASE && ADDRESS < BANK_END)'
+            else:
+                anchor = 'auto register_table_locked(Table* table, uint64_t physical)'
+                old, replacement = 'paging::PAGE_USER | ', ''
             body = actual_definition(text, anchor)
-            old = ('if (ADDRESS >= BANK_BASE && ADDRESS < BANK_END)' if args.control == 'remove-bank-table-veto'
-                   else 'paging::PAGE_USER | ')
-            if body.count(old) != 1: raise ValueError('nonunique actual Runtime negative-control anchor')
-            changed = body.replace(old, 'if (false && ADDRESS >= BANK_BASE && ADDRESS < BANK_END)'
-                                   if args.control == 'remove-bank-table-veto' else '', 1)
+            expected_count = 2 if args.finite_epoch_limit else 1
+            if body.count(old) != expected_count: raise ValueError('nonunique actual Runtime compile-copy anchor')
+            changed = body.replace(old, replacement, expected_count)
             copy = scratch / 'control-mmio_mapping.cpp'
             copy.write_text(text.replace(body, changed, 1))
-            result['negative_control'] = args.control
+            if args.finite_epoch_limit:
+                result['finite_actual_epoch_saturation_limit'] = 128
+                result['epoch_value_setter'] = False
+            else:
+                result['negative_control'] = args.control
             result['actual_runtime_control_copy'] = pin(copy)
             units = [copy if source == original else source for source in units]
         deps = {}
@@ -167,6 +196,9 @@ def main() -> int:
             'remove-writer-preflight': ('engine_native_writers', 'actual map entrypoint refuses before allocation, owner tracking, refs or TLB work'),
             'remove-bank-table-veto': ('engine_private_fences', 'typed device VA cannot masquerade as an arithmetically plausible HHDM page-table pointer'),
             'remove-table-supervisor-check': ('engine_bad_table_alias', 'actual unsafe HHDM leaf cannot register the permanent private bank'),
+            'remove-completed-child-skip': ('consumer_completed_va_reuse', 'completed-child retry preserves the actual newer function mapping'),
+            'remove-leaf-publication-epoch': ('engine_large_late_alias',
+                                              'late actual HHVA effect invalidates previously scanned full-resource absence'),
         }
         for name in ([controls[args.control][0]] if args.control else args.case or NAMES):
             row = command([str(binary), name], scratch / f'{name}.log', scratch, deadline, groups)
@@ -175,17 +207,25 @@ def main() -> int:
             result['runs'].append(dict(case=name, exit=row['exit'], receipt=pin(scratch / f'{name}.log')))
             print(f'[{name}]\n{output[-16000:]}', end='')
             if args.control:
-                exact = 'actual MM engine check failed: ' + controls[args.control][1]
+                prefix = 'e1000 consumer assertion: ' if args.control == 'remove-completed-child-skip' else 'actual MM engine check failed: '
+                exact = prefix + controls[args.control][1]
                 if row['exit'] != -6 or exact not in output:
-                    raise ValueError('compile-success preflight control did not fail its exact before-effects oracle')
+                    raise ValueError('compile-success control did not fail its exact oracle')
                 if any(token in output for token in ('AddressSanitizer', 'runtime error:', 'UndefinedBehaviorSanitizer')):
                     raise ValueError('control sanitizer failure is not a qualified oracle')
                 result['control_detected'] = True
                 continue
             if name == 'engine_bad_table_alias' and 'cold UC probe retained id=0x10d3 status=arena_unavailable' not in output:
                 raise ValueError('actual malformed HHDM leaf did not leave the typed arena unavailable')
-            if name == 'engine_budget_refusal' and 'cold UC probe retained id=0x10d3 status=capacity' not in output:
-                raise ValueError('actual own-span budget did not report capacity')
+            if name == 'engine_budget_refusal' and 'MMIO_VIEW_BUDGET_REFUSAL status=capacity bytes=33554432' not in output:
+                raise ValueError('actual materialized-view budget did not report capacity')
+            if name == 'consumer_admission_deadline' and ('MMIO_BOOT_PREPARE attempts=1 status=pending_retained exhausted=1' not in output or
+                                                        'MMIO_ADMISSION_DEADLINE_HOST next_va=' not in output):
+                raise ValueError('actual driver deadline/private-VA proof missing')
+            if name == 'consumer_completed_va_reuse' and 'MMIO_VA_REUSE_HOST old_mapping=' not in output:
+                raise ValueError('actual second-function generation/VA reuse proof missing')
+            if name == 'engine_large_epoch_saturation' and 'MMIO_EPOCH_SATURATION_HOST finite_limit=128 sticky=1 ordinary_ram_usable=1' not in output:
+                raise ValueError('finite actual saturation helper proof missing')
             if row['exit'] != 0 or f'MMIO_MAPPING_HOST CASE_PASS name={name} ' not in output:
                 raise ValueError(f'actual engine case failed: {name}')
             if any(token in output for token in ('AddressSanitizer', 'runtime error:', 'UndefinedBehaviorSanitizer')):

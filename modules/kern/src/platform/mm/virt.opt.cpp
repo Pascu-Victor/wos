@@ -6519,6 +6519,7 @@ void refresh_kernel_mappings(PageTable* page_table) {
         PageTableEntry const& kernel_entry = entry_at(kernel_pagemap, i);
         PageTableEntry& task_entry = entry_at(page_table, i);
         if (pte_raw(task_entry) != pte_raw(kernel_entry)) {
+            if (TYPED) mmio::detail::note_topology_publication_locked();
             task_entry = kernel_entry;
         }
     }
@@ -10509,7 +10510,10 @@ auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t fl
                     entry.no_execute = 0;
                     changed = true;
                 }
-                if (changed) slot = entry;
+                if (changed) {
+                    mmio::detail::note_topology_publication_locked();
+                    slot = entry;
+                }
                 user_mapping_pin_lock.unlock_irqrestore(pin);
                 if (spare != nullptr && !try_release_page_table_to_pool(spare, {__builtin_return_address(0), 0})) phys::page_free(spare);
                 if (changed) {
@@ -10521,6 +10525,7 @@ auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t fl
             if (spare != nullptr) {
                 require_ordinary_page_table(spare);
                 auto const physical = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(spare)));
+                mmio::detail::note_topology_publication_locked();
                 slot = paging::create_page_table_entry(physical, flags);
                 user_mapping_pin_lock.unlock_irqrestore(pin);
                 return spare;

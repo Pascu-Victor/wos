@@ -15,6 +15,9 @@ inline std::atomic<bool> typed_mmio_guards{};
 inline void require_mmio_disabled_fixture() noexcept {
     if (typed_mmio_guards.load(std::memory_order_relaxed)) std::abort();
 }
+namespace ker::mod::mm::mmio::detail {
+inline void note_topology_publication_locked() noexcept { require_mmio_disabled_fixture(); }
+}  // namespace ker::mod::mm::mmio::detail
 inline auto typed_mmio_table_allowed(const ker::mod::mm::paging::PageTable*) noexcept -> bool {
     require_mmio_disabled_fixture();
     return true;

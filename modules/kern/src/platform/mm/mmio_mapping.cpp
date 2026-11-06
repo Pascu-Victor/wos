@@ -21,9 +21,10 @@ using Controller = maintenance::detail::Controller;
 using Table = paging::PageTable;
 using log = dbg::logger<"mmio">;
 constexpr uint64_t PAGE = 4096;
-// Bounded service budget for the first cold 82574 UC transaction. Larger GPU
-// apertures need the separate prepared large-range/WC protocol, never truncation.
-constexpr uint64_t MAX_COLD_PHYSICAL_BYTES = 16 * 1024 * 1024;
+// Full resources consume fixed extent metadata. Only materialized view bytes
+// drive page tables and CPU tickets; WC policy remains a separate authority.
+constexpr uint64_t MAX_MATERIALIZED_BYTES = 16 * 1024 * 1024;
+constexpr size_t RESOURCE_WALK_BUDGET = 128;
 constexpr uint64_t FRAME = 0x000ffffffffff000ULL;
 constexpr uint64_t NX = uint64_t{1} << 63;
 constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
@@ -98,6 +99,11 @@ struct ChildView {
     bool leaves_removed{};
 };
 
+struct ResourceScan {
+    uint64_t root_frame{}, hhdm{}, epoch{}, cursor{}, visits{}, steps{}, restarts{};
+    size_t span{};
+};
+
 struct FunctionRecord {
     std::atomic<bool> used{};
     std::atomic<bool> operation{};
@@ -110,6 +116,10 @@ struct FunctionRecord {
     std::atomic<Status> status{Status::not_ready};
     std::atomic<uint64_t> gate{CLOSED};
     std::atomic<bool> terminal{};
+    // PIN-owned admission state. Early used rows own only private metadata;
+    // their zero child VAs are not reservations until final linearization.
+    bool resources_committed{};
+    ResourceScan resource_scan{};
     bool decode_off{}, hardware_stopped{};
 #ifdef WOS_SELFTEST
     bool deferred{}, resumed{};
@@ -157,9 +167,12 @@ class Runtime {
     // quadratic restart scan for every staged sibling. Never an owner.
     std::array<Interval, RECORDS * VIEW_CAPACITY + VIEW_CAPACITY> virtual_scratch_{};
     uint64_t next_id_{1}, bank_frame_{};
+    uint64_t publication_epoch_{1};
+    bool publication_exhausted_{};
     std::atomic<bool> bank_live_{};
 #ifdef WOS_SELFTEST
     bool defer_withdrawal_{};
+    bool admission_steps_{};
 #endif
 
     static auto token(const char* text, const char* expected) noexcept -> bool {
@@ -328,6 +341,15 @@ class Runtime {
         record.status.store(status, std::memory_order_release);
         return status;
     }
+    void advance_epoch_locked() noexcept {
+        if (publication_exhausted_) return;
+        if (publication_epoch_ >= UINT64_MAX - 1) {
+            publication_epoch_ = UINT64_MAX;
+            publication_exhausted_ = true;
+            return;
+        }
+        ++publication_epoch_;
+    }
 
    public:
     auto enabled() const noexcept -> bool { return requested_.load(std::memory_order_acquire); }
@@ -339,6 +361,8 @@ class Runtime {
         requested_.store(true, std::memory_order_release);
 #ifdef WOS_SELFTEST
         defer_withdrawal_ = token(platform::command_line(), "--selftest-e1000-mmio-withdraw-retry");
+        admission_steps_ = token(platform::command_line(), "--selftest-e1000-mmio-admission-steps") &&
+                           token(platform::command_line(), "--selftest-e1000-mmio") && token(platform::command_line(), "--typed-pci-mmio");
 #endif
         auto const* map = platform::boot_memory_map();
         if (map == nullptr || map->entries == nullptr || map->entry_count == 0 || map->entry_count > boot_regions_.size()) {
@@ -453,29 +477,20 @@ class Runtime {
         }
         if (OLD) remember(old);
         if (NEW) remember(incoming);
+        // The native caller retains this exact PIN through its actual store.
+        // Earlier preflights cannot linearize a scan against that later effect.
+        advance_epoch_locked();
         return true;
+    }
+    void note_topology() noexcept {
+        if (enabled()) advance_epoch_locked();
     }
 
    private:
-    auto has_mapping_locked(uint64_t physical, uint64_t bytes) const noexcept -> Status {
-        uint64_t const HHDM = platform::hhdm_offset();
-        Interval span{};
-        if (physical > UINT64_MAX - HHDM || !virtual_interval(HHDM + physical, bytes, span)) return Status::alias_present;
-        if (bank_live_.load(std::memory_order_acquire) && intersects(span, {BANK_BASE, BANK_END})) return Status::alias_present;
-        uint64_t address = span.start;
-        for (size_t visits = 0; address < span.end && visits < 32768; ++visits) {
-            auto const WALK = walk_locked(platform::kernel_root(), address);
-            if (!WALK.valid || WALK.remaining == 0) return Status::bad_hierarchy;
-            if (WALK.present) return Status::alias_present;
-            uint64_t const STEP = WALK.remaining < span.end - address ? WALK.remaining : span.end - address;
-            address += STEP;
-        }
-        return address == span.end ? Status::ready : Status::bad_hierarchy;
-    }
     auto collect_virtual_locked(size_t& count) noexcept -> bool {
         count = 0;
         for (const auto& record : records_) {
-            if (!record.used.load(std::memory_order_acquire)) continue;
+            if (!record.used.load(std::memory_order_acquire) || !record.resources_committed) continue;
             for (size_t i = 0; i < record.view_count; ++i) {
                 auto const& view = record.views[i];
                 if (view.phase.load(std::memory_order_acquire) == Phase::complete) continue;
@@ -523,15 +538,13 @@ class Runtime {
         output = start;
         return true;
     }
-    auto reserve_claim(ker::dev::pci::detail::ColdFunctionClaim&& claim, std::array<mmio_cache::QualifiedUcRange, VIEW_CAPACITY>&& policies,
-                       PreparedMapping& output) noexcept -> Status {
+    auto validate_claim_plan(const ker::dev::pci::detail::ColdFunctionClaim& claim, std::array<Interval, 6>& ranges) const noexcept
+        -> Status {
         if (claim.owner_id == 0 || claim.claim_epoch == 0 || claim.inventory_generation == 0 || claim.function_index >= RECORDS ||
             claim.span_count == 0 || claim.span_count > claim.spans.size() || claim.bar0_bytes == 0 ||
             ((claim.bar0_physical | claim.bar0_bytes) & (PAGE - 1)) != 0 || claim.view_count == 0 || claim.view_count > VIEW_CAPACITY)
             return Status::invalid_claim;
-        std::array<Interval, 6> ranges{};
         bool bar0_found = false;
-        uint64_t total_bytes = 0;
         for (size_t i = 0; i < claim.span_count; ++i) {
             auto const& bar = claim.bars[i];
             Interval exact{};
@@ -541,9 +554,6 @@ class Runtime {
                 !physical_interval(claim.spans[i].start, claim.spans[i].bytes, ranges[i]) || exact.start != ranges[i].start ||
                 exact.end != ranges[i].end || ((bar.attributes & 4U) == 0 && bar.physical + bar.bytes > (uint64_t{1} << 32)))
                 return Status::invalid_claim;
-            uint64_t const BYTES = ranges[i].end - ranges[i].start;
-            if (BYTES > MAX_COLD_PHYSICAL_BYTES - total_bytes) return Status::capacity;
-            total_bytes += BYTES;
             if (bar.index == 0) {
                 if (bar.physical != claim.bar0_physical || bar.bytes != claim.bar0_bytes) return Status::invalid_claim;
                 bar0_found = true;
@@ -557,14 +567,15 @@ class Runtime {
             }
         }
         if (!bar0_found) return Status::invalid_claim;
-        std::array<Interval, VIEW_CAPACITY> virtual_ranges{};
         std::array<Interval, VIEW_CAPACITY> view_ranges{};
-        uint64_t incarnation = 0;
+        uint64_t materialized_bytes = 0;
         for (size_t i = 0; i < claim.view_count; ++i) {
             auto const& view = claim.views[i];
             if (view.bytes == 0 || ((view.offset | view.physical | view.bytes) & (PAGE - 1)) != 0 ||
                 !physical_interval(view.physical, view.bytes, view_ranges[i]))
                 return Status::invalid_claim;
+            if (view.bytes > MAX_MATERIALIZED_BYTES - materialized_bytes) return Status::capacity;
+            materialized_bytes += view.bytes;
             bool found = false;
             for (size_t b = 0; b < claim.span_count; ++b) {
                 auto const& bar = claim.bars[b];
@@ -572,27 +583,62 @@ class Runtime {
                 found = view.offset <= bar.bytes && view.bytes <= bar.bytes - view.offset && view.physical == bar.physical + view.offset;
                 break;
             }
-            auto const& policy = policies[i];
-            if (!found || policy.empty() || policy.physical() != view.physical || policy.bytes() != view.bytes ||
-                (i != 0 && policy.incarnation() != incarnation))
-                return Status::invalid_claim;
-            incarnation = policy.incarnation();
+            if (!found) return Status::invalid_claim;
             for (size_t j = 0; j < i; ++j)
                 if (intersects(view_ranges[i], view_ranges[j])) return Status::invalid_claim;
         }
-        Pin const PIN;
+        return resource_geometry(ranges, claim.span_count, platform::hhdm_offset());
+    }
+    static auto resource_geometry(const std::array<Interval, 6>& ranges, size_t count, uint64_t hhdm) noexcept -> Status {
+        for (size_t i = 0; i < count; ++i) {
+            Interval alias{};
+            if (ranges[i].start > UINT64_MAX - hhdm || !virtual_interval(hhdm + ranges[i].start, ranges[i].end - ranges[i].start, alias) ||
+                intersects(alias, {BANK_BASE, BANK_END}))
+                return Status::alias_present;
+        }
+        return Status::ready;
+    }
+    auto physical_exclusions_locked(const std::array<Interval, 6>& ranges, size_t count) const noexcept -> Status {
         if (boot_.load(std::memory_order_acquire) != Boot::ready || !bank_live_.load(std::memory_order_acquire))
             return Status::arena_unavailable;
         if (history_incomplete_) return Status::history_incomplete;
-        for (size_t i = 0; i < claim.span_count; ++i) {
+        if (publication_exhausted_) return Status::generation_exhausted;
+        for (size_t i = 0; i < count; ++i) {
             for (size_t j = 0; j < boot_count_; ++j)
                 if (intersects(ranges[i], boot_regions_[j])) return Status::boot_memory;
             for (size_t j = 0; j < history_count_; ++j)
                 if (intersects(ranges[i], history_[j])) return Status::history_exposed;
             if (protected_physical(ranges[i]) || private_physical_locked(ranges[i])) return Status::foreign_overlap;
-            auto const ALIAS = has_mapping_locked(ranges[i].start, ranges[i].end - ranges[i].start);
-            if (ALIAS != Status::ready) return ALIAS;
         }
+        return Status::ready;
+    }
+    auto resource_identity_locked(uint64_t& frame, uint64_t& hhdm) const noexcept -> Status {
+        auto const* root = platform::kernel_root();
+        if (root == nullptr || !platform::table_physical(root, frame) || frame == 0 || !platform::table_frame_valid(frame) ||
+            private_frame(frame) || !bank_matches_locked())
+            return Status::bad_hierarchy;
+        hhdm = platform::hhdm_offset();
+        return Status::ready;
+    }
+    auto reserve_pending_claim(ker::dev::pci::detail::ColdFunctionClaim&& claim,
+                               std::array<mmio_cache::QualifiedUcRange, VIEW_CAPACITY>&& policies, const std::array<Interval, 6>& ranges,
+                               PreparedMapping& output) noexcept -> Status {
+        uint64_t incarnation = 0;
+        for (size_t i = 0; i < claim.view_count; ++i) {
+            auto const& policy = policies[i];
+            if (policy.empty() || policy.physical() != claim.views[i].physical || policy.bytes() != claim.views[i].bytes ||
+                (i != 0 && policy.incarnation() != incarnation))
+                return Status::invalid_claim;
+            incarnation = policy.incarnation();
+        }
+        Pin const PIN;
+        auto const EXCLUDED = physical_exclusions_locked(ranges, claim.span_count);
+        if (EXCLUDED != Status::ready) return EXCLUDED;
+        uint64_t frame = 0, hhdm = 0;
+        auto const IDENTITY = resource_identity_locked(frame, hhdm);
+        if (IDENTITY != Status::ready) return IDENTITY;
+        auto const GEOMETRY = resource_geometry(ranges, claim.span_count, hhdm);
+        if (GEOMETRY != Status::ready) return GEOMETRY;
         uint16_t slot = UINT16_MAX;
         for (size_t i = 0; i < records_.size(); ++i) {
             if (records_[i].used.load(std::memory_order_acquire)) {
@@ -600,43 +646,152 @@ class Runtime {
             } else if (slot == UINT16_MAX)
                 slot = static_cast<uint16_t>(i);
         }
-        size_t const TOMBS = tombstone_count_.load(std::memory_order_relaxed);
-        if (slot == UINT16_MAX || claim.span_count > tombstones_.size() - TOMBS) return Status::capacity;
-        size_t virtual_count = 0;
-        if (!collect_virtual_locked(virtual_count)) return Status::capacity;
-        for (size_t i = 0; i < claim.view_count; ++i) {
-            uint64_t address = 0;
-            if (!reserve_virtual_locked(claim.views[i].bytes, address, virtual_count)) return Status::capacity;
-            virtual_ranges[i] = {address, address + claim.views[i].bytes};
-        }
+        if (slot == UINT16_MAX) return Status::capacity;
         if (next_id_ == UINT64_MAX) return Status::generation_exhausted;
         auto& record = records_[slot];
         record.id = next_id_++;
         record.spans = claim.span_count;
         record.physical = ranges;
         record.view_count = claim.view_count;
+        record.resource_scan = {frame, hhdm, publication_epoch_, ranges[0].start};
         for (size_t i = 0; i < record.view_count; ++i) {
             auto const& plan = claim.views[i];
             auto& view = record.views[i];
             view.bar = plan.bar;
             view.offset = plan.offset;
             view.physical = plan.physical;
-            view.address = virtual_ranges[i].start;
             view.bytes = plan.bytes;
             view.incarnation.store(policies[i].incarnation(), std::memory_order_relaxed);
             view.initial_policy = std::move(policies[i]);
-            view.phase.store(Phase::reserved, std::memory_order_relaxed);
             view.status.store(Status::pending_retained, std::memory_order_relaxed);
         }
         record.claim = std::move(claim);
-        for (size_t i = 0; i < record.spans; ++i) tombstones_[TOMBS + i] = record.physical[i];
-        tombstone_count_.store(TOMBS + record.spans, std::memory_order_release);
-        record.phase.store(Phase::reserved, std::memory_order_relaxed);
+        record.phase.store(Phase::physical_pending, std::memory_order_relaxed);
         record.status.store(Status::pending_retained, std::memory_order_relaxed);
         record.used.store(true, std::memory_order_release);
         output.slot_ = slot;
         output.id_ = record.id;
         return Status::ready;
+    }
+    auto reject_resources_locked(FunctionRecord& record, Status status) noexcept -> Status {
+        record.phase.store(Phase::retained, std::memory_order_release);
+        return retain(record, status);
+    }
+    auto restart_resources_locked(FunctionRecord& record) noexcept -> Status {
+        auto const EXCLUDED = physical_exclusions_locked(record.physical, record.spans);
+        if (EXCLUDED != Status::ready) return reject_resources_locked(record, EXCLUDED);
+        auto& scan = record.resource_scan;
+        if (scan.restarts == UINT64_MAX) return reject_resources_locked(record, Status::generation_exhausted);
+        ++scan.restarts;
+        scan.epoch = publication_epoch_;
+        scan.span = 0;
+        scan.cursor = record.physical[0].start;
+        return Status::ready;
+    }
+    auto commit_resources_locked(FunctionRecord& record) noexcept -> Status {
+        auto& scan = record.resource_scan;
+        uint64_t frame = 0, hhdm = 0;
+        auto const IDENTITY = resource_identity_locked(frame, hhdm);
+        if (IDENTITY != Status::ready || frame != scan.root_frame || hhdm != scan.hhdm)
+            return reject_resources_locked(record, Status::bad_hierarchy);
+        if (publication_exhausted_) return reject_resources_locked(record, Status::generation_exhausted);
+        if (publication_epoch_ != scan.epoch) {
+            auto const RESTART = restart_resources_locked(record);
+            return RESTART == Status::ready ? Status::pending_retained : RESTART;
+        }
+        auto const EXCLUDED = physical_exclusions_locked(record.physical, record.spans);
+        if (EXCLUDED != Status::ready) return reject_resources_locked(record, EXCLUDED);
+        size_t const TOMBS = tombstone_count_.load(std::memory_order_relaxed);
+        if (record.spans > tombstones_.size() - TOMBS) return reject_resources_locked(record, Status::capacity);
+        size_t virtual_count = 0;
+        if (!collect_virtual_locked(virtual_count)) return reject_resources_locked(record, Status::capacity);
+        std::array<Interval, VIEW_CAPACITY> virtual_ranges{};
+        for (size_t i = 0; i < record.view_count; ++i) {
+            uint64_t address = 0;
+            if (!reserve_virtual_locked(record.views[i].bytes, address, virtual_count))
+                return reject_resources_locked(record, Status::capacity);
+            virtual_ranges[i] = {address, address + record.views[i].bytes};
+        }
+        // This same PIN spans the final root/epoch/history check, every VA
+        // assignment and publication of ALL full-resource exclusion spans.
+        for (size_t i = 0; i < record.view_count; ++i) {
+            auto& view = record.views[i];
+            view.address = virtual_ranges[i].start;
+            view.phase.store(Phase::reserved, std::memory_order_release);
+        }
+        for (size_t i = 0; i < record.spans; ++i) tombstones_[TOMBS + i] = record.physical[i];
+        tombstone_count_.store(TOMBS + record.spans, std::memory_order_release);
+        record.resources_committed = true;
+        record.phase.store(Phase::reserved, std::memory_order_release);
+        return Status::ready;
+    }
+    auto advance_resource_scan_locked(FunctionRecord& record, size_t budget, size_t& step_visits) noexcept -> Status {
+        if (record.resources_committed || record.phase.load(std::memory_order_acquire) != Phase::physical_pending)
+            return Status::failed_retained;
+        auto& scan = record.resource_scan;
+        if (scan.steps == UINT64_MAX || publication_exhausted_) return reject_resources_locked(record, Status::generation_exhausted);
+        ++scan.steps;
+        uint64_t frame = 0, hhdm = 0;
+        auto const IDENTITY = resource_identity_locked(frame, hhdm);
+        if (IDENTITY != Status::ready || frame != scan.root_frame || hhdm != scan.hhdm)
+            return reject_resources_locked(record, Status::bad_hierarchy);
+        if (scan.epoch != publication_epoch_) {
+            auto const RESTART = restart_resources_locked(record);
+            if (RESTART != Status::ready) return RESTART;
+        }
+        while (step_visits < budget && scan.span < record.spans) {
+            auto const range = record.physical[scan.span];
+            if (scan.cursor < range.start || scan.cursor >= range.end) return reject_resources_locked(record, Status::bad_hierarchy);
+            if (scan.visits == UINT64_MAX) return reject_resources_locked(record, Status::generation_exhausted);
+            ++scan.visits;
+            ++step_visits;
+            auto const WALK = walk_locked(platform::kernel_root(), scan.hhdm + scan.cursor);
+            if (!WALK.valid || WALK.remaining == 0) return reject_resources_locked(record, Status::bad_hierarchy);
+            if (WALK.present) return reject_resources_locked(record, Status::alias_present);
+            auto const STEP = std::min<uint64_t>(WALK.remaining, range.end - scan.cursor);
+            scan.cursor += STEP;
+            if (scan.cursor == range.end) {
+                ++scan.span;
+                if (scan.span < record.spans) scan.cursor = record.physical[scan.span].start;
+            }
+        }
+        return scan.span == record.spans ? commit_resources_locked(record) : Status::pending_retained;
+    }
+    auto advance_resource_scan(FunctionRecord& record) noexcept -> Status {
+        size_t budget = RESOURCE_WALK_BUDGET;
+#ifdef WOS_SELFTEST
+        if (admission_steps_) budget = 1;
+#endif
+        size_t step_visits = 0;
+        Status status = Status::failed_retained;
+        ResourceScan observed{};
+        bool committed = false;
+        {
+            Pin const PIN;
+            status = advance_resource_scan_locked(record, budget, step_visits);
+            record.status.store(status, std::memory_order_release);
+            observed = record.resource_scan;
+            committed = record.resources_committed;
+        }
+        // Operation still owns this record, but PIN never spans diagnostics.
+        if (status == Status::ready) {
+            log::info(
+                "MMIO_RESOURCE_COMMITTED mapping=%lu spans=%zu steps=%lu visits=%lu restarts=%lu epoch=%lu root=%lx hhdm=%lx views=%zu",
+                record.id, record.spans, observed.steps, observed.visits, observed.restarts, observed.epoch, observed.root_frame,
+                observed.hhdm, record.view_count);
+        }
+#ifdef WOS_SELFTEST
+        else if (admission_steps_) {
+            log::info(
+                "MMIO_RESOURCE_PROGRESS mapping=%lu status=%s steps=%lu visits=%lu step_visits=%zu restarts=%lu epoch=%lu root=%lx "
+                "hhdm=%lx span=%zu cursor=%lx spans=%zu committed=%u budget=%zu",
+                record.id, status_name(status), observed.steps, observed.visits, step_visits, observed.restarts, observed.epoch,
+                observed.root_frame, observed.hhdm, observed.span, observed.cursor, record.spans, committed ? 1U : 0U, budget);
+        }
+#else
+        (void)committed;
+#endif
+        return status;
     }
     auto bank_matches_locked() const noexcept -> bool {
         auto* root = platform::kernel_root();
@@ -847,9 +1002,14 @@ class Runtime {
     }
     auto prepare_record(FunctionRecord& record, const Controller& scope) -> Status {
         if (!context(&scope)) return retain(record, Status::invalid_context);
-        auto const PHASE = record.phase.load(std::memory_order_acquire);
-        if (PHASE == Phase::leaves_ready) return Status::ready;
-        if (PHASE != Phase::reserved && PHASE != Phase::cache_pending) return Status::failed_retained;
+        auto phase = record.phase.load(std::memory_order_acquire);
+        if (phase == Phase::physical_pending) {
+            auto const RESOURCE = advance_resource_scan(record);
+            if (RESOURCE != Status::ready) return retain(record, RESOURCE);
+            phase = record.phase.load(std::memory_order_acquire);
+        }
+        if (phase == Phase::leaves_ready) return Status::ready;
+        if (phase != Phase::reserved && phase != Phase::cache_pending) return Status::failed_retained;
         record.phase.store(Phase::cache_pending, std::memory_order_release);
         for (size_t i = 0; i < record.view_count; ++i) {
             auto& view = record.views[i];
@@ -867,7 +1027,9 @@ class Runtime {
         if (!output.empty()) return Status::output_not_empty;
         if (!enabled()) return Status::disabled;
         if (!context(&scope)) return Status::invalid_context;
-        if (claim.view_count == 0 || claim.view_count > VIEW_CAPACITY) return Status::invalid_claim;
+        std::array<Interval, 6> ranges{};
+        auto const VALIDATED = validate_claim_plan(claim, ranges);
+        if (VALIDATED != Status::ready) return VALIDATED;
         uint64_t until = 0;
         if (!deadline(until)) return Status::clock_unavailable;
         if (maintenance::detail::await_ready(scope, until) != maintenance::Status::ready) return Status::not_ready;
@@ -875,7 +1037,7 @@ class Runtime {
         for (size_t i = 0; i < claim.view_count; ++i)
             if (mmio_cache::qualify_uc_range(claim.views[i].physical, claim.views[i].bytes, policies[i]) != mmio_cache::Status::ready)
                 return Status::not_ready;
-        auto const RESERVED = reserve_claim(std::move(claim), std::move(policies), output);
+        auto const RESERVED = reserve_pending_claim(std::move(claim), std::move(policies), ranges, output);
         if (RESERVED != Status::ready) return RESERVED;
         return resume(output, scope);
     }
@@ -1042,13 +1204,23 @@ class Runtime {
         result.initial_ticket = first.initial_ticket;
         result.withdrawal_ticket = first.withdrawal_ticket;
         result.cohort_incarnation = first.cohort_incarnation;
+        // Resource scan observations are immutable before the public Mapping
+        // is issued; they grant no root, physical or completion authority.
+        result.resource_steps = record->resource_scan.steps;
+        result.resource_visits = record->resource_scan.visits;
+        result.resource_restarts = record->resource_scan.restarts;
+        result.resource_epoch = record->resource_scan.epoch;
+        result.resource_root_frame = record->resource_scan.root_frame;
         return result;
     }
     void abandon(PreparedMapping& prepared) noexcept {
         auto* record = find(prepared.slot_, prepared.id_);
         prepared.slot_ = UINT16_MAX;
         prepared.id_ = 0;
-        if (record != nullptr) (void)retain(*record, Status::failed_retained);
+        if (record != nullptr) {
+            record->phase.store(Phase::retained, std::memory_order_release);
+            (void)retain(*record, Status::failed_retained);
+        }
     }
     auto withdraw(uint16_t slot, uint64_t id, const Controller* scope, const QuiescedMapping& proof) -> Status {
         if (proof.slot_ != slot || proof.id_ != id || id == 0) return Status::not_quiesced;
@@ -1154,6 +1326,7 @@ auto record_boot_physical_range(uint64_t address, uint64_t bytes) noexcept -> bo
 auto record_generic_physical_access(uint64_t address, uint64_t bytes) noexcept -> bool { return runtime.record_access(address, bytes); }
 auto generic_table_allowed(const Table* table) noexcept -> bool { return runtime.generic_table(table); }
 auto generic_root_allowed_locked(const Table* root) noexcept -> bool { return runtime.generic_table(root); }
+void note_topology_publication_locked() noexcept { runtime.note_topology(); }
 auto generic_leaf_allowed_locked(const Table* table, uint64_t address, uint64_t old_raw, uint64_t new_raw, unsigned level) noexcept
     -> bool {
     return runtime.generic_leaf(table, address, old_raw, new_raw, level);

@@ -14,6 +14,15 @@ namespace cache = ker::mod::mm::mmio_cache;
 namespace cm = ker::mod::mm::cpu_maintenance;
 namespace pci = ker::dev::pci;
 inline size_t assertions{};
+inline limine_memmap_entry reuse_memory_entry{};
+inline limine_memmap_entry large_memory_entry{};
+inline std::array<limine_memmap_entry*, 6> extra_memory_pointers{};
+inline constexpr uint64_t LARGE_BAR = 1ULL << 37, LARGE_BYTES = 1ULL << 37;
+inline constexpr uint64_t HHDM = 0xffff800000000000ULL, RAM = 0x400000, ORDINARY_VA = 0x40000000;
+inline constexpr uint64_t ORDINARY_FLAGS = 3 | (1ULL << 63);
+inline std::string_view selected_engine_case;
+
+auto large_case(std::string_view name) -> bool { return name.starts_with("engine_large_") || name.starts_with("consumer_admission_"); }
 
 void check(bool value, const char* reason) {
     ++assertions;
@@ -23,7 +32,21 @@ void check(bool value, const char* reason) {
 }
 
 void setup(std::string_view name) {
+    selected_engine_case = name;
     pci_cold_host::setup();
+    std::copy(pci_cold_host::memory_pointers.begin(), pci_cold_host::memory_pointers.end(), extra_memory_pointers.begin());
+    size_t memory_count = pci_cold_host::memory_pointers.size();
+    if (name == "consumer_completed_va_reuse" || name == "consumer_admission_deadline" || name == "engine_large_epoch_saturation") {
+        // Initial finite hardware only: neither function has been enumerated,
+        // claimed or accessed. The second function needs no MMIO register bank.
+        auto& second = pci_cold_host::functions[5];
+        second = pci_cold_host::nic();
+        pci_cold_host::put(second.config, 0x10, e1000_host::REUSE_BAR0, 4);
+        pci_cold_host::put(second.config, 0x14, e1000_host::REUSE_BAR1, 4);
+        pci_cold_host::put(second.config, 0x18, 0xc101, 4);
+        reuse_memory_entry = {e1000_host::REUSE_BAR0, 2 * pci_cold_host::BAR_BYTES, LIMINE_MEMMAP_RESERVED};
+        extra_memory_pointers[memory_count++] = &reuse_memory_entry;
+    }
     if (name == "consumer_observed_profile") {
         // Captured firmware/chipset/capability bytes, with explicit finite BDF,
         // RAM and BAR geometry. Actual issuers/claim/MM/DMA paths stay shared.
@@ -35,14 +58,32 @@ void setup(std::string_view name) {
     }
     if (name == "engine_bad_table_alias") table_alias_flags |= 4;  // Real USER leaf; ancestors alone cannot justify private storage.
     if (name == "engine_budget_refusal") {
-        pci_cold_host::put(pci_cold_host::nic().config, 0x14, 0x84000000, 4);
-        pci_cold_host::nic().sizing_masks[1] = 0xfe000000;  // Genuine aligned 32-MiB companion sizing result.
+        pci_cold_host::put(pci_cold_host::nic().config, 0x10, 0x84000000, 4);
+        pci_cold_host::nic().sizing_masks[0] = 0xfe000000;
+        large_memory_entry = {0x84000000, 32 * 1024 * 1024, LIMINE_MEMMAP_RESERVED};
+        extra_memory_pointers[memory_count++] = &large_memory_entry;
     }
+    if (large_case(name)) {
+        // A finite 64-bit prefetchable resource: the high word and the entire
+        // 128-GiB extent are real PCI geometry, never host-buffer allocation.
+        auto& nic = pci_cold_host::nic();
+        pci_cold_host::put(nic.config, 0x14, 0xc, 4);
+        pci_cold_host::put(nic.config, 0x18, LARGE_BAR >> 32, 4);
+        pci_cold_host::put(nic.config, 0x1c, 0xc001, 4);
+        nic.sizing_masks[1] = 0xc;
+        nic.sizing_masks[2] = 0xffffffe0;
+        nic.sizing_masks[3] = 0xffffffe1;
+        large_memory_entry = {LARGE_BAR, LARGE_BYTES, LIMINE_MEMMAP_RESERVED};
+        extra_memory_pointers[memory_count++] = &large_memory_entry;
+    }
+    pci_cold_host::memory_map.entry_count = memory_count;
+    pci_cold_host::memory_map.entries = extra_memory_pointers.data();
     maintenance_host::setup(4);
     for (size_t cpu = 0; cpu < 4; ++cpu) {
         auto& input = runtime_ports::cpus[cpu];
         input.apic = static_cast<uint32_t>(cpu);
         input.cpuid[{1, 0}].ebx = static_cast<uint32_t>(cpu << 24);
+        if (large_case(name)) input.cpuid[{0x80000008U, 0}].eax = 48;
     }
     runtime_ports::select(0);
     check(cm::detail::initialize_boot(0x70) == cm::Status::ready, "actual permanent maintenance service initializes");
@@ -59,10 +100,15 @@ void setup(std::string_view name) {
     check(root != nullptr, "finite kernel root backing allocated");
     mmio_writer_host::kernel_pagemap = root;
     if (name == "consumer_withdrawal_retry") command_line += " --selftest-e1000-mmio-withdraw-retry";
+    if (name == "consumer_admission_steps" || name == "consumer_admission_deadline")
+        command_line += " --selftest-e1000-mmio --selftest-e1000-mmio-admission-steps";
     mapping::detail::begin_boot_history();
     mmio_writer_host::typed_mmio_guards.store(mapping::enabled());
     check(mapping::enabled(), "immutable real boot selection enabled");
-    check(pci::pci_enumerate_all() == 3 && pci::pci_enumeration_complete(), "actual PCI enumeration finds all three bounded functions");
+    int const EXPECTED_FUNCTIONS =
+        name == "consumer_completed_va_reuse" || name == "consumer_admission_deadline" || name == "engine_large_epoch_saturation" ? 4 : 3;
+    check(pci::pci_enumerate_all() == EXPECTED_FUNCTIONS && pci::pci_enumeration_complete(),
+          "actual PCI enumeration finds the complete finite topology");
     check(pci::extended_inventory().state == pci::ExtendedState::ready, "actual ECAM collector copies real finite configuration");
     pci::initialize_cold_mmio_inventory();
     if (name == "engine_bad_table_alias")
@@ -162,18 +208,23 @@ void run_fences() {
 }
 
 void run_budget_refusal() {
-    check(controller_host::with_actual_boot_controller([](const controller_host::cm::detail::Controller&) {
-              check(e1000_host::driver::device_count == 1, "actual rejected probe retains its sole real driver object");
-              auto* device = e1000_host::driver::devices[0];
-              check(device->typed_mmio && device->mmio == nullptr && device->registers.empty() &&
-                        device->retirement.load() == e1000_host::driver::E1000Device::Retirement::cold_failed,
-                    "over-budget exact own BARs cannot publish a view or raw fallback");
-              check(allocs == setup_allocs && register_reads == 0 && register_writes == 0 && dma_allocs == 0,
-                    "actual total-span budget refuses before table, register or DMA effects");
-              check(mapping::detail::record_generic_physical_access(pci_cold_host::BAR0, 4096),
-                    "pre-reservation capacity refusal does not claim physical frames");
-          }),
-          "actual boot issuer reaches the real capacity refusal");
+    controller_host::before_boot_callback = [](const controller_host::cm::detail::Controller& controller) {
+        auto claim = pci::try_claim_driver(pci_cold_host::selected_device(), pci::DriverKind::e1000e);
+        check(claim.has_value(), "oversized materialization test uses an actual exclusive enumerated claim");
+        mapping::Mapping output;
+        constexpr mapping::ViewRequest REQUEST{0, 0, 32 * 1024 * 1024};
+        auto const status = pci::map_cold_uc_82574(*claim, controller, std::span(&REQUEST, 1), output);
+        check(status == mapping::Status::capacity && output.empty(), "oversized materialized view reports actual capacity");
+        check(allocs == setup_allocs && register_reads == 0 && register_writes == 0 && dma_allocs == 0 &&
+                  maintenance_host::events().empty() && pci_cold_host::mem_enable_writes == 0,
+              "materialized-byte capacity refuses before tables, CPU work, decode, registers or DMA");
+        check(mapping::detail::record_generic_physical_access(0x84000000, 4096),
+              "pre-reservation materialized capacity refusal does not claim physical frames");
+        std::printf("MMIO_VIEW_BUDGET_REFUSAL status=capacity bytes=33554432\n");
+    };
+    check(controller_host::with_actual_boot_controller(nullptr), "actual boot issuer reaches real materialized-view capacity refusal");
+    controller_host::before_boot_callback = nullptr;
+    check(e1000_host::driver::device_count == 0, "failed direct producer claim stays retained before ordinary driver dispatch");
 }
 
 void run_bad_table_alias() {
@@ -385,6 +436,236 @@ void run_producer_case(std::string_view name) {
           "direct preparation tests claim no hardware access, DMA or actual driver-retirement proof");
 }
 
+void leave_empty_hhdm_leaf(uint64_t physical) {
+    mmio_writer_host::map_page(root, HHDM + physical, RAM, ORDINARY_FLAGS);
+    check(translate(HHDM + physical) == RAM, "actual generic writer first installs a different ordinary RAM frame");
+    mmio_writer_host::unmap_page(root, HHDM + physical);
+    check(translate(HHDM + physical) == UINT64_MAX && mmio_writer_host::cow_depth == 0,
+          "actual COW then PIN unmap clears the RAM leaf while retaining ordinary page tables");
+}
+
+void fragment_large_resource() {
+    auto const before = allocs;
+    leave_empty_hhdm_leaf(pci_cold_host::BAR0);
+    for (uint64_t i = 0; i < 65; ++i) leave_empty_hhdm_leaf(LARGE_BAR + i * 2 * 1024 * 1024);
+    check(allocs - before < 80 && tables.size() * 4096 < 1024 * 1024,
+          "over 32768 actual empty leaf walks need bounded sub-MiB table backing, never a resource-sized buffer");
+}
+
+auto resume_large(pci::DriverClaim& claim, const controller_host::cm::detail::Controller& controller,
+                  std::span<const mapping::ViewRequest> requests, mapping::Mapping& output, size_t& calls) -> mapping::Status {
+    auto status = mapping::Status::pending_retained;
+    for (; status == mapping::Status::pending_retained && calls < 1024; ++calls)
+        status = pci::map_cold_uc_82574(claim, controller, requests, output);
+    return status;
+}
+
+void producer_large(const controller_host::cm::detail::Controller& controller) {
+    auto const name = selected_engine_case;
+    auto claim = producer_claim();
+    if (name == "engine_large_epoch_saturation") e1000_host::preclaim_reuse_function(controller);
+    mapping::Mapping output;
+    std::array<mapping::ViewRequest, 2> const requests{{{0, 0, 4096}, {1, LARGE_BYTES - 4096, 4096}}};
+    bool const fragmented = name != "engine_large_sparse" && name != "engine_large_epoch_saturation";
+    if (fragmented) fragment_large_resource();
+    if (name == "engine_large_epoch_saturation") {
+        mmio_writer_host::map_page(root, ORDINARY_VA, RAM, ORDINARY_FLAGS);
+        mmio_writer_host::unmap_page(root, ORDINARY_VA);
+    }
+    auto const before = allocs;
+    // This is an actual writer preflight, deliberately before the admission
+    // cursor. Its ordinary PA history cannot stand in for a later HHVA store.
+    if (name == "engine_large_late_alias")
+        mmio_writer_host::require_ordinary_mapping(root, HHDM + pci_cold_host::BAR0, RAM, 4096, ORDINARY_FLAGS);
+    auto status = pci::map_cold_uc_82574(*claim, controller, requests, output);
+    size_t calls = 1;
+    check(status == mapping::Status::pending_retained && output.empty(),
+          "actual full-resource walk yields a private physical-pending record and no public Mapping");
+    check(allocs == before && maintenance_host::events().empty() && pci_cold_host::mem_enable_writes == 0 &&
+              translate(BANK + 4096) == UINT64_MAX && register_reads == 0 && register_writes == 0 && dma_allocs == 0,
+          "physical cursor does not assign VA, create child tables, submit CPU work or activate the function");
+    if (name == "engine_large_late_alias" || name == "engine_large_transient_alias") {
+        auto const topology_before = allocs;
+        mmio_writer_host::map_page(root, HHDM + pci_cold_host::BAR0, RAM, ORDINARY_FLAGS);
+        check(allocs == topology_before && translate(HHDM + pci_cold_host::BAR0) == RAM,
+              "late HHVA store uses the preexisting ordinary L1 and a different RAM PA without topology changes");
+        if (name == "engine_large_transient_alias") mmio_writer_host::unmap_page(root, HHDM + pci_cold_host::BAR0);
+    } else if (name == "engine_large_device_history" || name == "engine_large_transient_device") {
+        mmio_writer_host::map_page(root, ORDINARY_VA, LARGE_BAR + LARGE_BYTES - 4096, ORDINARY_FLAGS);
+        check(translate(ORDINARY_VA) == LARGE_BAR + LARGE_BYTES - 4096,
+              "pending admission has no provisional physical tombstone that would hide an ordinary writer effect");
+        if (name == "engine_large_transient_device") mmio_writer_host::unmap_page(root, ORDINARY_VA);
+    } else if (name == "engine_large_history_overflow") {
+        for (uint64_t i = 0; i < 4200; ++i)
+            check(mapping::detail::record_generic_physical_access(0x100000000ULL + i * 8192, 4096),
+                  "real public ordinary physical history endpoint receives disjoint nondevice accesses");
+    } else if (name == "engine_large_root_drift") {
+        root = allocate_table();
+        check(root != nullptr, "finite kernel-root input changes to another genuine allocated hierarchy");
+        mmio_writer_host::kernel_pagemap = root;
+    } else if (name == "engine_large_epoch_saturation") {
+        // This case is selected only by the manifest-labelled compile-copy
+        // saturation limit128 profile. No private epoch value is assigned.
+        for (unsigned i = 0; i < 130; ++i) {
+            mmio_writer_host::map_page(root, ORDINARY_VA, RAM, ORDINARY_FLAGS);
+            mmio_writer_host::unmap_page(root, ORDINARY_VA);
+        }
+    }
+    status = resume_large(*claim, controller, requests, output, calls);
+    auto const expected = name == "engine_large_late_alias" ? mapping::Status::alias_present
+                          : name == "engine_large_device_history" || name == "engine_large_transient_device"
+                              ? mapping::Status::history_exposed
+                          : name == "engine_large_history_overflow" ? mapping::Status::history_incomplete
+                          : name == "engine_large_root_drift"       ? mapping::Status::bad_hierarchy
+                          : name == "engine_large_epoch_saturation" ? mapping::Status::generation_exhausted
+                                                                    : mapping::Status::ready;
+    check(status == expected, "late actual HHVA effect invalidates previously scanned full-resource absence");
+    if (expected != mapping::Status::ready) {
+        check(output.empty() && maintenance_host::events().empty() && pci_cold_host::mem_enable_writes == 0 && register_reads == 0 &&
+                  register_writes == 0 && dma_allocs == 0,
+              "late root/history/alias rejection leaves no public owner, CPU ticket, decode or hardware exposure");
+        if (name == "engine_large_late_alias")
+            check(translate(HHDM + pci_cold_host::BAR0) == RAM,
+                  "rejected full-resource admission preserves the real later ordinary RAM mapping");
+        if (name == "engine_large_epoch_saturation") {
+            mmio_writer_host::map_page(root, ORDINARY_VA, RAM, ORDINARY_FLAGS);
+            check(translate(ORDINARY_VA) == RAM, "saturated admission epoch leaves ordinary generic RAM mapping usable");
+            constexpr mapping::ViewRequest REQUEST{0, 0, 4096};
+            check(pci::map_cold_uc_82574(*e1000_host::reuse_claim, controller, std::span(&REQUEST, 1), output) ==
+                          mapping::Status::generation_exhausted &&
+                      output.empty(),
+                  "actual epoch saturation is sticky and cannot wrap into an old absence certificate");
+            mmio_writer_host::unmap_page(root, ORDINARY_VA);
+            e1000_host::reuse_claim.reset();
+            std::printf("MMIO_EPOCH_SATURATION_HOST finite_limit=128 sticky=1 ordinary_ram_usable=1\n");
+        }
+    } else {
+        auto const report = output.report();
+        check(report.phase == mapping::Phase::active && report.physical_spans == 2 && report.view_count == 2 && report.bytes == 4096 &&
+                  report.views[1].bar == 1 && report.views[1].bar_offset == LARGE_BYTES - 4096 &&
+                  report.views[1].physical == LARGE_BAR + LARGE_BYTES - 4096 &&
+                  translate(report.views[1].virtual_base) == LARGE_BAR + LARGE_BYTES - 4096,
+              "actual high-word 128-GiB resource permits tiny exact child mappings with correct physical final-page geometry");
+        check(report.resource_steps == calls && report.resource_root_frame == physical.at(root) && report.resource_epoch != 0 &&
+                  report.views[0].initial_ticket == 1 && report.views[1].initial_ticket == 2 && maintenance_host::events().size() == 16 &&
+                  pci_cold_host::mem_enable_writes == 1,
+              "physical continuation preserves one claim, one activation and only the two original real CPU tickets");
+        if (fragmented)
+            check(report.resource_visits > 32768 && report.resource_steps > 256,
+                  "actual fragmented HHDM cursor traverses more than the old 32768-walk ceiling across bounded resumptions");
+        if (name == "engine_large_transient_alias")
+            check(report.resource_restarts >= 1 && translate(HHDM + pci_cold_host::BAR0) == UINT64_MAX,
+                  "transient actual HHVA RAM publication restarts all spans and proves fresh absence before commit");
+        for (uint64_t offset : {uint64_t{0}, uint64_t{1} << 32, LARGE_BYTES / 2, LARGE_BYTES - 4096})
+            check(!mapping::detail::record_generic_physical_access(LARGE_BAR + offset, 4096),
+                  "full high-word resource including unmapped interior and tail remains owned after tiny publication");
+        // Exclusion covers the owned PA, not every unrelated page at an HHVA.
+        mmio_writer_host::map_page(root, HHDM + LARGE_BAR + 4096, RAM, ORDINARY_FLAGS);
+        check(translate(HHDM + LARGE_BAR + 4096) == RAM,
+              "committed physical ownership still permits an unrelated RAM PA at an ordinary HHDM virtual address");
+        mmio_writer_host::unmap_page(root, HHDM + LARGE_BAR + 4096);
+        output.close();
+        check(!output.borrow().valid(), "API-only large owner closes and remains retained without a fabricated retirement witness");
+        std::printf("MMIO_LARGE_RESOURCE_HOST steps=%llu visits=%llu restarts=%llu epoch=%llu root=%llx calls=%zu tables=%zu\n",
+                    static_cast<unsigned long long>(report.resource_steps), static_cast<unsigned long long>(report.resource_visits),
+                    static_cast<unsigned long long>(report.resource_restarts), static_cast<unsigned long long>(report.resource_epoch),
+                    static_cast<unsigned long long>(report.resource_root_frame), calls, tables.size());
+    }
+    producer_case_observed = true;
+}
+
+void run_large_producer() {
+    controller_host::before_boot_callback = producer_large;
+    check(controller_host::with_actual_boot_controller(nullptr),
+          "genuine boot Controller dispatches actual bounded large-resource producer");
+    controller_host::before_boot_callback = nullptr;
+    check(producer_case_observed && e1000_host::driver::device_count == 0 && register_reads == 0 && register_writes == 0 && dma_allocs == 0,
+          "large-resource admission tests expose no second hardware model, device instruction or invented lifecycle authority");
+}
+
+void run_admission_consumer(std::string_view name) {
+    if (name == "consumer_admission_clock_unavailable" || name == "consumer_admission_clock_overflow" ||
+        name == "consumer_admission_clock_regression") {
+        controller_host::before_boot_callback = [](const controller_host::cm::detail::Controller&) {
+            if (selected_engine_case == "consumer_admission_clock_unavailable")
+                maintenance_host::clock_available.store(false);
+            else if (selected_engine_case == "consumer_admission_clock_overflow")
+                maintenance_host::now.store(UINT64_MAX - 1);
+            else {
+                maintenance_host::now.store(1'000'000);
+                maintenance_host::clock_step.store(UINT64_MAX - 100);
+            }
+        };
+        check(controller_host::with_actual_boot_controller([](const controller_host::cm::detail::Controller&) {
+                  check(e1000_host::driver::device_count == 1, "actual clock-failed boot probe retains its genuine metadata");
+                  auto* failed = e1000_host::driver::devices[0];
+                  check(failed->registers.empty() &&
+                            failed->retirement.load() == e1000_host::driver::E1000Device::Retirement::cold_failed &&
+                            allocs == setup_allocs && register_reads == 0 && register_writes == 0 && dma_allocs == 0 &&
+                            maintenance_host::events().empty() && pci_cold_host::mem_enable_writes == 0,
+                        "actual caller rejects unavailable, overflowing or regressing clock before producer or hardware exposure");
+              }),
+              "genuine boot caller applies the actual finite hardware clock failure input");
+        controller_host::before_boot_callback = nullptr;
+        return;
+    }
+    if (name == "consumer_admission_deadline") {
+        e1000_host::selected_case = name;
+        controller_host::before_boot_callback = [](const controller_host::cm::detail::Controller& controller) {
+            e1000_host::preclaim_reuse_function(controller);
+            maintenance_host::clock_step.store(3'000'000'000);
+        };
+        check(controller_host::with_actual_boot_controller([](const controller_host::cm::detail::Controller& controller) {
+                  check(e1000_host::driver::device_count == 1, "actual timed-out caller retains its genuine first driver object");
+                  auto* failed = e1000_host::driver::devices[0];
+                  check(failed->registers.empty() &&
+                            failed->retirement.load() == e1000_host::driver::E1000Device::Retirement::cold_failed && register_reads == 0 &&
+                            register_writes == 0 && dma_allocs == 0 && maintenance_host::events().empty() &&
+                            pci_cold_host::mem_enable_writes == 0,
+                        "actual deadline after a physical-pending step cannot activate MEM, CPU work, DMA or MMIO");
+                  maintenance_host::clock_step.store(50'000);
+                  mapping::Mapping replacement;
+                  constexpr mapping::ViewRequest REQUEST{0, 0, 4096};
+                  size_t calls = 0;
+                  check(resume_large(*e1000_host::reuse_claim, controller, std::span(&REQUEST, 1), replacement, calls) ==
+                            mapping::Status::ready,
+                        "same genuine boot Controller can map the separately preclaimed function after the first caller deadline");
+                  auto const report = replacement.report();
+                  check(report.virtual_base == BANK + 4096 && report.physical == e1000_host::REUSE_BAR0 && report.initial_ticket == 1 &&
+                            translate(report.virtual_base) == report.physical,
+                        "abandoned uncommitted physical record reserves no VA and does not displace the next actual owner");
+                  replacement.close();
+                  e1000_host::reuse_claim.reset();
+                  std::printf("MMIO_ADMISSION_DEADLINE_HOST next_va=%llx next_ticket=%llu calls=%zu\n",
+                              static_cast<unsigned long long>(report.virtual_base), static_cast<unsigned long long>(report.initial_ticket),
+                              calls);
+              }),
+              "actual boot driver enforces the finite monotonic next-call deadline");
+        controller_host::before_boot_callback = nullptr;
+        return;
+    }
+    if (name == "consumer_admission_fragmented")
+        controller_host::before_boot_callback = [](const controller_host::cm::detail::Controller&) { fragment_large_resource(); };
+    if (name == "consumer_admission_cpu_retry")
+        controller_host::before_boot_callback = [](const controller_host::cm::detail::Controller&) {
+            maintenance_host::pause_remote_after_ipis.store(2 * static_cast<unsigned>(runtime_ports::configured.load()) + 1);
+            maintenance_host::resume_remote_after_pauses.store(2600);
+        };
+    e1000_host::run_consumer_case("consumer_success");
+    controller_host::before_boot_callback = nullptr;
+    auto const report = e1000_host::device->registers.report();
+    check(report.phase == mapping::Phase::complete && report.resource_steps > 1 && report.resource_visits > 128 &&
+              report.views[0].initial_ticket == 1 && report.views[1].initial_ticket == 2,
+          "actual driver resumes bounded resource admission then performs genuine traffic and original-ticket retirement");
+    if (name == "consumer_admission_fragmented")
+        check(report.resource_visits > 32768 && report.resource_steps > 256,
+              "actual unmodified boot caller completes the real fragmented large-resource cursor beyond the old total limit");
+    if (name == "consumer_admission_cpu_retry")
+        check(report.views[1].timed_out_ever && report.views[0].initial_ticket == 1 && report.views[1].initial_ticket == 2 &&
+                  maintenance_host::pauses.load() >= 2600,
+              "actual boot caller resumes the timed-out second child with its original CPU ticket before genuine retirement");
+}
+
 template <typename Body>
 void writer_refuses_before_effects(Body body) {
     std::map<uint64_t, std::array<uint8_t, 4096>> before;
@@ -476,6 +757,10 @@ int main(int argc, char** argv) {
         mmio_host::run_bad_table_alias();
     else if (name == "engine_view_bounds")
         mmio_host::run_view_bounds();
+    else if (name.starts_with("engine_large_"))
+        mmio_host::run_large_producer();
+    else if (name.starts_with("consumer_admission_"))
+        mmio_host::run_admission_consumer(name);
     else if (name == "engine_invalid_view_plans" || name == "engine_view_prepare_resume" || name == "engine_cross_bar_views" ||
              name == "engine_legacy_view_default")
         mmio_host::run_producer_case(name);

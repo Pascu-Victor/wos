@@ -227,10 +227,11 @@ other operations drained and checks the actual DMA registry outside the config
 lock. Only this serialized transaction sizes every own memory BAR and verifies
 restoration.
 BAR0 must cover the consumer's highest register offset; assigned-positive zero
-addresses, overlap and malformed sizing fail. The sum of page-rounded own
-memory BARs is limited to 16 MiB; larger exact claims refuse capacity before
-physical reservation. A small window into a larger BAR does not bypass this
-full-resource bound. This service does not supply GPU-scale aperture mapping.
+addresses, overlap and malformed sizing fail. Complete resource extents are
+bounded by the actual CPU physical width and validated HHDM geometry, with at
+most six memory spans. Their size does not allocate page tables. The aggregate
+materialized child windows remain limited to 16 MiB and eight views. Large sparse
+resource ownership does not supply GPU-scale aperture mapping or WC policy.
 Cold describes WOS CPU exposure; firmware usage and engine quiescence remain
 separate obligations.
 
@@ -249,6 +250,22 @@ Unsupported profiles leave ordinary boot available without creating that bank.
 All own memory spans become boot-persistent physical tombstones. Nonreserved
 boot memory, previous WOS exposure and present aliases refuse the cold path;
 the implementation preserves existing RESERVED direct mappings.
+
+Physical admission is resumable. An early private handle retains the exact
+claim and view plan without reserving VA, publishing leaves, enabling MEM or
+admitting DMA. Each step performs at most 128 HHDM walk visits under the actual
+MM pin lock. A mutation epoch, real kernel-root frame and HHDM identity bind all
+resource spans; an intervening publication restarts the entire scan. Present
+aliases, including HHDM translations to different RAM, refuse admission. The
+final pin transaction rechecks boot, exposure-history, private-frame and retained
+resource exclusions, then commits all resource fences and child VA reservations
+together. Epoch saturation refuses new admission without wrapping.
+
+The actual boot consumer resumes the same claim, plan and Controller only for
+`pending_retained`. A qualified monotonic five-second budget and a finite call
+limit bound starting new calls. A successful call remains successful even if its
+bounded work crosses that deadline. Abandoned, uncommitted handles retain only
+private metadata; committed ownership retains its existing fences and tickets.
 
 The actual MM pin serialization protects the dedicated VA namespace, encoded
 incoming and displaced physical spans, and private page-table frames across
@@ -309,6 +326,9 @@ hotplug, WC mappings and userspace BAR mappings remain outside this path.
 The maintained `--selftest-e1000-mmio` diagnostic exercises the actual typed
 consumer, scoped borrowers and network traffic, then asks PID1 to perform its
 normal shutdown. It checks both sparse views and their guarded translations.
+The selftest-only `--selftest-e1000-mmio-admission-steps` option requires the
+existing typed diagnostic flags and reduces the actual resource walk to one
+visit per call, exercising boot-caller continuation across the NIC's own BARs.
 `--selftest-e1000-mmio-withdraw-retry` additionally withholds one real remote
 action for the first child's withdrawal and retries that same ticket. Host fixtures
 link actual engines with finite hardware ports. These interfaces do not by
@@ -581,7 +601,8 @@ device-specific treatment. Existing xHCI/virtio activation relies on halted or
 not-DRIVER_OK device state before handler publication. Large legacy apertures
 still map in proportion to their 4 KiB page count.
 GPU-scale and on-demand aperture mapping remain open; the opt-in cold register
-service has the 16 MiB admission bound described above.
+service retains large resource extents but materializes at most 16 MiB of UC
+child windows as described above.
 
 The shared 256-function capacity now covers PCI, ECAM and IOMMU ownership
 metadata with bounded traversal; it does not add resource/reset authority.
