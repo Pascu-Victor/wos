@@ -1858,6 +1858,164 @@ def test_node_cpu_model_override_is_exact(module) -> None:
         node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
 
 
+def test_vga_none_is_explicit_and_preserves_default_layout(module) -> None:
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        assert_equal("vga" in node.normalize_node_spec({})["vm"], False, "omitted VGA option stays omitted")
+        for tcg in (None, ""):
+            baseline = node.build_qemu_args({}, tcg_level=tcg, log=lambda _line: None)
+            assert_equal("-vga" in baseline, False, "omitted VGA preserves the existing QEMU default")
+            actual = node.build_qemu_args({"vm": {"vga": "none"}}, tcg_level=tcg, log=lambda _line: None)
+            assert_equal(actual.count("-vga"), 1, "one explicit VGA option for KVM and TCG")
+            at = actual.index("-vga")
+            assert_equal(actual[at:at + 2], ["-vga", "none"], "headless option uses exactly two literal arguments")
+            assert_equal(actual[:at] + actual[at + 2:], baseline, "all other default arguments remain unchanged")
+            assert_equal(actual[actual.index("-display") + 1], "none", "display output remains disabled")
+            assert_equal(actual[actual.index("-serial") + 1], "chardev:char0", "serial output remains configured")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
+def test_vga_none_config_roundtrip_owns_values(module) -> None:
+    node = module.node_setup
+    raw = json.loads(ROOTLESS_KTEST_CONFIG.read_text())
+    raw["node"]["vm"]["vga"] = "none"
+    original = json.dumps(raw, sort_keys=True)
+    normalized = node.normalize_node_spec(raw)
+    assert_equal(normalized["vm"]["vga"], "none", "normalization retains explicit headless selection")
+    assert_equal(normalized["vm"] is raw["node"]["vm"], False, "normalized VM settings are owned copies")
+    cluster = node.cluster_config_from_node_spec(normalized)
+    members = module.collect_unique_nodes(cluster)
+    restored = module.cluster_node_spec(0, members[0], cluster)
+    assert_equal(cluster["zones"][0]["vm"]["vga"], "none", "single-node conversion preserves global headless selection")
+    assert_equal(restored["vm"]["vga"], "none", "KTEST to cluster to node retains headless selection")
+    cluster["zones"][0]["vm"]["vga"] = "std"
+    assert_equal(normalized["vm"]["vga"], "none", "cluster owns a distinct VM settings copy")
+    assert_equal(restored["vm"]["vga"], "none", "restored node owns its VM settings")
+    normalized["vm"]["vga"] = "std"
+    assert_equal(json.dumps(raw, sort_keys=True), original, "normalization and conversion never mutate caller input")
+
+
+def test_invalid_vga_refuses_before_overlay_or_log_work(module) -> None:
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid VGA specification reached disk/log work")
+
+    node.prepare_node_overlays = node.cleanup_node_logs = forbidden
+    try:
+        invalid = (None, True, False, 0, 1, 0.0, [], {}, b"none", "", "default", "std", "None", "none ", " none", "none,-device=VGA")
+        for value in invalid:
+            for tcg in (None, ""):
+                try:
+                    node.build_qemu_args({"vm": {"vga": value}}, tcg_level=tcg, log=forbidden)
+                except ValueError as error:
+                    assert_equal(str(error), "vm.vga must be the string none when specified", "explicit invalid VGA rejection")
+                else:
+                    raise AssertionError(f"invalid VGA specification accepted: {value!r}")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
+def vga_cluster_fixture() -> dict:
+    return {"zones": [
+        {"id": "GLOBAL", "vm": {"vga": "none"}},
+        {"id": 0, "name": "lan", "nodes": 1, "vm": {"vga": "none"},
+         "nodes_config": [{"id": 0, "vm": {"vga": "none"}}]},
+    ]}
+
+
+def vga_cluster_sections(config: dict) -> list[dict]:
+    return [config["zones"][0]["vm"], config["zones"][1]["vm"], config["zones"][1]["nodes_config"][0]["vm"]]
+
+
+def test_cluster_vga_preflight_preserves_valid_inheritance(module) -> None:
+    for selected in range(3):
+        config = vga_cluster_fixture()
+        for index, section in enumerate(vga_cluster_sections(config)):
+            if index != selected:
+                section.clear()
+        original = json.dumps(config, sort_keys=True)
+        module.validate_cluster_config(config)
+        members = module.collect_unique_nodes(config)
+        restored = module.cluster_node_spec(0, members[0], config)
+        assert_equal(restored["vm"]["vga"], "none", "GLOBAL, zone and node headless selections each inherit correctly")
+        assert_equal(json.dumps(config, sort_keys=True), original, "shared preflight does not normalize or mutate caller config")
+
+
+def test_cluster_vga_preflight_checks_shadowed_and_unused_sections(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "cluster.json"
+        for selected in range(4):
+            config = vga_cluster_fixture()
+            if selected < 3:
+                vga_cluster_sections(config)[selected]["vga"] = "std"
+            else:
+                config["zones"][0]["nodes_config"] = [{"id": 0, "vm": {"vga": "std"}}]
+            path.write_text(json.dumps(config))
+            for invoke in (lambda: module.validate_cluster_config(config), lambda: module.load_config(path),
+                           lambda: module.collect_unique_nodes(config)):
+                try:
+                    invoke()
+                except ValueError as error:
+                    assert_equal(str(error), "vm.vga must be the string none when specified", "invalid explicit layer is rejected")
+                else:
+                    raise AssertionError(f"invalid shadowed/unused VGA layer {selected} accepted")
+
+
+def test_cluster_launch_vga_preflight_precedes_all_mutations(module) -> None:
+    names = ("remove_live_debug_descriptor", "setup", "validate_no_setup_topology", "provision_wki_auth", "launch_one_vm")
+    original = {name: getattr(module, name) for name in names}
+    old_guard = module.cluster_launch_guard
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    effects = []
+
+    def forbidden(name):
+        def invoke(*_args, **_kwargs):
+            effects.append(name)
+            raise AssertionError(f"invalid VGA reached {name}")
+        return invoke
+
+    for name in names:
+        setattr(module, name, forbidden(name))
+    module.cluster_launch_guard = lambda: contextlib.nullcontext()
+    node.prepare_node_overlays = forbidden("prepare_node_overlays")
+    node.cleanup_node_logs = forbidden("cleanup_node_logs")
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            descriptor = Path(temporary) / "existing-live.json"
+            content = b"existing descriptor must survive invalid input\n"
+            descriptor.write_bytes(content)
+            invalid = (None, True, False, 0, 1, 0.0, [], {}, b"none", "", "default", "std", "None", "none ", " none", "none,-device=VGA")
+            for selected in range(4):
+                for value in invalid:
+                    config = vga_cluster_fixture()
+                    if selected < 3:
+                        vga_cluster_sections(config)[selected]["vga"] = value
+                    else:
+                        config["zones"][0]["nodes_config"] = [{"id": 0, "vm": {"vga": value}}]
+                    for entry in (module.launch_guarded, module.launch):
+                        for skip_setup in (False, True):
+                            try:
+                                entry(config, skip_setup=skip_setup, live_debug_descriptor=descriptor)
+                            except ValueError as error:
+                                assert_equal(str(error), "vm.vga must be the string none when specified", "actual launch preflight refusal")
+                            else:
+                                raise AssertionError(f"invalid VGA reached launch: layer={selected} value={value!r}")
+            assert_equal(effects, [], "invalid input cannot remove descriptors, set up topology, provision auth or touch disks/logs")
+            assert_equal(descriptor.read_bytes(), content, "existing live descriptor remains untouched")
+    finally:
+        for name, value in original.items():
+            setattr(module, name, value)
+        module.cluster_launch_guard = old_guard
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
 def test_iommu_option_is_explicit_and_validated_before_disk_work(module) -> None:
     node_setup = module.node_setup
     old_prepare = node_setup.prepare_node_overlays
@@ -2128,6 +2286,12 @@ def main() -> None:
         test_disk_cache_modes_are_validated_before_disk_work,
         test_ivshmem_modes_share_the_node_launcher,
         test_node_cpu_model_override_is_exact,
+        test_vga_none_is_explicit_and_preserves_default_layout,
+        test_vga_none_config_roundtrip_owns_values,
+        test_invalid_vga_refuses_before_overlay_or_log_work,
+        test_cluster_vga_preflight_preserves_valid_inheritance,
+        test_cluster_vga_preflight_checks_shadowed_and_unused_sections,
+        test_cluster_launch_vga_preflight_precedes_all_mutations,
         test_iommu_option_is_explicit_and_validated_before_disk_work,
         test_topology_probe_is_timeout_bounded,
         test_no_setup_topology_accepts_configured_links,

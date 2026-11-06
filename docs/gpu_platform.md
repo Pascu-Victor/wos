@@ -110,9 +110,22 @@ BAR restoration before restoring memory decoding; uncertain restoration attempts
 to inhibit memory decoding and bus mastering. Host tests exercise the same
 production transaction template, including failed readback.
 
+Sizing also verifies all four read-only BAR attribute bits after restoring the
+saved configuration. Only an entirely zero ordinary 32-bit BAR and zero raw
+probe response prove absence. A 64-bit or prefetchable BAR with no address-mask
+bits fails validation and poisons the retained function; it cannot enable bus
+mastering or produce a mapping. A valid positive mask at address zero still
+reports its size, independently of the mapper's address-zero refusal.
+
 The legacy address/size/map wrappers preserve their zero/null error conventions.
 Mapping failure no longer invents a 4 KiB resource. Bridges expose only their two
 BARs; window registers are separate resources.
+
+For controlled serial-only platform fixtures, the shared cluster/KTEST node
+spec accepts `"vm": {"vga": "none"}`. This explicitly removes QEMU's default
+VGA function; `-display none` alone only hides its output. Omit the option for
+the usual layout. This fixture option provides no physical-GPU qualification
+or guest authority to trust QMP-reported BAR sizes.
 
 ## Retained boot resources and MSI-X
 

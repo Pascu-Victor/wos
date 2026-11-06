@@ -62,6 +62,14 @@ def merge_section(base: dict, override: dict) -> dict:
     return result
 
 
+def validate_vga_option(vm: dict) -> None:
+    """Validate an explicit VM section without normalizing or changing it."""
+    if not isinstance(vm, dict):
+        raise ValueError("vm must be an object")
+    if "vga" in vm and (type(vm["vga"]) is not str or vm["vga"] != "none"):
+        raise ValueError("vm.vga must be the string none when specified")
+
+
 def normalize_qemu_netdev(raw: dict, *, queues: int, vhost: bool, where: str) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be an object")
@@ -213,6 +221,7 @@ def normalize_node_spec(raw: dict) -> dict:
     spec["id"] = node_id
     spec["hostname"] = spec.get("hostname", f"wos-{node_id}")
     spec["debug"] = bool(spec.get("debug", False))
+    validate_vga_option(spec.get("vm", {}))
     spec["vm"] = merge_section(DEFAULT_VM_CONFIG, spec.get("vm", {}))
     disk_cache = spec["vm"]["disk_cache"]
     if not isinstance(disk_cache, str) or disk_cache not in ("unsafe", "writeback", "none", "writethrough", "directsync"):
@@ -484,6 +493,9 @@ def build_qemu_args(
         "-D",
         str(qemu_log),
     ]
+
+    if "vga" in vm_cfg:
+        args.extend(["-vga", "none"])
 
     if vm_cfg.get("iommu", False):
         args.extend(["-device", "intel-iommu,intremap=off,caching-mode=on,aw-bits=48"])

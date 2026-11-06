@@ -38,7 +38,7 @@ template <typename Reader>
     // Both halves must contain all ones together when sizing a 64-bit BAR.
     reader.write32(LOW_REG, UINT32_MAX);
     if (WIDE) reader.write32(HIGH_REG, UINT32_MAX);
-    uint32_t const MASK_LOW = reader.read32(LOW_REG) & ~uint32_t{15};
+    uint32_t const RAW_MASK_LOW = reader.read32(LOW_REG);
     uint32_t const MASK_HIGH = WIDE ? reader.read32(HIGH_REG) : 0;
     reader.write32(LOW_REG, LOW);
     if (WIDE) reader.write32(HIGH_REG, HIGH);
@@ -53,8 +53,13 @@ template <typename Reader>
         return std::nullopt;
     }
 
-    if (MASK_LOW == 0 && MASK_HIGH == 0 && BAR.address == 0) return 0;
-    uint64_t const SIZE = memory_size(BAR, MASK_LOW, MASK_HIGH);
+    // Attributes are read-only even during sizing. Classify only after the
+    // complete saved configuration has been restored and verified above.
+    if ((RAW_MASK_LOW & 15U) != (LOW & 15U)) return std::nullopt;
+    // Only an entirely hardwired-zero ordinary BAR proves absence. A type or
+    // prefetch attribute with no address mask is invalid sizing, not absence.
+    if (!WIDE && LOW == 0 && RAW_MASK_LOW == 0) return 0;
+    uint64_t const SIZE = memory_size(BAR, RAW_MASK_LOW & ~uint32_t{15}, MASK_HIGH);
     return SIZE != 0 ? std::optional<uint64_t>{SIZE} : std::nullopt;
 }
 

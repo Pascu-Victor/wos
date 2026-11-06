@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <dev/pci_bar_probe.hpp>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,7 @@ struct Config {
     std::array<bool, 6> sizing{};
     std::vector<Access> accesses;
     uint32_t low_mask = 0xfffff000, high_mask = UINT32_MAX;
+    std::optional<uint32_t> raw_low_response;
     size_t index = 0, slots = 6, mask_reads = 0, premature_mask_reads = 0;
     bool wide = false, decoded_sizing_address = false;
     Failure failure = Failure::none;
@@ -61,7 +63,7 @@ struct Config {
                 ++premature_mask_reads;
                 value = 0xdeadc0de;
             } else {
-                value = SLOT == index ? low_mask | (snapshot[index] & 15U) : high_mask;
+                value = SLOT == index ? raw_low_response.value_or(low_mask | (snapshot[index] & 15U)) : high_mask;
             }
         }
         accesses.push_back({'r', offset, value});
@@ -262,7 +264,7 @@ TEST(PciBarProbe, DistinguishesUnimplementedBarFromAssignedZeroMaskAndRestoresOn
             }
             auto const BEFORE = config.registers;
             auto const SIZE = config.probe();
-            if (mode <= 1) {
+            if (mode == 1 || (mode == 0 && !wide)) {
                 ASSERT_TRUE(SIZE);
                 EXPECT_EQ(*SIZE, mode == 0 ? 0U : 4096U);
             } else {
@@ -271,6 +273,58 @@ TEST(PciBarProbe, DistinguishesUnimplementedBarFromAssignedZeroMaskAndRestoresOn
             EXPECT_EQ(config.registers, BEFORE);
             config.expect_status_preserved();
         }
+    }
+}
+
+TEST(PciBarProbe, FlaggedZeroPayloadCannotProveAnUnimplementedBar) {
+    for (uint32_t attributes : {4U, 8U, 12U}) {
+        bool const WIDE = (attributes & 4U) != 0;
+        Config config(WIDE);
+        config.registers[4] = config.snapshot[0] = attributes;
+        if (WIDE) config.registers[5] = config.snapshot[1] = 0;
+        config.low_mask = config.high_mask = 0;
+        auto const BEFORE = config.registers;
+        EXPECT_FALSE(config.probe()) << attributes;
+        EXPECT_EQ(config.registers, BEFORE);
+        EXPECT_EQ(config.mask_reads, WIDE ? 2U : 1U);
+        EXPECT_EQ(config.premature_mask_reads, 0U);
+        EXPECT_EQ(config.accesses[config.accesses.size() - 2].operation, 'W');
+        EXPECT_EQ(config.accesses[config.accesses.size() - 2].value, Config::COMMAND);
+        EXPECT_EQ(config.accesses.back().operation, 'R');
+        EXPECT_EQ(config.accesses.back().offset, 4);
+        config.expect_status_preserved();
+    }
+}
+
+TEST(PciBarProbe, EveryImmutableAttributeBitMustSurviveSizingBeforeClassification) {
+    for (bool wide : {false, true}) {
+        for (unsigned bit = 0; bit < 4; ++bit) {
+            Config config(wide);
+            config.raw_low_response = (config.low_mask | (config.snapshot[0] & 15U)) ^ (uint32_t{1} << bit);
+            auto const BEFORE = config.registers;
+            EXPECT_FALSE(config.probe()) << "wide=" << wide << " bit=" << bit;
+            EXPECT_EQ(config.registers, BEFORE);
+            EXPECT_EQ(config.mask_reads, wide ? 2U : 1U);
+            EXPECT_EQ(config.premature_mask_reads, 0U);
+            EXPECT_EQ(config.accesses[config.accesses.size() - 2].operation, 'W');
+            EXPECT_EQ(config.accesses[config.accesses.size() - 2].value, Config::COMMAND);
+            EXPECT_EQ(config.accesses.back().operation, 'R');
+            EXPECT_EQ(config.accesses.back().offset, 4);
+            config.expect_status_preserved();
+        }
+    }
+}
+
+TEST(PciBarProbe, ValidZeroBasedBarStillHasPositiveSizeWithOrWithoutPrefetch) {
+    for (uint32_t attributes : {0U, 4U, 8U, 12U}) {
+        bool const WIDE = (attributes & 4U) != 0;
+        Config config(WIDE);
+        config.registers[4] = config.snapshot[0] = attributes;
+        if (WIDE) config.registers[5] = config.snapshot[1] = 0;
+        auto const BEFORE = config.registers;
+        EXPECT_EQ(config.probe(), std::optional<uint64_t>{4096}) << attributes;
+        EXPECT_EQ(config.registers, BEFORE);
+        config.expect_status_preserved();
     }
 }
 

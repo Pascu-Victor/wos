@@ -27,12 +27,13 @@ namespace pci_runtime {
 namespace pci = ker::dev::pci;
 thread_local unsigned lock_depth = 0;
 std::atomic<uint64_t> lock_acquisitions{0};
-constexpr size_t DEVICES = 26;
+constexpr size_t DEVICES = 29;
 constexpr uint64_t BASE = 0x80000000;
 struct Function {
     std::array<uint8_t, 256> config{};
     alignas(4096) std::array<uint32_t, 2048> mmio{};
     std::array<bool, 6> sizing{};
+    std::array<uint32_t, 6> sizing_masks{};
     bool fail_restore = false;
     bool domain_healthy = true;
     uint64_t probe_epoch = 0;
@@ -103,6 +104,7 @@ void write(uint16_t port, uint32_t value, size_t bytes) {
 void setup() {
     for (size_t slot = 0; slot < DEVICES; ++slot) {
         auto& f = functions[slot];
+        f.sizing_masks.fill(0xfffff000);
         store(f, 0, 0x10001234U + static_cast<uint32_t>(slot) * 0x10000, 4);
         store(f, 4, 2, 2);
         store(f, 6, 0x8010, 2);
@@ -117,6 +119,17 @@ void setup() {
         store(f, 0x60, 0x05, 2);
         store(f, 0x62, 0x180, 2);  // Conventional 64-bit MSI with per-vector masks.
     }
+    // Independent real-adapter inputs: true absence, flagged zero payloads,
+    // and a positive assigned mask whose immutable prefetch bit changes.
+    store(functions[25], 0x10, 0, 4);
+    functions[25].sizing_masks[0] = 0;
+    store(functions[26], 0x10, 8, 4);
+    functions[26].sizing_masks[0] = 8;
+    store(functions[27], 0x10, 4, 4);
+    store(functions[27], 0x14, 0, 4);
+    functions[27].sizing_masks[0] = 4;
+    functions[27].sizing_masks[1] = 0;
+    store(functions[28], 0x10, physical(28) | 8U, 4);
 }
 class PciRuntime : public ::testing::Test {
    protected:
@@ -138,7 +151,7 @@ auto inl(uint16_t port) -> uint32_t {
     if (f == nullptr) return UINT32_MAX;
     check_epoch(*f);
     size_t const OFFSET = address & 0xfcU;
-    if (OFFSET >= 0x10 && OFFSET < 0x28 && f->sizing[(OFFSET - 0x10) / 4]) return 0xfffff000;
+    if (OFFSET >= 0x10 && OFFSET < 0x28 && f->sizing[(OFFSET - 0x10) / 4]) return f->sizing_masks[(OFFSET - 0x10) / 4];
     uint32_t const VALUE = load(*f, OFFSET, 4);
     if (OFFSET == 4 && (VALUE & 6U) == 2 && !f->sizing[0] && !f->sizing[1]) f->transaction = false;
     return VALUE;
@@ -301,6 +314,46 @@ TEST_F(PciRuntime, FirstProbeWithBusMasteringOnRefusesWithoutSizingAndMayLaterPr
     EXPECT_EQ(maps, MAPS);
     ASSERT_TRUE(pci::pci_set_bus_master(device(2), false));
     EXPECT_EQ(pci::pci_get_bar_size_checked(device(2), 0), 4096U);
+}
+
+TEST_F(PciRuntime, EntirelyZeroAbsentBarIsCachedWithoutPoisoningTheFunction) {
+    auto* const DEV = device(25);
+    auto const BEFORE = functions[25].config;
+    auto const PROBES = probes, MAPS = maps, STATUS_WRITES = status_dword_writes;
+    ASSERT_EQ(pci::pci_get_bar_size_checked(DEV, 0), std::optional<uint64_t>{0});
+    EXPECT_EQ(functions[25].config, BEFORE);
+    EXPECT_EQ(probes, PROBES + 1);
+    EXPECT_EQ(status_dword_writes, STATUS_WRITES);
+    auto const IO = io;
+    EXPECT_EQ(pci::pci_get_bar_size_checked(DEV, 0), std::optional<uint64_t>{0});
+    EXPECT_EQ(pci::pci_map_bar(DEV, 0), nullptr);
+    EXPECT_EQ(io, IO);
+    EXPECT_EQ(probes, PROBES + 1);
+    EXPECT_EQ(maps, MAPS);
+    ASSERT_TRUE(pci::pci_set_bus_master(DEV, true));
+    EXPECT_EQ(load(functions[25], 4, 2) & pci::PCI_COMMAND_BUS_MASTER, pci::PCI_COMMAND_BUS_MASTER);
+    EXPECT_TRUE(pci::pci_set_bus_master(DEV, false));
+}
+
+TEST_F(PciRuntime, FlaggedZeroPayloadOrChangedAttributesPoisonWithoutMappingOrRetry) {
+    for (size_t slot : {26U, 27U, 28U}) {
+        auto* const DEV = device(slot);
+        auto const BEFORE = functions[slot].config;
+        auto const PROBES = probes, MAPS = maps, STATUS_WRITES = status_dword_writes;
+        EXPECT_FALSE(pci::pci_get_bar_size_checked(DEV, 0)) << slot;
+        EXPECT_EQ(functions[slot].config, BEFORE);
+        EXPECT_EQ(probes, PROBES + (slot == 27 ? 2U : 1U));
+        EXPECT_EQ(status_dword_writes, STATUS_WRITES);
+        EXPECT_FALSE(functions[slot].transaction);
+        auto const IO = io, RETAINED_PROBES = probes;
+        EXPECT_FALSE(pci::pci_get_bar_size_checked(DEV, 0));
+        EXPECT_EQ(pci::pci_map_bar(DEV, 0), nullptr);
+        EXPECT_FALSE(pci::pci_set_bus_master(DEV, true));
+        EXPECT_EQ(io, IO);
+        EXPECT_EQ(probes, RETAINED_PROBES);
+        EXPECT_EQ(maps, MAPS);
+        EXPECT_EQ(load(functions[slot], 4, 2) & pci::PCI_COMMAND_BUS_MASTER, 0U);
+    }
 }
 
 TEST_F(PciRuntime, MappingClaimsBlockDmaAndCompetitorsWhileMappingOutsideConfigLock) {

@@ -226,6 +226,16 @@ def validate_cluster_config(config: dict) -> None:
         if zone_id in seen_zone_ids:
             raise ValueError("cluster config zone ids must be unique")
         seen_zone_ids.add(zone_id)
+        if "vm" in zone:
+            node_setup.validate_vga_option(zone["vm"])
+        overrides = zone.get("nodes_config", [])
+        if not isinstance(overrides, list) or any(
+            not isinstance(item, dict) for item in overrides
+        ):
+            raise ValueError(f"zone {zone_name(zone)} nodes_config must be an array of objects")
+        for override in overrides:
+            if "vm" in override:
+                node_setup.validate_vga_option(override["vm"])
 
     for zone in zones:
         if zone.get("id") == "GLOBAL":
@@ -250,10 +260,6 @@ def validate_cluster_config(config: dict) -> None:
                     )
                 socket_endpoints[endpoint] = zone_name(zone)
         overrides = zone.get("nodes_config", [])
-        if not isinstance(overrides, list) or any(
-            not isinstance(item, dict) for item in overrides
-        ):
-            raise ValueError(f"zone {zone_name(zone)} nodes_config must be an array of objects")
         override_ids: list[int] = []
         for index, override in enumerate(overrides):
             node_id = override.get("id")
@@ -2821,6 +2827,7 @@ def launch_guarded(
     symbol_path: str | Path = DEFAULT_KERNEL_SYMBOL_PATH,
 ):
     """Launch VMs while the caller holds the cluster launch guard."""
+    validate_cluster_config(config)
     descriptor_path = (
         absolute_runtime_path(live_debug_descriptor)
         if live_debug_descriptor is not None
