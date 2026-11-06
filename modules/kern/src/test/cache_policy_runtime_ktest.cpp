@@ -1,9 +1,11 @@
 #include <array>
 #include <atomic>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/cache_policy.hpp>
+#include <platform/mm/cpu_maintenance.hpp>
 #include <platform/mm/mmio_cache.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
@@ -18,6 +20,7 @@
 namespace ker::test {
 namespace {
 namespace cache = ker::mod::mm::cache;
+namespace maintenance = ker::mod::mm::cpu_maintenance;
 namespace mmio = ker::mod::mm::mmio_cache;
 namespace sched = ker::mod::sched;
 namespace task = sched::task;
@@ -330,6 +333,220 @@ void require_same_cohort(const mmio::CohortObservation& before, const mmio::Coho
             "sealed/refused cohort observation remains stable across scheduling");
 }
 
+auto maintenance_deadline(uint64_t duration_ns) -> uint64_t {
+    uint64_t const NOW = ker::mod::time::get_monotonic_ns();
+    require(NOW != 0 && duration_ns <= UINT64_MAX - NOW, "bounded monotonic maintenance deadline");
+    return NOW + duration_ns;
+}
+
+void require_empty_maintenance_pool() {
+    auto const POOL = maintenance::pool_stats();
+    require(POOL.capacity == maintenance::POOL_CAPACITY && POOL.prepared == 0 && POOL.published == 0 && POOL.complete == 0 &&
+                POOL.retained == 0,
+            "scheduled diagnostic leaves no prepared, published, complete or retained maintenance request");
+}
+
+void wait_for_maintenance_ready(uint64_t expected, bool refusal) {
+    auto const DEADLINE = maintenance_deadline(10'000'000'000);
+    for (size_t attempt = 0; attempt < 10'000; ++attempt) {
+        auto const SERVICE = maintenance::service_observation();
+        uint64_t const SCHEDULED = sched::selftest_task_context_ready_mask();
+        require(SERVICE.expected_mask == expected && SERVICE.vector != 0 && (SERVICE.ready_mask & ~expected) == 0 &&
+                    (SCHEDULED & ~expected) == 0,
+                "maintenance and actual scheduled CPU observations match the configured topology");
+        if (SCHEDULED == expected && (refusal ? SERVICE.ready_mask == 0 : SERVICE.ready_mask == expected)) {
+            if (!refusal)
+                require(SERVICE.status == maintenance::Status::ready && SERVICE.service_error == mmio::Status::ready,
+                        "all actual scheduled CPUs qualified for maintenance");
+            log::info("CPU_MAINTENANCE_RUNTIME READY expected=%016lx scheduled=%016lx ready=%016lx vector=%u refusal=%u", expected,
+                      SCHEDULED, SERVICE.ready_mask, static_cast<unsigned>(SERVICE.vector), refusal ? 1U : 0U);
+            return;
+        }
+        require(ker::mod::time::get_monotonic_ns() < DEADLINE, "bounded wait for every real scheduler-ready maintenance CPU");
+        sched::kern_sleep_us(1000);
+    }
+    require(false, "finite wait for every real scheduler-ready maintenance CPU");
+}
+
+void log_maintenance_report(const char* name, const char* stage, const maintenance::Report& report, size_t cpus) {
+    log::info(
+        "CPU_MAINTENANCE_RUNTIME RECEIPT case=%s stage=%s status=%s phase=%u id=%lu physical=%016lx bytes=%lu incarnation=%lu "
+        "targets=%016lx",
+        name, stage, maintenance::status_name(report.status), static_cast<unsigned>(report.phase), report.id, report.physical, report.bytes,
+        report.cohort_incarnation, report.targets);
+    log::info(
+        "CPU_MAINTENANCE_RUNTIME MASKS case=%s stage=%s id=%lu tlb_claimed=%016lx tlb_completed=%016lx cache_claimed=%016lx "
+        "cache_completed=%016lx failed=%016lx tlb_withheld=%016lx cache_withheld=%016lx",
+        name, stage, report.id, report.translation_claimed, report.translation_completed, report.cache_claimed, report.cache_completed,
+        report.failed, report.translation_withheld, report.cache_withheld);
+    log::info("CPU_MAINTENANCE_RUNTIME GATE case=%s stage=%s id=%lu readers=%lu closed=%u timed_out_ever=%u abandoned=%u service_error=%s",
+              name, stage, report.id, report.readers, report.admission_closed ? 1U : 0U, report.timed_out_ever ? 1U : 0U,
+              report.abandoned ? 1U : 0U, mmio::status_name(report.service_error));
+    for (size_t cpu = 0; cpu < cpus; ++cpu) {
+        auto const& row = report.cpus[cpu];
+        log::info(
+            "CPU_MAINTENANCE_RUNTIME CPU case=%s stage=%s id=%lu logical=%lu target_apic=%u tlb_apic=%u cache_apic=%u "
+            "tlb_claimed_id=%lu tlb_completed_id=%lu cache_claimed_id=%lu cache_completed_id=%lu tlb_status=%s cache_status=%s "
+            "tlb_cr3=%016lx cache_cr3=%016lx",
+            name, stage, report.id, cpu, row.target_apic, row.translation_apic, row.cache_apic, row.translation_claimed,
+            row.translation_completed, row.cache_claimed, row.cache_completed, mmio::status_name(row.translation_status),
+            mmio::status_name(row.cache_status), row.translation_cr3, row.cache_cr3);
+    }
+}
+
+void require_maintenance_report(const maintenance::Report& report, uint64_t id, uint64_t expected, uint64_t physical, uint64_t bytes,
+                                uint64_t incarnation) {
+    require(report.id == id && id != 0 && report.kind == maintenance::Kind::translations_then_cache && report.targets == expected &&
+                report.physical == physical && report.bytes == bytes && report.cohort_incarnation == incarnation,
+            "maintenance receipt retains exact request, actual targets and privately qualified range");
+    require(report.failed == 0 && report.service_error == mmio::Status::ready && !report.abandoned,
+            "maintenance receipt has no failed CPU, service error or abandoned controller");
+    uint64_t translation_claimed = 0, translation_completed = 0, cache_claimed = 0, cache_completed = 0;
+    for (size_t cpu = 0; cpu < maintenance::CPU_CAPACITY; ++cpu) {
+        auto const& row = report.cpus[cpu];
+        uint64_t const BIT = uint64_t{1} << cpu;
+        require((row.translation_claimed == 0 || row.translation_claimed == id) &&
+                    (row.translation_completed == 0 || row.translation_completed == id) &&
+                    (row.cache_claimed == 0 || row.cache_claimed == id) && (row.cache_completed == 0 || row.cache_completed == id),
+                "per-CPU claims and completions use this exact request ID");
+        if ((expected & BIT) != 0)
+            require(row.target_apic == ker::mod::smt::get_cpu(cpu).lapic_id, "maintenance target is the actual logical CPU's APIC");
+        if (row.translation_claimed == id) translation_claimed |= BIT;
+        if (row.translation_completed == id) {
+            translation_completed |= BIT;
+            require(row.translation_claimed == id && row.translation_status == mmio::Status::ready &&
+                        row.translation_apic == row.target_apic && row.translation_cr3 != 0,
+                    "TLB completion follows a successful exact-CPU action with actual current CR3");
+        }
+        if (row.cache_claimed == id) cache_claimed |= BIT;
+        if (row.cache_completed == id) {
+            cache_completed |= BIT;
+            require(row.cache_claimed == id && row.cache_status == mmio::Status::ready && row.cache_apic == row.target_apic &&
+                        row.cache_cr3 != 0,
+                    "cache completion follows a successful exact-CPU action with actual current CR3");
+        }
+    }
+    require(((translation_claimed | translation_completed | cache_claimed | cache_completed) & ~expected) == 0 &&
+                report.translation_claimed == translation_claimed && report.translation_completed == translation_completed &&
+                report.cache_claimed == cache_claimed && report.cache_completed == cache_completed,
+            "receipt masks derive from the same copied exact-ID CPU rows");
+    require(cache_claimed == 0 || translation_completed == expected, "every target completes TLB work before any cache claim");
+    require((report.translation_withheld & ~expected) == 0 && (report.cache_withheld & ~expected) == 0,
+            "withheld observations contain only actual configured targets");
+}
+
+void run_maintenance_request(mmio::QualifiedUcRange& range, const char* name, maintenance::Phase deferred_phase, uint64_t expected,
+                             uint64_t& previous_id) {
+    uint64_t const PHYSICAL = range.physical(), BYTES = range.bytes(), INCARNATION = range.incarnation();
+    require(!range.empty(), "maintenance request receives an actual privately minted range");
+    maintenance::Ticket ticket;
+    require(maintenance::prepare(std::move(range), maintenance::Kind::translations_then_cache, ticket) == maintenance::Status::ready &&
+                !ticket.empty(),
+            "prepare retains a real qualified range in a new actual maintenance ticket");
+    require_empty(range, "successful maintenance preparation moves the genuine range");
+    uint64_t const ID = ticket.id();
+    require(ID > previous_id, "native maintenance requests have distinct increasing nonwrapping IDs");
+    previous_id = ID;
+    bool const DEFERRED = deferred_phase != maintenance::Phase::empty;
+    size_t const ORIGIN = static_cast<size_t>(ker::mod::cpu::current_cpu());
+    require(ORIGIN < 4, "actual scheduled controller has a configured logical CPU");
+    size_t const TARGET = (ORIGIN + 1) % 4;
+    uint64_t const TARGET_BIT = uint64_t{1} << TARGET;
+    if (DEFERRED) {
+        require(maintenance::diagnostic_defer(ticket, deferred_phase, TARGET) == maintenance::Status::ready,
+                "exact prepared ticket can only defer actual target work before its claim");
+        log::info("CPU_MAINTENANCE_RUNTIME DEFER case=%s id=%lu phase=%u logical=%lu apic=%u controller_at_arm=%lu", name, ID,
+                  static_cast<unsigned>(deferred_phase), TARGET, ker::mod::smt::get_cpu(TARGET).lapic_id, ORIGIN);
+    }
+    require(maintenance::publish(ticket) == maintenance::Status::pending, "publication starts only the real TLB round");
+    bool const BEFORE_IF = sched::interrupts_enabled();
+    auto const FIRST = maintenance::wait_until(ticket, maintenance_deadline(DEFERRED ? 250'000'000 : 10'000'000'000));
+    require(BEFORE_IF && sched::interrupts_enabled() == BEFORE_IF, "scheduled maintenance wait preserves incoming IRQ admission");
+    log_maintenance_report(name, DEFERRED ? "timeout" : "complete", FIRST, 4);
+    require_maintenance_report(FIRST, ID, expected, PHYSICAL, BYTES, INCARNATION);
+    if (DEFERRED) {
+        require(FIRST.status == maintenance::Status::timeout_retained && FIRST.timed_out_ever && !FIRST.admission_closed &&
+                    !ticket.empty() && ticket.id() == ID && FIRST.phase == deferred_phase,
+                "bounded timeout retains the original ticket, active round and timeout history");
+        if (deferred_phase == maintenance::Phase::translations)
+            require(FIRST.translation_withheld == TARGET_BIT && (FIRST.translation_claimed & TARGET_BIT) == 0 &&
+                        (FIRST.translation_completed & TARGET_BIT) == 0 && FIRST.cache_claimed == 0 && FIRST.cache_completed == 0 &&
+                        FIRST.cache_withheld == 0,
+                    "deferred real TLB work produces withheld proof without a claim, ACK or early cache round");
+        else
+            require(FIRST.translation_completed == expected && FIRST.cache_withheld == TARGET_BIT &&
+                        (FIRST.cache_claimed & TARGET_BIT) == 0 && (FIRST.cache_completed & TARGET_BIT) == 0 &&
+                        FIRST.translation_withheld == 0,
+                    "deferred real cache work follows all TLB completions and produces no claim or ACK");
+        sched::kern_sleep_us(1000);
+        auto const HELD = maintenance::observe(ticket);
+        require_maintenance_report(HELD, ID, expected, PHYSICAL, BYTES, INCARNATION);
+        require(HELD.phase == FIRST.phase && HELD.timed_out_ever &&
+                    (deferred_phase != maintenance::Phase::translations || (HELD.cache_claimed == 0 && HELD.cache_completed == 0)),
+                "observation and late active-round service cannot advance a timed-out request");
+        require(maintenance::diagnostic_resume(ticket, deferred_phase) == maintenance::Status::ready,
+                "same-ticket resume clears only its exact work deferral");
+        auto const RETRY = maintenance::wait_until(ticket, maintenance_deadline(10'000'000'000));
+        require(sched::interrupts_enabled() == BEFORE_IF, "same-ticket retry preserves incoming IRQ admission");
+        log_maintenance_report(deferred_phase == maintenance::Phase::translations ? "tlb_retry" : "cache_retry", "retry-complete", RETRY,
+                               4);
+        require_maintenance_report(RETRY, ID, expected, PHYSICAL, BYTES, INCARNATION);
+        require(RETRY.status == maintenance::Status::complete && RETRY.phase == maintenance::Phase::complete &&
+                    RETRY.translation_completed == expected && RETRY.cache_completed == expected && RETRY.admission_closed &&
+                    RETRY.readers == 0 && RETRY.timed_out_ever && FIRST.status == maintenance::Status::timeout_retained,
+                "explicit same-ID retry completes real work and reader drain without erasing the historical timeout receipt");
+    } else {
+        require(FIRST.status == maintenance::Status::complete && FIRST.phase == maintenance::Phase::complete &&
+                    FIRST.translation_completed == expected && FIRST.cache_completed == expected && FIRST.admission_closed &&
+                    FIRST.readers == 0 && !FIRST.timed_out_ever && FIRST.translation_withheld == 0 && FIRST.cache_withheld == 0,
+                "positive request completes all real TLB and cache actions then closes and drains admission");
+    }
+    require(maintenance::release_complete(ticket) == maintenance::Status::complete && ticket.empty() && ticket.id() == 0,
+            "only actual complete reader-drained metadata is released and clears its ticket");
+    require_empty_maintenance_pool();
+    log::info("CPU_MAINTENANCE_RUNTIME CASE_PASS name=%s id=%lu historical_timeout=%u cpu_actions_only=1", name, ID, DEFERRED ? 1U : 0U);
+}
+
+void maintenance_observations(mmio::QualifiedUcRange& sample, bool refusal, uint64_t expected, const mmio::CohortObservation& sealed) {
+    require(has_cmdline_token("--selftest-cache-policy"), "scheduled rendezvous modifier requires the cache-policy base mode");
+    require(ker::mod::smt::get_core_count() == 4 && expected == 0xf && ker::mod::mm::phys::can_wait_for_reclaim(),
+            "native maintenance diagnostic requires four actual CPUs and ordinary scheduled context");
+    log::info("CPU_MAINTENANCE_RUNTIME BEGIN cpus=4 refusal_profile=%u cpu_actions_only=1", refusal ? 1U : 0U);
+    wait_for_maintenance_ready(expected, refusal);
+    require_empty_maintenance_pool();
+    if (refusal) {
+        require_empty(sample, "unsupported CPU profile cannot supply a maintenance token");
+        maintenance::Ticket empty;
+        require(maintenance::prepare(std::move(sample), maintenance::Kind::translations_then_cache, empty) ==
+                        maintenance::Status::empty_range &&
+                    empty.empty() && empty.id() == 0,
+                "unsupported profile's empty token refuses preparation before publication or action");
+        require_empty(sample, "refused maintenance preparation preserves the empty input");
+        require_empty_maintenance_pool();
+        auto const SERVICE = maintenance::service_observation();
+        require(SERVICE.expected_mask == expected && SERVICE.ready_mask == 0, "unsupported profile grants no maintenance readiness");
+        require_same_cohort(sealed, mmio::cohort_observation());
+        log::info("CPU_MAINTENANCE_RUNTIME REFUSAL_PASS cpus=4 ready=0 tokens=0 publications=0 actions=0 reason=missing_features");
+        return;
+    }
+    uint64_t const PHYSICAL = sample.physical(), BYTES = sample.bytes(), INCARNATION = sample.incarnation();
+    uint64_t previous_id = 0;
+    run_maintenance_request(sample, "positive", maintenance::Phase::empty, expected, previous_id);
+    for (auto phase : {maintenance::Phase::translations, maintenance::Phase::caches}) {
+        require(mmio::qualify_uc_range(PHYSICAL, BYTES, sample) == mmio::Status::ready && !sample.empty() &&
+                    sample.physical() == PHYSICAL && sample.bytes() == BYTES && sample.incarnation() == INCARNATION,
+                "subsequent request refills its token only through the actual private qualifier");
+        run_maintenance_request(sample, phase == maintenance::Phase::translations ? "tlb_timeout" : "cache_timeout", phase, expected,
+                                previous_id);
+    }
+    require_empty(sample, "three completed requests consume only their three real range tokens");
+    require_same_cohort(sealed, mmio::cohort_observation());
+    log::info(
+        "CPU_MAINTENANCE_RUNTIME PASS cpus=4 requests=3 timeout_retries=2 physical=%016lx bytes=%lu incarnation=%lu "
+        "cpu_actions_only=1",
+        PHYSICAL, BYTES, INCARNATION);
+}
+
 void cache_state_observations() {
     bool const REFUSAL = has_cmdline_token("--selftest-cache-state-refusal");
     require(!REFUSAL || has_cmdline_token("--selftest-cache-policy"), "cache-state refusal modifier requires its scheduled base mode");
@@ -450,6 +667,7 @@ void cache_state_observations() {
         log::info("MMIO_CACHE_RUNTIME REFUSAL_PASS cpus=%lu ready=0 qualified=0 reason=missing_features cpu_policy_only=1", CPUS);
     else
         log::info("MMIO_CACHE_RUNTIME PASS cpus=%lu qualified=%lu incarnation=%lu cpu_policy_only=1", CPUS, qualified, SEALED.incarnation);
+    if (has_cmdline_token("--selftest-cache-rendezvous")) maintenance_observations(sample, REFUSAL, EXPECTED, SEALED);
 }
 
 void runtime_entry() {

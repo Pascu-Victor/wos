@@ -124,8 +124,25 @@ With `WOS_SELFTEST=ON`, `--selftest-cache-policy` uses an ordinary scheduled
 worker to inspect actual BSP/AP PAT and later cache-state reports. Its
 `MMIO_CACHE_RUNTIME PASS` requires every configured CPU ready and at least one
 privately qualified UC interval; candidate physical addresses are queried as
-metadata. The worker checks token moves, local hardware revalidation, immutable
-reports and normal PID1 shutdown. It performs no mapping or cache flush.
+metadata. The worker checks token moves, local hardware revalidation and immutable
+reports, then requests normal PID1 shutdown. Without the rendezvous modifier it
+performs no mapping or cache flush.
+
+Add `--selftest-cache-rendezvous` to that base flag for the scheduled four-CPU
+maintenance diagnostic. It moves actual qualified UC tokens into real requests,
+executes current-CR3 invalidation on every configured CPU, then fenced WBINVD
+only after all translation completions. Copied per-CPU receipts record request
+IDs, APIC identities, phases, CR3 values and reader drain. Two selftest-only
+deferrals withhold a selected CPU before its claim/work, demonstrate bounded
+TLB/cache timeouts, then resume actual work through the same retained ticket.
+Deferral cannot create an ACK or bypass hardware revalidation. Original timeout
+receipts remain distinct from later successful retries.
+
+The modifier requires `--selftest-cache-policy`; orphan cache modifiers refuse
+before AP launch. With the MTRR-disabled refusal profile below, the rendezvous
+must retain zero tokens/readiness/publications/actions and emit its distinct
+`CPU_MAINTENANCE_RUNTIME REFUSAL_PASS`. These CPU-maintenance checks perform no
+PTE publication or candidate-physical-address access and qualify no physical GPU.
 
 For the explicit unsupported-machine control, use that base flag together with
 `--selftest-cache-state-refusal` and a VM CPU model with MTRR disabled (for

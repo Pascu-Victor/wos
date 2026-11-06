@@ -29,6 +29,7 @@ KERN = ROOT / 'modules/kern/src'
 SOURCE = KERN / 'platform/sched/scheduler.cpp'
 CONTEXT = KERN / 'platform/sys/context_switch.cpp'
 ASM = KERN / 'platform/sys/context_switch.asm'
+INIT_WRAPPERS = KERN / 'platform/init/init_wrappers.cpp'
 HEADERS = [KERN / 'platform/sched/frame_class.hpp', KERN / 'platform/sched/preemption_policy.hpp']
 
 # Complete retained predecessor, with no decision or instruction removed.
@@ -320,6 +321,7 @@ PRELUDE = r'''
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <string_view>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/preemption_policy.hpp>
 namespace fixture {
@@ -752,11 +754,59 @@ void run(){
  std::printf("%s bootstrap_idle cases=%u assertions=%u failures=%u\n",failures?"FAIL":"PASS",cases,assertions,failures);
 }
 }
-int main(){try{fixture::run();}catch(...){std::fprintf(stderr,"FAIL unexpected finite boundary escape\n");return 3;}return fixture::failures?1:0;}
+int main(){try{fixture::run();cache_modifier_fixture::run();}catch(...){std::fprintf(stderr,"FAIL unexpected finite boundary escape\n");return 3;}return fixture::failures?1:0;}
 '''
 
 
-def generate(scheduler: str, context: str, assembly: str, control: str) -> tuple[str, dict]:
+CACHE_MODIFIER_GUARD = r'''
+namespace cache_modifier_fixture {
+const char* command_line{};
+const char* panic_reason{};
+unsigned launches{};
+struct Panic {};
+struct Failure {};
+namespace mod::dbg {
+[[noreturn]] void panic_handler(const char* reason) { panic_reason=reason;throw Panic{}; }
+}
+auto get_kernel_cmdline() -> const char* { return command_line; }
+@ACTUAL_TOKEN_HELPER@
+void actual_guard() {
+@ACTUAL_DECLARATION@
+@ACTUAL_GUARD@
+    ++launches; // Finite next-stage/AP-launch endpoint; no real AP is started.
+}
+void run() {
+    struct Case {const char* line;bool rejected;};
+    constexpr Case cases[]{
+        {nullptr,false},{"",false},
+        {"--selftest-cache-rendezvous",true},
+        {"--selftest-cache-state-refusal",true},
+        {"--selftest-cache-rendezvous --selftest-cache-state-refusal",true},
+        {"--selftest-cache-policy",false},
+        {"--selftest-cache-policy --selftest-cache-rendezvous",false},
+        {"--selftest-cache-policy --selftest-cache-state-refusal",false},
+        {"--selftest-cache-policy=1 --selftest-cache-rendezvous",true},
+        {" \t--selftest-cache-policy\n--selftest-cache-rendezvous ",false},
+        {"--selftest-cache-rendezvous-extra",false},
+    };
+    unsigned count=0;
+    for(auto const& c:cases) {
+        command_line=c.line;panic_reason=nullptr;launches=0;bool rejected=false;
+        try { actual_guard(); } catch(Panic const&) { rejected=true; }
+        if(rejected!=c.rejected || launches!=(c.rejected?0U:1U) ||
+           (rejected && std::string_view{panic_reason}!="cache diagnostic modifier requires --selftest-cache-policy")) {
+            std::fprintf(stderr,"FAIL cache_modifier_guard case=%u rejected=%u launches=%u\n",count,rejected,launches);
+            throw Failure{};
+        }
+        ++count;
+    }
+    std::printf("PASS cache_modifier_guard cases=%u actual_guard=1 ap_launch_port=1\n",count);
+}
+}
+'''
+
+
+def generate(scheduler: str, context: str, assembly: str, control: str, init_source: str) -> tuple[str, dict]:
     selected = {}
 
     def body(text: str, anchor: str, key: str | None = None) -> str:
@@ -831,7 +881,22 @@ def generate(scheduler: str, context: str, assembly: str, control: str) -> tuple
     text = PRELUDE.replace('// ACTUAL_CONTEXT', '\nnamespace ker::mod::sys::context_switch {\n' + '\n'.join(actual_context) + '\n}')
     text = text.replace('// ACTUAL_SCHEDULER', '\nnamespace ker::mod::sched {\n' + '\n'.join(actual_scheduler) + '\n}')
     selected['ported-startup'] = dict(bytes=len(start.encode()), sha256=hashlib.sha256(start.encode()).hexdigest())
-    return text + ENDPOINTS + CASES, selected
+    helper, helper_row = capture(init_source, 'auto cmdline_has_token(')
+    sched_init, _ = capture(init_source, 'void sched_init()')
+    declaration_start = sched_init.index('bool const CACHE_POLICY =')
+    declaration_end = sched_init.index(';', declaration_start) + 1
+    declaration = sched_init[declaration_start:declaration_end]
+    guard_start = sched_init.index('if (!CACHE_POLICY && (cmdline_has_token')
+    guard_end = sched_init.index('    bool const UNMATCHED_MSR', guard_start)
+    guard = sched_init[guard_start:guard_end]
+    if guard_end >= sched_init.index('mod::smt::start_smt('):
+        raise ValueError('actual cache modifier guard must precede AP launch')
+    selected['cache-modifier-token-helper'] = helper_row
+    selected['cache-modifier-declaration-and-guard'] = dict(
+        bytes=len((declaration + guard).encode()), sha256=hashlib.sha256((declaration + guard).encode()).hexdigest())
+    modifier = CACHE_MODIFIER_GUARD.replace('@ACTUAL_TOKEN_HELPER@', helper).replace(
+        '@ACTUAL_DECLARATION@', declaration).replace('@ACTUAL_GUARD@', guard)
+    return text + ENDPOINTS + modifier + CASES, selected
 
 
 def main() -> int:
@@ -859,7 +924,7 @@ def main() -> int:
         result['compiler_argv'] = str(compiler)
         result['compiler_resolved_elf'] = pin(compiler_elf)
         subreaper()
-        watched = [source, CONTEXT, ASM, *HEADERS, Path(__file__).resolve(),
+        watched = [source, CONTEXT, ASM, INIT_WRAPPERS, *HEADERS, Path(__file__).resolve(),
                    ROOT / 'tests/host/unit/file_mmap_registry_runtime_test.py', compiler, compiler_elf]
         before = [pin(path) for path in watched]
         result['sources_before'] = before
@@ -873,7 +938,8 @@ def main() -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(header.read_bytes())
         for control in ('current', 'original-bootstrap', 'original-kernel-ss'):
-            text, actual = generate(scheduler=source.read_text(), context=CONTEXT.read_text(), assembly=ASM.read_text(), control=control)
+            text, actual = generate(scheduler=source.read_text(), context=CONTEXT.read_text(), assembly=ASM.read_text(), control=control,
+                                    init_source=INIT_WRAPPERS.read_text())
             result.setdefault('actual_definition_hashes', {})[control] = actual
             translation, binary, depfile = (scratch / (control + suffix) for suffix in ('.cpp', '', '.d'))
             translation.write_text(text)
@@ -897,6 +963,8 @@ def main() -> int:
             result['commands'].append(row)
             log = log_path.read_text(errors='replace')
             print(log[-32768:], end='')
+            if not re.search(r'^PASS cache_modifier_guard cases=11 actual_guard=1 ap_launch_port=1$', log, re.M):
+                raise ValueError('actual cache modifier guard failed its independent pre-AP-launch matrix')
             positive = row['exit'] == 0 and re.search(r'^PASS bootstrap_idle cases=29 assertions=\d+ failures=0$', log, re.M)
             if (control == 'current') != bool(positive):
                 raise ValueError(control + ': complete actual-body oracle did not distinguish expected behavior')

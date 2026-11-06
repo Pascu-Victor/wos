@@ -92,6 +92,21 @@ def require_atomic_per_origin_protocol(source: str) -> None:
     ]:
         if snippet not in init_body:
             fail(f"TLB shootdown init missing vector setup: {snippet}")
+    configure = init_body.find("cpu_maintenance::detail::initialize_boot(tlb_shootdown_vector)")
+    installed = init_body.find("gates::set_interrupt_handler(tlb_shootdown_vector, tlb_shootdown_handler)")
+    if configure < 0 or configure < installed:
+        fail("CPU maintenance must configure after the actual legacy vector is installed")
+
+    for name in ["acquire_tlb_shootdown_gate", "wait_for_tlb_shootdown_completion", "tlb_shootdown_handler",
+                 "service_pending_tlb_shootdowns"]:
+        if "cpu_maintenance::detail::service_current_cpu()" not in function_body(source, name):
+            fail(f"{name} must independently service retained CPU maintenance")
+
+    online = function_body(source, "note_tlb_shootdown_cpu_online")
+    ready = online.find("cpu_maintenance::detail::note_current_cpu_ready()")
+    published = online.find("tlb_shootdown_cpu_online[static_cast<size_t>(CPU_NO)].store(1U, std::memory_order_release)")
+    if min(ready, published) < 0 or ready < published:
+        fail("CPU maintenance readiness must follow actual legacy scheduler-online publication")
 
     wait_body = function_body(source, "wait_for_tlb_shootdown_completion")
     for snippet in [

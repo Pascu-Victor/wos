@@ -28,6 +28,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/cache_bits.hpp>
 #include <platform/mm/cache_policy.hpp>
+#include <platform/mm/cpu_maintenance.hpp>
 #include <platform/mm/lifetime_retirement_executor.hpp>
 #include <platform/mm/mmio_cache.hpp>
 #include <platform/mm/numa_alloc.hpp>
@@ -3830,6 +3831,7 @@ auto acquire_tlb_shootdown_gate() -> TlbShootdownGateGuard {
         }
 
         service_tlb_shootdown_requests_for_cpu(CPU_NO);
+        cpu_maintenance::detail::service_current_cpu();
         sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
         if ((interrupt_flags & cpu::GATE_IF_MASK) != 0U) {
             asm volatile("sti" ::: "memory");
@@ -3911,6 +3913,7 @@ void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t or
         }
 
         service_tlb_shootdown_requests_for_cpu(origin_cpu);
+        cpu_maintenance::detail::service_current_cpu();
         ++spins;
         if ((spins & 0xFFFU) == 0) {
             TlbShootdownWaitSnapshot const SNAPSHOT = snapshot_tlb_shootdown_wait(request, core_count, generation);
@@ -4051,6 +4054,7 @@ void flush_pagemap_after_update(PageTable* pagemap, vaddr_t vaddr, bool reload_c
 
 void tlb_shootdown_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::InterruptFrame frame) {
     service_tlb_shootdown_requests_for_cpu(cpu::current_cpu());
+    cpu_maintenance::detail::service_current_cpu();
 }
 
 void zero_page_table_for_pool(PageTable* table) {
@@ -6168,6 +6172,7 @@ void service_pending_tlb_shootdowns() {
         return;
     }
     service_tlb_shootdown_requests_for_cpu(cpu::get_current_cpu_id_safe());
+    cpu_maintenance::detail::service_current_cpu();
 }
 
 constexpr size_t KERNEL_PML4_START = 256;
@@ -6720,6 +6725,7 @@ void init_tlb_shootdown() {
         if (smt::get_core_count() > 1) dbg::panic_handler("SMP requires a TLB shootdown vector");
         dbg::log("WARNING: No free interrupt vector for TLB shootdown IPI");
     }
+    (void)cpu_maintenance::detail::initialize_boot(tlb_shootdown_vector);
 }
 
 bool active_pagemap_is(PageTable* pagemap) { return is_current_pagemap(pagemap); }
@@ -7409,6 +7415,7 @@ void note_tlb_shootdown_cpu_online() {
         dbg::panic_handler("CPU cannot enter SMP scheduling without TLB shootdown");
     tlb_active_pagemaps[static_cast<size_t>(CPU_NO)].store(kernel_pagemap, std::memory_order_release);
     tlb_shootdown_cpu_online[static_cast<size_t>(CPU_NO)].store(1U, std::memory_order_release);
+    (void)cpu_maintenance::detail::note_current_cpu_ready();
 }
 
 void init(limine_memmap_response* memmap_response_param, limine_executable_file_response* kernel_file_response_param,

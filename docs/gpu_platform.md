@@ -279,6 +279,33 @@ and a completed all-CPU translation/cache-maintenance barrier. These CPU tokens
 provide none of those independent authorities. WC, active encrypted mappings and
 physical GPU qualification remain Goal41 work.
 
+`platform/mm/cpu_maintenance` provides a separate scheduled CPU-maintenance
+rendezvous. A private move-only ticket retains a genuine qualified UC range in
+one of 16 permanent slots. All configured CPUs, including the controller's CPU,
+must have independently reached the scheduler-ready boundary. Parked early
+diagnostic APs supply no readiness. Each CPU validates
+its current hardware state and reloads its actual current CR3. Only an explicit
+controller wait can start the cache round after every translation completion;
+each CPU then validates again and executes fenced WBINVD. The current profile
+requires PGE, PCIDE and LA57 disabled.
+
+Controllers are ordinary scheduled DAEMONs with real shutdown ownership,
+interrupts enabled and preemption depth zero, outside MM, PCI and driver locks.
+Waiting uses a qualified monotonic clock, a finite work budget and bounded IPI
+retries. A timeout retains the request, token and late-handler storage; a later
+explicit wait can retry the same ID. Observation and late acknowledgments never
+start another round. Abandoned published requests consume bounded capacity
+until reboot. Completion requires exact per-CPU generations, closed reader
+admission and drained handler tails before metadata reuse.
+
+Copied completion reports grant no PTE, alias, BAR or storage-release authority.
+A future typed mapper must retain its actual physical ownership, withdrawn
+translations and mutation exclusion across maintenance. Scheduled CPU actions
+with existing mappings do not prove a safe cache-type transition. Bootstrap and
+process-controlled consumers need their own reviewed lifetime integration;
+phase-5 driver startup and the legacy synchronous shootdowns keep their current
+behavior. Physical GPU qualification remains separate.
+
 Bootstrap preserves each framebuffer page's incoming PAT selector when replacing
 Limine's page tables. It verifies the inherited supervisor translation and
 physical address, converts large-leaf PAT bit 12 to 4 KiB leaf bit 7, and audits

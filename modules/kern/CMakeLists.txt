@@ -373,6 +373,9 @@ if(WOS_KASAN OR WOS_KUBSAN OR WOS_KCOV)
         src/platform/mm/mmio_cache_model.cpp
         src/platform/mm/mmio_cache_amd.cpp
         src/platform/mm/mmio_cache_protected.cpp
+        # Persistent CPU maintenance is serviced from raw allocator/MM/IRQ waits.
+        src/platform/mm/cpu_maintenance.cpp
+        src/platform/mm/cpu_maintenance_platform.cpp
         src/platform/asm/tlb.cpp
         src/util/hcf.hpp
         # Synchronization primitives — called from excluded early-boot code
@@ -398,7 +401,8 @@ endif()
 set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/asm/cpu_safe_msr.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
 foreach(src IN ITEMS mtrr_policy.cpp mmio_cache.cpp mmio_cache_platform.cpp
-                     mmio_cache_model.cpp mmio_cache_amd.cpp mmio_cache_protected.cpp)
+                     mmio_cache_model.cpp mmio_cache_amd.cpp mmio_cache_protected.cpp
+                     cpu_maintenance.cpp cpu_maintenance_platform.cpp)
     set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mm/${src}
         APPEND PROPERTY COMPILE_OPTIONS -fno-stack-protector)
 endforeach()
