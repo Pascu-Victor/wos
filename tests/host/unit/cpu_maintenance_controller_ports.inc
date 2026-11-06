@@ -17,7 +17,7 @@ namespace cm = ker::mod::mm::cpu_maintenance;
 using Callback = void (*)(const cm::detail::Controller&);
 struct Finished {};
 struct Refused {};
-inline Callback boot_callback{}, finalizer_callback{};
+inline Callback boot_callback{}, finalizer_callback{}, before_boot_callback{};
 inline ker::mod::sched::task::Task* current{};
 inline bool scheduled{}, queues{true}, safe{true}, seal_allowed{true};
 inline unsigned preempt{}, seals{}, boot_calls{}, finalizer_calls{};
@@ -167,6 +167,7 @@ auto current_root_path() -> const char* { return "/"; }
 
 #ifdef WOS_HOST_ACTUAL_E1000
 namespace controller_host {
+void before_actual_boot_driver(const cm::detail::Controller&);
 void after_actual_boot_driver(const cm::detail::Controller&);
 void after_actual_retirement(const cm::detail::Controller&, int);
 }  // namespace controller_host
@@ -209,6 +210,11 @@ auto with_actual_finalizer_controller(Callback callback) -> int {
 }
 
 #ifdef WOS_HOST_ACTUAL_E1000
+// Controlled actual-call dispatch before the ordinary producer call. A test
+// may invoke real PCI/MM with this already-authentic lexical Controller.
+void before_actual_boot_driver(const cm::detail::Controller& controller) {
+    if (before_boot_callback != nullptr) before_boot_callback(controller);
+}
 // Observation-only hooks added around the exact real calls in compile copies.
 // They receive only the already-minted synchronous lexical permission.
 void after_actual_boot_driver(const cm::detail::Controller& controller) {

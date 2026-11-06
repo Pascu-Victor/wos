@@ -116,7 +116,8 @@ def controller_definitions() -> tuple[str, list[Path]]:
         fragments.append(f'void {name}() {{ {body} }}\n')
     wrapper = actual_definition(boot, 'void e1000e_init(const mod::mm::cpu_maintenance::detail::Controller& controller)')
     call = 'dev::e1000e::e1000e_init(controller);'
-    wrapper = replace_once(wrapper, call, call + '\n#ifdef WOS_HOST_ACTUAL_E1000\n'
+    wrapper = replace_once(wrapper, call, '\n#ifdef WOS_HOST_ACTUAL_E1000\n'
+                           'controller_host::before_actual_boot_driver(controller);\n#endif\n' + call + '\n#ifdef WOS_HOST_ACTUAL_E1000\n'
                            'controller_host::after_actual_boot_driver(controller);\n#endif\n')
     fragments += [wrapper, '}\n']
     return ''.join(fragments), [platform, wrappers, power, registry, host_scope,

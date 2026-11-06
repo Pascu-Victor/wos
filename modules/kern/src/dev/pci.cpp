@@ -559,10 +559,23 @@ class ColdMmioAccess {
             return false;
         auto const& record = cold_records[cap.function_index];
         if (!record.selected.load(std::memory_order_acquire) || record.id != cap.owner_id || record.epoch != cap.claim_epoch ||
-            record.bar0_physical != cap.bar0_physical || record.bar0_bytes != cap.bar0_bytes || record.span_count != cap.span_count)
+            record.bar0_physical != cap.bar0_physical || record.bar0_bytes != cap.bar0_bytes || record.span_count != cap.span_count ||
+            record.view_count != cap.view_count)
             return false;
-        for (size_t i = 0; i < record.span_count; ++i)
-            if (record.spans[i].start != cap.spans[i].start || record.spans[i].bytes != cap.spans[i].bytes) return false;
+        for (size_t i = 0; i < record.span_count; ++i) {
+            auto const& bar = record.bars[i];
+            auto const& expected = cap.bars[i];
+            if (record.spans[i].start != cap.spans[i].start || record.spans[i].bytes != cap.spans[i].bytes || bar.index != expected.index ||
+                bar.attributes != expected.attributes || bar.physical != expected.physical || bar.bytes != expected.bytes)
+                return false;
+        }
+        for (size_t i = 0; i < record.view_count; ++i) {
+            auto const& view = record.views[i];
+            auto const& expected = cap.views[i];
+            if (view.bar != expected.bar || view.offset != expected.offset || view.physical != expected.physical ||
+                view.bytes != expected.bytes)
+                return false;
+        }
         return true;
     }
     static auto operation_unlocked(size_t index, uint64_t epoch) -> DriverOperation {
@@ -594,8 +607,49 @@ class ColdMmioAccess {
     }
     static auto cap_for(size_t index) -> ColdFunctionClaim {
         auto const& record = cold_records[index];
-        return ColdFunctionClaim{static_cast<uint16_t>(index), record.id,         record.epoch,      cold_inventory_generation,
-                                 record.bar0_physical,         record.bar0_bytes, record.span_count, record.spans};
+        return ColdFunctionClaim{static_cast<uint16_t>(index),
+                                 record.id,
+                                 record.epoch,
+                                 cold_inventory_generation,
+                                 record.bar0_physical,
+                                 record.bar0_bytes,
+                                 record.span_count,
+                                 record.spans,
+                                 record.bars,
+                                 record.view_count,
+                                 record.views};
+    }
+    static auto select_views_unlocked(ColdRecord& record, std::span<const mod::mm::mmio::ViewRequest> requests) -> ColdStatus {
+        std::array<PreparedView, mod::mm::mmio::VIEW_CAPACITY> plan{};
+        size_t const COUNT = requests.empty() ? 1 : requests.size();
+        if (COUNT > plan.size()) return ColdStatus::capacity;
+        for (size_t i = 0; i < COUNT; ++i) {
+            auto const request = requests.empty() ? mod::mm::mmio::ViewRequest{0, 0, record.bar0_bytes} : requests[i];
+            const MemoryBar* bar = nullptr;
+            for (size_t j = 0; j < record.span_count; ++j)
+                if (record.bars[j].index == request.bar) bar = &record.bars[j];
+            if (bar == nullptr || request.bytes == 0 || (request.offset | request.bytes) & 4095 || request.offset >= bar->bytes ||
+                request.bytes > bar->bytes - request.offset || request.offset > UINT64_MAX - bar->physical)
+                return ColdStatus::invalid_claim;
+            uint64_t const PHYSICAL = bar->physical + request.offset;
+            if ((PHYSICAL & 4095) != 0 || request.bytes > UINT64_MAX - PHYSICAL) return ColdStatus::invalid_claim;
+            plan[i] = {request.bar, request.offset, PHYSICAL, request.bytes};
+            for (size_t j = 0; j < i; ++j)
+                if (aperture::overlaps({plan[j].physical, plan[j].bytes}, {PHYSICAL, request.bytes})) return ColdStatus::invalid_claim;
+        }
+        if (record.view_count != 0) {
+            if (record.view_count != COUNT) return ColdStatus::invalid_claim;
+            for (size_t i = 0; i < COUNT; ++i) {
+                auto const& prior = record.views[i];
+                if (prior.bar != plan[i].bar || prior.offset != plan[i].offset || prior.physical != plan[i].physical ||
+                    prior.bytes != plan[i].bytes)
+                    return ColdStatus::invalid_claim;
+            }
+        } else {
+            record.views = plan;
+            record.view_count = COUNT;
+        }
+        return ColdStatus::ready;
     }
     static void inhibit_unlocked(size_t index) {
         auto const& device = discovered_devices[index];
@@ -628,10 +682,20 @@ class ColdMmioAccess {
         return ColdStatus::ready;
     }
     static auto map(const DriverClaim& claim, const mod::mm::cpu_maintenance::detail::Controller& controller,
-                    mod::mm::mmio::Mapping& output) -> ColdStatus {
+                    std::span<const mod::mm::mmio::ViewRequest> requests, mod::mm::mmio::Mapping& output) -> ColdStatus {
         if (!mod::mm::mmio::enabled()) return ColdStatus::disabled;
         if (!output.empty()) return ColdStatus::output_not_empty;
         if (controller.context_status() != mod::mm::cpu_maintenance::Status::ready) return ColdStatus::invalid_context;
+        if (requests.size() > mod::mm::mmio::VIEW_CAPACITY) return ColdStatus::capacity;
+        // Copy caller metadata once; no pointer into a request array survives
+        // the synchronous invocation or enters the retained resource owner.
+        std::array<mod::mm::mmio::ViewRequest, mod::mm::mmio::VIEW_CAPACITY> snapshot{};
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto const request = requests[i];
+            if (request.bar >= BAR_COUNT || request.bytes == 0 || (request.offset | request.bytes) & 4095) return ColdStatus::invalid_claim;
+            snapshot[i] = request;
+        }
+        requests = {snapshot.data(), requests.size()};
         auto const INDEX = published_device_index(claim.device());
         if (!INDEX) return ColdStatus::invalid_claim;
         size_t const index = *INDEX;
@@ -725,6 +789,8 @@ class ColdMmioAccess {
                                 record.stage = ColdStage::failed;
                                 return ColdStatus::bad_probe;
                             }
+                        record.bars[record.span_count] = {static_cast<uint8_t>(bar), static_cast<uint8_t>(claim.device()->bar[bar] & 15U),
+                                                          BAR.address, *SIZE};
                         record.spans[record.span_count++] = {RANGE->start, RANGE->bytes};
                         if (bar == 0) {
                             record.bar0_physical = BAR.address;
@@ -739,6 +805,8 @@ class ColdMmioAccess {
                 }
                 record.probed = true;
             }
+            auto const PLAN = select_views_unlocked(record, requests);
+            if (PLAN != ColdStatus::ready) return PLAN;
         }
         auto status = record.prepared.empty() ? mod::mm::mmio::detail::prepare_from_pci(cap_for(index), controller, record.prepared)
                                               : mod::mm::mmio::detail::resume_prepared(record.prepared, controller);
@@ -809,7 +877,11 @@ auto cold_inventory_allows_arena(uint64_t virtual_start, uint64_t bytes) noexcep
 
 auto map_cold_uc_82574(const DriverClaim& claim, const mod::mm::cpu_maintenance::detail::Controller& controller,
                        mod::mm::mmio::Mapping& output) -> mod::mm::mmio::Status {
-    return detail::ColdMmioAccess::map(claim, controller, output);
+    return detail::ColdMmioAccess::map(claim, controller, {}, output);
+}
+auto map_cold_uc_82574(const DriverClaim& claim, const mod::mm::cpu_maintenance::detail::Controller& controller,
+                       std::span<const mod::mm::mmio::ViewRequest> requests, mod::mm::mmio::Mapping& output) -> mod::mm::mmio::Status {
+    return detail::ColdMmioAccess::map(claim, controller, requests, output);
 }
 
 DriverClaim::~DriverClaim() { retain(); }

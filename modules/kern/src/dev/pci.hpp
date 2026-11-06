@@ -6,9 +6,11 @@
 #include <dev/pci_inventory_limits.hpp>
 #include <optional>
 #include <platform/dbg/dbg.hpp>
+#include <span>
 
 namespace ker::mod::mm::mmio {
 class Mapping;
+struct ViewRequest;
 enum class Status : uint8_t;
 }  // namespace ker::mod::mm::mmio
 namespace ker::mod::mm::cpu_maintenance::detail {
@@ -23,6 +25,12 @@ class DriverClaim;
 void initialize_cold_mmio_inventory();
 [[nodiscard]] auto map_cold_uc_82574(const DriverClaim&, const ker::mod::mm::cpu_maintenance::detail::Controller&,
                                      ker::mod::mm::mmio::Mapping& empty_output) -> ker::mod::mm::mmio::Status;
+// Select checked subranges of actual probed memory BARs. Requests carry no
+// physical address or cache permission. The immutable function-wide plan is
+// prepared completely before activation/publication; retries must match it.
+[[nodiscard]] auto map_cold_uc_82574(const DriverClaim&, const ker::mod::mm::cpu_maintenance::detail::Controller&,
+                                     std::span<const ker::mod::mm::mmio::ViewRequest>, ker::mod::mm::mmio::Mapping& empty_output)
+    -> ker::mod::mm::mmio::Status;
 
 // PCI Configuration Space Access
 // QEMU provides PCI via port I/O (0xCF8 and 0xCFC)

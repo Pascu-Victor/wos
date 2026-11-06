@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
+#include <unistd.h>
 // clang-format on
 
 namespace mmio_writer_host {
@@ -37,6 +38,7 @@ inline std::map<uint64_t, Table*> tables;
 inline std::map<const Table*, uint64_t> physical;
 inline Table* root{};
 inline uint64_t next_table{0x1000000}, reloads{}, allocs{}, releases{}, register_reads{}, register_writes{};
+inline int register_effect_fd{-1};
 inline size_t table_budget{SIZE_MAX};
 inline bool building{true}, addressable{true}, nx{true}, layout{true};
 inline uint64_t table_alias_flags{3ULL | (1ULL << 63)};
@@ -289,12 +291,14 @@ auto ensure_table_addressable(paging::PageTable* table) noexcept -> bool {
 }
 void reload_current_root() noexcept { ++mmio_host::reloads; }
 auto read_register32(uint64_t virtual_address) noexcept -> uint32_t {
+    if (mmio_host::register_effect_fd >= 0) assert(::write(mmio_host::register_effect_fd, "R", 1) == 1);
     ++mmio_host::register_reads;
     auto const physical = mmio_host::translate(virtual_address);
     assert(physical >= pci_cold_host::BAR0 && physical - pci_cold_host::BAR0 < pci_cold_host::BAR_BYTES);
     return e1000_host::read_register(physical - pci_cold_host::BAR0);
 }
 void write_register32(uint64_t virtual_address, uint32_t value) noexcept {
+    if (mmio_host::register_effect_fd >= 0) assert(::write(mmio_host::register_effect_fd, "W", 1) == 1);
     ++mmio_host::register_writes;
     auto const physical = mmio_host::translate(virtual_address);
     assert(physical >= pci_cold_host::BAR0 && physical - pci_cold_host::BAR0 < pci_cold_host::BAR_BYTES);

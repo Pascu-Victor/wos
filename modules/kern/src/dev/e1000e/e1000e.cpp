@@ -17,6 +17,10 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/cpu_maintenance_controller.hpp>
 #include <platform/mm/phys.hpp>
+#ifdef WOS_SELFTEST
+#include <platform/mm/addr.hpp>
+#include <platform/mm/virt.hpp>
+#endif
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
@@ -41,6 +45,13 @@ class MmioRetirementAccess {
 }  // namespace detail
 
 namespace {
+
+// These disjoint BAR0 windows cover every register used by the actual driver.
+// The retained function still owns the full BAR and its companion resources.
+constexpr std::array<mmio::ViewRequest, 2> REGISTER_VIEWS = {{
+    {.bar = 0, .offset = 0, .bytes = 0x1000},
+    {.bar = 0, .offset = 0x2000, .bytes = 0x4000},
+}};
 
 // WKI remotable ops for E1000E devices
 auto remotable_can_remote() -> bool { return true; }
@@ -134,14 +145,26 @@ constexpr std::array<DeviceID, 5> SUPPORTED_DEVICES = {{
 
 // -- MMIO access ---------------------------------------------------------
 inline auto reg_read(E1000Device* dev, const mmio::Borrow& registers, uint32_t offset) -> uint32_t {
-    return dev->typed_mmio ? registers.read32(offset) : dev->mmio[offset / 4];
+    if (!dev->typed_mmio) return dev->mmio[offset / 4];
+    if (offset < 0x1000) return registers.read32(0, offset);
+    if (offset >= 0x2000 && offset < 0x6000) return registers.read32(1, offset - 0x2000);
+    __builtin_trap();
 }
 
 inline void reg_write(E1000Device* dev, const mmio::Borrow& registers, uint32_t offset, uint32_t value) {
-    if (dev->typed_mmio)
-        registers.write32(offset, value);
-    else
+    if (!dev->typed_mmio) {
         dev->mmio[offset / 4] = value;
+        return;
+    }
+    if (offset < 0x1000) {
+        registers.write32(0, offset, value);
+        return;
+    }
+    if (offset >= 0x2000 && offset < 0x6000) {
+        registers.write32(1, offset - 0x2000, value);
+        return;
+    }
+    __builtin_trap();
 }
 
 // A failed DMA transition closes software admission immediately. Teardown runs
@@ -827,7 +850,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name, const Controller* co
         log::info("MMIO_BOOT_PROBE device=%x controller=1 task_present=%u actor_pid=%llu actor_type=%u if=%u", pci_dev->device_id,
                   actor != nullptr, actor != nullptr ? actor->pid : UINT64_MAX,
                   actor != nullptr ? static_cast<unsigned>(actor->type) : UINT32_MAX, ker::mod::sched::interrupts_enabled());
-        auto const STATUS = pci::map_cold_uc_82574(dev->driver_claim, *controller, dev->registers);
+        auto const STATUS = pci::map_cold_uc_82574(dev->driver_claim, *controller, REGISTER_VIEWS, dev->registers);
         if (STATUS != mmio::Status::ready) {
             // Private PCI preparation retains any physical/cache obligations.
             // No public mapping or register view exists and no raw fallback is
@@ -1284,9 +1307,9 @@ auto detail::MmioRetirementAccess::retire(E1000Device* dev, const Controller* co
     auto const REPORT = dev->registers.report();
     bool const COMPLETE = STATUS == mmio::Status::complete;
     dev->retirement.store(COMPLETE ? Retirement::released : Retirement::withdrawal_pending, std::memory_order_release);
-    log::info("MMIO retirement id=%llu retry=%u status=%s phase=%u ticket=%llu readers=%llu terminal=%u closed=%u timed_out=%u", REPORT.id,
-              retry, mmio::status_name(STATUS), static_cast<unsigned>(REPORT.phase), REPORT.withdrawal_ticket, REPORT.normal_readers,
-              REPORT.terminal_active, REPORT.admission_closed, REPORT.timed_out_ever);
+    log::info("MMIO retirement id=%llu retry=%u status=%s phase=%u ticket=%llu readers=%llu terminal=%u closed=%u timed_out=%u views=%zu",
+              REPORT.id, retry, mmio::status_name(STATUS), static_cast<unsigned>(REPORT.phase), REPORT.withdrawal_ticket,
+              REPORT.normal_readers, REPORT.terminal_active, REPORT.admission_closed, REPORT.timed_out_ever, REPORT.view_count);
     if (COMPLETE) return 0;
     return STATUS == mmio::Status::failed_retained || STATUS == mmio::Status::bad_hierarchy || STATUS == mmio::Status::decode_readback
                ? -EIO
@@ -1312,18 +1335,45 @@ auto e1000e_mmio_runtime_check() -> bool {
         return false;
     auto const MAPPED = dev->registers.report();
     auto const DMA = dma::stats(dev->pci);
-    if (MAPPED.phase != mmio::Phase::active || MAPPED.id == 0 || MAPPED.initial_ticket == 0 || MAPPED.bytes < 0x5b04 ||
+    if (MAPPED.phase != mmio::Phase::active || MAPPED.id == 0 || MAPPED.initial_ticket == 0 || MAPPED.view_count != REGISTER_VIEWS.size() ||
         MAPPED.admission_closed || MAPPED.terminal_active || DMA.regions != 514 || DMA.streaming != 512)
         return false;
+    for (size_t i = 0; i < REGISTER_VIEWS.size(); ++i) {
+        auto const& request = REGISTER_VIEWS[i];
+        auto const& view = MAPPED.views[i];
+        if (view.status != mmio::Status::ready || view.phase != mmio::Phase::active || view.bar != request.bar ||
+            view.bar_offset != request.offset || view.physical != MAPPED.physical + request.offset || view.bytes != request.bytes ||
+            view.initial_ticket == 0 || view.cohort_incarnation != MAPPED.cohort_incarnation)
+            return false;
+    }
     uint32_t status = UINT32_MAX;
+    uint32_t secondary_gcr = UINT32_MAX;
     {
         auto borrow = dev->registers.borrow();
         if (!borrow.valid()) return false;
         mmio::Borrow moved{std::move(borrow)};
         if (borrow.valid() || !moved.valid()) return false;
-        status = moved.read32(REG_STATUS);
+        status = moved.read32(0, REG_STATUS);
+        secondary_gcr = reg_read(dev, moved, 0x5b00);
+        // The genuine whole-function Borrow keeps every observed child stable
+        // while this read-only walk checks real leaves and unmapped guards.
+        namespace virt = ker::mod::mm::virt;
+        auto* const ROOT = virt::get_kernel_pagemap();
+        if (ROOT == nullptr) return false;
+        for (size_t i = 0; i < REGISTER_VIEWS.size(); ++i) {
+            auto const& view = MAPPED.views[i];
+            for (uint64_t offset = 0; offset < view.bytes; offset += 4096)
+                if (virt::translate(ROOT, view.virtual_base + offset) != view.physical + offset) return false;
+            if (virt::translate(ROOT, view.virtual_base - 4096) != virt::PADDR_INVALID ||
+                virt::translate(ROOT, view.virtual_base + view.bytes) != virt::PADDR_INVALID)
+                return false;
+        }
+        uint64_t const HHDM = ker::mod::mm::addr::get_hhdm_offset();
+        if (virt::translate(ROOT, HHDM + MAPPED.physical + 0x1000) != virt::PADDR_INVALID ||
+            virt::translate(ROOT, HHDM + MAPPED.physical + 0x6000) != virt::PADDR_INVALID)
+            return false;
         moved.reset();
-        if (moved.valid() || status == UINT32_MAX) return false;
+        if (moved.valid() || status == UINT32_MAX || secondary_gcr == UINT32_MAX) return false;
     }
     E1000Device* expected = nullptr;
     if (!live_test.device.compare_exchange_strong(expected, dev, std::memory_order_acq_rel)) return false;
@@ -1354,14 +1404,23 @@ auto e1000e_mmio_runtime_check() -> bool {
     auto const RX_CPUS = live_test.receive_cpus.load(std::memory_order_acquire);
     bool const OK = COUNTED && live_test.holder_released.load(std::memory_order_acquire) && live_test.bad.load() == 0 && TX_CPU < 64 &&
                     (RX_CPUS & ~(uint64_t{1} << TX_CPU)) != 0 && FINAL.id == MAPPED.id && FINAL.phase == mmio::Phase::active &&
-                    !FINAL.admission_closed && !FINAL.terminal_active &&
+                    FINAL.view_count == MAPPED.view_count && !FINAL.admission_closed && !FINAL.terminal_active &&
                     dev->retirement.load(std::memory_order_acquire) == E1000Device::Retirement::live;
+    for (size_t i = 0; i < MAPPED.view_count; ++i) {
+        auto const& view = MAPPED.views[i];
+        log::info(
+            "E1000_MMIO_RUNTIME_VIEW mapping=%llu view=%zu bar=%u bar_offset=%llx pa=%llx va=%llx bytes=%llu initial_ticket=%llu "
+            "phase=%u pte_pages=%llu guards_absent=1",
+            MAPPED.id, i, view.bar, view.bar_offset, view.physical, view.virtual_base, view.bytes, view.initial_ticket,
+            static_cast<unsigned>(view.phase), view.bytes / 4096);
+    }
     log::info(
         "E1000_MMIO_RUNTIME %s id=%llu pa=%llx va=%llx bytes=%llu initial_ticket=%llu status=%x raw_export=0 helpers_joined=%u "
-        "held_readers=%llu rx64=%llu rx1514=%llu worker_rx=%llu irq=%llu tx_cpu=%llu rx_cpus=%llx regions=%zu first_retirement_pending=1",
+        "held_readers=%llu rx64=%llu rx1514=%llu worker_rx=%llu irq=%llu tx_cpu=%llu rx_cpus=%llx regions=%zu first_retirement_pending=1 "
+        "views=%zu sparse_pages=5 hhdm_gap_absent=1 hhdm_tail_absent=1 secondary_gcr=%x",
         OK ? "PASS" : "FAIL", MAPPED.id, MAPPED.physical, MAPPED.virtual_base, MAPPED.bytes, MAPPED.initial_ticket, status, JOINED,
         HELD.normal_readers, live_test.small.load(), live_test.large.load(), live_test.worker_rx.load(), live_test.irqs.load(), TX_CPU,
-        RX_CPUS, DMA.regions);
+        RX_CPUS, DMA.regions, MAPPED.view_count, secondary_gcr);
     return OK;
 }
 

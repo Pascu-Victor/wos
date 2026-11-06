@@ -19,6 +19,9 @@ struct ColdRecord {
     uint64_t bar0_physical{}, bar0_bytes{};
     size_t span_count{};
     std::array<detail::Span, 6> spans{};
+    std::array<detail::MemoryBar, 6> bars{};
+    size_t view_count{};
+    std::array<detail::PreparedView, mod::mm::mmio::VIEW_CAPACITY> views{};
     mod::mm::mmio::detail::PreparedMapping prepared{};
 };
 constinit std::array<ColdRecord, inventory_limits::FUNCTION_CAPACITY> cold_records{};

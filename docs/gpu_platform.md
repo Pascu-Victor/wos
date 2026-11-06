@@ -185,9 +185,14 @@ authority.
 `--typed-pci-mmio` selects the kernel-only cold register path for the actual
 Intel 82574/8086:10d3 consumer. The default legacy path remains available when
 this option is absent. A selected typed probe has no raw mapping fallback.
-`pci::map_cold_uc_82574(claim, controller, empty_mapping)` consumes facts from
-the actual exclusive driver claim and immutable hardware inventory; callers
-cannot adopt a supplied physical address or copied diagnostic report.
+`pci::map_cold_uc_82574(claim, controller, requests, empty_mapping)` consumes
+facts from the actual exclusive driver claim and immutable hardware inventory.
+Each `mmio::ViewRequest` names only a BAR index, byte offset and length. The
+issuer checks positive page-aligned windows against exact probed BAR geometry
+and attributes; callers cannot adopt a supplied physical address or copied
+report. Requested windows must have disjoint physical pages, and resumption
+must preserve the original plan. The three-argument overload keeps the original
+full-BAR0 plan for existing callers.
 
 The initial platform profile is a trusted, conforming, controlled q35-compatible
 deployment. It observes bounded MCFG, MADT including the full type5 address,
@@ -224,9 +229,17 @@ restoration.
 BAR0 must cover the consumer's highest register offset; assigned-positive zero
 addresses, overlap and malformed sizing fail. The sum of page-rounded own
 memory BARs is limited to 16 MiB; larger exact claims refuse capacity before
-physical reservation. This bounds the initial service and does not supply
-GPU-scale aperture mapping. Cold describes WOS CPU exposure; firmware usage
-and engine quiescence remain separate obligations.
+physical reservation. A small window into a larger BAR does not bypass this
+full-resource bound. This service does not supply GPU-scale aperture mapping.
+Cold describes WOS CPU exposure; firmware usage and engine quiescence remain
+separate obligations.
+
+One `mmio::Mapping` owns the function and its complete physical exclusions.
+Its immutable set of at most eight child views has separate guarded VA ranges,
+qualified UC policies, preparation progress and original CPU tickets. All own
+memory BARs remain fenced, including gaps, unmapped tails and other BARs with
+no child view. Preparing a child does not grant ownership of a second function
+or permit another cache alias.
 
 `platform/mm/mmio_mapping` begins bounded physical-exposure history during boot
 before generic mapping publication. After the complete PCI inventory, before
@@ -243,33 +256,47 @@ legacy mutation and root-copy/free paths. Device pages receive no PMM ownership
 or generic frame decrement. Private table frames remain retained. Geometry,
 capacity or history uncertainty refuses new typed work before publication.
 
-Initial preparation retains a genuine qualified UC range and its original CPU
-maintenance ticket. Every configured ready CPU completes current-root TLB
-invalidation before the WBINVD round; both rounds revalidate actual state.
+Each child's initial preparation retains a genuine qualified UC range and its
+own CPU maintenance ticket. Every configured ready CPU completes current-root
+TLB invalidation before the WBINVD round; both rounds revalidate actual state.
 Inherited PAT, MTRR/protected-range policy and NX/WP prerequisites remain
 mandatory. Supervisor RW/NX UC leaves publish only after exact completion and
-handler drain. PCI then verifies MEM activation before exposing the public
-Mapping and reopening DMA admission. No config/MM lock spans allocation or a
-CPU wait. A pending preparation retains the same private handle and ticket.
+handler drain. Every requested child must finish preparation before PCI enables
+MEM, exposes the public Mapping and reopens DMA admission. Partial preparation
+retains the same private function handle, issued tickets and completed child
+progress. No config/MM lock spans allocation or a CPU wait.
 
 The move-only `mmio::Mapping` supplies scoped, IRQ-safe `Borrow` objects rather
-than raw register pointers. `read32`/`write32` check generation, alignment and
-bounds. Existing borrows survive admission closure. Destruction closes and
-retains ownership; it never stops hardware or unmaps a live register window.
-The e1000 consumer carries these borrows through its actual callbacks and uses
-one unique terminal borrow after closing and draining normal readers.
+than raw register pointers. One Borrow leases the whole immutable child set;
+`read32(view_index, byte_offset)` and `write32(view_index, byte_offset, value)`
+check the function generation, selected child, alignment and bounds. Existing
+single-offset overloads select view zero. Copied reports expose each view's
+geometry and tickets; the original scalar geometry and ticket fields describe
+view zero. Existing borrows survive function admission closure. Mapping
+destruction closes and retains the whole function; it never stops hardware or
+unmaps a live register window. Child views cannot be independently unmapped or
+added after publication.
+
+The actual e1000 consumer routes its existing register offsets through BAR0
+windows `[0,0x1000)` and `[0x2000,0x6000)`. These materialize five 4 KiB pages,
+compared with 32 pages for a full 128 KiB BAR0. The intervening gap and remaining
+BAR0 tail retain the parent's exclusions. A single normal or terminal Borrow
+covers both views, preserving the driver's callback and hardware operations.
+The unique terminal Borrow requires function closure and zero normal readers.
 
 Retirement preserves the established 82574 master drain, interrupt masking,
 BME disable, callback/IRQ drain and DMA release order. A closed typed claim may
 mask INTx while preserving an already-live BME under the final config lock;
 this exception admits neither fresh BME nor new DMA. After the terminal borrow's
 last register access and destruction, the actual driver's private
-`QuiescedMapping` witness allows decode-off readback and PTE withdrawal. Only
-the original withdrawal ticket's exact all-CPU TLB completion and reader drain
-release the VA allocation. Physical tombstones and private tables stay pinned
-until reboot.
-Timeout preserves ownership and the original ticket; an accepted finalizer can
-retry without accessing BARs again or repeating hardware release.
+`QuiescedMapping` witness binds the function. Decode-off readback happens once;
+each child then withdraws its own PTEs and completes its original all-CPU TLB
+ticket before its VA allocation becomes reusable. The function reports complete
+only after every child completes, with normal and terminal readers drained.
+Physical tombstones and private tables stay pinned until reboot. Timeout
+preserves the pending child's original ticket; an accepted finalizer skips
+completed children on retry without accessing BARs again or repeating hardware,
+IRQ or DMA release.
 
 The public scheduled DAEMON maintenance API keeps its existing contract. Private
 nonmovable Controllers borrow authority synchronously from the actual phase5
@@ -281,8 +308,9 @@ hotplug, WC mappings and userspace BAR mappings remain outside this path.
 
 The maintained `--selftest-e1000-mmio` diagnostic exercises the actual typed
 consumer, scoped borrowers and network traffic, then asks PID1 to perform its
-normal shutdown. `--selftest-e1000-mmio-withdraw-retry` additionally withholds
-one real remote action and retries the same withdrawal ticket. Host fixtures
+normal shutdown. It checks both sparse views and their guarded translations.
+`--selftest-e1000-mmio-withdraw-retry` additionally withholds one real remote
+action for the first child's withdrawal and retries that same ticket. Host fixtures
 link actual engines with finite hardware ports. These interfaces do not by
 themselves establish native or physical-GPU qualification; receipts must identify
 the frozen source, artifacts, actual CPU completion and guest shutdown.

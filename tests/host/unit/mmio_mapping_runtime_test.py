@@ -29,9 +29,11 @@ UNIT = Path(__file__).resolve().parent
 SHIM = UNIT / 'mmio_mapping_shim'
 CASES = UNIT / 'mmio_mapping_cases.cpp'
 PORTS = UNIT / 'mmio_mapping_ports.inc'
-NAMES = ['engine_private_fences', 'engine_budget_refusal', 'engine_native_writers', 'engine_bad_table_alias', 'consumer_success', 'consumer_held_callback', 'consumer_probe_packet_failure',
+NAMES = ['engine_private_fences', 'engine_budget_refusal', 'engine_native_writers', 'engine_bad_table_alias',
+         'engine_view_bounds', 'engine_invalid_view_plans', 'engine_legacy_view_default', 'engine_cross_bar_views', 'engine_view_prepare_resume',
+         'consumer_success', 'consumer_held_callback', 'consumer_probe_packet_failure',
          'consumer_probe_irq_failure', 'consumer_stop_failure', 'consumer_mask_failure',
-         'consumer_initial_bme_refusal', 'consumer_withdrawal_retry', 'consumer_observed_profile']
+         'consumer_initial_bme_refusal', 'consumer_withdrawal_retry', 'consumer_observed_profile', 'consumer_second_view_retry']
 SOURCES = COMMON + [KERN / relative for relative in
     ('platform/mm/paging.opt.cpp', 'platform/mm/cache_policy.cpp', 'platform/mm/cpu_maintenance.cpp', 'platform/mm/mmio_mapping.cpp', 'dev/pci.cpp', 'dev/pci_extended.cpp',
      'dev/pci_platform_apertures.cpp', 'dev/dma/dma.cpp')]

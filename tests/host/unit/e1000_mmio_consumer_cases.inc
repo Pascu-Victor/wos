@@ -9,16 +9,17 @@ namespace driver = ker::dev::e1000e;
 namespace dma = ker::dev::dma;
 namespace mapping = ker::mod::mm::mmio;
 namespace pci = ker::dev::pci;
-inline constexpr std::array<std::string_view, 9> consumer_cases{
-    "consumer_success",         "consumer_held_callback", "consumer_probe_packet_failure", "consumer_probe_irq_failure",
-    "consumer_stop_failure",    "consumer_mask_failure",  "consumer_initial_bme_refusal",  "consumer_withdrawal_retry",
-    "consumer_observed_profile"};
+inline constexpr std::array<std::string_view, 10> consumer_cases{
+    "consumer_success",          "consumer_held_callback",    "consumer_probe_packet_failure", "consumer_probe_irq_failure",
+    "consumer_stop_failure",     "consumer_mask_failure",     "consumer_initial_bme_refusal",  "consumer_withdrawal_retry",
+    "consumer_observed_profile", "consumer_second_view_retry"};
 inline size_t assertions{}, final_observations{};
 inline std::string_view selected_case;
 inline driver::E1000Device* device{};
 inline std::unique_ptr<driver::CallbackGuard> held_callback;
 inline bool held_released{};
 inline uint64_t retry_ticket{}, retry_mapping{};
+inline std::array<uint64_t, mapping::VIEW_CAPACITY> initial_tickets{}, pending_withdrawal_tickets{};
 inline size_t stopped_effect_count{};
 
 void expect(bool condition, const char* reason) {
@@ -26,6 +27,39 @@ void expect(bool condition, const char* reason) {
     if (condition) return;
     std::fprintf(stderr, "e1000 consumer assertion: %s (%.*s)\n", reason, static_cast<int>(selected_case.size()), selected_case.data());
     std::abort();
+}
+
+void expect_sparse_views(const mapping::Report& report, bool mapped) {
+    expect(report.view_count == driver::REGISTER_VIEWS.size(), "actual function owns both fixed sparse register views");
+    for (size_t i = 0; i < report.view_count; ++i) {
+        auto const& view = report.views[i];
+        auto const& request = driver::REGISTER_VIEWS[i];
+        expect(view.bar == request.bar && view.bar_offset == request.offset && view.bytes == request.bytes &&
+                   view.physical == pci_cold_host::BAR0 + request.offset,
+               "actual private PCI child geometry matches exact BAR-relative requested windows");
+        expect(view.initial_ticket != 0 && view.cohort_incarnation == report.cohort_incarnation,
+               "every real child retains its own completed initial CPU ticket from the same cohort");
+        for (uint64_t offset = 0; offset < view.bytes; offset += 4096)
+            expect(mmio_host::translate(view.virtual_base + offset) == (mapped ? view.physical + offset : UINT64_MAX),
+                   "actual child hierarchy contains exactly its retained mapped pages or complete withdrawal");
+        expect(mmio_host::translate(view.virtual_base - 4096) == UINT64_MAX &&
+                   mmio_host::translate(view.virtual_base + view.bytes) == UINT64_MAX,
+               "every child has genuinely absent guard pages");
+        if (mapped)
+            expect(view.phase == mapping::Phase::active && view.status == mapping::Status::ready,
+                   "all children are ready before actual whole-function publication");
+        else
+            expect(view.phase == mapping::Phase::complete && view.status == mapping::Status::complete && view.withdrawal_ticket != 0,
+                   "function completion requires actual completion of every child withdrawal");
+    }
+    expect(report.views[0].virtual_base != report.views[1].virtual_base && report.views[0].initial_ticket != report.views[1].initial_ticket,
+           "distinct child VAs and maintenance tickets are retained separately");
+    expect(mmio_host::translate(0xffff800000000000ULL + pci_cold_host::BAR0 + 0x1000) == UINT64_MAX &&
+               mmio_host::translate(0xffff800000000000ULL + pci_cold_host::BAR0 + 0x6000) == UINT64_MAX,
+           "parent-owned unmapped BAR gap and tail have no HHDM alias");
+    expect(!mapping::detail::record_generic_physical_access(pci_cold_host::BAR0 + 0x1000, 4096) &&
+               !mapping::detail::record_generic_physical_access(pci_cold_host::BAR0 + 0x6000, pci_cold_host::BAR_BYTES - 0x6000),
+           "all unmapped BAR bytes remain protected by the actual parent physical tombstone");
 }
 
 void observe_boot(const controller_host::cm::detail::Controller&) {
@@ -45,12 +79,15 @@ void observe_boot(const controller_host::cm::detail::Controller&) {
         expect(REPORT.phase == mapping::Phase::complete && REPORT.normal_readers == 0 && !REPORT.terminal_active,
                "real failed probe withdraws the actual typed leaves after dropping terminal access");
         expect(dma::stats(device->pci).regions == 0 && packets.empty(), "real DMA registry and packet borrows fully unwind");
+        expect_sparse_views(REPORT, false);
     } else {
         expect(STATE == driver::E1000Device::Retirement::live && published == &device->netdev && device->irq_owned,
                "actual driver publishes only after the real factory and complete setup");
         expect(REPORT.phase == mapping::Phase::active && REPORT.id != 0 && REPORT.initial_ticket != 0 && REPORT.normal_readers == 0 &&
                    !REPORT.admission_closed && !REPORT.terminal_active,
                "actual engine opens a real typed mapping after maintenance and PCI activation");
+        expect_sparse_views(REPORT, true);
+        for (size_t i = 0; i < REPORT.view_count; ++i) initial_tickets[i] = REPORT.views[i].initial_ticket;
         auto const DMA = dma::stats(device->pci);
         expect(DMA.regions == 514 && DMA.streaming == 512, "actual managed driver created its full real DMA registry");
         expect(device->netdev.ops->open(&device->netdev) == 0 && device->registers.report().normal_readers == 0,
@@ -83,6 +120,8 @@ void release_held_callback() {
            "actual counted callback prevents unique terminal admission");
     expect(held_callback->registers().read32(driver::REG_STATUS) != UINT32_MAX,
            "a genuine existing borrow remains usable after admission closure");
+    expect(held_callback->registers().read32(1, 0x5b00 - 0x2000) != UINT32_MAX,
+           "the same held function Borrow keeps the second child usable while global terminal admission is blocked");
     expect(dma::stats(device->pci).regions == 514, "drain wait retains real DMA backing");
     held_callback.reset();
     held_released = true;
@@ -105,7 +144,7 @@ void observe_retirement(const controller_host::cm::detail::Controller&) {
         expect(device->irq_owned == (selected_case == "consumer_mask_failure"), "actual interrupt release requires verified mask");
         return;
     }
-    if (selected_case == "consumer_withdrawal_retry" && final_observations == 1) {
+    if ((selected_case == "consumer_withdrawal_retry" || selected_case == "consumer_second_view_retry") && final_observations == 1) {
         expect(RESULT == -EAGAIN && REPORT.phase == mapping::Phase::withdrawal_pending && REPORT.withdrawal_ticket != 0 &&
                    REPORT.timed_out_ever && REPORT.normal_readers == 0 && !REPORT.terminal_active,
                "real withheld remote action retains the original withdrawal and its historical timeout");
@@ -113,6 +152,23 @@ void observe_retirement(const controller_host::cm::detail::Controller&) {
                "only actually stopped and released hardware enters CPU withdrawal retry");
         retry_ticket = REPORT.withdrawal_ticket;
         retry_mapping = REPORT.id;
+        expect(REPORT.view_count == 2, "actual retained parent still owns both children");
+        if (selected_case == "consumer_second_view_retry") {
+            expect(REPORT.views[0].phase == mapping::Phase::complete && REPORT.views[0].withdrawal_ticket != 0 &&
+                       !REPORT.views[0].timed_out_ever && REPORT.views[1].phase == mapping::Phase::withdrawal_pending &&
+                       REPORT.views[1].withdrawal_ticket != 0 && REPORT.views[1].timed_out_ever,
+                   "second-child timeout retains a real completed first child and the original pending second ticket");
+            for (uint64_t offset = 0; offset < REPORT.views[0].bytes; offset += 4096)
+                expect(mmio_host::translate(REPORT.views[0].virtual_base + offset) == UINT64_MAX,
+                       "completed first-child leaves are actually absent before parent completion");
+            maintenance_host::pause_remote_after_ipis.store(UINT_MAX);
+            maintenance_host::auto_progress.store(true);
+        } else {
+            expect(REPORT.views[0].phase == mapping::Phase::withdrawal_pending && REPORT.views[0].timed_out_ever &&
+                       REPORT.views[1].phase != mapping::Phase::complete,
+                   "one pending first child keeps the actual parent noncomplete and its sibling retained");
+        }
+        for (size_t i = 0; i < REPORT.view_count; ++i) pending_withdrawal_tickets[i] = REPORT.views[i].withdrawal_ticket;
         stopped_effect_count = register_effects.size();
         return;
     }
@@ -121,6 +177,9 @@ void observe_retirement(const controller_host::cm::detail::Controller&) {
     expect(REPORT.phase == mapping::Phase::complete && REPORT.withdrawal_ticket != 0 && REPORT.admission_closed &&
                REPORT.normal_readers == 0 && !REPORT.terminal_active,
            "actual typed VA release follows terminal destruction and exact maintenance completion");
+    expect_sparse_views(REPORT, false);
+    for (size_t i = 0; i < REPORT.view_count; ++i)
+        expect(REPORT.views[i].initial_ticket == initial_tickets[i], "actual retirement keeps every original child initial identity");
     expect(!device->irq_owned && !device->published && dma::stats(device->pci).regions == 0 && packets.empty(),
            "actual IRQ, registered endpoint, packet owners and DMA regions are drained");
     auto const COMMAND = pci::pci_config_read16(device->pci->bus, device->pci->slot, device->pci->function, pci::PCI_COMMAND);
@@ -134,10 +193,13 @@ void observe_retirement(const controller_host::cm::detail::Controller&) {
                "actual retirement disables captured MSI and retains the third physical tombstone after VA withdrawal");
     }
     if (selected_case == "consumer_held_callback") expect(held_released, "actual retire wait released the genuine callback before stop");
-    if (selected_case == "consumer_withdrawal_retry") {
+    if (selected_case == "consumer_withdrawal_retry" || selected_case == "consumer_second_view_retry") {
         expect(final_observations == 2 && REPORT.withdrawal_ticket == retry_ticket && REPORT.id == retry_mapping && REPORT.timed_out_ever,
                "actual finalizer retry resumes exactly the original mapping and ticket");
         expect(register_effects.size() == stopped_effect_count, "CPU-only retry never touches any BAR again");
+        for (size_t i = 0; i < REPORT.view_count; ++i)
+            expect(pending_withdrawal_tickets[i] == 0 || REPORT.views[i].withdrawal_ticket == pending_withdrawal_tickets[i],
+                   "actual retry preserves every already-issued child withdrawal ticket");
     }
 }
 
@@ -195,6 +257,9 @@ void run_consumer_case(std::string_view name) {
     }
     if (name == "consumer_stop_failure") master_stuck = true;
     if (name == "consumer_mask_failure") interrupt_mask_stuck = true;
+    if (name == "consumer_second_view_retry")
+        maintenance_host::pause_remote_after_ipis.store(maintenance_host::ipis.load() +
+                                                        static_cast<unsigned>(runtime_ports::configured.load()) + 1);
     ker::mod::sched::task::Task actor;
     actor.pid = 1;
     controller_host::initialize(actor);
@@ -209,6 +274,7 @@ void run_consumer_case(std::string_view name) {
     // uncertain DMA resources. The observer above requires the real -EIO and
     // forbids a CPU-complete mapping; it never turns that into release proof.
     expect(!refused, "accepted finalizer follows its actual platform policy after the checked consumer result");
-    expect(final_observations == (name == "consumer_withdrawal_retry" ? 2 : 1), "bounded actual finalizer attempt count");
+    expect(final_observations == (name == "consumer_withdrawal_retry" || name == "consumer_second_view_retry" ? 2 : 1),
+           "bounded actual finalizer attempt count");
 }
 }  // namespace e1000_host

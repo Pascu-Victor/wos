@@ -85,34 +85,42 @@ class Pin {
 };
 
 enum class Boot : uint8_t { cold, disabled, recording, ready, unavailable };
-struct Record {
-    std::atomic<bool> used{};
-    std::atomic<bool> operation{};
-    uint64_t id{};
-    ker::dev::pci::detail::ColdFunctionClaim claim{};
-    std::array<Interval, 6> physical{};
-    size_t spans{};
-    uint64_t address{}, bytes{};
+struct ChildView {
+    uint8_t bar{};
+    uint64_t offset{}, physical{}, address{}, bytes{};
     std::atomic<Phase> phase{Phase::empty};
     std::atomic<Status> status{Status::not_ready};
-    std::atomic<uint64_t> gate{CLOSED};
-    std::atomic<bool> terminal{};
     std::atomic<size_t> table_pages{};
     maintenance::Ticket initial{}, withdrawal{};
     mmio_cache::QualifiedUcRange initial_policy{}, withdrawal_policy{};
     std::atomic<uint64_t> initial_id{}, withdrawal_id{}, incarnation{};
     std::atomic<bool> timed_out{};
-    bool decode_off{}, leaves_removed{}, hardware_stopped{};
+    bool leaves_removed{};
+};
+
+struct FunctionRecord {
+    std::atomic<bool> used{};
+    std::atomic<bool> operation{};
+    uint64_t id{};
+    ker::dev::pci::detail::ColdFunctionClaim claim{};
+    std::array<Interval, 6> physical{};
+    size_t spans{}, view_count{};
+    std::array<ChildView, VIEW_CAPACITY> views{};
+    std::atomic<Phase> phase{Phase::empty};
+    std::atomic<Status> status{Status::not_ready};
+    std::atomic<uint64_t> gate{CLOSED};
+    std::atomic<bool> terminal{};
+    bool decode_off{}, hardware_stopped{};
 #ifdef WOS_SELFTEST
     bool deferred{}, resumed{};
 #endif
 };
 
 class Operation {
-    Record* held_{};
+    FunctionRecord* held_{};
 
    public:
-    explicit Operation(Record& record) {
+    explicit Operation(FunctionRecord& record) {
         bool empty = false;
         if (record.operation.compare_exchange_strong(empty, true, std::memory_order_acq_rel, std::memory_order_acquire)) held_ = &record;
     }
@@ -144,7 +152,10 @@ class Runtime {
     std::array<std::atomic<uint64_t>, TABLE_HASH> private_frames_{};
     std::array<Interval, HISTORY> private_ranges_{};
     size_t private_ranges_count_{}, private_count_{};
-    std::array<Record, RECORDS> records_{};
+    std::array<FunctionRecord, RECORDS> records_{};
+    // PIN-owned scratch avoids both large bootstrap stack arrays and a
+    // quadratic restart scan for every staged sibling. Never an owner.
+    std::array<Interval, RECORDS * VIEW_CAPACITY + VIEW_CAPACITY> virtual_scratch_{};
     uint64_t next_id_{1}, bank_frame_{};
     std::atomic<bool> bank_live_{};
 #ifdef WOS_SELFTEST
@@ -297,7 +308,7 @@ class Runtime {
                (OLD.raw & (paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_PWT | paging::PAGE_PCD | NX)) ==
                    TABLE_FLAGS;
     }
-    auto find(uint16_t slot, uint64_t id) noexcept -> Record* {
+    auto find(uint16_t slot, uint64_t id) noexcept -> FunctionRecord* {
         if (id == 0 || slot >= records_.size()) return nullptr;
         auto& record = records_[slot];
         return record.used.load(std::memory_order_acquire) && record.id == id ? &record : nullptr;
@@ -312,7 +323,7 @@ class Runtime {
         result = now + WAIT_NS;
         return true;
     }
-    auto retain(Record& record, Status status) noexcept -> Status {
+    auto retain(FunctionRecord& record, Status status) noexcept -> Status {
         record.gate.fetch_or(CLOSED, std::memory_order_acq_rel);
         record.status.store(status, std::memory_order_release);
         return status;
@@ -461,50 +472,114 @@ class Runtime {
         }
         return address == span.end ? Status::ready : Status::bad_hierarchy;
     }
-    auto reserve_virtual_locked(uint64_t bytes, uint64_t& output) const noexcept -> bool {
-        if (bytes == 0 || (bytes & (PAGE - 1)) != 0 || bytes > BANK_BYTES - 2 * PAGE) return false;
-        uint64_t start = BANK_BASE + PAGE;
-        for (size_t attempt = 0; attempt <= records_.size(); ++attempt) {
-            if (start > BANK_END - PAGE || bytes > BANK_END - PAGE - start) return false;
-            bool collided = false;
-            for (const auto& record : records_) {
-                if (!record.used.load(std::memory_order_acquire) || record.phase.load(std::memory_order_acquire) == Phase::complete)
-                    continue;
-                if (!intersects({start - PAGE, start + bytes + PAGE}, {record.address - PAGE, record.address + record.bytes + PAGE}))
-                    continue;
-                start = record.address + record.bytes + 2 * PAGE;
-                collided = true;
-                break;
-            }
-            if (!collided) {
-                output = start;
-                return true;
+    auto collect_virtual_locked(size_t& count) noexcept -> bool {
+        count = 0;
+        for (const auto& record : records_) {
+            if (!record.used.load(std::memory_order_acquire)) continue;
+            for (size_t i = 0; i < record.view_count; ++i) {
+                auto const& view = record.views[i];
+                if (view.phase.load(std::memory_order_acquire) == Phase::complete) continue;
+                if (count == virtual_scratch_.size()) return false;
+                virtual_scratch_[count++] = {view.address - PAGE, view.address + view.bytes + PAGE};
             }
         }
-        return false;
+        // Fixed-capacity in-place heapsort: O(N log N), no heap allocation,
+        // recursive stack, callback, or iterator-debug runtime under PIN.
+        auto sift = [&](size_t root, size_t limit) {
+            while (root < limit / 2) {
+                size_t child = root * 2 + 1;
+                if (child + 1 < limit && virtual_scratch_[child].start < virtual_scratch_[child + 1].start) ++child;
+                if (virtual_scratch_[root].start >= virtual_scratch_[child].start) break;
+                std::swap(virtual_scratch_[root], virtual_scratch_[child]);
+                root = child;
+            }
+        };
+        for (size_t root = count / 2; root != 0;) sift(--root, count);
+        for (size_t end = count; end > 1;) {
+            std::swap(virtual_scratch_[0], virtual_scratch_[--end]);
+            sift(0, end);
+        }
+        return true;
     }
-    auto reserve_claim(ker::dev::pci::detail::ColdFunctionClaim&& claim, mmio_cache::QualifiedUcRange&& policy,
+    auto reserve_virtual_locked(uint64_t bytes, uint64_t& output, size_t& count) noexcept -> bool {
+        if (bytes == 0 || (bytes & (PAGE - 1)) != 0 || bytes > BANK_BYTES - 2 * PAGE || count == virtual_scratch_.size()) return false;
+        uint64_t start = BANK_BASE + PAGE;
+        for (size_t i = 0; i < count; ++i) {
+            if (start > BANK_END - PAGE || bytes > BANK_END - PAGE - start) return false;
+            auto const occupied = virtual_scratch_[i];
+            if (occupied.end <= start - PAGE) continue;
+            if (start + bytes + PAGE <= occupied.start) break;
+            start = occupied.end + PAGE;
+        }
+        if (start > BANK_END - PAGE || bytes > BANK_END - PAGE - start) return false;
+        Interval const reserved{start - PAGE, start + bytes + PAGE};
+        size_t at = count;
+        while (at != 0 && virtual_scratch_[at - 1].start > reserved.start) {
+            virtual_scratch_[at] = virtual_scratch_[at - 1];
+            --at;
+        }
+        virtual_scratch_[at] = reserved;
+        ++count;
+        output = start;
+        return true;
+    }
+    auto reserve_claim(ker::dev::pci::detail::ColdFunctionClaim&& claim, std::array<mmio_cache::QualifiedUcRange, VIEW_CAPACITY>&& policies,
                        PreparedMapping& output) noexcept -> Status {
         if (claim.owner_id == 0 || claim.claim_epoch == 0 || claim.inventory_generation == 0 || claim.function_index >= RECORDS ||
             claim.span_count == 0 || claim.span_count > claim.spans.size() || claim.bar0_bytes == 0 ||
-            (claim.bar0_physical | claim.bar0_bytes) & (PAGE - 1))
+            ((claim.bar0_physical | claim.bar0_bytes) & (PAGE - 1)) != 0 || claim.view_count == 0 || claim.view_count > VIEW_CAPACITY)
             return Status::invalid_claim;
         std::array<Interval, 6> ranges{};
-        bool bar0_covered = false;
+        bool bar0_found = false;
         uint64_t total_bytes = 0;
         for (size_t i = 0; i < claim.span_count; ++i) {
-            if (!physical_interval(claim.spans[i].start, claim.spans[i].bytes, ranges[i])) return Status::invalid_claim;
+            auto const& bar = claim.bars[i];
+            Interval exact{};
+            if (bar.index >= 6 || (bar.attributes & ~uint8_t{0x0c}) != 0 || ((bar.attributes & 4U) != 0 && bar.index == 5) ||
+                bar.physical == 0 || bar.bytes < 16 || (bar.bytes & (bar.bytes - 1)) != 0 || (bar.physical & (bar.bytes - 1)) != 0 ||
+                ((claim.spans[i].start | claim.spans[i].bytes) & (PAGE - 1)) != 0 || !physical_interval(bar.physical, bar.bytes, exact) ||
+                !physical_interval(claim.spans[i].start, claim.spans[i].bytes, ranges[i]) || exact.start != ranges[i].start ||
+                exact.end != ranges[i].end || ((bar.attributes & 4U) == 0 && bar.physical + bar.bytes > (uint64_t{1} << 32)))
+                return Status::invalid_claim;
             uint64_t const BYTES = ranges[i].end - ranges[i].start;
             if (BYTES > MAX_COLD_PHYSICAL_BYTES - total_bytes) return Status::capacity;
             total_bytes += BYTES;
-            if (claim.bar0_physical >= ranges[i].start && claim.bar0_physical < ranges[i].end &&
-                claim.bar0_bytes <= ranges[i].end - claim.bar0_physical)
-                bar0_covered = true;
-            for (size_t j = 0; j < i; ++j)
-                if (intersects(ranges[i], ranges[j])) return Status::invalid_claim;
+            if (bar.index == 0) {
+                if (bar.physical != claim.bar0_physical || bar.bytes != claim.bar0_bytes) return Status::invalid_claim;
+                bar0_found = true;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                auto const& prior = claim.bars[j];
+                if (intersects(ranges[i], ranges[j]) || bar.index == prior.index ||
+                    ((prior.attributes & 4U) != 0 && bar.index == prior.index + 1) ||
+                    ((bar.attributes & 4U) != 0 && prior.index == bar.index + 1))
+                    return Status::invalid_claim;
+            }
         }
-        if (!bar0_covered || policy.empty() || policy.physical() != claim.bar0_physical || policy.bytes() != claim.bar0_bytes)
-            return Status::invalid_claim;
+        if (!bar0_found) return Status::invalid_claim;
+        std::array<Interval, VIEW_CAPACITY> virtual_ranges{};
+        std::array<Interval, VIEW_CAPACITY> view_ranges{};
+        uint64_t incarnation = 0;
+        for (size_t i = 0; i < claim.view_count; ++i) {
+            auto const& view = claim.views[i];
+            if (view.bytes == 0 || ((view.offset | view.physical | view.bytes) & (PAGE - 1)) != 0 ||
+                !physical_interval(view.physical, view.bytes, view_ranges[i]))
+                return Status::invalid_claim;
+            bool found = false;
+            for (size_t b = 0; b < claim.span_count; ++b) {
+                auto const& bar = claim.bars[b];
+                if (bar.index != view.bar) continue;
+                found = view.offset <= bar.bytes && view.bytes <= bar.bytes - view.offset && view.physical == bar.physical + view.offset;
+                break;
+            }
+            auto const& policy = policies[i];
+            if (!found || policy.empty() || policy.physical() != view.physical || policy.bytes() != view.bytes ||
+                (i != 0 && policy.incarnation() != incarnation))
+                return Status::invalid_claim;
+            incarnation = policy.incarnation();
+            for (size_t j = 0; j < i; ++j)
+                if (intersects(view_ranges[i], view_ranges[j])) return Status::invalid_claim;
+        }
         Pin const PIN;
         if (boot_.load(std::memory_order_acquire) != Boot::ready || !bank_live_.load(std::memory_order_acquire))
             return Status::arena_unavailable;
@@ -525,19 +600,34 @@ class Runtime {
             } else if (slot == UINT16_MAX)
                 slot = static_cast<uint16_t>(i);
         }
-        uint64_t address = 0;
         size_t const TOMBS = tombstone_count_.load(std::memory_order_relaxed);
-        if (slot == UINT16_MAX || claim.span_count > tombstones_.size() - TOMBS || !reserve_virtual_locked(claim.bar0_bytes, address))
-            return Status::capacity;
+        if (slot == UINT16_MAX || claim.span_count > tombstones_.size() - TOMBS) return Status::capacity;
+        size_t virtual_count = 0;
+        if (!collect_virtual_locked(virtual_count)) return Status::capacity;
+        for (size_t i = 0; i < claim.view_count; ++i) {
+            uint64_t address = 0;
+            if (!reserve_virtual_locked(claim.views[i].bytes, address, virtual_count)) return Status::capacity;
+            virtual_ranges[i] = {address, address + claim.views[i].bytes};
+        }
         if (next_id_ == UINT64_MAX) return Status::generation_exhausted;
         auto& record = records_[slot];
         record.id = next_id_++;
         record.spans = claim.span_count;
         record.physical = ranges;
-        record.address = address;
-        record.bytes = claim.bar0_bytes;
-        record.incarnation.store(policy.incarnation(), std::memory_order_relaxed);
-        record.initial_policy = std::move(policy);
+        record.view_count = claim.view_count;
+        for (size_t i = 0; i < record.view_count; ++i) {
+            auto const& plan = claim.views[i];
+            auto& view = record.views[i];
+            view.bar = plan.bar;
+            view.offset = plan.offset;
+            view.physical = plan.physical;
+            view.address = virtual_ranges[i].start;
+            view.bytes = plan.bytes;
+            view.incarnation.store(policies[i].incarnation(), std::memory_order_relaxed);
+            view.initial_policy = std::move(policies[i]);
+            view.phase.store(Phase::reserved, std::memory_order_relaxed);
+            view.status.store(Status::pending_retained, std::memory_order_relaxed);
+        }
         record.claim = std::move(claim);
         for (size_t i = 0; i < record.spans; ++i) tombstones_[TOMBS + i] = record.physical[i];
         tombstone_count_.store(TOMBS + record.spans, std::memory_order_release);
@@ -553,7 +643,7 @@ class Runtime {
         return bank_live_.load(std::memory_order_acquire) && root != nullptr && (load(root, 505) & ~AD) == (bank_frame_ | TABLE_FLAGS) &&
                private_frame(bank_frame_);
     }
-    auto child(Table* parent, size_t at, Record& record, Table*& output) noexcept -> Status {
+    auto child(Table* parent, size_t at, ChildView& record, Table*& output) noexcept -> Status {
         Table* fresh = nullptr;
         uint64_t physical = 0;
         {
@@ -596,7 +686,7 @@ class Runtime {
         if (!attached) platform::release_unpublished_table(fresh);
         return output != nullptr ? status : status == Status::ready ? Status::bad_hierarchy : status;
     }
-    auto prepare_paths(Record& record) noexcept -> Status {
+    auto prepare_paths(ChildView& record) noexcept -> Status {
         uint64_t const FIRST = record.address & ~((uint64_t{1} << 21) - 1);
         uint64_t const END = record.address + record.bytes;
         for (uint64_t address = FIRST; address < END; address += uint64_t{1} << 21) {
@@ -626,7 +716,7 @@ class Runtime {
         leaf = table;
         return leaf != nullptr;
     }
-    auto leaves(Record& record, bool remove, bool verify_empty = false) noexcept -> Status {
+    auto leaves(ChildView& record, bool remove, bool verify_empty = false) noexcept -> Status {
         // Record exclusivity + permanently private paths exclude software
         // writers between short PIN batches. Validate the whole range before
         // the first leaf effect; hardware A/D is the only permitted drift.
@@ -638,7 +728,7 @@ class Runtime {
                 Table* table = nullptr;
                 if (!private_leaf_locked(record.address + offset, table)) return Status::bad_hierarchy;
                 uint64_t const RAW = load(table, index(record.address + offset, 1));
-                uint64_t const EXPECTED = remove ? (record.claim.bar0_physical + offset) | LEAF_FLAGS : 0;
+                uint64_t const EXPECTED = remove ? (record.physical + offset) | LEAF_FLAGS : 0;
                 if (verify_empty ? RAW != 0 : (RAW & ~AD) != EXPECTED) return Status::bad_hierarchy;
             }
         }
@@ -649,48 +739,48 @@ class Runtime {
             for (uint64_t offset = first; offset < END; offset += PAGE) {
                 Table* table = nullptr;
                 if (!private_leaf_locked(record.address + offset, table)) __builtin_trap();
-                uint64_t const EXPECTED = remove ? (record.claim.bar0_physical + offset) | LEAF_FLAGS : 0;
+                uint64_t const EXPECTED = remove ? (record.physical + offset) | LEAF_FLAGS : 0;
                 if ((load(table, index(record.address + offset, 1)) & ~AD) != EXPECTED) __builtin_trap();
-                store(table, index(record.address + offset, 1), remove ? 0 : (record.claim.bar0_physical + offset) | LEAF_FLAGS);
+                store(table, index(record.address + offset, 1), remove ? 0 : (record.physical + offset) | LEAF_FLAGS);
             }
         }
         return Status::ready;
     }
-    static void emit(const Record& record, const maintenance::Report& receipt, bool withdrawal) {
+    static void emit(const FunctionRecord& record, size_t view_index, const maintenance::Report& receipt, bool withdrawal) {
         log::info(
-            "MMIO_MAINTENANCE stage=%s mapping=%lu ticket=%lu status=%s targets=%lx tlb=%lx cache=%lx readers=%lu closed=%u timeout=%u",
-            withdrawal ? "withdrawal" : "initial", record.id, receipt.id, maintenance::status_name(receipt.status), receipt.targets,
-            receipt.translation_completed, receipt.cache_completed, receipt.readers, receipt.admission_closed ? 1U : 0U,
+            "MMIO_MAINTENANCE stage=%s mapping=%lu view=%zu ticket=%lu status=%s targets=%lx tlb=%lx cache=%lx readers=%lu closed=%u "
+            "timeout=%u",
+            withdrawal ? "withdrawal" : "initial", record.id, view_index, receipt.id, maintenance::status_name(receipt.status),
+            receipt.targets, receipt.translation_completed, receipt.cache_completed, receipt.readers, receipt.admission_closed ? 1U : 0U,
             receipt.timed_out_ever ? 1U : 0U);
         for (size_t i = 0; i < receipt.cpus.size(); ++i) {
             if ((receipt.targets & (uint64_t{1} << i)) == 0) continue;
             auto const& cpu = receipt.cpus[i];
             log::info(
-                "MMIO_MAINTENANCE_CPU stage=%s mapping=%lu ticket=%lu cpu=%zu apic=%u tlb=%lu cache=%lu tlb_apic=%u cache_apic=%u "
+                "MMIO_MAINTENANCE_CPU stage=%s mapping=%lu view=%zu ticket=%lu cpu=%zu apic=%u tlb=%lu cache=%lu tlb_apic=%u cache_apic=%u "
                 "tlb_status=%s cache_status=%s tlb_cr3=%lx cache_cr3=%lx",
-                withdrawal ? "withdrawal" : "initial", record.id, receipt.id, i, cpu.target_apic, cpu.translation_completed,
+                withdrawal ? "withdrawal" : "initial", record.id, view_index, receipt.id, i, cpu.target_apic, cpu.translation_completed,
                 cpu.cache_completed, cpu.translation_apic, cpu.cache_apic, mmio_cache::status_name(cpu.translation_status),
                 mmio_cache::status_name(cpu.cache_status), cpu.translation_cr3, cpu.cache_cr3);
         }
     }
-    auto maintain(Record& record, const Controller* scope, bool withdrawal) -> Status {
+    auto maintain(FunctionRecord& record, ChildView& view, size_t view_index, const Controller* scope, bool withdrawal) -> Status {
         if (!context(scope)) return Status::invalid_context;
-        auto& ticket = withdrawal ? record.withdrawal : record.initial;
-        auto& policy = withdrawal ? record.withdrawal_policy : record.initial_policy;
+        auto& ticket = withdrawal ? view.withdrawal : view.initial;
+        auto& policy = withdrawal ? view.withdrawal_policy : view.initial_policy;
         uint64_t until = 0;
         if (!deadline(until)) return Status::clock_unavailable;
         if (ticket.empty()) {
-            if (policy.empty() &&
-                mmio_cache::qualify_uc_range(record.claim.bar0_physical, record.bytes, policy) != mmio_cache::Status::ready)
+            if (policy.empty() && mmio_cache::qualify_uc_range(view.physical, view.bytes, policy) != mmio_cache::Status::ready)
                 return Status::not_ready;
-            if (policy.incarnation() != record.incarnation.load(std::memory_order_acquire)) return Status::failed_retained;
+            if (policy.incarnation() != view.incarnation.load(std::memory_order_acquire)) return Status::failed_retained;
             auto const KIND = withdrawal ? maintenance::Kind::translations : maintenance::Kind::translations_then_cache;
             auto const PREPARED = scope != nullptr ? maintenance::detail::prepare(*scope, std::move(policy), KIND, ticket)
                                                    : maintenance::prepare(std::move(policy), KIND, ticket);
             if (PREPARED != maintenance::Status::ready) return Status::pending_retained;
-            (withdrawal ? record.withdrawal_id : record.initial_id).store(ticket.id(), std::memory_order_release);
+            (withdrawal ? view.withdrawal_id : view.initial_id).store(ticket.id(), std::memory_order_release);
 #ifdef WOS_SELFTEST
-            if (withdrawal && defer_withdrawal_ && !record.deferred && scope != nullptr) {
+            if (withdrawal && view_index == 0 && defer_withdrawal_ && !record.deferred && scope != nullptr) {
                 auto const SERVICE = maintenance::service_observation();
                 size_t target = 63;
                 while (target != 0 && (SERVICE.expected_mask & (uint64_t{1} << target)) == 0) --target;
@@ -711,14 +801,14 @@ class Runtime {
         }
         auto const RECEIPT =
             scope != nullptr ? maintenance::detail::wait_until(*scope, ticket, until) : maintenance::wait_until(ticket, until);
-        emit(record, RECEIPT, withdrawal);
+        emit(record, view_index, RECEIPT, withdrawal);
         if (RECEIPT.status == maintenance::Status::complete && RECEIPT.admission_closed && RECEIPT.readers == 0) return Status::ready;
-        if (RECEIPT.timed_out_ever) record.timed_out.store(true, std::memory_order_release);
+        if (RECEIPT.timed_out_ever) view.timed_out.store(true, std::memory_order_release);
 #ifdef WOS_SELFTEST
-        if (withdrawal && scope != nullptr && record.deferred && !record.resumed &&
+        if (withdrawal && view_index == 0 && scope != nullptr && record.deferred && !record.resumed &&
             RECEIPT.status == maintenance::Status::timeout_retained) {
-            // The original timeout and all actual pending CPU rows above are
-            // retained. Clearing suppresses no prior error and fabricates no ACK.
+            // Resume only the original first-child action; no copied report or
+            // sibling completion can acknowledge this CPU on its behalf.
             if (maintenance::detail::diagnostic_resume(*scope, ticket, maintenance::Phase::translations) == maintenance::Status::ready)
                 record.resumed = true;
         }
@@ -729,30 +819,45 @@ class Runtime {
         return (scope != nullptr ? maintenance::detail::release_complete(*scope, ticket) : maintenance::release_complete(ticket)) ==
                maintenance::Status::complete;
     }
-    auto prepare_record(Record& record, const Controller& scope) -> Status {
-        if (!context(&scope)) return retain(record, Status::invalid_context);
-        auto phase = record.phase.load(std::memory_order_acquire);
+    auto prepare_view(FunctionRecord& record, ChildView& view, size_t view_index, const Controller& scope) -> Status {
+        auto phase = view.phase.load(std::memory_order_acquire);
         if (phase == Phase::leaves_ready)
-            return record.initial.empty() || release_ticket(record.initial, &scope) ? Status::ready : Status::pending_retained;
+            return view.initial.empty() || release_ticket(view.initial, &scope) ? Status::ready : Status::pending_retained;
         if (phase != Phase::reserved && phase != Phase::cache_pending) return Status::failed_retained;
         if (phase == Phase::reserved) {
-            auto const PATHS = prepare_paths(record);
-            if (PATHS != Status::ready) return retain(record, PATHS);
-            record.phase.store(Phase::cache_pending, std::memory_order_release);
+            auto const PATHS = prepare_paths(view);
+            if (PATHS != Status::ready) return PATHS;
+            view.phase.store(Phase::cache_pending, std::memory_order_release);
         }
-        auto const ROUND = maintain(record, &scope, false);
-        if (ROUND != Status::ready) return retain(record, ROUND);
+        auto const ROUND = maintain(record, view, view_index, &scope, false);
+        if (ROUND != Status::ready) return ROUND;
         // Re-issue only through the real immutable registry and revalidate the
         // actual publishing CPU; no copied completion/report adopts a token.
         mmio_cache::QualifiedUcRange final_policy;
-        if (mmio_cache::qualify_uc_range(record.claim.bar0_physical, record.bytes, final_policy) != mmio_cache::Status::ready ||
-            final_policy.incarnation() != record.incarnation.load(std::memory_order_acquire) ||
+        if (mmio_cache::qualify_uc_range(view.physical, view.bytes, final_policy) != mmio_cache::Status::ready ||
+            final_policy.incarnation() != view.incarnation.load(std::memory_order_acquire) ||
             mmio_cache::revalidate_current_cpu(final_policy) != mmio_cache::Status::ready || !context(&scope))
-            return retain(record, Status::failed_retained);
-        auto const written = leaves(record, false);
-        if (written == Status::ready) record.phase.store(Phase::leaves_ready, std::memory_order_release);
-        if (written != Status::ready) return retain(record, written);
-        if (!release_ticket(record.initial, &scope)) return retain(record, Status::pending_retained);
+            return Status::failed_retained;
+        auto const written = leaves(view, false);
+        if (written != Status::ready) return written;
+        view.phase.store(Phase::leaves_ready, std::memory_order_release);
+        if (!release_ticket(view.initial, &scope)) return Status::pending_retained;
+        view.status.store(Status::ready, std::memory_order_release);
+        return Status::ready;
+    }
+    auto prepare_record(FunctionRecord& record, const Controller& scope) -> Status {
+        if (!context(&scope)) return retain(record, Status::invalid_context);
+        auto const PHASE = record.phase.load(std::memory_order_acquire);
+        if (PHASE == Phase::leaves_ready) return Status::ready;
+        if (PHASE != Phase::reserved && PHASE != Phase::cache_pending) return Status::failed_retained;
+        record.phase.store(Phase::cache_pending, std::memory_order_release);
+        for (size_t i = 0; i < record.view_count; ++i) {
+            auto& view = record.views[i];
+            auto const STATUS = prepare_view(record, view, i, scope);
+            view.status.store(STATUS, std::memory_order_release);
+            if (STATUS != Status::ready) return retain(record, STATUS);
+        }
+        record.phase.store(Phase::leaves_ready, std::memory_order_release);
         record.status.store(Status::ready, std::memory_order_release);
         return Status::ready;
     }
@@ -762,13 +867,15 @@ class Runtime {
         if (!output.empty()) return Status::output_not_empty;
         if (!enabled()) return Status::disabled;
         if (!context(&scope)) return Status::invalid_context;
+        if (claim.view_count == 0 || claim.view_count > VIEW_CAPACITY) return Status::invalid_claim;
         uint64_t until = 0;
         if (!deadline(until)) return Status::clock_unavailable;
         if (maintenance::detail::await_ready(scope, until) != maintenance::Status::ready) return Status::not_ready;
-        mmio_cache::QualifiedUcRange policy;
-        if (mmio_cache::qualify_uc_range(claim.bar0_physical, claim.bar0_bytes, policy) != mmio_cache::Status::ready)
-            return Status::not_ready;
-        auto const RESERVED = reserve_claim(std::move(claim), std::move(policy), output);
+        std::array<mmio_cache::QualifiedUcRange, VIEW_CAPACITY> policies{};
+        for (size_t i = 0; i < claim.view_count; ++i)
+            if (mmio_cache::qualify_uc_range(claim.views[i].physical, claim.views[i].bytes, policies[i]) != mmio_cache::Status::ready)
+                return Status::not_ready;
+        auto const RESERVED = reserve_claim(std::move(claim), std::move(policies), output);
         if (RESERVED != Status::ready) return RESERVED;
         return resume(output, scope);
     }
@@ -787,22 +894,29 @@ class Runtime {
         if (!context(&scope) || record->phase.load(std::memory_order_acquire) != Phase::leaves_ready) return Status::invalid_context;
         auto const PCI = ker::dev::pci::detail::validate_cold_activation(record->claim);
         if (PCI != Status::ready) return retain(*record, PCI);
-        // Operation excludes other private writers. Ordinary writers cannot
-        // enter this hierarchy, so verify in short IRQ-off batches and publish
-        // the borrow gate only after the complete immutable path was checked.
-        for (uint64_t begin = 0; begin < record->bytes;) {
-            uint64_t const end = begin + std::min<uint64_t>(record->bytes - begin, 512 * PAGE);
-            Pin const PIN;
-            for (uint64_t offset = begin; offset < end; offset += PAGE) {
-                Table* table = nullptr;
-                if (!private_leaf_locked(record->address + offset, table) ||
-                    (load(table, index(record->address + offset, 1)) & ~AD) != ((record->claim.bar0_physical + offset) | LEAF_FLAGS))
-                    return retain(*record, Status::bad_hierarchy);
+        // One parent owns the whole immutable set. No sibling can escape while
+        // another is still preparing, and generic writers cannot enter paths.
+        for (size_t i = 0; i < record->view_count; ++i) {
+            auto& view = record->views[i];
+            if (view.phase.load(std::memory_order_acquire) != Phase::leaves_ready) return retain(*record, Status::failed_retained);
+            for (uint64_t begin = 0; begin < view.bytes;) {
+                uint64_t const end = begin + std::min<uint64_t>(view.bytes - begin, 512 * PAGE);
+                Pin const PIN;
+                for (uint64_t offset = begin; offset < end; offset += PAGE) {
+                    Table* table = nullptr;
+                    if (!private_leaf_locked(view.address + offset, table) ||
+                        (load(table, index(view.address + offset, 1)) & ~AD) != ((view.physical + offset) | LEAF_FLAGS))
+                        return retain(*record, Status::bad_hierarchy);
+                }
+                begin = end;
             }
-            begin = end;
         }
         {
             Pin const PIN;
+            for (size_t i = 0; i < record->view_count; ++i) {
+                record->views[i].phase.store(Phase::active, std::memory_order_release);
+                record->views[i].status.store(Status::ready, std::memory_order_release);
+            }
             record->phase.store(Phase::active, std::memory_order_release);
             record->gate.store(0, std::memory_order_release);
             record->status.store(Status::ready, std::memory_order_release);
@@ -811,9 +925,17 @@ class Runtime {
             prepared.slot_ = UINT16_MAX;
             prepared.id_ = 0;
         }
-        log::info("MMIO_PUBLISHED mapping=%lu physical=%lx virtual=%lx bytes=%lu spans=%zu initial_ticket=%lu", record->id,
-                  record->claim.bar0_physical, record->address, record->bytes, record->spans,
-                  record->initial_id.load(std::memory_order_acquire));
+        auto const& first = record->views[0];
+        log::info("MMIO_PUBLISHED mapping=%lu physical=%lx virtual=%lx bytes=%lu spans=%zu initial_ticket=%lu views=%zu", record->id,
+                  first.physical, first.address, first.bytes, record->spans, first.initial_id.load(std::memory_order_acquire),
+                  record->view_count);
+        for (size_t i = 0; i < record->view_count; ++i) {
+            auto const& view = record->views[i];
+            log::info(
+                "MMIO_VIEW_PUBLISHED mapping=%lu view=%zu bar=%u bar_offset=%lx physical=%lx virtual=%lx bytes=%lu initial_ticket=%lu",
+                record->id, i, static_cast<unsigned>(view.bar), view.offset, view.physical, view.address, view.bytes,
+                view.initial_id.load(std::memory_order_acquire));
+        }
         return Status::ready;
     }
 
@@ -857,11 +979,13 @@ class Runtime {
             record->terminal.store(false, std::memory_order_release);
         // The release above is the borrow's final access to its retained row.
     }
-    auto register_address(const Borrow& borrow, size_t offset) noexcept -> uint64_t {
+    auto register_address(const Borrow& borrow, size_t view_index, size_t offset) noexcept -> uint64_t {
         if (!valid(borrow)) __builtin_trap();
         auto* record = find(borrow.slot_, borrow.id_);
-        if ((offset & 3) != 0 || record->bytes < 4 || offset > record->bytes - 4) __builtin_trap();
-        return record->address + offset;
+        if (view_index >= record->view_count) __builtin_trap();
+        auto const& view = record->views[view_index];
+        if ((offset & 3) != 0 || view.bytes < 4 || offset > view.bytes - 4) __builtin_trap();
+        return view.address + offset;
     }
     void close(uint16_t slot, uint64_t id) noexcept {
         auto* record = find(slot, id);
@@ -869,6 +993,11 @@ class Runtime {
         record->gate.fetch_or(CLOSED, std::memory_order_acq_rel);
         Phase active = Phase::active;
         (void)record->phase.compare_exchange_strong(active, Phase::closed, std::memory_order_acq_rel, std::memory_order_acquire);
+        for (size_t i = 0; i < record->view_count; ++i) {
+            active = Phase::active;
+            (void)record->views[i].phase.compare_exchange_strong(active, Phase::closed, std::memory_order_acq_rel,
+                                                                 std::memory_order_acquire);
+        }
     }
     auto drained(uint16_t slot, uint64_t id) noexcept -> bool {
         auto* record = find(slot, id);
@@ -882,19 +1011,37 @@ class Runtime {
         result.status = record->status.load(std::memory_order_acquire);
         result.phase = record->phase.load(std::memory_order_acquire);
         result.id = record->id;
-        result.physical = record->claim.bar0_physical;
-        result.virtual_base = record->address;
-        result.bytes = record->bytes;
         uint64_t const GATE = record->gate.load(std::memory_order_acquire);
         result.normal_readers = GATE & ~CLOSED;
         result.admission_closed = (GATE & CLOSED) != 0;
         result.terminal_active = record->terminal.load(std::memory_order_acquire);
-        result.table_pages = record->table_pages.load(std::memory_order_acquire);
         result.physical_spans = record->spans;
-        result.initial_ticket = record->initial_id.load(std::memory_order_acquire);
-        result.withdrawal_ticket = record->withdrawal_id.load(std::memory_order_acquire);
-        result.cohort_incarnation = record->incarnation.load(std::memory_order_acquire);
-        result.timed_out_ever = record->timed_out.load(std::memory_order_acquire);
+        result.view_count = record->view_count;
+        for (size_t i = 0; i < record->view_count; ++i) {
+            auto const& view = record->views[i];
+            auto& observed = result.views[i];
+            observed.status = view.status.load(std::memory_order_acquire);
+            observed.phase = view.phase.load(std::memory_order_acquire);
+            observed.bar = view.bar;
+            observed.bar_offset = view.offset;
+            observed.physical = view.physical;
+            observed.virtual_base = view.address;
+            observed.bytes = view.bytes;
+            observed.table_pages = view.table_pages.load(std::memory_order_acquire);
+            observed.initial_ticket = view.initial_id.load(std::memory_order_acquire);
+            observed.withdrawal_ticket = view.withdrawal_id.load(std::memory_order_acquire);
+            observed.cohort_incarnation = view.incarnation.load(std::memory_order_acquire);
+            observed.timed_out_ever = view.timed_out.load(std::memory_order_acquire);
+            result.table_pages += observed.table_pages;
+            result.timed_out_ever |= observed.timed_out_ever;
+        }
+        auto const& first = result.views[0];
+        result.physical = first.physical;
+        result.virtual_base = first.virtual_base;
+        result.bytes = first.bytes;
+        result.initial_ticket = first.initial_ticket;
+        result.withdrawal_ticket = first.withdrawal_ticket;
+        result.cohort_incarnation = first.cohort_incarnation;
         return result;
     }
     void abandon(PreparedMapping& prepared) noexcept {
@@ -918,8 +1065,8 @@ class Runtime {
             auto const PHASE = record->phase.load(std::memory_order_acquire);
             if (PHASE != Phase::closed && PHASE != Phase::withdrawal_pending) return Status::not_quiesced;
             record->hardware_stopped = true;
-            // Terminal acquisition uses this same PIN. No terminal can become
-            // usable between this check and the pending phase publication.
+            // One terminal lease covers every child. This same PIN prevents a
+            // terminal acquisition once any child can begin withdrawal.
             record->phase.store(Phase::withdrawal_pending, std::memory_order_release);
         }
         if (!record->decode_off) {
@@ -927,24 +1074,48 @@ class Runtime {
             if (PCI != Status::ready && PCI != Status::complete) return retain(*record, PCI);
             record->decode_off = true;
         }
-        if (!record->leaves_removed) {
-            auto const removed = leaves(*record, true);
-            if (removed != Status::ready) return retain(*record, removed);
-            record->leaves_removed = true;
-            log::info("MMIO_WITHDRAWN mapping=%lu virtual=%lx bytes=%lu normal=0 terminal=0 decode_off=1", record->id, record->address,
-                      record->bytes);
+        for (size_t i = 0; i < record->view_count; ++i) {
+            auto& view = record->views[i];
+            if (view.phase.load(std::memory_order_acquire) == Phase::complete) continue;
+            view.phase.store(Phase::withdrawal_pending, std::memory_order_release);
+            if (!view.leaves_removed) {
+                auto const REMOVED = leaves(view, true);
+                if (REMOVED != Status::ready) {
+                    view.status.store(REMOVED, std::memory_order_release);
+                    return retain(*record, REMOVED);
+                }
+                view.leaves_removed = true;
+                log::info("MMIO_WITHDRAWN mapping=%lu view=%zu virtual=%lx bytes=%lu normal=0 terminal=0 decode_off=1", record->id, i,
+                          view.address, view.bytes);
+            }
+            auto const ROUND = maintain(*record, view, i, scope, true);
+            if (ROUND != Status::ready) {
+                view.status.store(ROUND, std::memory_order_release);
+                return retain(*record, ROUND);
+            }
+            if (!release_ticket(view.withdrawal, scope)) {
+                view.status.store(Status::pending_retained, std::memory_order_release);
+                return retain(*record, Status::pending_retained);
+            }
+            auto const EMPTY = leaves(view, false, true);
+            if (EMPTY != Status::ready) {
+                view.status.store(EMPTY, std::memory_order_release);
+                return retain(*record, EMPTY);
+            }
+            view.phase.store(Phase::complete, std::memory_order_release);
+            view.status.store(Status::complete, std::memory_order_release);
+            log::info(
+                "MMIO_VIEW_COMPLETE mapping=%lu view=%zu virtual=%lx bytes=%lu withdrawal_ticket=%lu leaves=0 normal=0 terminal=0 "
+                "physical_retained=1 tables_retained=1",
+                record->id, i, view.address, view.bytes, view.withdrawal_id.load(std::memory_order_acquire));
         }
-        auto const ROUND = maintain(*record, scope, true);
-        if (ROUND != Status::ready) return retain(*record, ROUND);
-        if (!release_ticket(record->withdrawal, scope)) return retain(*record, Status::pending_retained);
-        auto const EMPTY = leaves(*record, false, true);
-        if (EMPTY != Status::ready) return retain(*record, EMPTY);
         record->phase.store(Phase::complete, std::memory_order_release);
         record->status.store(Status::complete, std::memory_order_release);
+        auto const& first = record->views[0];
         log::info(
             "MMIO_COMPLETE mapping=%lu virtual=%lx bytes=%lu withdrawal_ticket=%lu leaves=0 normal=0 terminal=0 physical_retained=1 "
-            "tables_retained=1",
-            record->id, record->address, record->bytes, record->withdrawal_id.load(std::memory_order_acquire));
+            "tables_retained=1 views=%zu",
+            record->id, first.address, first.bytes, first.withdrawal_id.load(std::memory_order_acquire), record->view_count);
         return Status::complete;
     }
 };
@@ -1004,11 +1175,13 @@ auto Borrow::operator=(Borrow&& other) noexcept -> Borrow& {
 }
 auto Borrow::valid() const noexcept -> bool { return detail::runtime.valid(*this); }
 void Borrow::reset() noexcept { detail::runtime.drop(*this); }
-auto Borrow::read32(size_t offset) const noexcept -> uint32_t {
-    return detail::platform::read_register32(detail::runtime.register_address(*this, offset));
+auto Borrow::read32(size_t offset) const noexcept -> uint32_t { return read32(0, offset); }
+void Borrow::write32(size_t offset, uint32_t value) const noexcept { write32(0, offset, value); }
+auto Borrow::read32(size_t view_index, size_t offset) const noexcept -> uint32_t {
+    return detail::platform::read_register32(detail::runtime.register_address(*this, view_index, offset));
 }
-void Borrow::write32(size_t offset, uint32_t value) const noexcept {
-    detail::platform::write_register32(detail::runtime.register_address(*this, offset), value);
+void Borrow::write32(size_t view_index, size_t offset, uint32_t value) const noexcept {
+    detail::platform::write_register32(detail::runtime.register_address(*this, view_index, offset), value);
 }
 Mapping::Mapping(uint16_t slot, uint64_t id) noexcept : id_(id), slot_(slot) {}
 Mapping::~Mapping() { close(); }

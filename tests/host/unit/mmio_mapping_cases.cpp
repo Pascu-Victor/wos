@@ -5,6 +5,7 @@
 #include "e1000_mmio_consumer_cases.inc"
 #include "mmio_writer_generated.hpp"
 #include <dev/pci_extended.hpp>
+#include <optional>
 // clang-format on
 
 namespace mmio_host {
@@ -83,10 +84,12 @@ void fences_after_boot(const controller_host::cm::detail::Controller& controller
     e1000_host::observe_boot(controller);
     auto* device = e1000_host::device;
     auto const report = device->registers.report();
-    check(report.physical == pci_cold_host::BAR0 && report.bytes == pci_cold_host::BAR_BYTES && report.physical_spans == 2,
+    check(report.physical == pci_cold_host::BAR0 && report.bytes == 0x1000 && report.physical_spans == 2 && report.view_count == 2,
           "actual private PCI capability accounts both decoded physical BARs");
-    for (uint64_t offset = 0; offset < report.bytes; offset += 4096)
-        check(translate(report.virtual_base + offset) == report.physical + offset, "actual typed page tables cover every exact BAR page");
+    for (size_t i = 0; i < report.view_count; ++i)
+        for (uint64_t offset = 0; offset < report.views[i].bytes; offset += 4096)
+            check(translate(report.views[i].virtual_base + offset) == report.views[i].physical + offset,
+                  "actual typed page tables cover every requested sparse child page");
     {
         auto original = device->registers.borrow();
         check(original.valid() && device->registers.report().normal_readers == 1, "actual affine normal borrow increments its real gate");
@@ -96,6 +99,8 @@ void fences_after_boot(const controller_host::cm::detail::Controller& controller
         device->registers.close();
         check(moved.valid() && moved.read32(e1000_host::driver::REG_STATUS) != UINT32_MAX,
               "existing genuine view survives actual gate closure");
+        check(moved.read32(1, 0x5b00 - 0x2000) != UINT32_MAX,
+              "the same genuine whole-function Borrow also retains its second child after closure");
         check(!device->registers.borrow().valid() && !device->registers.terminal_borrow().valid(),
               "closed admission refuses new normals and a held normal refuses terminal access");
         moved.reset();
@@ -103,9 +108,13 @@ void fences_after_boot(const controller_host::cm::detail::Controller& controller
         auto terminal = device->registers.terminal_borrow();
         check(terminal.valid() && !device->registers.terminal_borrow().valid(), "actual terminal view is unique after closed-and-drained");
         check(terminal.read32(e1000_host::driver::REG_STATUS) != UINT32_MAX, "real terminal view accesses the original live hardware bank");
+        check(terminal.read32(1, 0x5b00 - 0x2000) != UINT32_MAX,
+              "one unique terminal Borrow grants actual access to both drained child views");
     }
     check(!device->registers.report().terminal_active, "terminal destruction precedes the genuine hardware lifecycle");
     check(!mapping::detail::generic_virtual_allowed(root, report.virtual_base, 4096), "generic virtual mutator cannot enter private arena");
+    check(!mapping::detail::generic_virtual_allowed(root, report.views[1].virtual_base, report.views[1].bytes),
+          "the second sparse child has the same actual generic-writer exclusion");
     check(!mapping::detail::record_generic_mapping(root, 0x400000, report.physical, 4096, 3),
           "actual physical tombstone blocks a generic incoming alias");
     auto* private_table = tables.at(raw(root, 505) & FRAME);
@@ -132,8 +141,9 @@ void fences_after_boot(const controller_host::cm::detail::Controller& controller
 void fences_after_retirement(const controller_host::cm::detail::Controller& controller) {
     e1000_host::observe_retirement(controller);
     auto const report = e1000_host::device->registers.report();
-    for (uint64_t offset = 0; offset < report.bytes; offset += 4096)
-        check(translate(report.virtual_base + offset) == UINT64_MAX, "actual withdrawal clears every original leaf");
+    for (size_t i = 0; i < report.view_count; ++i)
+        for (uint64_t offset = 0; offset < report.views[i].bytes; offset += 4096)
+            check(translate(report.views[i].virtual_base + offset) == UINT64_MAX, "actual withdrawal clears every original child leaf");
     check(!mapping::detail::record_generic_mapping(root, 0x400000, report.physical, 4096, 3),
           "exact ACK permits VA withdrawal but never returns the physical tombstone");
     check(!e1000_host::device->registers.borrow().valid() && !e1000_host::device->registers.terminal_borrow().valid(),
@@ -177,6 +187,202 @@ void run_bad_table_alias() {
                     "unsafe private-table alias refuses before MMIO, DMA or any CPU-maintenance action");
           }),
           "actual issuer reaches selected refusal after unsafe real HHDM leaf");
+}
+
+template <typename Body>
+void register_refuses_before_effects(Body body) {
+    int pipefd[2];
+    check(pipe(pipefd) == 0, "finite register effect observation pipe opens");
+    auto child = fork();
+    check(child >= 0, "actual register bounds refusal executes in a fresh child");
+    if (child == 0) {
+        close(pipefd[0]);
+        register_effect_fd = pipefd[1];
+        body();
+        _exit(0);
+    }
+    close(pipefd[1]);
+    int status = 0;
+    check(waitpid(child, &status, 0) == child, "exact register-refusal child is joined");
+    char effect = 0;
+    auto const count = read(pipefd[0], &effect, 1);
+    close(pipefd[0]);
+    check(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL, "actual view bounds trap before device instructions");
+    check(count == 0, "invalid child, byte range or driver hole cannot enter a register instruction port");
+}
+
+void bounds_after_boot(const controller_host::cm::detail::Controller& controller) {
+    e1000_host::observe_boot(controller);
+    auto* device = e1000_host::device;
+    auto const report = device->registers.report();
+    auto borrow = device->registers.borrow();
+    check(borrow.valid() && report.view_count == 2, "real function Borrow retains both actual sparse children");
+    auto const reads_before = register_reads;
+    // These boundary words are finite host bank input, not extra native NIC
+    // register accesses or a claim that reserved hardware registers are safe.
+    (void)borrow.read32(0, report.views[0].bytes - 4);
+    (void)borrow.read32(1, report.views[1].bytes - 4);
+    check(register_reads == reads_before + 2, "last complete finite word of each actual child reaches exactly one instruction");
+    register_refuses_before_effects([&] { (void)borrow.read32(report.view_count, 0); });
+    register_refuses_before_effects([&] { (void)borrow.read32(SIZE_MAX, 0); });
+    register_refuses_before_effects([&] { (void)borrow.read32(0, report.views[0].bytes); });
+    register_refuses_before_effects([&] { (void)borrow.read32(1, report.views[1].bytes); });
+    register_refuses_before_effects([&] { (void)borrow.read32(0, 0x2000); });
+    register_refuses_before_effects([&] { (void)borrow.read32(1, 1); });
+    register_refuses_before_effects([&] { (void)borrow.read32(1, SIZE_MAX - 3); });
+    register_refuses_before_effects([&] { borrow.write32(report.view_count, 0, 0); });
+    register_refuses_before_effects([&] { borrow.write32(1, report.views[1].bytes, 0); });
+    register_refuses_before_effects([&] { (void)e1000_host::driver::reg_read(device, borrow, 0x1000); });
+    register_refuses_before_effects([&] { e1000_host::driver::reg_write(device, borrow, 0x6000, 0); });
+    check(device->registers.report().normal_readers == 1, "rejected forked calls do not disturb the real parent Borrow count");
+    borrow.reset();
+    register_refuses_before_effects([&] { (void)borrow.read32(1, 0); });
+    device->registers.close();
+    check(device->registers.borrows_drained(), "actual Borrow reset drains the complete function set");
+}
+
+void run_view_bounds() {
+    e1000_host::selected_case = "consumer_success";
+    check(controller_host::with_actual_boot_controller(bounds_after_boot), "actual boot producer supplies real view-boundary targets");
+    ker::mod::sched::task::Task actor;
+    actor.pid = 1;
+    controller_host::initialize(actor);
+    check(controller_host::with_actual_finalizer_controller(e1000_host::observe_retirement) == 0,
+          "actual hardware witness still retires every child after bounds refusals");
+}
+
+inline bool producer_case_observed{};
+
+auto producer_claim() -> std::optional<pci::DriverClaim> {
+    auto* device = pci::pci_find_by_class(pci::PCI_CLASS_NETWORK, pci::PCI_SUBCLASS_ETHERNET);
+    check(device == pci_cold_host::selected_device(), "direct producer test uses the genuine enumerated function");
+    auto claim = pci::try_claim_driver(device, pci::DriverKind::e1000e);
+    check(claim.has_value(), "actual exclusive driver ledger grants the test caller's claim");
+    return claim;
+}
+
+void producer_invalid_plans(const controller_host::cm::detail::Controller& controller) {
+    auto claim = producer_claim();
+    mapping::Mapping output;
+    auto reject = [&](std::span<const mapping::ViewRequest> requests, mapping::Status expected) {
+        auto const allocations_before = allocs;
+        auto const actions_before = maintenance_host::events().size();
+        auto const status = pci::map_cold_uc_82574(*claim, controller, requests, output);
+        check(status == expected && output.empty(), "actual PCI producer rejects invalid view geometry without a public owner");
+        check(allocs == allocations_before && maintenance_host::events().size() == actions_before && register_reads == 0 &&
+                  register_writes == 0 && dma_allocs == 0 && pci_cold_host::mem_enable_writes == 0,
+              "invalid view plans cannot allocate tables, begin CPU work, activate decode or access hardware");
+    };
+    for (auto request : {mapping::ViewRequest{6, 0, 4096}, mapping::ViewRequest{255, 0, 4096}, mapping::ViewRequest{2, 0, 4096},
+                         mapping::ViewRequest{3, 0, 4096}, mapping::ViewRequest{0, 0, 0}, mapping::ViewRequest{0, 1, 4096},
+                         mapping::ViewRequest{0, 0, 1}, mapping::ViewRequest{0, pci_cold_host::BAR_BYTES, 4096},
+                         mapping::ViewRequest{0, UINT64_MAX - 4095, 4096}, mapping::ViewRequest{0, 0, UINT64_MAX - 4095}}) {
+        reject(std::span<const mapping::ViewRequest>(&request, 1), mapping::Status::invalid_claim);
+    }
+    std::array<mapping::ViewRequest, 2> overlap{{{0, 0, 4096}, {0, 0, 4096}}};
+    reject(overlap, mapping::Status::invalid_claim);
+    std::array<mapping::ViewRequest, mapping::VIEW_CAPACITY + 1> too_many{};
+    for (auto& request : too_many) request = {0, 0, 4096};
+    reject(too_many, mapping::Status::capacity);
+    check(mapping::detail::record_generic_physical_access(pci_cold_host::BAR1, 4096),
+          "invalid plans produced no parent physical reservation before a later valid request");
+    // The explicit history observation above makes this separate companion
+    // unavailable to a real cold owner. Do not follow it with a fabricated
+    // successful reservation; the compatibility case runs in its own process.
+    producer_case_observed = true;
+}
+
+void producer_legacy_default(const controller_host::cm::detail::Controller& controller) {
+    auto claim = producer_claim();
+    mapping::Mapping output;
+    check(pci::map_cold_uc_82574(*claim, controller, output) == mapping::Status::ready,
+          "actual three-argument compatibility path still maps the complete original BAR0");
+    auto const report = output.report();
+    check(report.view_count == 1 && report.views[0].bar == 0 && report.views[0].bar_offset == 0 &&
+              report.bytes == pci_cold_host::BAR_BYTES && report.views[0].bytes == pci_cold_host::BAR_BYTES,
+          "compatibility report preserves full-BAR geometry through the new retained function engine");
+    for (uint64_t offset = 0; offset < report.bytes; offset += 4096)
+        check(translate(report.virtual_base + offset) == pci_cold_host::BAR0 + offset,
+              "actual compatibility hierarchy materializes every original BAR page");
+    output.close();
+    check(output.report().phase == mapping::Phase::closed && !output.borrow().valid() &&
+              !mapping::detail::record_generic_physical_access(pci_cold_host::BAR0, pci_cold_host::BAR_BYTES),
+          "closing a genuine compatibility owner retains its physical exclusion and all backing");
+    producer_case_observed = true;
+}
+
+void producer_cross_bar(const controller_host::cm::detail::Controller& controller) {
+    auto claim = producer_claim();
+    mapping::Mapping output;
+    std::array<mapping::ViewRequest, 2> requests{{{0, 0, 4096}, {1, 0, 4096}}};
+    check(pci::map_cold_uc_82574(*claim, controller, requests, output) == mapping::Status::ready,
+          "actual PCI capability can select two independently bounded memory BARs");
+    auto const report = output.report();
+    check(report.view_count == 2 && report.views[0].bar == 0 && report.views[1].bar == 1 &&
+              report.views[0].physical == pci_cold_host::BAR0 && report.views[1].physical == pci_cold_host::BAR1,
+          "each real child retains its own actual BAR index and physical base");
+    for (size_t i = 0; i < report.view_count; ++i)
+        check(translate(report.views[i].virtual_base) == report.views[i].physical,
+              "real private page tables select the actual requested BAR rather than scalar BAR0");
+    check(register_reads == 0 && register_writes == 0 && dma_allocs == 0,
+          "cross-BAR geometry test performs no unused native or finite device-register access");
+    output.close();
+    check(!output.borrow().valid() && !mapping::detail::record_generic_physical_access(pci_cold_host::BAR1, 4096),
+          "closing the genuine function owner retains every companion resource");
+    producer_case_observed = true;
+}
+
+void producer_prepare_resume(const controller_host::cm::detail::Controller& controller) {
+    auto claim = producer_claim();
+    mapping::Mapping output;
+    auto const requests = e1000_host::driver::REGISTER_VIEWS;
+    maintenance_host::pause_remote_after_ipis.store(2 * static_cast<unsigned>(runtime_ports::configured.load()) + 1);
+    auto const status = pci::map_cold_uc_82574(*claim, controller, requests, output);
+    check(status == mapping::Status::pending_retained && output.empty(),
+          "real second-child CPU timeout retains private preparation without a public mapping");
+    auto const first_actions = maintenance_host::events();
+    check(first_actions.size() == 9 && pci_cold_host::mem_enable_writes == 0 && register_reads == 0 && register_writes == 0 &&
+              dma_allocs == 0,
+          "first child completes its eight actions while second remote work remains pending before function activation");
+    check(translate(BANK + 4096) == pci_cold_host::BAR0 && translate(BANK + 4 * 4096) == UINT64_MAX,
+          "first prepared child has actual private leaves while incomplete sibling remains unpublished");
+    check(!mapping::detail::record_generic_physical_access(pci_cold_host::BAR0 + 0x6000, 4096),
+          "partial preparation already retains the whole parent including its unmapped tail");
+    auto changed = requests;
+    changed[1].offset += 4096;
+    auto const allocations_before = allocs;
+    auto const probes_before = pci_cold_host::bar_probes;
+    auto const mismatch = pci::map_cold_uc_82574(*claim, controller, changed, output);
+    check(mismatch == mapping::Status::invalid_claim && output.empty() && allocs == allocations_before &&
+              pci_cold_host::bar_probes == probes_before && maintenance_host::events().size() == first_actions.size(),
+          "changed resume plan cannot re-probe, replace child geometry or advance the original CPU work");
+    maintenance_host::pause_remote_after_ipis.store(UINT_MAX);
+    maintenance_host::auto_progress.store(true);
+    check(pci::map_cold_uc_82574(*claim, controller, requests, output) == mapping::Status::ready,
+          "same real plan resumes retained preparation through actual pending CPU work");
+    auto const report = output.report();
+    check(report.view_count == 2 && report.views[0].initial_ticket == 1 && report.views[1].initial_ticket == 2 &&
+              report.views[1].timed_out_ever && report.phase == mapping::Phase::active && maintenance_host::events().size() == 16 &&
+              pci_cold_host::bar_probes == probes_before && pci_cold_host::mem_enable_writes == 1,
+          "resumption preserves both original child tickets, skips completed first work and activates the function exactly once");
+    output.close();
+    check(!output.borrow().valid() && output.report().phase == mapping::Phase::closed,
+          "API-only test closes and retains its genuine owner without manufacturing a hardware witness");
+    producer_case_observed = true;
+}
+
+void run_producer_case(std::string_view name) {
+    e1000_host::selected_case = name;
+    controller_host::before_boot_callback = name == "engine_invalid_view_plans"    ? producer_invalid_plans
+                                            : name == "engine_view_prepare_resume" ? producer_prepare_resume
+                                            : name == "engine_cross_bar_views"     ? producer_cross_bar
+                                                                                   : producer_legacy_default;
+    check(controller_host::with_actual_boot_controller(nullptr), "real phase5 issuer dispatches the actual public producer test call");
+    controller_host::before_boot_callback = nullptr;
+    check(producer_case_observed && e1000_host::driver::device_count == 0,
+          "exclusive actual test claim prevents the later ordinary driver from adopting the same function");
+    check(register_reads == 0 && register_writes == 0 && dma_allocs == 0,
+          "direct preparation tests claim no hardware access, DMA or actual driver-retirement proof");
 }
 
 template <typename Body>
@@ -268,6 +474,11 @@ int main(int argc, char** argv) {
         mmio_host::run_writers();
     else if (name == "engine_bad_table_alias")
         mmio_host::run_bad_table_alias();
+    else if (name == "engine_view_bounds")
+        mmio_host::run_view_bounds();
+    else if (name == "engine_invalid_view_plans" || name == "engine_view_prepare_resume" || name == "engine_cross_bar_views" ||
+             name == "engine_legacy_view_default")
+        mmio_host::run_producer_case(name);
     else
         e1000_host::run_consumer_case(name);
     mmio_host::verify_global_ports();

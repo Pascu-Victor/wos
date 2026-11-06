@@ -1,7 +1,9 @@
 #pragma once
 
-// Generated unchanged from the finite-port prefix of mmio_cache_runtime_test;
-// it contains no registry implementation or production state setter.
+// Adapted finite hardware ports with bounded IPI delivery deferral.
+// CPU-observation inputs come from the generated prefix below. These ports
+// contain no registry implementation or production state setter.
+#include <climits>
 #include <mutex>
 #include <platform/mm/cpu_maintenance.hpp>
 #include <platform/mm/cpu_maintenance_platform.hpp>
@@ -26,6 +28,7 @@ std::atomic<uint64_t> clock_step{50'000};
 std::atomic<bool> clock_available{true};
 std::atomic<bool> auto_progress{true};
 std::atomic<unsigned> ipis{}, pauses{}, yields{};
+std::atomic<unsigned> pause_remote_after_ipis{UINT_MAX};
 std::atomic<bool> nested_service{};
 std::atomic<bool> pre_armed{}, pre_entered{}, pre_release{};
 std::atomic<bool> post_armed{}, post_entered{}, post_release{};
@@ -100,6 +103,7 @@ void setup(size_t count, ker::mod::mm::cache_arch::Vendor vendor = ker::mod::mm:
     clock_available.store(true);
     auto_progress.store(true);
     ipis.store(0);
+    pause_remote_after_ipis.store(UINT_MAX);
     pauses.store(0);
     yields.store(0);
     nested_service.store(false);
@@ -143,7 +147,8 @@ void send_ipi(uint32_t apic, uint8_t vector) noexcept {
     for (size_t i = 0; i < count && i < 64; ++i) {
         if (runtime_ports::cpus[i].apic == apic) {
             maintenance_host::pending.fetch_or(uint64_t{1} << i);
-            maintenance_host::ipis.fetch_add(1);
+            auto const SENT = maintenance_host::ipis.fetch_add(1) + 1;
+            if (SENT >= maintenance_host::pause_remote_after_ipis.load()) maintenance_host::auto_progress.store(false);
             return;
         }
     }

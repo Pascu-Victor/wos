@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -53,6 +54,25 @@ enum class Status : uint8_t {
 
 enum class Phase : uint8_t { empty, reserved, cache_pending, leaves_ready, active, closed, withdrawal_pending, complete, retained };
 
+inline constexpr size_t VIEW_CAPACITY = 8;
+
+// A requested bounded window inside an actual retained PCI BAR. The actual
+// issuer resolves physical geometry; these scalars grant no mapping authority.
+struct ViewRequest {
+    uint8_t bar{};
+    uint64_t offset{}, bytes{};
+};
+
+struct ViewReport {
+    Status status{Status::invalid_mapping};
+    Phase phase{Phase::empty};
+    uint8_t bar{};
+    uint64_t bar_offset{}, physical{}, virtual_base{}, bytes{};
+    uint64_t initial_ticket{}, withdrawal_ticket{}, cohort_incarnation{};
+    size_t table_pages{};
+    bool timed_out_ever{};
+};
+
 // Copied observations only; none of these scalars can adopt a mapping or grant
 // physical ownership, register access, hardware retirement or CPU completion.
 struct Report {
@@ -71,6 +91,8 @@ struct Report {
     bool admission_closed{};
     bool terminal_active{};
     bool timed_out_ever{};
+    size_t view_count{};
+    std::array<ViewReport, VIEW_CAPACITY> views{};
 };
 
 class Borrow {
@@ -95,6 +117,8 @@ class Borrow {
     // a volatile access; register access never allocates, waits or logs.
     [[nodiscard]] auto read32(size_t byte_offset) const noexcept -> uint32_t;
     void write32(size_t byte_offset, uint32_t value) const noexcept;
+    [[nodiscard]] auto read32(size_t view_index, size_t byte_offset) const noexcept -> uint32_t;
+    void write32(size_t view_index, size_t byte_offset, uint32_t value) const noexcept;
 };
 
 class QuiescedMapping;
