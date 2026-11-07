@@ -1824,6 +1824,26 @@ def test_ktest_node_conversion_preserves_rootless_backend(module) -> None:
     assert_equal(backend["port"], 47920, "conversion owns its backend copy")
 
 
+def test_ktest_configs_supply_exact_fw_cfg_fixture(module) -> None:
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        for path in (ROOT / "configs" / "node_ktest.json", ROOTLESS_KTEST_CONFIG):
+            spec = node.normalize_node_spec(node.load_json_config(path))
+            config = node.cluster_config_from_node_spec(spec)
+            module.validate_cluster_config(config)
+            nodes = module.collect_unique_nodes(config)
+            converted = module.cluster_node_spec(0, nodes[0], config)
+            args = node.build_qemu_args(converted, log=lambda _line: None)
+            records = [args[index + 1] for index, token in enumerate(args) if token == "-fw_cfg"]
+            expected = "name=opt/wos/selftest/fw-cfg-exact-v1,string=WOSFW001"
+            assert_equal(records.count(expected), 1, f"{path.name} exact-read fixture reaches QEMU")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
 def test_rootless_ktest_config_has_no_host_link_dependency(module) -> None:
     raw = module.node_setup.load_json_config(ROOTLESS_KTEST_CONFIG)
     spec = module.node_setup.normalize_node_spec(raw)
@@ -2322,6 +2342,7 @@ def main() -> None:
         test_user_backend_mixed_topology_lifecycle_without_host_operations,
         test_user_backend_no_setup_still_validates_ivshmem,
         test_ktest_node_conversion_preserves_rootless_backend,
+        test_ktest_configs_supply_exact_fw_cfg_fixture,
         test_rootless_ktest_config_has_no_host_link_dependency,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,

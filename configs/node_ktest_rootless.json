@@ -34,6 +34,12 @@
     "node": {
         "id": 0,
         "hostname": "wos-ktest-ipv6",
+        "fw_cfg": [
+            {
+                "name": "opt/wos/selftest/fw-cfg-exact-v1",
+                "string": "WOSFW001"
+            }
+        ],
         "debug": false,
         "mtu": 9000,
         "vm": {
