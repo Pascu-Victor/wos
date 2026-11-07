@@ -141,7 +141,7 @@ void release_unpublished_tables() {
 }
 
 auto cache_line_bytes() -> size_t {
-    mod::cpu::CpuidContext cpu{.function = 1};
+    mod::cpu::CpuidContext cpu{.eax = 0, .ebx = 0, .ecx = 0, .edx = 0, .function = 1};
     mod::cpu::cpuid(&cpu);
     if ((static_cast<uint32_t>(cpu.edx) & (1U << 19U)) == 0) return 0;
     size_t const BYTES = ((static_cast<uint32_t>(cpu.ebx) >> 8U) & 255U) * 8U;

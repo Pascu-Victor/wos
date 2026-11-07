@@ -59,7 +59,7 @@ void collect() {
         inventory.table_error = TABLE.error;
         return;
     }
-    mod::cpu::CpuidContext cpu{.function = static_cast<int>(0x80000000U)};
+    mod::cpu::CpuidContext cpu{.eax = 0, .ebx = 0, .ecx = 0, .edx = 0, .function = static_cast<int>(0x80000000U)};
     mod::cpu::cpuid(&cpu);
     if (static_cast<uint32_t>(cpu.eax) < 0x80000008U) {
         inventory.state = ExtendedState::unsafe_window;

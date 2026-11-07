@@ -33,28 +33,29 @@
 // TLS relocation support
 namespace {
 
-// Define relocation types that we need to handle
+// ELF relocation identifiers. Keep the unsupported forms named for diagnostics
+// and future support; maybe_unused does not add them to the accepted relocations.
 constexpr uint64_t R_X86_64_NONE = 0;
 constexpr uint64_t R_X86_64_64 = 1;
 constexpr uint64_t R_X86_64_PC32 = 2;
-constexpr uint64_t R_X86_64_GOT32 = 3;
+[[maybe_unused]] constexpr uint64_t R_X86_64_GOT32 = 3;
 constexpr uint64_t R_X86_64_PLT32 = 4;
-constexpr uint64_t R_X86_64_COPY = 5;
+[[maybe_unused]] constexpr uint64_t R_X86_64_COPY = 5;
 constexpr uint64_t R_X86_64_GLOB_DAT = 6;
 constexpr uint64_t R_X86_64_JUMP_SLOT = 7;
 constexpr uint64_t R_X86_64_RELATIVE = 8;
-constexpr uint64_t R_X86_64_GOTPCREL = 9;
-constexpr uint64_t R_X86_64_32 = 10;
-constexpr uint64_t R_X86_64_32S = 11;
-constexpr uint64_t R_X86_64_16 = 12;
-constexpr uint64_t R_X86_64_PC16 = 13;
-constexpr uint64_t R_X86_64_8 = 14;
-constexpr uint64_t R_X86_64_PC8 = 15;
-constexpr uint64_t R_X86_64_DTPMOD64 = 16;
-constexpr uint64_t R_X86_64_DTPOFF64 = 17;
+[[maybe_unused]] constexpr uint64_t R_X86_64_GOTPCREL = 9;
+[[maybe_unused]] constexpr uint64_t R_X86_64_32 = 10;
+[[maybe_unused]] constexpr uint64_t R_X86_64_32S = 11;
+[[maybe_unused]] constexpr uint64_t R_X86_64_16 = 12;
+[[maybe_unused]] constexpr uint64_t R_X86_64_PC16 = 13;
+[[maybe_unused]] constexpr uint64_t R_X86_64_8 = 14;
+[[maybe_unused]] constexpr uint64_t R_X86_64_PC8 = 15;
+[[maybe_unused]] constexpr uint64_t R_X86_64_DTPMOD64 = 16;
+[[maybe_unused]] constexpr uint64_t R_X86_64_DTPOFF64 = 17;
 constexpr uint64_t R_X86_64_TPOFF64 = 18;
-constexpr uint64_t R_X86_64_TLSGD = 19;
-constexpr uint64_t R_X86_64_TLSLD = 20;
+[[maybe_unused]] constexpr uint64_t R_X86_64_TLSGD = 19;
+[[maybe_unused]] constexpr uint64_t R_X86_64_TLSLD = 20;
 }  // namespace
 
 #ifndef SHF_TLS

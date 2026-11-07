@@ -4,12 +4,19 @@
 #include <cstdint>
 #include <cstring>
 #include <platform/sched/service_resource_model.hpp>
+#include <type_traits>
 
 namespace ker::net::wki {
 inline constexpr uint16_t WKI_SERVICE_REPORT_VERSION = 1;
 inline constexpr uint16_t WKI_SERVICE_REPORT_FINAL = 1;
 inline constexpr uint16_t WKI_SERVICE_REPORT_INCOMPLETE = 2;
 
+// The non-POD array intentionally retains natural alignment within this
+// packed record; the wire offset and byte-copy contract are checked below.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpacked-non-pod"
+#endif
 struct TaskServiceReport {
     uint32_t task_id = 0;
     uint16_t version = WKI_SERVICE_REPORT_VERSION;
@@ -21,6 +28,14 @@ struct TaskServiceReport {
     uint64_t pending_remote_children = 0;
     std::array<abi::resource::Usage, abi::service_resource::RESOURCE_COUNT> usage{};
 } __attribute__((packed, aligned(8)));
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+static_assert(std::is_standard_layout_v<TaskServiceReport>);
+static_assert(std::is_trivially_copyable_v<TaskServiceReport>);
+static_assert(alignof(TaskServiceReport) == 8);
+static_assert(sizeof(decltype(TaskServiceReport::usage)) == 336);
+static_assert(offsetof(TaskServiceReport, usage) % alignof(decltype(TaskServiceReport::usage)) == 0);
 static_assert(sizeof(TaskServiceReport) == 384);
 static_assert(offsetof(TaskServiceReport, usage) == 48);
 

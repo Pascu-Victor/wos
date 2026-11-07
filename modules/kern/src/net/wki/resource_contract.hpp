@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace ker::net::wki {
 inline constexpr uint32_t WKI_RESOURCE_VERSION = 2;
@@ -25,6 +26,12 @@ inline constexpr uint16_t WKI_RESOURCE_KNOWN_FLAGS =
 
 // Capability-gated suffix. This preserves exec's lifetime observations as
 // well as policy: migrating again must not reset an exhausted CPU budget.
+// Clang leaves the non-POD array naturally aligned. That is intentional:
+// the wire offset already satisfies its alignment, checked below.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpacked-non-pod"
+#endif
 struct TaskResourceSnapshot {
     uint32_t version = WKI_RESOURCE_VERSION;
     uint16_t count = abi::resource::COUNT;
@@ -40,7 +47,14 @@ struct TaskResourceSnapshot {
     uint64_t reaped_system_time_us = 0;
     uint64_t reserved = 0;
 } __attribute__((packed, aligned(8)));
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
+static_assert(std::is_standard_layout_v<TaskResourceSnapshot>);
+static_assert(std::is_trivially_copyable_v<TaskResourceSnapshot>);
+static_assert(sizeof(decltype(TaskResourceSnapshot::entries)) == 768);
+static_assert(offsetof(TaskResourceSnapshot, entries) % alignof(decltype(TaskResourceSnapshot::entries)) == 0);
 static_assert(sizeof(TaskResourceSnapshot) == 832);
 // Copy from packet bytes before accessing this record; the wire suffix need
 // not be aligned, while Usage and std::array require natural alignment.
