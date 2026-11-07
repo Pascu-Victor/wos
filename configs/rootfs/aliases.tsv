@@ -9,30 +9,30 @@ copy	configs/rootfs/etc/termcap	/etc/termcap
 copy	configs/rootfs/etc/nanorc	/etc/nanorc
 copy	configs/rootfs/etc/gitconfig	/etc/gitconfig
 copy	configs/wos-services.conf	/etc/wos-services.conf
-copy	build/modules/testprog/testprog	/usr/bin/testprog
-copy	build/modules/testprog/resource_exec_probe	/usr/libexec/wos-resource-exec-probe
-copy	build/modules/testprog/resource_core_probe	/usr/libexec/wos-resource-core-probe
-copy	build/modules/testd/testd	/usr/bin/testd
-copy	build/modules/perf/perf	/usr/bin/perf
-copy	build/modules/top/top	/usr/bin/top
-copy	build/modules/memacc/memacc	/usr/bin/memacc
-copy	build/modules/renderbench/renderbench	/usr/bin/renderbench
+copy-mode	build/modules/testprog/testprog	/usr/bin/testprog	0755
+copy-mode	build/modules/testprog/resource_exec_probe	/usr/libexec/wos-resource-exec-probe	0755
+copy-mode	build/modules/testprog/resource_core_probe	/usr/libexec/wos-resource-core-probe	0755
+copy-mode	build/modules/testd/testd	/usr/bin/testd	0755
+copy-mode	build/modules/perf/perf	/usr/bin/perf	0755
+copy-mode	build/modules/top/top	/usr/bin/top	0755
+copy-mode	build/modules/memacc/memacc	/usr/bin/memacc	0755
+copy-mode	build/modules/renderbench/renderbench	/usr/bin/renderbench	0755
 copy-mode	configs/drive/srv/wos_userland_suite.sh	/usr/bin/wos-userland-suite	755
 copy-mode	configs/drive/srv/coproc.sh	/usr/bin/coproc	755
 copy	configs/rootfs/root/wos-showcase	/root/wos-showcase
 symlink	/root/wos-showcase/run-all.sh	/root/run-wos-showcase
 symlink	/root/wos-showcase	/wos-showcase
 symlink	/root/wos-showcase/run-all.sh	/run-wos-showcase
-copy	build/modules/debugserver/debugserver	/usr/bin/debugserver
-copy	build/modules/strace/strace	/usr/bin/strace
+copy-mode	build/modules/debugserver/debugserver	/usr/bin/debugserver	0755
+copy-mode	build/modules/strace/strace	/usr/bin/strace	0755
 copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
-copy	build/modules/journal/journal	/usr/bin/journalctl
-copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
-copy	build/modules/wkictl/wki-run	/usr/libexec/wki-run
-copy	build/modules/compartment/wos-compartment	/usr/bin/wos-compartment
+copy-mode	build/modules/journal/journal	/usr/bin/journalctl	0755
+copy-mode	build/modules/wkictl/wkictl	/usr/bin/wkictl	0755
+copy-mode	build/modules/wkictl/wki-run	/usr/libexec/wki-run	0755
+copy-mode	build/modules/compartment/wos-compartment	/usr/bin/wos-compartment	0755
 copy	modules/kern/src/abi/compartment.hpp	/usr/include/wos/compartment.hpp
-copy	build/modules/powerctl/powerctl	/usr/sbin/powerctl
-copy	build/modules/servicectl/servicectl	/usr/bin/servicectl
+copy-mode	build/modules/powerctl/powerctl	/usr/sbin/powerctl	0755
+copy-mode	build/modules/servicectl/servicectl	/usr/bin/servicectl	0755
 symlink	/usr/sbin/powerctl	/sbin/reboot
 symlink	/usr/sbin/powerctl	/sbin/poweroff
 symlink	/usr/sbin/powerctl	/sbin/halt
@@ -124,8 +124,8 @@ symlink	/usr/bin/llvm-size	/usr/bin/size
 symlink	/usr/bin/llvm-strings	/usr/bin/strings
 symlink	/usr/bin/llvm-cxxfilt	/usr/bin/c++filt
 symlink	/usr/bin/llvm-addr2line	/usr/bin/addr2line
-copy	build/modules/httpd/httpd	/usr/sbin/httpd
-copy	build/modules/netd/netd	/usr/sbin/netd
-copy	build/modules/journal/journal	/usr/sbin/journald
+copy-mode	build/modules/httpd/httpd	/usr/sbin/httpd	0755
+copy-mode	build/modules/netd/netd	/usr/sbin/netd	0755
+copy-mode	build/modules/journal/journal	/usr/sbin/journald	0755
 
-copy	build/modules/testprog/resource_stack_probe	/usr/libexec/wos-resource-stack-probe
+copy-mode	build/modules/testprog/resource_stack_probe	/usr/libexec/wos-resource-stack-probe	0755

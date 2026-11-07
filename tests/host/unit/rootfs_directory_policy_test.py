@@ -23,6 +23,39 @@ qcow_spec.loader.exec_module(qcow)
 
 
 class DirectoryPolicy(unittest.TestCase):
+    def test_service_executables_install_publicly_without_chmodding_build_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "build/modules/journal/journal"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"executable fixture\n")
+            source.chmod(0o700)
+            manifest = root / "configs/rootfs/aliases.tsv"
+            manifest.parent.mkdir(parents=True)
+            # Use the production declaration, with only its fixture present.
+            manifest.write_text((ROOT / "configs/rootfs/aliases.tsv").read_text())
+            full = root / "full"
+            full.mkdir()
+            script = '''
+source "$1/scripts/build/rootfs_common.sh"
+ROOTFS_REPO="$2"
+ROOTFS_STAGING="$2/full"
+ROOTFS_MANAGED_TMP="$2/managed"
+rootfs_stage_manifest
+'''
+            subprocess.run(["bash", "-eu", "-c", script, "fixture", str(ROOT), str(root)], check=True)
+            args = argparse.Namespace(repo=root, **{name: root / name for name in
+                ("staging", "cache", "new_cache", "stamp", "changed_paths", "tar_paths")})
+            with patch.dict("os.environ", {"WOS_BUILD_DIR": "build"}):
+                collector = delta.RootfsDelta(args)
+                collector.collect_alias_manifest()
+            for target in ("/usr/sbin/journald", "/usr/bin/journalctl"):
+                self.assertEqual((full / target.lstrip("/")).stat().st_mode & 0o7777, 0o755)
+                self.assertEqual(collector.entries[target].mode, 0o755)
+                collector.stage_entry(collector.entries[target])
+                self.assertEqual((args.staging / target.lstrip("/")).stat().st_mode & 0o7777, 0o755)
+            self.assertEqual(source.stat().st_mode & 0o7777, 0o700)
+
     def test_copied_directory_modes_survive_child_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -155,10 +188,13 @@ for helper in sysroot_libs sysroot_headers sysroot_cmake_data sysroot_python bus
     eval "rootfs_stage_${helper}() { :; }"
 done
 rootfs_finalize_usr_merge() { :; }
+umask 077
 rootfs_stage_tree "$1" "$2"
+test "$(umask)" = 0077
 '''
             subprocess.run(["bash", "-eu", "-c", script, "fixture", str(ROOT), str(staging)], check=True)
             self.assertEqual(staging.stat().st_mode & 0o7777, 0o755)
+            self.assertEqual((staging / "var").stat().st_mode & 0o7777, 0o755)
             self.assertEqual((staging / "var/log/journal").stat().st_mode & 0o7777, 0o700)
             manifest = (staging / "etc/wos-rootfs-manifest.tsv").read_text()
             self.assertIn("/\tD\t755\t", manifest)

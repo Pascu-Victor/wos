@@ -566,6 +566,11 @@ rootfs_write_managed_paths() {
 }
 
 rootfs_stage_tree() {
+    local staging_umask
+    staging_umask=$(umask)
+    # Public directories/configuration must not inherit the build user's umask.
+    # Private state is restricted explicitly by its staging helper.
+    umask 022
     ROOTFS_REPO="$1"
     ROOTFS_STAGING="$2"
     ROOTFS_MANAGED_TMP="$ROOTFS_STAGING/.wos-managed-paths.tmp"
@@ -592,6 +597,7 @@ rootfs_stage_tree() {
     rootfs_write_managed_paths
     rm -f "$ROOTFS_MANAGED_TMP"
     rootfs_write_content_manifest "$ROOTFS_STAGING$ROOTFS_CONTENT_MANIFEST"
+    umask "$staging_umask"
 }
 
 rootfs_remove_old_managed_paths() {
