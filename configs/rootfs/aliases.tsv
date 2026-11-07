@@ -27,6 +27,7 @@ copy-mode	build/modules/debugserver/debugserver	/usr/bin/debugserver	0755
 copy-mode	build/modules/strace/strace	/usr/bin/strace	0755
 copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
 copy-mode	build/modules/journal/journal	/usr/bin/journalctl	0755
+copy-mode	build/modules/journal/libjournal.so	/usr/lib/libjournal.so	0644
 copy-mode	build/modules/wkictl/wkictl	/usr/bin/wkictl	0755
 copy-mode	build/modules/wkictl/wki-run	/usr/libexec/wki-run	0755
 copy-mode	build/modules/compartment/wos-compartment	/usr/bin/wos-compartment	0755

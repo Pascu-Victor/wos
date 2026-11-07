@@ -23,13 +23,21 @@ qcow_spec.loader.exec_module(qcow)
 
 
 class DirectoryPolicy(unittest.TestCase):
-    def test_service_executables_install_publicly_without_chmodding_build_output(self):
+    def test_service_artifacts_install_publicly_without_chmodding_build_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "build/modules/journal/journal"
             source.parent.mkdir(parents=True)
             source.write_bytes(b"executable fixture\n")
             source.chmod(0o700)
+            library = source.with_name("libjournal.so")
+            library.write_bytes(b"shared library fixture\n")
+            library.chmod(0o700)
+            sysroot = root / "toolchain/sysroot"
+            cached_library = sysroot / "lib/libjournal.so"
+            cached_library.parent.mkdir(parents=True)
+            cached_library.write_bytes(b"cached library fixture\n")
+            cached_library.chmod(0o700)
             manifest = root / "configs/rootfs/aliases.tsv"
             manifest.parent.mkdir(parents=True)
             # Use the production declaration, with only its fixture present.
@@ -41,20 +49,28 @@ source "$1/scripts/build/rootfs_common.sh"
 ROOTFS_REPO="$2"
 ROOTFS_STAGING="$2/full"
 ROOTFS_MANAGED_TMP="$2/managed"
+ROOTFS_SYSROOT_DIR="$2/toolchain/sysroot"
+rootfs_stage_sysroot_libs
 rootfs_stage_manifest
 '''
             subprocess.run(["bash", "-eu", "-c", script, "fixture", str(ROOT), str(root)], check=True)
             args = argparse.Namespace(repo=root, **{name: root / name for name in
                 ("staging", "cache", "new_cache", "stamp", "changed_paths", "tar_paths")})
-            with patch.dict("os.environ", {"WOS_BUILD_DIR": "build"}):
+            with patch.dict("os.environ", {"WOS_BUILD_DIR": "build", "WOS_SYSROOT_PATH": str(sysroot)}):
                 collector = delta.RootfsDelta(args)
+                collector.collect_sysroot_libs()
                 collector.collect_alias_manifest()
-            for target in ("/usr/sbin/journald", "/usr/bin/journalctl"):
-                self.assertEqual((full / target.lstrip("/")).stat().st_mode & 0o7777, 0o755)
-                self.assertEqual(collector.entries[target].mode, 0o755)
+            for target, mode in (("/usr/sbin/journald", 0o755), ("/usr/bin/journalctl", 0o755),
+                                 ("/usr/lib/libjournal.so", 0o644)):
+                self.assertEqual((full / target.lstrip("/")).stat().st_mode & 0o7777, mode)
+                self.assertEqual(collector.entries[target].mode, mode)
                 collector.stage_entry(collector.entries[target])
-                self.assertEqual((args.staging / target.lstrip("/")).stat().st_mode & 0o7777, 0o755)
+                self.assertEqual((args.staging / target.lstrip("/")).stat().st_mode & 0o7777, mode)
             self.assertEqual(source.stat().st_mode & 0o7777, 0o700)
+            self.assertEqual(library.stat().st_mode & 0o7777, 0o700)
+            self.assertEqual(cached_library.stat().st_mode & 0o7777, 0o700)
+            for staging in (full, args.staging):
+                self.assertEqual((staging / "usr/lib/libjournal.so").read_bytes(), library.read_bytes())
 
     def test_copied_directory_modes_survive_child_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:
