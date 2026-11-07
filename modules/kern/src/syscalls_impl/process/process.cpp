@@ -390,7 +390,10 @@ inline auto is_live_signal_target(const ker::mod::sched::task::Task& task) -> bo
     return task.state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE && !task.has_exited;
 }
 
-auto process_pid_for_task(const ker::mod::sched::task::Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
+// Retained process identity helper; current paths call the shared task helper directly.
+[[maybe_unused]] auto process_pid_for_task(const ker::mod::sched::task::Task& task) -> uint64_t {
+    return ker::mod::sched::task::process_pid(task);
+}
 
 void release_cloned_fd_table_refs(ker::mod::sched::task::Task* task) {
     if (task == nullptr) {

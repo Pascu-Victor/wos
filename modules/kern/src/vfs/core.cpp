@@ -3842,7 +3842,8 @@ void OrdinaryFinalCloseOwner::cleanup_for_task(uint64_t pid) {
     }
 }
 
-auto vfs_install_open_file(ker::mod::sched::task::Task* task, File* file) -> int {
+// Used by the isolated file-install selftest.
+[[maybe_unused]] auto vfs_install_open_file(ker::mod::sched::task::Task* task, File* file) -> int {
     int const FD = vfs_alloc_fd(task, file);
     if (FD < 0) {
         vfs_put_file(file);
@@ -18370,7 +18371,7 @@ auto change_directory_at(ker::mod::sched::task::Task* task, int dirfd, const cha
     for (unsigned attempt = 0; attempt < 4; ++attempt) {
         LookupHandle lookup{};
         // Both rejected candidates and the replaced cwd retire after all guards.
-        Context context{.task = task};
+        Context context{.task = task, .candidate = {}};
         int result = vfs_acquire_lookup(task, dirfd, stable_path.data(), LookupIntent::STAT, LookupFollowPolicy::FOLLOW_FINAL, true,
                                         apply_task_route, &lookup, 0, false, &CREDENTIALS);
         if (result == 0) result = capture_lookup_root(*task, lookup, context.root);

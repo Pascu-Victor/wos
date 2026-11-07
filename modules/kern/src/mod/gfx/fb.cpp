@@ -30,7 +30,7 @@ __attribute__((used, section(".requests"))) volatile limine_framebuffer_request 
     .response = nullptr,
 };
 
-FbFont current_font;
+[[maybe_unused]] constinit FbFont current_font{FbFont::DeferredLoad{}};
 limine_framebuffer* framebuffer;
 [[maybe_unused]]
 BackBuffer back_buffer{};

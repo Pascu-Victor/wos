@@ -58,7 +58,7 @@ using log = ker::mod::dbg::logger<"wki">;
 // Global state
 // -----------------------------------------------------------------------------
 
-WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constinit WkiState g_wki{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 namespace {
 
@@ -3742,7 +3742,12 @@ void send_signal_policy_denial_with(const WkiHeader& header, const uint8_t* payl
             GroupSignalRequest request{};
             std::memcpy(&request, payload, sizeof(request));
             if (request.request_id == 0 || request.version != WKI_GROUP_SIGNAL_VERSION) return;
-            GroupSignalResponse response{.request_id = request.request_id, .result = -EACCES, .version = WKI_GROUP_SIGNAL_VERSION};
+            GroupSignalResponse response{.request_id = request.request_id,
+                                         .result = -EACCES,
+                                         .version = WKI_GROUP_SIGNAL_VERSION,
+                                         .flags = 0,
+                                         .reserved = 0,
+                                         .other = {}};
             static_cast<void>(send(IDENTITY, MsgType::GROUP_SIGNAL_RESP, &response, sizeof(response)));
             return;
         }

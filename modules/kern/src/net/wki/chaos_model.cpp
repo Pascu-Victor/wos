@@ -188,6 +188,12 @@ auto reliable_message_type(uint8_t raw_type) -> bool {
         case MsgType::TASK_TERMINAL_SIGNAL:
         case MsgType::TASK_SIGNAL_REQ:
         case MsgType::TASK_SIGNAL_RESP:
+        case MsgType::TASK_PARENT_DEATH:
+        case MsgType::TASK_CHILD_SIGNAL:
+        case MsgType::TASK_CHILD_QUERY_REQ:
+        case MsgType::TASK_CHILD_QUERY_RESP:
+        case MsgType::TASK_CHILD_CLAIM_REQ:
+        case MsgType::TASK_CHILD_CLAIM_RESP:
         case MsgType::TASK_EXEC_READY:
         case MsgType::TASK_EXEC_COMMIT:
         case MsgType::GROUP_ROUTE_REQ:

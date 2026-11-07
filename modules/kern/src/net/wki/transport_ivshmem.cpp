@@ -104,7 +104,7 @@ struct IvshmemTransportPrivate {
     uint16_t direct_peer = WKI_NODE_INVALID;
 };
 
-WkiTransport s_ivshmem_transport;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constinit WkiTransport s_ivshmem_transport{};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 IvshmemTransportPrivate s_ivshmem_priv;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> s_ivshmem_initialized{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 #ifdef WOS_SELFTEST

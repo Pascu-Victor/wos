@@ -71,7 +71,12 @@
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hcf.hpp"
 
+// Clang supports offsetof for this non-standard-layout kernel type. Assembly
+// consumes this compiler-derived offset so Task layout changes cannot stale it.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
 extern "C" const uint64_t WOS_DEFERRED_TASK_SWITCH_OFFSET = offsetof(ker::mod::sched::task::Task, deferred_task_switch);
+#pragma clang diagnostic pop
 
 // Kernel idle loop - defined in context_switch.asm
 extern "C" void wos_kernel_idle_loop();                               // NOLINT(readability-identifier-naming)

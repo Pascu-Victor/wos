@@ -2550,7 +2550,9 @@ auto wki_remote_net_selftest_link_identity_owner() -> bool {
     NetOpenOwnerTestContext context{};
     ker::net::NetDeviceOps const OPS{.open = net_open_owner_test_driver,
                                      .close = net_close_owner_test_driver,
+                                     .start_xmit = nullptr,
                                      .set_mac = net_link_owner_test_mac,
+                                     .set_queue_cpu = nullptr,
                                      .check_mac = net_link_owner_test_check};
     dev.ops = &OPS;
     dev.private_data = &context;
@@ -2656,7 +2658,11 @@ auto net_control_selftest_identity_owner(bool closing) -> bool {
     };
     ker::net::NetDevice dev{};
     NetOpenOwnerTestContext context{};
-    ker::net::NetDeviceOps const OPS{.open = net_open_owner_test_driver, .close = net_close_owner_test_driver};
+    ker::net::NetDeviceOps const OPS{.open = net_open_owner_test_driver,
+                                     .close = net_close_owner_test_driver,
+                                     .start_xmit = nullptr,
+                                     .set_mac = nullptr,
+                                     .set_queue_cpu = nullptr};
     dev.ops = &OPS;
     dev.private_data = &context;
     std::array<uint8_t, WKI_NET_OPEN_IDENTITY_SIZE> bytes{};

@@ -255,6 +255,27 @@ TEST(WkiChaosModel, DelayRequiresReleaseAndReorderReleasesNewestFirst) {
     reorder_model->finish_delivery(delivery.slot);
 }
 
+TEST(WkiChaosModel, ChildLifecycleMessagesCoalesceReliableRetransmits) {
+    constexpr std::array TYPES{MsgType::TASK_PARENT_DEATH,     MsgType::TASK_CHILD_SIGNAL,    MsgType::TASK_CHILD_QUERY_REQ,
+                               MsgType::TASK_CHILD_QUERY_RESP, MsgType::TASK_CHILD_CLAIM_REQ, MsgType::TASK_CHILD_CLAIM_RESP};
+    for (auto type : TYPES) {
+        auto model = new_model();
+        ASSERT_TRUE(model->upsert_rule(base_rule(15, WkiChaosAction::DELAY)));
+        auto frame = make_frame(1, 2, 3, static_cast<uint8_t>(type), 17);
+        auto const FIRST = model->intercept(WkiChaosDirection::TX, 3, 0x3000, 2, frame.data(), frame.size());
+        ASSERT_EQ(FIRST.outcome, WkiChaosOutcome::QUEUED);
+        auto const RETRY = model->intercept(WkiChaosDirection::TX, 3, 0x3000, 2, frame.data(), frame.size());
+        EXPECT_EQ(RETRY.outcome, WkiChaosOutcome::COALESCED);
+        EXPECT_EQ(model->release(15, 0), 1U);
+        WkiChaosDeliveryView delivery{};
+        ASSERT_TRUE(model->claim_ready(&delivery));
+        ASSERT_EQ(delivery.len, frame.size());
+        EXPECT_EQ(std::memcmp(delivery.data, frame.data(), frame.size()), 0);
+        model->finish_delivery(delivery.slot);
+        EXPECT_FALSE(model->claim_ready(&delivery));
+    }
+}
+
 TEST(WkiChaosModel, LimitedDelayAndReorderCoalesceExactRetransmitsWithoutConsumingSchedule) {
     constexpr std::array ACTIONS{WkiChaosAction::DELAY, WkiChaosAction::REORDER};
     for (WkiChaosAction const ACTION : ACTIONS) {

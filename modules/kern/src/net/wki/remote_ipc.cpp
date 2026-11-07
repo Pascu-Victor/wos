@@ -2158,7 +2158,8 @@ auto mark_pending_pipe_write_closed(uint16_t home_node, uint32_t resource_id, Ip
     return true;
 }
 
-auto consume_pending_pipe_closed(uint16_t home_node, uint32_t resource_id) -> bool {
+// Used by the pending-pipe selftest configuration.
+[[maybe_unused]] auto consume_pending_pipe_closed(uint16_t home_node, uint32_t resource_id) -> bool {
     PendingPipeDelivery* closed_pending = nullptr;
     uint64_t const IRQF = s_ipc_lock.lock_irqsave();
     auto* pending = find_pending_pipe_delivery_locked(home_node, resource_id);

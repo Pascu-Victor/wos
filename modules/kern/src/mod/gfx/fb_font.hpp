@@ -23,6 +23,9 @@ class FbFont {
 
     FbFont(const char* name, uint8_t height, uint8_t width, const FontData* data);
     FbFont();
+    // Boot code loads glyphs explicitly in fb::init; avoid a pre-init glyph copy.
+    struct DeferredLoad {};
+    constexpr explicit FbFont(DeferredLoad) : name{'d', 'e', 'f', 'a', 'u', 'l', 't'}, height(16), width(16) {}
     FbFont(const FbFont& other);
     auto operator=(const FbFont& other) -> FbFont&;
 

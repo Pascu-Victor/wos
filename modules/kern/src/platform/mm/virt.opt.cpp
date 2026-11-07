@@ -5234,8 +5234,9 @@ auto survey_managed_range_chunk_locked(PageTable* root, huge::RangeSplitCursor& 
 
 // Existing PUB -> COW -> pin, all outputs already addressable. An exclusive
 // unpublished owner supplies preparation lifetime, not the copied RootKey.
-auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end, huge::SplitPlanStorage* storage, uint16_t& count)
-    -> huge::Error {
+// Retained locked split survey; active range preparation uses the bounded cursor.
+[[maybe_unused]] auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end, huge::SplitPlanStorage* storage,
+                                                  uint16_t& count) -> huge::Error {
     if (!managed_root_matches_locked(key)) return huge::Error::Again;
     auto* root = reinterpret_cast<PageTable*>(key.address_bits);
     count = 0;

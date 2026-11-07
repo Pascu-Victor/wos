@@ -478,7 +478,8 @@ auto thread_group_task_at(uint64_t group_pid, size_t index, const pid_ns::Namesp
     return nullptr;
 }
 
-auto task_group_pid_for(uint64_t pid, uint64_t& group_pid) -> bool {
+// Retained process-group lookup helper; current procfs readers retain their task directly.
+[[maybe_unused]] auto task_group_pid_for(uint64_t pid, uint64_t& group_pid) -> bool {
     auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
     if (task == nullptr) {
         return false;

@@ -70,9 +70,9 @@ struct EthTransportPrivate {
     WkiRxHandler rx_handler = nullptr;
 };
 
-WkiTransport s_eth_transport;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-EthTransportPrivate s_eth_priv;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool s_eth_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constinit WkiTransport s_eth_transport{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+EthTransportPrivate s_eth_priv;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool s_eth_initialized = false;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 using log = ker::mod::dbg::logger<"wki">;
 
 constexpr uint64_t WKI_TX_PRESSURE_FENCE_GRACE_US = static_cast<uint64_t>(WKI_PEER_FENCE_CONFIRM_GRACE_MS) * 1000;

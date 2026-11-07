@@ -920,7 +920,7 @@ auto add_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint
         return false;
     }
 
-    LazyVmemRange const RANGE{.start = vaddr, .end = vaddr + size, .prot = prot, .flags = flags};
+    LazyVmemRange const RANGE{.start = vaddr, .end = vaddr + size, .prot = prot, .flags = flags, .file = nullptr};
     return add_lazy_vmem_range_entry(task, RANGE);
 }
 
@@ -2706,7 +2706,8 @@ auto allocate_public_huge_anonymous(uint64_t hint, uint64_t size, uint64_t prot,
             int const PREPARED = metadata.prepare(*task);
             if (PREPARED != 0) return PREPARED;
             if (metadata.serial() != initial_key.incarnation) return -EAGAIN;
-            LazyVmemRange const ROW{.start = address, .end = address + size, .prot = prot, .flags = flags, .kind = LazyVmemKind::ANONYMOUS};
+            LazyVmemRange const ROW{
+                .start = address, .end = address + size, .prot = prot, .flags = flags, .kind = LazyVmemKind::ANONYMOUS, .file = nullptr};
             int const STAGED = metadata.stage(SharedLazyVmemUpdate::Change::ADD, address, address + size, &ROW);
             if (STAGED != 0) return STAGED;
             int const BATCH = detail::managed_range_error(batch.prepare(initial_key, address, size, prot_to_page_flags(prot), placement));
@@ -3829,8 +3830,9 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
 }
 
 // Original internal/native File delegate remains unprepared, including FIXED hint0.
-auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset)
-    -> uint64_t {
+// Retained native delegate; current allocation paths supply an explicit preparation context.
+[[maybe_unused]] auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd,
+                                    uint64_t offset) -> uint64_t {
     return file_allocate(task, hint, size, prot, flags, fd, offset, nullptr);
 }
 

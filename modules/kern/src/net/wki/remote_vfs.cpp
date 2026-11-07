@@ -1466,8 +1466,19 @@ auto close_native_directory_grant(ker::vfs::File* file) -> int {
     file->private_data = nullptr;
     return cleanup ? cancel_native_directory_grant(cleanup->id) : 0;
 }
-ker::vfs::FileOperations g_native_directory_grant_cleanup_ops{
-    .vfs_close = close_native_directory_grant};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constinit ker::vfs::FileOperations g_native_directory_grant_cleanup_ops{
+    .vfs_open = nullptr,
+    .vfs_close = close_native_directory_grant,
+    .vfs_read = nullptr,
+    .vfs_write = nullptr,
+    .vfs_lseek = nullptr,
+    .vfs_isatty = nullptr,
+    .vfs_readdir = nullptr,
+    .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // Reserve registry storage before an owner OPEN can create or truncate. The
 // inactive row is invisible to descriptor operations until publication.
@@ -3228,8 +3239,9 @@ auto readlink_status_is_cacheable(int status) -> bool {
     return status == 0 || status == -EINVAL || status == -ENOENT || status == -ENOTDIR;
 }
 
-auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_path, char* buf, size_t bufsize, ssize_t* result_out,
-                               uint32_t* generation_out) -> bool {
+// Exercised by the isolated cache selftest; credential-bound reads bypass this cache.
+[[maybe_unused]] auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_path, char* buf, size_t bufsize,
+                                                ssize_t* result_out, uint32_t* generation_out) -> bool {
     if (state == nullptr || fs_relative_path == nullptr || result_out == nullptr || generation_out == nullptr) {
         return false;
     }
@@ -4394,8 +4406,10 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     return normalize_proxy_status_for_errno(STATUS);
 }
 
-auto vfs_proxy_send_split_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_prefix, size_t req_prefix_len,
-                                   const uint8_t* req_tail, size_t req_tail_len, void* resp_buf, uint16_t resp_buf_max) -> int {
+// Retained split-request convenience wrapper; current callers use the general sender.
+[[maybe_unused]] auto vfs_proxy_send_split_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_prefix, size_t req_prefix_len,
+                                                    const uint8_t* req_tail, size_t req_tail_len, void* resp_buf, uint16_t resp_buf_max)
+    -> int {
     return vfs_proxy_send_and_wait(state, op_id, req_prefix, req_prefix_len, resp_buf, resp_buf_max, nullptr, VFS_PROXY_OP_TIMEOUT_US,
                                    nullptr, req_tail, req_tail_len);
 }

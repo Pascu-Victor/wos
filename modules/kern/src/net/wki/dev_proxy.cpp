@@ -1562,7 +1562,8 @@ auto remote_block_read_secure_or_msg(ProxyBlockState* state, ker::dev::BlockDevi
     return 0;
 }
 
-auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, void* buffer) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || buffer == nullptr) {
         return -EIO;
     }
@@ -1922,7 +1923,8 @@ auto remote_block_write_secure_or_msg(ProxyBlockState* state, ker::dev::BlockDev
     return 0;
 }
 
-auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, const void* buffer) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, const void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || buffer == nullptr) {
         return -EIO;
     }
@@ -2124,7 +2126,8 @@ auto remote_block_flush_msg(ProxyBlockState* state) -> int {
 }
 
 // RDMA ring-based flush
-auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr) {
         return -EIO;
     }
@@ -2460,7 +2463,8 @@ auto rdma_batch_collect(ProxyBlockState* state, const std::array<BatchEntry, WKI
 }
 
 // Batch RDMA read: submits multiple read SQEs, single doorbell, collects all CQEs.
-auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* ranges, uint32_t count) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* ranges, uint32_t count) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || ranges == nullptr || count == 0) {
         return -1;
     }
@@ -2549,7 +2553,8 @@ auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* rang
 }
 
 // Batch RDMA write: submits multiple write SQEs, single doorbell, collects all CQEs.
-auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ranges, uint32_t count) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ranges, uint32_t count) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || ranges == nullptr || count == 0) {
         return -1;
     }
@@ -2747,7 +2752,8 @@ auto setup_block_bulk_staging(ProxyBlockState* state) -> bool {
 
 // Bulk RDMA read: post a BULK_READ SQE, server RDMA-writes entire range into
 // consumer's staging buffer, single CQE covers the whole transfer.
-auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t block_count, void* buffer) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t block_count, void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || !state->bulk_capable) {
         return -1;
     }
@@ -2893,7 +2899,8 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
 
 // Bulk RDMA write: copy data into staging buffer, post a BULK_WRITE SQE,
 // server RDMA-reads from staging buffer and writes to disk.
-auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t block_count, const void* buffer) -> int {
+// Legacy raw RDMA implementation retained; active I/O uses the secure provider or message path.
+[[maybe_unused]] auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t block_count, const void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || !state->bulk_capable) {
         return -1;
     }

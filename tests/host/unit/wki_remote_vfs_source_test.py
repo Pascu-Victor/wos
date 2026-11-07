@@ -4548,7 +4548,9 @@ def test_native_directory_grants_have_separate_close_only_staging():
     require_tokens(close, ["NativeDirectoryGrantCleanup", "file->private_data = nullptr", "cancel_native_directory_grant"],
                    "close-only local staging must own cancellation")
     ops = source.split("g_native_directory_grant_cleanup_ops{", 1)[1].split("};", 1)[0]
-    if ".vfs_close = close_native_directory_grant" not in ops or any(name in ops for name in ("vfs_read", "vfs_write", "vfs_readdir")):
+    if ".vfs_close = close_native_directory_grant" not in ops or any(
+        f".{name} = nullptr" not in ops for name in ("vfs_read", "vfs_write", "vfs_readdir")
+    ):
         fail("native grant staging must not grant file data access")
     require_tokens(WKI_DEV_PROXY_KTEST.read_text(), ["NativeOwnerRetainsScopeAndCancelsWithoutPeerBinding",
                    "wki_remote_vfs_selftest_native_directory_grant()"], "native owner fixture must be registered")

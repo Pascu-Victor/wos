@@ -1839,7 +1839,9 @@ struct ChildQueryReply {
     child_query::Outcome outcome{};
     child_events::QueueVersion version{};
 };
-auto child_query_wire_origin(child_query::Origin origin) -> TaskSessionOrigin { return {.node = origin.node, .boot = origin.boot}; }
+auto child_query_wire_origin(child_query::Origin origin) -> TaskSessionOrigin {
+    return {.node = origin.node, .reserved = 0, .boot = origin.boot};
+}
 auto child_query_local_origin(const TaskSessionOrigin& origin) -> child_query::Origin { return {origin.node, origin.boot}; }
 auto valid_child_query_origin(const TaskSessionOrigin& origin) -> bool {
     return origin.reserved == 0 && origin.node != WKI_NODE_BROADCAST && ((origin.node == 0) == (origin.boot == 0));
@@ -7236,7 +7238,7 @@ void execute_group_route(const GroupRouteRequest& request, const ker::mod::secur
         return;
     }
     response.kind = static_cast<uint8_t>(GroupRouteResult::REDIRECT);
-    response.destination = {.node = NODE, .boot = BOOT};
+    response.destination = {.node = NODE, .reserved = 0, .boot = BOOT};
     response.target_pid = redirect_pid;
 }
 
@@ -13667,7 +13669,8 @@ auto authorize_group_receivers(const PendingComputeRx& work) -> GroupReceiverRes
 auto authorize_group_signal(const PendingComputeRx& work) -> GroupSignalResponse {
     GroupSignalRequest request{};
     std::memcpy(&request, work.payload.data(), sizeof(request));
-    GroupSignalResponse response{.request_id = request.request_id, .result = -ESRCH, .version = WKI_GROUP_SIGNAL_VERSION};
+    GroupSignalResponse response{
+        .request_id = request.request_id, .result = -ESRCH, .version = WKI_GROUP_SIGNAL_VERSION, .flags = 0, .reserved = 0, .other = {}};
     ker::mod::security::Snapshot supplied, caller;
     response.result = ker::mod::security::credential_record::decode(request.credentials, supplied);
     if (response.result != 0) return response;
@@ -13697,7 +13700,7 @@ auto authorize_group_signal(const PendingComputeRx& work) -> GroupSignalResponse
         response.result = ker::syscall::process::query_group_local(request.pgid, NAMESPACE, job, groups);
         if (response.result == 0) {
             response.flags = groups.flags;
-            response.other = {.node = groups.other.node, .boot = groups.other.boot};
+            response.other = {.node = groups.other.node, .reserved = 0, .boot = groups.other.boot};
         }
     } else {
         ker::mod::sched::session::Identity const GROUP{.pgid = request.pgid, .group_origin = job.group_origin};
@@ -18595,7 +18598,7 @@ auto wki_remote_compute_selftest_group_route() -> bool {
     request.reserved = 0;
     request.operation = static_cast<uint8_t>(GroupRouteOperation::DELIVER);
     ok &= admit() == WkiComputeRxAdmission::DISCARD;
-    request.home = {.origin = {.node = NODE, .boot = BOOT}, .serial = 4};
+    request.home = {.origin = {.node = NODE, .reserved = 0, .boot = BOOT}, .serial = 4};
     request.target_pid = 17;
     ok &= admit() == WkiComputeRxAdmission::DEFERRED;
     request.home.origin.boot = 0;
@@ -18644,7 +18647,7 @@ auto wki_remote_compute_selftest_group_route() -> bool {
             response.anchors[1] = {.serial = 5, .pid = 41};
         } else if (operation == GroupRouteOperation::QUERY) {
             response.target_pgid = 77;
-            response.group_origin = {.node = NODE, .boot = BOOT};
+            response.group_origin = {.node = NODE, .reserved = 0, .boot = BOOT};
         }
         auto receive = [&](uint32_t generation = GENERATION) {
             detail::handle_group_route_response(&header, reinterpret_cast<const uint8_t*>(&response), sizeof(response), &channel,
