@@ -1,0 +1,45 @@
+--- a/src/nano.c
++++ b/src/nano.c
+@@ -329,7 +329,7 @@
+ 
+ 	if (*filename == '\0') {
+ 		plainname = nmalloc(28);
+-		sprintf(plainname, "nano.%u", getpid());
++		sprintf(plainname, "nano.%ld", (long)getpid());
+ 	} else
+ 		plainname = copy_of(filename);
+ 
+--- a/lib/mbiter-aux.c
++++ b/lib/mbiter-aux.c
+@@ -29,7 +29,7 @@
+   if (*cache < 0)
+     {
+       /* UTF-8 is the only encoding in use which maps the bytes 0xC4 0x80
+-         to U+0100.  (See libiconv/tests/*.TXT for all the mapping tables.)
++         to U+0100.  (See the libiconv test mapping tables for all the mapping tables.)
+          We can assume that in this case, the char32_t encoding is Unicode
+          (not platform-dependent like for other locale encodings).  */
+       mbstate_t state; mbszero (&state);
+--- a/po/Makefile.in.in
++++ b/po/Makefile.in.in
+@@ -107,7 +107,7 @@
+ # the .pot file. This eliminates the need to update the .po files when the
+ # .pot file has changed, which would be troublesome if the .po files are put
+ # under version control.
+-.po.gmo: $(srcdir)/$(DOMAIN).pot
++%.gmo: %.po $(srcdir)/$(DOMAIN).pot
+ 	@lang=`echo $* | sed -e 's,.*/,,'`; \
+ 	test "$(srcdir)" = . && cdcmd="" || cdcmd="cd $(srcdir) && "; \
+ 	echo "$${cdcmd}rm -f $${lang}.gmo && $(MSGMERGE) $(MSGMERGE_FOR_MSGFMT_OPTION) -o $${lang}.1po $${lang}.po $(DOMAIN).pot && $(GMSGFMT) -c --statistics --verbose -o $${lang}.gmo $${lang}.1po && rm -f $${lang}.1po"; \
+--- a/lib/localcharset.c
++++ b/lib/localcharset.c
+@@ -90,7 +90,8 @@
+ };
+ 
+ /* Table of platform-dependent mappings, sorted in ascending order.  */
+-static const struct table_entry alias_table[] =
++/* This table is unused on targets with native locale charset queries. */
++static const struct table_entry alias_table[] __attribute__((unused)) =
+   {
+ #  if defined __FreeBSD__                                   /* FreeBSD */
+   /*{ "ARMSCII-8",  "ARMSCII-8" },*/

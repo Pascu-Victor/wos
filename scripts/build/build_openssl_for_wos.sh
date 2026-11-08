@@ -414,6 +414,20 @@ wos_timed_step "configure" "libressl" \
     --disable-asm
 disable_libressl_man_install
 
+# Static archives have no runtime loader cache to finish on the target. Keep
+# libtool's other diagnostics, but omit its inapplicable staged-install reminder.
+python3 - "$TLS_WORK/libtool" <<'PYLIBTOOL'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+lines = text.splitlines(keepends=True)
+for index, line in enumerate(lines):
+    if 'func_warning "remember to run ' in line and '--finish$future_libdirs' in line:
+        lines[index] = "      : # Static WOS archives need no target libtool --finish.\n"
+path.write_text("".join(lines))
+PYLIBTOOL
+
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "" \
     "$TLS_WORK" "$TARGET_SYSROOT/include"

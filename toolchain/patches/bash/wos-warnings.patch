@@ -1,0 +1,157 @@
+--- a/include/gettext.h
++++ b/include/gettext.h
+@@ -39,19 +39,17 @@
+ #endif
+ 
+ /* Disabled NLS.
+-   The casts to 'const char *' serve the purpose of producing warnings
+-   for invalid uses of the value returned from these functions.
+-   On pre-ANSI systems without 'const', the config.h file is supposed to
+-   contain "#define const".  */
+-# define gettext(Msgid) ((const char *) (Msgid))
+-# define dgettext(Domainname, Msgid) ((const char *) (Msgid))
+-# define dcgettext(Domainname, Msgid, Category) ((const char *) (Msgid))
++   Preserve the argument's qualifiers when translation is disabled. C string
++   literals retain the same pointer type accepted by enabled GNU gettext.  */
++# define gettext(Msgid) ((Msgid))
++# define dgettext(Domainname, Msgid) ((Msgid))
++# define dcgettext(Domainname, Msgid, Category) ((Msgid))
+ # define ngettext(Msgid1, Msgid2, N) \
+-    ((N) == 1 ? (const char *) (Msgid1) : (const char *) (Msgid2))
++    ((N) == 1 ? (Msgid1) : (Msgid2))
+ # define dngettext(Domainname, Msgid1, Msgid2, N) \
+-    ((N) == 1 ? (const char *) (Msgid1) : (const char *) (Msgid2))
++    ((N) == 1 ? (Msgid1) : (Msgid2))
+ # define dcngettext(Domainname, Msgid1, Msgid2, N, Category) \
+-    ((N) == 1 ? (const char *) (Msgid1) : (const char *) (Msgid2))
++    ((N) == 1 ? (Msgid1) : (Msgid2))
+ # define textdomain(Domainname) ((const char *) (Domainname))
+ # define bindtextdomain(Domainname, Dirname) ((const char *) (Dirname))
+ # define bind_textdomain_codeset(Domainname, Codeset) ((const char *) (Codeset))
+--- a/jobs.c
++++ b/jobs.c
+@@ -840,7 +840,7 @@
+   /* XXX - what if psi == *bucket? */
+   if (psi == *bucket)
+     {
+-      internal_debug ("hashed pid %d (pid %d) collides with bgpids.head, skipping", psi, pid);
++      internal_debug ("hashed pid %ld (pid %ld) collides with bgpids.head, skipping", (long)psi, (long)pid);
+       bgpids.storage[psi].pid = NO_PID;		/* make sure */
+       psi = bgp_getindex ();			/* skip to next one */
+     }
+@@ -907,7 +907,7 @@
+ 	break;
+       if (orig_psi == bgpids.storage[psi].bucket_next)	/* catch reported bug */
+ 	{
+-	  internal_warning (_("bgp_delete: LOOP: psi (%d) == storage[psi].bucket_next"), psi);
++	  internal_warning (_("bgp_delete: LOOP: psi (%ld) == storage[psi].bucket_next"), (long)psi);
+ 	  return 0;
+ 	}
+     }
+@@ -959,7 +959,7 @@
+ 	return (bgpids.storage[psi].status);
+       if (orig_psi == bgpids.storage[psi].bucket_next)	/* catch reported bug */
+ 	{
+-	  internal_warning (_("bgp_search: LOOP: psi (%d) == storage[psi].bucket_next"), psi);
++	  internal_warning (_("bgp_search: LOOP: psi (%ld) == storage[psi].bucket_next"), (long)psi);
+ 	  return -1;
+ 	}
+     }
+@@ -1377,7 +1377,7 @@
+ 	delete_job (job, DEL_NOBGPID);
+       else
+ 	{
+-	  internal_debug (_("forked pid %d appears in running job %d"), pid, job+1);
++	  internal_debug (_("forked pid %ld appears in running job %d"), (long)pid, job+1);
+ 	  if (p)
+ 	    p->pid = 0;
+ 	}
+@@ -2815,7 +2815,7 @@
+ 
+ 	  if (jobs[i] && STOPPED (i))
+ 	    {
+-	      builtin_warning ("job %d[%d] stopped", i+1, find_last_pid (i, 0));
++	      builtin_warning ("job %d[%ld] stopped", i+1, (long)find_last_pid (i, 0));
+ 	      any_stopped = 1;
+ 	    }
+ 
+@@ -4841,7 +4841,7 @@
+ 		  setpgid (0, original_pgrp);
+ 		  shell_pgrp = original_pgrp;
+ 		  errno = t_errno;
+-		  sys_error (_("cannot set terminal process group (%d)"), shell_pgrp);
++		  sys_error (_("cannot set terminal process group (%ld)"), (long)shell_pgrp);
+ 		  job_control = 0;
+ 		}
+ 	    }
+@@ -4850,7 +4850,7 @@
+ 	    {
+ 	      if (t_errno != -1)
+ 		errno = t_errno;
+-	      sys_error (_("cannot set terminal process group (%d)"), t);
++	      sys_error (_("cannot set terminal process group (%ld)"), (long)t);
+ 	      job_control = 0;
+ 	    }
+ 	}
+@@ -5049,7 +5049,7 @@
+     }
+   else if (tpgrp != opgrp)
+     {
+-      internal_debug ("%d: maybe_give_terminal_to: terminal pgrp == %d shell pgrp = %d new pgrp = %d in_background = %d", (int)getpid(), tpgrp, opgrp, npgrp, running_in_background);
++      internal_debug ("%d: maybe_give_terminal_to: terminal pgrp == %ld shell pgrp = %ld new pgrp = %ld in_background = %d", (int)getpid(), (long)tpgrp, (long)opgrp, (long)npgrp, running_in_background);
+       return -1;
+     }
+   else
+--- a/error.c
++++ b/error.c
+@@ -426,7 +426,7 @@
+   programming_error ("%s: %s: %d", func, _(cmd_error_table[code]), e);
+ }
+ 
+-char *
++const char *
+ command_errstr (int code)
+ {
+   if (code > CMDERR_LAST)
+--- a/error.h
++++ b/error.h
+@@ -64,7 +64,7 @@
+ /* Report an error having to do with command parsing or execution. */
+ extern void command_error (const char *, int, int, int);
+ 
+-extern char *command_errstr (int);
++extern const char *command_errstr (int);
+ 
+ /* Specific error message functions that eventually call report_error or
+    internal_error. */
+--- a/locale.c
++++ b/locale.c
+@@ -427,7 +427,7 @@
+ localetrans (const char *string, int len, size_t *lenp)
+ {
+   char *locale, *t;
+-  char *translated;
++  const char *translated;
+   size_t tlen;
+ 
+   /* Don't try to translate null strings. */
+--- a/builtins/help.def
++++ b/builtins/help.def
+@@ -372,7 +372,7 @@
+ {
+   int j;
+   size_t dispcols;
+-  char *helpdoc;
++  const char *helpdoc;
+ 
+   /* first column */
+   helpdoc = _(shell_builtins[i].short_doc);
+@@ -410,7 +410,7 @@
+ {
+   int j;
+   int dispcols, dispchars;
+-  char *helpdoc;
++  const char *helpdoc;
+   wchar_t *wcstr;
+   size_t slen, n;
+ 

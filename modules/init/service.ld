@@ -7,7 +7,6 @@ PHDRS
     rodata PT_LOAD FLAGS(4);        /* R */
     data PT_LOAD FLAGS(6);          /* RW */
     tls PT_TLS FLAGS(4);            /* R (TLS template) */
-    dynamic PT_DYNAMIC FLAGS(6);    /* RW */
 }
 
 SECTIONS
@@ -92,8 +91,10 @@ SECTIONS
     .got : { *(.got.plt) *(.igot.plt) *(.got) *(.igot) } :data
     .got.plt : { *(.got.plt) } :data
 
-    /* Dynamic sections (for PIE, though we're static) */
-    .dynamic : { *(.dynamic) } :data :dynamic
+    /* This script is used only for static init. Reject dynamic metadata rather
+       than emitting an invalid, empty PT_DYNAMIC program header. */
+    .dynamic : { *(.dynamic) } :data
+    ASSERT(SIZEOF(.dynamic) == 0, "static init must not contain dynamic metadata")
     .dynsym : { *(.dynsym) } :data
     .dynstr : { *(.dynstr) } :data
     .hash : { *(.hash) } :data

@@ -82,14 +82,17 @@ cat > "$WOS_NINJA_COMPAT_INCLUDE/sched.h" <<'EOF'
 #endif
 EOF
 
-TARGET_CXX_FLAGS="--sysroot=$TARGET_SYSROOT -I$WOS_NINJA_COMPAT_INCLUDE -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -fdiagnostics-color=always -isystem $TARGET_SYSROOT/include/c++/v1 -isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"
+TARGET_CXX_FLAGS="--target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT -I$WOS_NINJA_COMPAT_INCLUDE -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -fdiagnostics-color=always -isystem $TARGET_SYSROOT/include/c++/v1 -isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"
 TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 
+# CMP0138 makes the IPO probe use these target flags, preserving working LTO.
 wos_timed_step "configure" "ninja_cmake" \
     cmake -S "$NINJA_SRC" -B "$NINJA_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_DEFAULT_CMP0138=NEW \
+    -DNINJA_USE_PREGENERATED_LEXERS=ON \
     -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT" \
     -DCMAKE_INSTALL_RPATH="/usr/lib" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \

@@ -88,10 +88,12 @@ TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/inclu
 TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 
+# LLVM's escaped macro probe expects the pre-CMP0219 argument interpretation.
 wos_timed_step "configure" "clang_for_wos" \
     "$WOS_CMAKE_COMMAND" -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_DEFAULT_CMP0219=OLD \
     -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT/usr" \
     -DCMAKE_INSTALL_RPATH="/usr/lib" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \

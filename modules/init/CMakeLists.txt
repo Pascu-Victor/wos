@@ -36,6 +36,7 @@ include_directories(src ../extern ../ ../extern/limine)
 # Do not include kernel source headers; rely exclusively on toolchain/sysroot headers
 
 set_target_properties(${TARGET} PROPERTIES
+    LINK_DEPENDS "${WOS_MODULES_DIR}/init/service.ld"
     POSITION_INDEPENDENT_CODE OFF
     INTERPROCEDURAL_OPTIMIZATION OFF
 )

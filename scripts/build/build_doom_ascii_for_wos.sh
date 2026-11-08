@@ -54,6 +54,7 @@ mkdir -p "$DOOM_ASCII_WORK"
 wos_copy_tree_entries_excluding \
     "$DOOM_ASCII_SRC" "$DOOM_ASCII_WORK" ".git" ".github" "screenshots"
 patch --batch --forward --fuzz=0 -d "$DOOM_ASCII_WORK" -p1 < "$DOOM_ASCII_WOS_PATCH"
+patch --batch --forward --fuzz=0 -d "$DOOM_ASCII_WORK" -p1 < "$WORKSPACE_ROOT/toolchain/patches/doom-ascii/wos-warnings.patch"
 
 DOOM_ASCII_CFLAGS=(
     "--target=$TARGET_ARCH"
@@ -70,6 +71,9 @@ DOOM_ASCII_CFLAGS=(
     -fno-sanitize=safe-stack
     -fno-stack-protector
     -Wall
+    # Upstream retains tables and intermediates for other renderer/input modes.
+    -Wno-unused-const-variable
+    -Wno-unused-but-set-variable
 )
 if [ "${WOS_USERSPACE_NO_AVX:-0}" = "1" ]; then
     DOOM_ASCII_CFLAGS+=(

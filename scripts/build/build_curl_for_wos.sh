@@ -397,6 +397,16 @@ CURL_SOURCE_DIR="$(resolve_curl_source)"
 copy_source_to_workdir "$CURL_SOURCE_DIR"
 patch_config_sub_for_wos "$CURL_WORK/config.sub"
 patch_getifaddrs_probe_for_wos "$CURL_WORK/configure"
+# The argv runtime probe cannot execute a WOS binary here. Retain its existing
+# conservative no-write fallback explicitly, rather than warning about it.
+python3 - "$CURL_WORK/configure" <<'PYARGV'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text().replace("curl_cv_writable_argv=cross", "curl_cv_writable_argv=no")
+path.write_text(text)
+PYARGV
+
 write_curl_config_site
 export CONFIG_SITE="$CURL_WORK/config.site"
 
@@ -418,6 +428,12 @@ fi
 # with embedded target/sysroot flags as a library object. Keep CC to one path.
 export CC="$HOST/bin/clang"
 export AR="$HOST/bin/llvm-ar"
+export NM="$HOST/bin/llvm-nm"
+export OBJDUMP="$HOST/bin/llvm-objdump"
+# PE dumpbin is inapplicable to this ELF target.
+export DUMPBIN=:
+# file inspects target ELF data; it is intentionally a build-host program.
+export FILECMD="$(command -v file)"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
 export CFLAGS="$CURL_CFLAGS"
@@ -458,6 +474,19 @@ wos_timed_step "configure" "curl" \
     --disable-threaded-resolver \
     --disable-manual \
     --disable-docs
+
+# Static WOS archives require no target loader-cache finishing step. Preserve
+# every other libtool install diagnostic.
+python3 - "$CURL_WORK/libtool" <<'PYLIBTOOL'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines(keepends=True)
+for index, line in enumerate(lines):
+    if "func_warning" in line and "remember to run" in line and "--finish$future_libdirs" in line:
+        lines[index] = "      : # Static WOS archives need no target libtool --finish.\n"
+path.write_text("".join(lines))
+PYLIBTOOL
 
 # curl creates this disabled-CA placeholder as a Make prerequisite. Materialize
 # it before snapshotting the build tree so distributed compilers never race a

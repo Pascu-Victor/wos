@@ -419,6 +419,10 @@ if(WOS_BUILD_MLIBC_CONFORMANCE)
     list(APPEND WOS_MLIBC_CONFORMANCE_ROOTFS_INPUTS ${MLIBC_CONFORMANCE_STAMP})
 endif()
 
+# Both libc builders install into the same sysroot. Readers must wait until
+# conformance installation finishes, not merely the first libc install.
+set(WOS_MLIBC_READY_DEPENDS ${MLIBC_STAMP} ${WOS_MLIBC_CONFORMANCE_ROOTFS_INPUTS})
+
 # --- libcxx: build and install libc++ ---------------------------------------
 set(LIBCXX_STAMP ${CMAKE_BINARY_DIR}/stamps/libcxx.stamp)
 if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
@@ -434,7 +438,7 @@ elseif(WOS_SKIP_LIBCXX_INSTALL)
         COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Using pre-seeded libc++ in isolated sysroot..."
-        DEPENDS ${MLIBC_STAMP}
+        DEPENDS ${WOS_MLIBC_READY_DEPENDS}
     )
 else()
     add_custom_command(
@@ -446,7 +450,7 @@ else()
         COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Building libc++..."
-        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_libcxx_for_wos.sh ${MLIBC_STAMP}
+        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_libcxx_for_wos.sh ${WOS_MLIBC_READY_DEPENDS}
     )
 endif()
 if(NOT WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
@@ -476,7 +480,7 @@ else()
         COMMAND ${CMAKE_COMMAND} -E touch ${BUSYBOX_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Building busybox..."
-        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh ${WOS_BUSYBOX_CONFIG} ${BUSYBOX_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
+        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh ${WOS_BUSYBOX_CONFIG} ${BUSYBOX_SOURCES} ${WOS_MLIBC_READY_DEPENDS} ${LIBCXX_STAMP}
     )
     add_custom_target(busybox DEPENDS ${BUSYBOX_STAMP})
 endif()
@@ -502,7 +506,7 @@ else()
         COMMAND ${CMAKE_COMMAND} -E touch ${DROPBEAR_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Building dropbear..."
-        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh ${DROPBEAR_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
+        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh ${DROPBEAR_SOURCES} ${WOS_MLIBC_READY_DEPENDS} ${LIBCXX_STAMP}
     )
     add_custom_target(dropbear DEPENDS ${DROPBEAR_STAMP})
 endif()
@@ -529,7 +533,7 @@ else()
         COMMAND ${CMAKE_COMMAND} -E touch ${GNU_MAKE_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Building GNU make..."
-        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_make.sh ${GNU_MAKE_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
+        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_make.sh ${GNU_MAKE_SOURCES} ${WOS_MLIBC_READY_DEPENDS} ${LIBCXX_STAMP}
     )
     add_custom_target(gnu_make DEPENDS ${GNU_MAKE_STAMP})
 endif()
@@ -559,8 +563,9 @@ if(WOS_BUILD_BASH_FOR_WOS)
             COMMENT "Building native WOS Bash..."
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_bash_for_wos.sh
+                ${CMAKE_SOURCE_DIR}/toolchain/patches/bash/wos-warnings.patch
                 ${BASH_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(bash_for_wos DEPENDS ${BASH_FOR_WOS_STAMP})
     endif()
@@ -593,7 +598,7 @@ if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_zlib_for_wos.sh
                 ${ZLIB_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(zlib_for_wos DEPENDS ${ZLIB_FOR_WOS_STAMP})
     endif()
@@ -627,7 +632,7 @@ if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_openssl_for_wos.sh
                 ${OPENSSL_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(openssl_for_wos DEPENDS ${OPENSSL_FOR_WOS_STAMP})
     endif()
@@ -663,7 +668,7 @@ if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
                 ${CURL_FOR_WOS_SOURCES}
                 ${ZLIB_FOR_WOS_STAMP}
                 ${OPENSSL_FOR_WOS_STAMP}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(curl_for_wos DEPENDS ${CURL_FOR_WOS_STAMP})
         add_dependencies(curl_for_wos zlib_for_wos openssl_for_wos)
@@ -703,7 +708,7 @@ if(WOS_BUILD_GIT_FOR_WOS)
                 ${WOS_BUILD_SCRIPTS_DIR}/build_git_for_wos.sh
                 ${GIT_FOR_WOS_SOURCES}
                 ${CURL_FOR_WOS_STAMP}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(git_for_wos DEPENDS ${GIT_FOR_WOS_STAMP})
         add_dependencies(git_for_wos bash_for_wos curl_for_wos)
@@ -800,7 +805,7 @@ if(WOS_BUILD_CLANG_FOR_WOS)
                 ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/lld/CMakeLists.txt
                 ${CLANG_FOR_WOS_SOURCES}
                 ${WOS_CMAKE_FOR_HOST_DEPENDS}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
                 ${LIBCXX_STAMP}
         )
         add_custom_target(clang_for_wos DEPENDS ${CLANG_FOR_WOS_STAMP})
@@ -838,7 +843,7 @@ if(WOS_BUILD_NINJA_FOR_WOS)
                 ${CMAKE_SOURCE_DIR}/toolchain/src/ninja/CMakeLists.txt
                 ${NINJA_FOR_WOS_SOURCES}
                 ${WOS_CMAKE_FOR_HOST_DEPENDS}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
                 ${LIBCXX_STAMP}
         )
         add_custom_target(ninja_for_wos DEPENDS ${NINJA_FOR_WOS_STAMP})
@@ -876,7 +881,7 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
                 ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/CMakeLists.txt
                 ${CMAKE_FOR_WOS_SOURCES}
                 ${WOS_CMAKE_FOR_HOST_DEPENDS}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
                 ${LIBCXX_STAMP}
         )
         add_custom_target(cmake_for_wos DEPENDS ${CMAKE_FOR_WOS_STAMP})
@@ -914,7 +919,7 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_python_for_wos.sh
                 ${PYTHON_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
                 ${LIBCXX_STAMP}
         )
         add_custom_target(python_for_wos ALL DEPENDS ${PYTHON_FOR_WOS_STAMP})
@@ -937,7 +942,7 @@ if(WOS_BUILD_MESON_FOR_WOS)
         set(WOS_MESON_FOR_WOS_DEPENDS
             ${WOS_BUILD_SCRIPTS_DIR}/build_meson_for_wos.sh
             ${MESON_FOR_WOS_SOURCES}
-            ${MLIBC_STAMP}
+            ${WOS_MLIBC_READY_DEPENDS}
             ${LIBCXX_STAMP}
         )
         if(WOS_BUILD_PYTHON_FOR_WOS)
@@ -992,7 +997,7 @@ if(WOS_BUILD_NASM_FOR_WOS)
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_nasm_for_wos.sh
                 ${NASM_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(nasm_for_wos DEPENDS ${NASM_FOR_WOS_STAMP})
     endif()
@@ -1027,7 +1032,7 @@ if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_ncurses_for_wos.sh
                 ${NCURSES_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(ncurses_for_wos DEPENDS ${NCURSES_FOR_WOS_STAMP})
     endif()
@@ -1068,9 +1073,10 @@ if(WOS_BUILD_NANO_FOR_WOS)
             COMMENT "Building native WOS nano..."
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_nano_for_wos.sh
+                ${CMAKE_SOURCE_DIR}/toolchain/patches/nano/wos-warnings.patch
                 ${NANO_FOR_WOS_SOURCES}
                 ${NCURSES_FOR_WOS_STAMP}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(nano_for_wos DEPENDS ${NANO_FOR_WOS_STAMP})
         add_dependencies(nano_for_wos ncurses_for_wos)
@@ -1112,8 +1118,9 @@ if(WOS_BUILD_DOOM_ASCII_FOR_WOS)
             DEPENDS
                 ${WOS_BUILD_SCRIPTS_DIR}/build_doom_ascii_for_wos.sh
                 ${CMAKE_SOURCE_DIR}/toolchain/patches/doom-ascii/wos-clean-exit.patch
+                ${CMAKE_SOURCE_DIR}/toolchain/patches/doom-ascii/wos-warnings.patch
                 ${DOOM_ASCII_FOR_WOS_SOURCES}
-                ${MLIBC_STAMP}
+                ${WOS_MLIBC_READY_DEPENDS}
         )
         add_custom_target(doom_ascii_for_wos DEPENDS ${DOOM_ASCII_FOR_WOS_STAMP})
     endif()
@@ -1319,6 +1326,9 @@ if(NOT WOS_NATIVE_SYSTEM_BUILD)
     foreach(mod IN LISTS WOS_SYSROOT_DEPENDENT_TARGETS)
         if(TARGET ${mod})
             add_dependencies(${mod} mlibc libcxx)
+            if(TARGET mlibc_conformance)
+                add_dependencies(${mod} mlibc_conformance)
+            endif()
         endif()
     endforeach()
 endif()

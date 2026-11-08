@@ -341,6 +341,20 @@ if [ -f "$NASM_BUILD/source.path" ] && [ "$(cat "$NASM_BUILD/source.path")" != "
     wos_remove_tree "$NASM_BUILD"
 fi
 patch_config_sub_for_wos "$NASM_SOURCE_DIR/autoconf/helpers/config.sub"
+# This port builds assembler binaries, not optional manpages. Keep the tool
+# checks and their visible notices without treating missing doc tools as errors.
+python3 - "$NASM_SOURCE_DIR/configure" <<'PYDOCS'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+for tool in ("asciidoc", "xmlto"):
+    text = text.replace(f"WARNING: No {tool} package found, cannot build man pages",
+                        f"NOTICE: No {tool} package found; optional man pages omitted")
+if text != path.read_text():
+    path.write_text(text)
+PYDOCS
+
 
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     BUILD_TRIPLE="$TARGET_ARCH"
@@ -353,7 +367,7 @@ printf '%s\n' "$NASM_SOURCE_DIR" > "$NASM_BUILD/source.path"
 write_nasm_config_site
 export CONFIG_SITE="$NASM_BUILD/config.site"
 
-NASM_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -m64 -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
+NASM_CFLAGS="-I$NASM_SOURCE_DIR --sysroot=$TARGET_SYSROOT -O2 -g -m64 -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
 NASM_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 
 export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
@@ -361,7 +375,8 @@ export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
 export CFLAGS="$NASM_CFLAGS"
-# Keep NASM's project headers ahead of any sysroot headers.
+# The attribute probes temporarily replace CPPFLAGS; keep their source include
+# path in CFLAGS so out-of-tree feature checks can find autoconf/attribute.h.
 export CPPFLAGS=""
 export LDFLAGS="$NASM_LDFLAGS"
 
@@ -370,7 +385,10 @@ if [ -f "$NASM_BUILD/Makefile" ] && grep -F -- "-I$TARGET_SYSROOT/include" "$NAS
     rm -f "$NASM_BUILD/Makefile" "$NASM_BUILD/config.status"
 fi
 
-if [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_BUILD/Makefile" ] ||
+# Configure feature probes must be rerun when compiler/include flags change.
+printf '%s\n' "$CC" "$CFLAGS" "$CPPFLAGS" "$LDFLAGS" > "$NASM_BUILD/config.flags.next"
+if ! cmp -s "$NASM_BUILD/config.flags.next" "$NASM_BUILD/config.flags" ||
+    [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_BUILD/Makefile" ] ||
     [ "$NASM_BUILD/config.site" -nt "$NASM_BUILD/Makefile" ]; then
     echo "Configuring NASM for WOS..."
     NASM_CONFIGURE_CACHE_ARGS=()
@@ -395,7 +413,9 @@ if [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_
         --prefix=/usr \
         --with-zlib=no \
         --disable-pdf-compression
+    mv "$NASM_BUILD/config.flags.next" "$NASM_BUILD/config.flags"
 fi
+rm -f "$NASM_BUILD/config.flags.next"
 
 seed_nasm_generated_files
 

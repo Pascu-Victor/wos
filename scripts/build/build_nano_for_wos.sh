@@ -289,6 +289,7 @@ require_file "$TARGET_SYSROOT/include/term.h" "Run scripts/build/build_ncurses_f
 NANO_SOURCE_DIR="$(resolve_nano_source)"
 copy_source_to_workdir "$NANO_SOURCE_DIR"
 patch_config_sub_for_wos "$NANO_WORK/config.sub"
+patch --batch --forward --fuzz=0 -d "$NANO_WORK" -p1 < "$WORKSPACE_ROOT/toolchain/patches/nano/wos-warnings.patch"
 write_nano_config_site
 export CONFIG_SITE="$NANO_WORK/config.site"
 
@@ -311,6 +312,28 @@ export CFLAGS="$NANO_CFLAGS"
 export CPPFLAGS="$NANO_CPPFLAGS"
 export LDFLAGS="$NANO_LDFLAGS"
 export LIBS="-lncursesw"
+
+# COLOR_WHITE is a compile-time constant. Test it with the target compiler;
+# nano's upstream runtime-only cross branch cannot test this otherwise.
+"$HOST/bin/clang" "--target=$TARGET_ARCH" "--sysroot=$TARGET_SYSROOT" \
+    "-I$TARGET_SYSROOT/include" -x c -fsyntax-only - <<'EOCOLOR'
+#include <curses.h>
+int color_probe(void) { return COLOR_WHITE; }
+EOCOLOR
+python3 - "$NANO_WORK/configure" <<'PYCOLOR'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+start = text.index('  { printf', text.index('checking whether _XOPEN_SOURCE_EXTENDED is needed'))
+end = text.index('else $as_nop', start)
+block = text[start:end]
+if "Can't check need for _XOPEN_SOURCE_EXTENDED when cross-compiling." not in block:
+    raise SystemExit("nano color probe layout changed; review the cross check")
+text = text[:start] + '  echo "no (target compile probe passed)" >&6;' + chr(10) + text[end:]
+path.write_text(text)
+PYCOLOR
+
 export PKG_CONFIG=false
 export NCURSESW_CFLAGS="-I$TARGET_SYSROOT/include"
 export NCURSESW_LIBS="-L$TARGET_SYSROOT/lib -lncursesw"

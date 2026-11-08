@@ -613,6 +613,7 @@ require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before b
 
 BASH_SOURCE_DIR="$(resolve_bash_source)"
 copy_source_to_workdir "$BASH_SOURCE_DIR"
+patch --batch --forward --fuzz=0 -d "$BASH_WORK" -p1 < "$WORKSPACE_ROOT/toolchain/patches/bash/wos-warnings.patch"
 patch_config_sub_for_wos "$BASH_WORK/support/config.sub"
 patch_shobj_conf_for_wos "$BASH_WORK/support/shobj-conf"
 if [ "$HOST_SYSTEM" = "WOS" ]; then
@@ -627,7 +628,9 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
     ln -s . "$TARGET_SYSROOT/usr"
 fi
 
-BASH_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -DNEED_EXTERN_PC"
+# Bash deliberately uses assignments as loop conditions and nested unbraced ifs.
+# Suppress these two upstream style diagnostics only; retain type/format checks.
+BASH_CFLAGS="-Wno-parentheses -Wno-dangling-else --sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -DNEED_EXTERN_PC"
 BASH_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 BUILD_CC="$(find_build_cc)" || {
     echo "ERROR: could not find a host C compiler for Bash build tools." >&2
