@@ -423,6 +423,7 @@ namespace {
 // runs after every lexical stable pin has ended, while a queued frame may live.
 struct SelftestFutexFrame {
     static constexpr uint64_t ADDRESS = 0x49000040;
+    static constexpr uint64_t PAGE_ADDRESS = ADDRESS & ~(mod::mm::paging::PAGE_SIZE - 1);
     mod::sched::task::Task task{};
     mod::mm::paging::PageTable* root{};
     void* frame{};
@@ -449,8 +450,7 @@ struct SelftestFutexFrame {
         oracle_owned = true;
         uint64_t const PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(frame)));
         // map_page transfers this initial frame reference into the owned root.
-        mod::mm::virt::map_page(root, ADDRESS & ~(mod::mm::paging::PAGE_SIZE - 1), PHYSICAL,
-                                mod::mm::paging::page_types::USER | mod::mm::paging::PAGE_SHARED);
+        mod::mm::virt::map_page(root, PAGE_ADDRESS, PHYSICAL, mod::mm::paging::page_types::USER | mod::mm::paging::PAGE_SHARED);
         // The following real stable pin verifies this mapping before retain;
         // the fixture needs no raw translation at the syscall entrypoint.
         return true;
@@ -644,12 +644,12 @@ auto futex_selftest_private_keys_separate_physical_aliases() -> bool {
     if (!first.initialize() || !second.initialize()) return false;
     uint64_t const PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(first.frame)));
     uint64_t const PRIVATE_FLAGS = mod::mm::paging::page_types::USER_READONLY;
-    mod::mm::virt::map_page(first.root, first.ADDRESS, PHYSICAL, PRIVATE_FLAGS);  // Same-frame flag change owns no extra ref.
+    mod::mm::virt::map_page(first.root, first.PAGE_ADDRESS, PHYSICAL, PRIVATE_FLAGS);  // Same-frame flag change owns no extra ref.
     if (!mod::mm::phys::page_ref_try_inc(first.frame)) return false;
-    mod::mm::virt::map_page(second.root, second.ADDRESS, PHYSICAL, PRIVATE_FLAGS);
+    mod::mm::virt::map_page(second.root, second.PAGE_ADDRESS, PHYSICAL, PRIVATE_FLAGS);
     uint64_t const ALIAS = first.ADDRESS + mod::mm::paging::PAGE_SIZE;
     if (!mod::mm::phys::page_ref_try_inc(first.frame)) return false;
-    mod::mm::virt::map_page(first.root, ALIAS, PHYSICAL, PRIVATE_FLAGS);
+    mod::mm::virt::map_page(first.root, ALIAS & ~(mod::mm::paging::PAGE_SIZE - 1), PHYSICAL, PRIVATE_FLAGS);
     mod::mm::virt::UserFutexIdentity own{};
     mod::mm::virt::UserFutexIdentity other_root{};
     mod::mm::virt::UserFutexIdentity other_word{};
@@ -677,7 +677,8 @@ auto futex_selftest_shared_alias_and_private_replacement_keys() -> bool {
     uint64_t const FIRST_PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(first.frame)));
     uint64_t const SECOND_PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(second.frame)));
     if (!mod::mm::phys::page_ref_try_inc(first.frame)) return false;
-    mod::mm::virt::map_page(second.root, second.ADDRESS, FIRST_PHYSICAL, mod::mm::paging::page_types::USER | mod::mm::paging::PAGE_SHARED);
+    mod::mm::virt::map_page(second.root, second.PAGE_ADDRESS, FIRST_PHYSICAL,
+                            mod::mm::paging::page_types::USER | mod::mm::paging::PAGE_SHARED);
     mod::mm::virt::UserFutexIdentity shared_own{};
     mod::mm::virt::UserFutexIdentity shared_peer{};
     if (!selftest_capture_key(first, first.ADDRESS, shared_own) || !selftest_capture_key(second, second.ADDRESS, shared_peer) ||
@@ -693,7 +694,7 @@ auto futex_selftest_shared_alias_and_private_replacement_keys() -> bool {
         SelftestFutexWaiterOwners owners{table, first.task, waiter};
         if (selftest_remove_key(table, futex_key(shared_peer), owners) != 1) return false;
     }
-    mod::mm::virt::map_page(first.root, first.ADDRESS, FIRST_PHYSICAL, mod::mm::paging::page_types::USER_READONLY);
+    mod::mm::virt::map_page(first.root, first.PAGE_ADDRESS, FIRST_PHYSICAL, mod::mm::paging::page_types::USER_READONLY);
     mod::mm::virt::UserFutexIdentity before{};
     if (!selftest_capture_key(first, first.ADDRESS, before) || before.shared) return false;
     decltype(futex_table) table;
@@ -702,7 +703,7 @@ auto futex_selftest_shared_alias_and_private_replacement_keys() -> bool {
     if (waiter == nullptr) return false;
     SelftestFutexWaiterOwners owners{table, first.task, waiter};
     if (!mod::mm::phys::page_ref_try_inc(second.frame)) return false;
-    mod::mm::virt::map_page(first.root, first.ADDRESS, SECOND_PHYSICAL, mod::mm::paging::page_types::USER_READONLY);
+    mod::mm::virt::map_page(first.root, first.PAGE_ADDRESS, SECOND_PHYSICAL, mod::mm::paging::page_types::USER_READONLY);
     mod::mm::virt::UserFutexIdentity after{};
     if (!selftest_capture_key(first, first.ADDRESS, after) || after.shared || after.physical_word == before.physical_word ||
         !FutexKeyEqual{}(futex_key(before), futex_key(after))) {
