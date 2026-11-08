@@ -1,5 +1,8 @@
 # Physical GPU platform
 
+See [the external VFIO GPU fixture](gpu_vfio_fixture.md) for the reproducible
+physical-device guest layout and evidence checklist.
+
 Goal 41 is in progress. It provides the common platform needed by physical AMD
 and NVIDIA drivers; it does not yet provide a GPU driver or a hardware support
 claim. The selected deployment is a whole physical PCI function on bare metal
