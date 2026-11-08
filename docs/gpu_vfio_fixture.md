@@ -69,6 +69,13 @@ profiles. Under WOS strict policy, an unsupported/no-vIOMMU mode must fail
 closed instead of being counted as isolated DMA. Do not enable ATS, PRI, or
 PASID as a workaround for a failed capability check.
 
+Treat the AMD virtual-IOMMU option as a compatibility probe until the guest
+trace shows a matching IVRS owner, a supported PCI IOMMU function/capability,
+and translated-domain activation. An IVRS table alone is insufficient: if the
+virtual model omits the required PCI interface, WOS must stop strict boot with
+bus mastering inhibited. Record that as an unsupported fixture, not AMD-Vi
+qualification; do not fabricate PCI capability bytes or relax strict policy.
+
 ## Evidence and exit checks
 
 Freeze the kernel ELF, boot/rootfs hashes, WOS command line, QEMU command and
