@@ -11027,6 +11027,8 @@ auto rollback_kernel_vmap_reservation(size_t first_page, size_t page_count) -> b
     return true;
 }
 
+constexpr size_t RELEASE_BATCH_PAGES = 512;
+
 auto release_kernel_vmap_mappings(vaddr_t start, size_t page_count) -> bool {
     if (kernel_pagemap == nullptr || page_count == 0) {
         return false;
@@ -11051,7 +11053,6 @@ auto release_kernel_vmap_mappings(vaddr_t start, size_t page_count) -> bool {
     // Buffer-cache vmap allocations are at most 2 MiB, but keep teardown
     // bounded for any future caller. PTEs are cleared before the global flush;
     // frames remain referenced until every CPU has discarded stale leaves.
-    constexpr size_t RELEASE_BATCH_PAGES = 512;
     std::array<void*, RELEASE_BATCH_PAGES> frames{};
     size_t released = 0;
     while (released < page_count) {
@@ -11263,7 +11264,9 @@ auto drain_kernel_vmap_frees_bounded(size_t max_pages) -> KernelVmapReclaimStats
     while (stats.reclaimed_pages < max_pages) {
         size_t first_page = 0;
         size_t page_count = 0;
-        size_t const REMAINING = max_pages - stats.reclaimed_pages;
+        // The typed-MMIO range walker has a finite leaf-visit budget. Keep
+        // each validation and shootdown within one ordinary release batch.
+        size_t const REMAINING = std::min(max_pages - stats.reclaimed_pages, RELEASE_BATCH_PAGES);
         if (!find_pending_kernel_vmap_run(REMAINING, first_page, page_count)) {
             break;
         }

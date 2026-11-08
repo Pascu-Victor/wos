@@ -160,7 +160,7 @@ def main() -> None:
         [
             "!kernel_vmap_context_can_drain()",
             "kernel_vmap_draining.compare_exchange_strong",
-            "REMAINING = max_pages - stats.reclaimed_pages",
+            "REMAINING = std::min(max_pages - stats.reclaimed_pages, RELEASE_BATCH_PAGES)",
             "find_pending_kernel_vmap_run(REMAINING, first_page, page_count)",
             "release_kernel_vmap_mappings(START, page_count)",
             "release_kernel_vmap_span(first_page, page_count, true)",
