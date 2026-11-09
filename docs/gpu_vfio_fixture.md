@@ -69,6 +69,20 @@ profiles. Under WOS strict policy, an unsupported/no-vIOMMU mode must fail
 closed instead of being counted as isolated DMA. Do not enable ATS, PRI, or
 PASID as a workaround for a failed capability check.
 
+Record the guest kernel command line together with the QEMU device list. For a
+read-only physical PCI diagnostic, use these distinct profiles:
+
+| Guest mode | QEMU IOMMU device | WOS DMA policy | Expected isolation claim |
+| --- | --- | --- | --- |
+| No vIOMMU compatibility | None | `--iommu-off` | Explicit software passthrough; no guest DMA isolation. |
+| Intel vIOMMU translation | `intel-iommu` | `--iommu-strict` | Only a successfully admitted translated guest domain; host VFIO isolation is separate. |
+| No vIOMMU negative control | None | `--iommu-strict` | Boot must refuse requested translation with bus mastering inhibited. |
+
+Use the same selected physical function and immutable guest artifacts for a
+paired comparison where possible. A successful `--iommu-off` boot establishes
+mode distinction and PCI inventory only; it does not authorize DMA submission
+or satisfy the BAR, firmware, IRQ, reset, or full GPU smoke tests below.
+
 Treat the AMD virtual-IOMMU option as a compatibility probe until the guest
 trace shows a matching IVRS owner, a supported PCI IOMMU function/capability,
 and translated-domain activation. An IVRS table alone is insufficient: if the
