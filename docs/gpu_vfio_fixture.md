@@ -19,6 +19,26 @@ operator must make the entire required group/reset domain available to VFIO
 without resetting an unrelated device. Do not begin if group isolation or
 recovery is uncertain.
 
+Inside a host lease that already holds a **bound** VFIO cdev FD and its
+iommufd context, call `scripts/test/vfio_hot_reset_info.py` as a Python module:
+
+```python
+from vfio_hot_reset_info import query
+
+dependency_record = query(gpu_fd)  # The lease retains gpu_fd after this call.
+```
+
+Add `scripts/test` to the host worker's Python import path. Save the returned
+record privately with the fixture. It reports VFIO's exact physical hot-reset
+dependency BDFs and whether each is bound, implicitly owned through a shared
+group, or not owned. The helper performs only the read-only
+`VFIO_DEVICE_GET_PCI_HOT_RESET_INFO` ioctl; it never opens or closes a device,
+binds an iommufd, changes a driver, or requests a reset. A cdev queried before
+`VFIO_DEVICE_BIND_IOMMUFD` returns an error. Even an `all_owned` result is only
+one prerequisite: require stable topology, device quiescence, recovery and a
+retained lease before any reset. The guest's virtual PCI topology and the IOMMU
+group alone cannot establish the host reset set.
+
 Use one WOS guest at a time. Keep immutable, hash-identified QCOW2 boot/rootfs
 bases and create private QCOW2 overlays. Measure allocated bytes and free space
 before creation and after cleanup; set a bound before the run. Never delete a
