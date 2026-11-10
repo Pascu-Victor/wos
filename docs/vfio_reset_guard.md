@@ -33,3 +33,12 @@ failed and recover the host; do not remove the filter to force it through.
 
 The host unit test uses `/dev/null` and a child `exec`; it does not require
 root, open VFIO, or operate a GPU.
+
+One selected physical AMD VFIO guest also booted WOS through the guard under
+an existing single-function host lease. Its read-only GPU discovery and
+verified firmware-header diagnostic passed, followed by natural shutdown,
+QEMU exit zero, disposable-overlay cleanup and native host recovery. The
+physical hot-reset query still reported six unowned sibling functions, so the
+run did not attempt a shared reset or qualify a full-domain lease, GPU DMA or
+interrupt delivery. The private result and serial SHA-256 values are recorded
+in Goal 41's local evidence ledger.
